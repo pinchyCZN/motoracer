@@ -1,0 +1,438 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                FUN_00476100 - DIRECTDRAW INITIALISATION
+
+
+Abstract
+
+   FUN_00476100 is the DirectDraw initialisation routine: display mode
+   selection, surface creation, and texture-bound resolution. It is
+   where the game's hard 16-bit colour-depth requirement is enforced,
+   which makes it the first function of real interest to the renderer
+   modernisation effort.
+
+   Address     0x00476100
+   TU          screen3d\dd.cpp (between the two assert anchors)
+   Signature   __thiscall, 6 parameters, returns 1 ok / 0 fail
+   Caller      FUN_00474520 (sole caller)
+
+Table of Contents
+
+   1. Identity and parameters
+   2. The 16-bit lock lives here [verified]
+      2.1. Enumerated display mode table [verified]
+      2.2. The lock actually begins at enumeration [verified]
+   3. Texture bound resolution [verified]
+   4. The MinTextureHeight bug, resolved [verified]
+   5. The 329-byte stride is real: a seven-entry surface array
+      5.1. What the loop actually does
+   6. Callees
+   7. Open questions
+
+
+1.  Identity and parameters
+
+   Correction to an earlier note: this function was previously described
+   as "the texture-size clamp". That undersold it. It is the DirectDraw
+   init routine - mode selection, surface creation, and texture-bound
+   resolution all in one. The texture clamping is one section of it.
+
+   Identity evidence [verified]: it builds the MFC CString "Fatal error
+   in DirectDraw init" (0x004eee20) at entry, is __thiscall with vtable
+   calls through param_1, sets an init-complete flag DAT_004ee9dc = 1
+   only on the success path, and reports failure via AfxMessageBox. The
+   this pointer and the Cd3d/CDD naming in nearby strings suggest a
+   CDD::Init-style method [inferred].
+
+   Parameters, identified from where each one is stored:
+
+   +---------+-----------------+-----------------------------------------+
+   | Param   | Global          | Meaning                                 |
+   +=========+=================+=========================================+
+   | param_1 | (this)          | Cdd object; vtable +4 and +8 are called |
+   +---------+-----------------+-----------------------------------------+
+   | param_2 | g_displayWidth  | requested screen width                  |
+   +---------+-----------------+-----------------------------------------+
+   | param_3 | g_displayHeight | requested screen height                 |
+   +---------+-----------------+-----------------------------------------+
+   | param_4 | g_mainWidth     | main surface (render target) width      |
+   +---------+-----------------+-----------------------------------------+
+   | param_5 | g_mainHeight    | main surface (render target) height     |
+   +---------+-----------------+-----------------------------------------+
+   | param_6 | g_displayBpp    | display bit depth                       |
+   +---------+-----------------+-----------------------------------------+
+
+   RESOLVED. All six parameters are identified; param_4 and param_5
+   came from Cdd_CreateMainSurface, which stores them as the surface
+   height and width. The prototype is applied in the database:
+
+   int __thiscall Cdd_Init(void *this,
+                           int screenWidth, int screenHeight,
+                           int mainWidth,   int mainHeight,
+                           int bpp);
+
+   The render target is therefore sized independently of the screen.
+   See dd-main-surface.txt.
+
+2.  The 16-bit lock lives here [verified]
+
+   This is one of the places behind "16 bit screen mode required !",
+   though not the first - see section 2.2. The requested resolution is
+   only honoured if a matching 16 bpp mode was enumerated:
+
+   for each entry in the enumerated mode table:
+       if (entry.bpp == 0x10 && entry.width == req_w && entry.height == req_h)
+           found = true
+
+   if (found) { use req_w, req_h }
+   else       { use 0x280, 0x1e0 }      // 640 x 480
+
+   0x10 is 16, compared against the mode's depth field. There is no
+   15/24/32 bpp branch anywhere in this function. The fallback is a hard
+   640x480, which matches the "At least 640x480 mode required" string.
+
+   The scan is skipped entirely when g_ddFullscreen (DAT_005d43a8) is
+   zero, in which case the requested width and height are taken
+   unconditionally. RESOLVED: that global is the fullscreen flag. Zero
+   means windowed, and windowed mode never calls SetDisplayMode at all,
+   so the 16-bit lock applies to the fullscreen path only. See dd-
+   chain.txt.
+
+2.1.  Enumerated display mode table [verified]
+
+   Base g_displayModes at 0x005d8954, count in g_displayModeCount at
+   0x004ee984, stride 0x24 = 36 bytes. The record is typed in the
+   database as MR_DisplayMode and written up on its own in
+   structs/MR_DisplayMode.txt; what follows is the summary.
+
+   CORRECTION. An earlier draft of this section gave the base as
+   0x005d8968 with width at +0x00, height at +0x04 and bpp at +0x08.
+   Both the base and the order were wrong. That address is record 0's
+   BPP field, 0x14 bytes into the record, and the earlier offsets were
+   read backwards from it. The database symbol g_displayModeTable named
+   the same address and has been renamed g_displayModeBpp0 for the same
+   reason.
+
+   The layout below is taken from the writer rather than the readers, so
+   it is complete - every field the callback assigns, in the order it
+   assigns them:
+
+   +--------+------+------+-----------+------------+---------------------------------+
+   | Offset | Size | Type | Name      | Confidence | Evidence                        |
+   +========+======+======+===========+============+=================================+
+   | 0x00   | 4    | int  | rMask     | verified   | DDSURFACEDESC +0x58             |
+   +--------+------+------+-----------+------------+---------------------------------+
+   | 0x04   | 4    | int  | gMask     | verified   | DDSURFACEDESC +0x5c             |
+   +--------+------+------+-----------+------------+---------------------------------+
+   | 0x08   | 4    | int  | bMask     | verified   | DDSURFACEDESC +0x60             |
+   +--------+------+------+-----------+------------+---------------------------------+
+   | 0x0c   | 4    | int  | width     | verified   | dwWidth, +0x0c; vs param_2      |
+   +--------+------+------+-----------+------------+---------------------------------+
+   | 0x10   | 4    | int  | height    | verified   | dwHeight, +0x08; vs param_3     |
+   +--------+------+------+-----------+------------+---------------------------------+
+   | 0x14   | 4    | int  | bpp       | verified   | dwRGBBitCount, +0x54; always 16 |
+   +--------+------+------+-----------+------------+---------------------------------+
+   | 0x18   | 4    | int  | pixels    | verified   | width * height, computed        |
+   +--------+------+------+-----------+------------+---------------------------------+
+   | 0x1c   | 4    | int  | sizeClass | verified   | 0, 1 or 2; see below            |
+   +--------+------+------+-----------+------------+---------------------------------+
+   | 0x20   | 4    | ?    | unused    | verified   | never written                   |
+   +--------+------+------+-----------+------------+---------------------------------+
+
+   The 24 bytes previously recorded as unexamined are now accounted for:
+   three colour masks ahead of the dimensions, and two derived values
+   behind them. Only the last dword of the 36 is dead.
+
+   sizeClass deserves a note, because it is the ScreenMode setting
+   computed from first principles. The callback writes 0 when the pixel
+   count is below 0x30000, 1 when it equals it, and 2 when it exceeds
+   it. 0x30000 is 196608, which is 512 x 384 exactly:
+
+   +---------+--------+------------+-----------+
+   | Mode    | Pixels | vs 0x30000 | sizeClass |
+   +=========+========+============+===========+
+   | 320x240 | 76800  | below      | 0         |
+   +---------+--------+------------+-----------+
+   | 512x384 | 196608 | equal      | 1         |
+   +---------+--------+------------+-----------+
+   | 640x480 | 307200 | above      | 2         |
+   +---------+--------+------------+-----------+
+
+   That is an independent confirmation, from a function that has nothing
+   to do with fonts or menus, that g_cfgScreenMode 2 is 640x480 and not
+   320x240 - the error corrected in structs/MR_Font.txt section 5
+   [verified].
+
+2.2.  The lock actually begins at enumeration [verified]
+
+   The bpp test in section 2 is real but it is not the mechanism. It is
+   a second check on data that has already been filtered, because a mode
+   that is not 16 bits per pixel never reaches the table at all.
+
+   Cdd_EnumVideoModes at 0x004741a0 - named from its own error string
+   "Cdd::enumVideoModes()" - zeroes the count and calls
+   IDirectDraw::EnumDisplayModes with Cdd_EnumModesCallback at
+   0x00477160 as the callback. The callback records a mode only if every
+   one of these holds:
+
+   +------------------------------------+-------------------------------+
+   | Test                               | Meaning                       |
+   +====================================+===============================+
+   | g_displayModeCount < 0x32          | at most 50 modes recorded     |
+   +------------------------------------+-------------------------------+
+   | desc != NULL                       |                               |
+   +------------------------------------+-------------------------------+
+   | dwFlags & 0x1000                   | DDSD_PIXELFORMAT present      |
+   +------------------------------------+-------------------------------+
+   | dwFlags & 2                        | DDSD_HEIGHT present           |
+   +------------------------------------+-------------------------------+
+   | dwFlags & 4                        | DDSD_WIDTH present            |
+   +------------------------------------+-------------------------------+
+   | ddpfPixelFormat.dwFlags & 0x40     | DDPF_RGB, not a paletted mode |
+   +------------------------------------+-------------------------------+
+   | dwRGBBitCount == 0x10              | SIXTEEN BITS PER PIXEL        |
+   +------------------------------------+-------------------------------+
+   | width <= 0x280 and height <= 0x1e0 | 640x480 ceiling, conditional  |
+   +------------------------------------+-------------------------------+
+
+   So the filter is one equality against 0x10 in a callback, and
+   everything downstream inherits it. It is the earliest 16-bit
+   enforcement point, and the load-bearing one FOR THE MODE LIST.
+
+   CORRECTION - it is NOT true that the other enforcement points are
+   merely consequences of it. maybe_Cdd_ValidateDisplayMode at
+   0x0045a660 checks the CURRENT DESKTOP MODE, which enumeration does
+   not control at all, and the gate in Cdd_Init checks the primary
+   surface. Those are three independent gates on three different things.
+   See subsystems/display-mode-gate.txt [verified].
+
+   The last test is the resolution ceiling, and it looks conditional.
+   Modes above 640x480 are admitted only when g_allowLargeModes at
+   0x004dc174 is set AND g_rendererReady is non-zero AND g_rendererMode
+   is 0.
+
+   g_allowLargeModes is never written [verified]. The single read in
+   this callback, at 0x004771b4, is the ONLY occurrence of the address
+   0x004dc174 anywhere in the image - confirmed by a raw byte scan of
+   every initialised block, not just by the reference database, so a
+   write through an addressing form the analyser missed is ruled out.
+   Its .data initialiser is 0.
+
+   So the first arm is dead code and the ceiling is UNCONDITIONAL. No
+   display mode larger than 640x480 is ever enumerated, on the hardware
+   path or the software path. The resolution cap is exactly as hard as
+   the 16-bit one and lives in the same eight lines.
+
+   That is the more consequential half of this function for the
+   modernization goal. The 16-bit requirement is at least announced to
+   the player, in five languages; the 640x480 ceiling is silent. A
+   modern adapter enumerating dozens of modes would have all but three
+   of them discarded here, and nothing in the game would say why.
+
+   The flag reads as a development switch that shipped disabled
+   [inferred]. Its two companions in the test are real runtime state,
+   which is what makes the intent legible: someone meant the hardware
+   path to be allowed larger modes, and the feature was gated off rather
+   than removed.
+
+   After enumeration Cdd_EnumVideoModes scans the table twice to record
+   the smallest and largest modes in DAT_004ee97c and DAT_004ee980. Both
+   scans use the same flawed test: a candidate replaces the incumbent
+   only when BOTH its width and its height compare the right way. A mode
+   that is wider but shorter, or taller but narrower, is silently
+   ignored rather than ordered. On the 4:3 mode lists of 1997 that never
+   mattered; on a modern adapter reporting widescreen modes it would
+   [inferred].
+3.  Texture bound resolution [verified]
+
+   Four config globals from the command-line parser are resolved here
+   against the hardware's reported capabilities:
+
+   +---------------+-------------------+---------------+-----------------------+
+   | Source global | Flag              | Destination   | Meaning               |
+   +===============+===================+===============+=======================+
+   | DAT_004dc158  | -MinTextureWidth  | _DAT_004ee9f4 | min width, default 1  |
+   +---------------+-------------------+---------------+-----------------------+
+   | DAT_004dc15c  | -MaxTextureWidth  | DAT_004ee9f8  | max width             |
+   +---------------+-------------------+---------------+-----------------------+
+   | DAT_004dc160  | (never written)   | _DAT_004ee9fc | min height, default 1 |
+   +---------------+-------------------+---------------+-----------------------+
+   | DAT_004dc164  | -MaxTextureHeight | DAT_004eea00  | max height            |
+   +---------------+-------------------+---------------+-----------------------+
+
+   CORRECTED: DAT_005d93b0 and DAT_005d93c4 were described here as
+   device capability inputs (max texture width and height). They are
+   not. Cdd_CreatePrimarySurface assigns them from GetSurfaceDesc on the
+   primary surface, so they are the primary surface dimensions, now
+   named g_primaryWidth and g_primaryHeight. The texture bound therefore
+   defaults to the screen size, not to a hardware capability, and is
+   then clamped by the configured maximum or by the 256 clamp. See dd-
+   primary-surface.txt.
+
+   Two other controls feed in:
+
+   o DAT_004ee968 - "clamp textures to 256" flag. Static init is 1 (on).
+     -NoTextureSizeMax256 sets it to 0. When on, max width/height are
+     pinned to 0x100. Correction: config-globals.txt previously implied
+     0 was the meaningful value; it is a default-on flag that the flag
+     turns off.
+   o DAT_004ee964 - static init 0; selects whether the device maximum is
+     consulted for height. Unidentified.
+
+   -PowerVr (DAT_004dc1cc) or DAT_0053c524 forces a hard 256x256 texture
+   cap, overwriting DAT_004dc15c and DAT_004dc164 directly.
+
+4.  The MinTextureHeight bug, resolved [verified]
+
+   config-globals.txt recorded that -MinTextureHeight writes to the max-
+   texture-width global. This function shows the consequence, and a read
+   of the static initialisers settles it.
+
+   All four globals at 0x004dc158..0x004dc164 are initialised to -1 (ff
+   ff ff ff in .data). The consumer treats -1 as "unset":
+
+   _DAT_004ee9fc = DAT_004dc160;
+   if (DAT_004dc160 == -1) { _DAT_004ee9fc = 1; }
+
+   DAT_004dc160 has exactly one reference in the whole binary - this
+   read. No code ever writes it. So it is always -1, and minimum texture
+   height is always 1.
+
+   The impact is therefore two-sided:
+
+   1. -MinTextureHeight<n> is a no-op for its stated purpose. Minimum
+      texture height cannot be configured at all.
+   2. Worse, it is not merely inert: it writes into DAT_004dc15c, so
+      -MinTextureHeight 64 silently sets maximum texture width to 64.
+
+   The fallback is benign (1 is effectively no minimum), so the bug
+   would present as "-MinTextureHeight makes textures break" rather than
+   as a crash. Preserve it in transcription; fix only in a later
+   deliberate change.
+
+5.  The 329-byte stride is real: a seven-entry surface array
+
+   The function walks two arrays with stride 0x149 (329 bytes), one
+   backwards from 0x005d41fa and one forwards from 0x005d3a44 to
+   0x005d4343. The span is 2303 bytes, about 7 entries. Fields touched
+   are [0] (a flag), [3], and [4], where [4] is passed to FUN_0041e4c0
+   and then set to -1 - a release or free [inferred].
+
+   RESOLVED - the stride is real and Ghidra recovered it correctly. The
+   disassembly carries it as a literal [verified]:
+
+       0047625f  SUB EBX,0x149
+       004764a9  SUB ESI,0x149
+       004764eb  ADD EDI,0x149
+
+   Nothing is inferred from a decompiler-guessed index expression; the
+   constant is in the instruction stream three times. The geometry is
+   exact: 0x005d4343 - 0x005d3a44 = 0x8ff = 2303 = 7 x 329, and
+   0x005d41fa is 0x005d3a44 + 6 x 329, which is the last record. So the
+   array has SEVEN entries.
+
+   The base is not 0x005d3a44 either. The load call takes its object
+   pointer from LEA ECX,[EDI + -0x24], so the walked pointer is a field
+   0x24 into each record and the records themselves begin at 0x005d3a20
+   + i * 329 [verified].
+
+   A 329-byte stride is still unaligned and still odd, but it is what
+   the code does. Records after the first are progressively misaligned
+   and the dword read at +0x24 is therefore unaligned for most of them,
+   which x86 tolerates. That is a fact about the original struct, not a
+   defect in the database.
+
+5.1.  What the loop actually does
+
+   With the callees named, the shape is clear [verified]:
+
+       for (pass = 0; pass < 2; pass++)
+           for (i = 0; i < 7; i++) {
+               flag = rec[i].f24;
+               if (pass == 0 ? flag != 0 : flag == 0)
+                   if (maybe_DdCaps_ShouldLoad(i))
+                       maybe_Cdd_LoadRawToSurface(&rec[i]);
+           }
+
+   So it is a two-priority load: the pass-0 sweep takes every record
+   whose +0x24 flag is set, the pass-1 sweep takes the rest, and each
+   candidate is gated by maybe_DdCaps_ShouldLoad on its index. The
+   records are surface objects - maybe_Cdd_LoadRawToSurface receives one
+   as its this pointer.
+
+   The naming around it already existed and now fits:
+   maybe_DdCaps_ShouldLoad, maybe_DdCaps_TotalSize and
+   maybe_DdCaps_ReloadAll are the family, and ReloadAll calls the same
+   loader, which is what a surface-loss recovery path would do.
+
+   o Still open: what the 329 bytes hold, and why the flag at +0x24
+     splits the load into two passes. Typing the record needs the other
+     members of the DdCaps family read, not more of Cdd_Init.
+
+6.  Callees
+
+   +-----------------+---------------------------------------------------------+
+   | Address         | Role (guessed from position)                            |
+   +=================+=========================================================+
+   | FUN_00496940    | called before the surface teardown loop                 |
+   +-----------------+---------------------------------------------------------+
+   | FUN_004752d0    | first init step; failure aborts                         |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00475c90    | second init step, gated on DAT_005d8938                 |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00475630    | third init step, gated on DAT_005d4320                  |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00475f80(0) | gated on DAT_004ee940                                   |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00475f80(1) | gated on DAT_004e8928 (-SnapShot) - snapshot surface    |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00473ba0    | after the vtable +4 call                                |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00474e40(i) | per-entry, in the second array walk                     |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00477b30    | dd.cpp assert anchor; called when FUN_00474e40 succeeds |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00473da0    | dd.cpp assert anchor; called on the success path        |
+   +-----------------+---------------------------------------------------------+
+   | FUN_0041e4c0    | release/free for the [4] handle                         |
+   +-----------------+---------------------------------------------------------+
+   | FUN_00472bf0    | error string formatting, before AfxMessageBox           |
+   +-----------------+---------------------------------------------------------+
+   | FUN_0047652f    | epilogue / SEH unwind helper                            |
+   +-----------------+---------------------------------------------------------+
+
+   FUN_004752d0, FUN_00475c90, FUN_00475630 and FUN_00475f80 form the
+   ordered init chain and are the natural next functions to read.
+
+7.  Open questions
+
+   o RESOLVED, and it was a trap. The test 0xf < DAT_004ee9a8 is not the
+     game's code: byte 0x0047642d was patched from 74 (JZ) to 7d (JGE).
+     The original reads CMP EAX,0x10 / JZ, i.e. DAT_004ee9a8 == 16 -
+     this IS the 16-bit screen mode check, and the fall-through is the
+     localized error via 0x0053b8ac. Verified by byte-diff against
+     ORIGINAL_MOTO.EXE; see binary-modifications.txt [verified].
+
+   BOTH GLOBALS ARE NOW NAMED. Cdd_InitCapsVariables writes them, and
+   they are the only two things it exports besides the three channel
+   triples [verified]:
+
+   +--------------+-------------------------+-----------------------------+
+   | Was          | Is                      | Meaning                     |
+   +==============+=========================+=============================+
+   | DAT_004ee9a8 | maybe_g_primaryBitDepth | DDPIXELFORMAT dwRGBBitCount |
+   +--------------+-------------------------+-----------------------------+
+   | DAT_004ee9e8 | maybe_g_primaryIsRGB    | DDPF_RGB was set            |
+   +--------------+-------------------------+-----------------------------+
+
+   So the gate runs only when the primary surface reports a non-
+   palettized RGB format. If it is palettized, Cdd_InitCapsVariables
+   writes nothing at all and this depth check is skipped entirely - the
+   behaviour display-mode-gate.txt records from the other side.
+
+   maybe_g_primaryBitDepth has exactly two references in the whole
+   binary: the write in Cdd_InitCapsVariables and this read. The engine
+   measures the true bit depth and consults it solely to decide whether
+   to run, never to decide how to address a pixel. See pixel-format.txt
+   section 1.1.3.

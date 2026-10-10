@@ -1,0 +1,672 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                        THE HUD COUNTER
+
+
+Abstract
+
+   The instrument cluster in the lower right of a race: a small rev
+   counter with the gear number inside it, a larger speedometer with
+   the digital speed inside it, two needles and their drop shadows.
+
+   The game calls it the COUNTER, and two settings drive it -
+   ShowCounter and CounterType.  Hud_DrawCounter (0x00484810) is the
+   whole of it except the dial FACES, which are meshes and belong to
+   the track.
+
+Table of Contents
+
+   1. The settings
+   2. Where it sits
+   3. The layout table
+   4. The dial
+      4.1. Hud_DialInit
+      4.2. The two shipped dials
+   5. The needle
+      5.1. The four points
+      5.2. The shadow
+      5.3. The vertex fields
+   6. The values
+      6.1. The tacho slew limit
+      6.2. The two readout fonts are LCD art
+         6.2.1. The two SpeedLcd faces are INVERTED
+         6.2.2. The gear digit sits differently per mode
+      6.3. Both readouts are left aligned
+   7. The dial face is a track decor quad
+      7.1. The placement
+      7.2. The six corner signs share the mechanism
+   8. The port
+   9. Open questions
+
+1.  The settings
+
+   +------------------+------------+-------------------------------+
+   | Setting          | Global     | Meaning                       |
+   +==================+============+===============================+
+   | ShowCounter      | 0x004f0dc8 | 0 draws nothing at all        |
+   +------------------+------------+-------------------------------+
+   | CounterType      | 0x004f0dcc | 0 off, 1 dials + digits,      |
+   |                  |            | 2 digits only                 |
+   +------------------+------------+-------------------------------+
+   | SpeedUnit        |            | 1 = mph                       |
+   +------------------+------------+-------------------------------+
+   | SmallFonts       | 0x004f0e08 | with ScreenMode, halves it    |
+   +------------------+------------+-------------------------------+
+
+   Both counter settings are CONFIG.BPT items 23 and 24 and both
+   default to 1.  NEITHER HAS A ROW ON THE OPTIONS PAGE: one in-race
+   key cycles the whole cluster, at 0x00432107 [verified]:
+
+       if (!ShowCounter)      turn it on
+       else if (!CounterType) turn it on
+       else if (type == 1)    Hud_CycleCounterType(2)
+       else                   Hud_CycleCounterType(0)
+
+   so the order is off -> dials -> digits -> off.  They are the
+   game's settings even though the options screen never shows them.
+
+   THE SIZE SWITCH IS ONE BOOLEAN used everywhere below:
+
+       hi = (SmallFonts == 0 && ScreenMode == 2)
+
+   so the full-size layout is 640x480 with big fonts and everything
+   else gets the half-size one.
+
+   MPH IS INTEGER AND EXACT [verified]:
+
+       v = v * 0x3e800 / 0x649 >> 8      i.e. v * 1000 / 1609
+
+2.  Where it sits
+
+   One origin, at 0x00484d60, and it is the only thing in the
+   function tied to the frame [verified]:
+
+       hi    (g_viewWidth - 195, g_viewTopMargin + g_viewHeight - 140)
+       else  (g_viewWidth - 102, g_viewTopMargin + g_viewHeight -  74)
+
+   kept in g_hudCounterOriginX / Y (0x005dbc80 / 0x005dbc84).
+   Everything in section 3 is an offset from it, so the cluster
+   hugs the bottom-right corner at any frame size.
+
+3.  The layout table
+
+   Recomputed only when CounterType, ScreenMode or SmallFonts
+   changes.  Offsets from the origin, before the type-1 shift
+   [verified]:
+
+   +-----------------+------------------+------------------+
+   | Item            | full size        | half size        |
+   +=================+==================+==================+
+   | speed digits    | (0xcf, 0xd2)     | (0xe2, 0x4f)     |
+   +-----------------+------------------+------------------+
+   | gear digit      | (0x43, 0x6a)     | (0x1f, 0x33)     |
+   +-----------------+------------------+------------------+
+   | speedo hub      | (0xcd, 0xbf)     | (0xe3, 0x44)     |
+   +-----------------+------------------+------------------+
+   | speedo zero     | (0xbb, 0xfa)     | (0xdb, 0x63)     |
+   +-----------------+------------------+------------------+
+   | speedo full     | (0xf2, 0x8e)     | (0xf9, 0x2a)     |
+   +-----------------+------------------+------------------+
+   | tacho hub       | (0x77, 0xd3)     | (0xb7, 0x4f)     |
+   +-----------------+------------------+------------------+
+   | tacho zero      | (0x6c, 0xf7)     | (0xb1, 0x63)     |
+   +-----------------+------------------+------------------+
+   | tacho full      | (0x77, 0xaa)     | (0xb7, 0x39)     |
+   +-----------------+------------------+------------------+
+   | shadow offset   | (-3, -3)         | (-2, -2)         |
+   +-----------------+------------------+------------------+
+   | type-1 shift    | (0x3d, 0x74)     | (0x9a, 0x1e)     |
+   +-----------------+------------------+------------------+
+
+   EVERY NUMBER ABOVE IS A RAW MOV IMMEDIATE, read at 0x004849df
+   (full) and 0x00484a9b (half).  DO NOT take them from the
+   decompiler: four of the slots are typed float, so the constants
+   render as denormals like 3.06884e-43, and converting one of those
+   by hand is how the half-size speedo zero came to be written down
+   as 188 instead of 0xdb.
+
+   WITH CounterType == 1 MOST OF THE CLUSTER MOVES by minus the
+   shift, and only then are the dials built at all.  Type 2 keeps
+   the unshifted positions and draws digits over bare track.
+
+   THE GEAR TEXT IS NOT SHIFTED, AND THAT IS NOT AN OVERSIGHT.  The
+   block at 0x00484b74 has SIX subtractions and no seventh: the
+   speed text (0x005f14e8/ec) and the six dial points on the stack.
+   0x005f1500/04 is never touched [verified].
+
+   The effect is deliberate.  The tacho hub moves to (58, 95) while
+   the gear digit stays at (67, 106) - just below and right of it,
+   INSIDE the small dial.  Shifting the gear as well throws it 61
+   pixels left and 116 up at full size, and 154 left in the
+   half-size layout where the shift X is larger.
+
+   The shift is uniform, so it moves the hubs and their two
+   reference points together and THE ANGLES ARE UNCHANGED by it.
+
+4.  The dial
+
+4.1.  Hud_DialInit
+
+   Hud_DialInit (0x00485be0) builds a dial from THREE SCREEN POINTS -
+   the hub, where the needle sits at minValue, and where it sits at
+   maxValue.  Nothing is authored as an angle [verified].
+
+   +--------+------+--------+-------------------------------------+
+   | Offset | Size | Type   | Field                               |
+   +========+======+========+=====================================+
+   | +0x00  |   4  | int    | cx                                  |
+   +--------+------+--------+-------------------------------------+
+   | +0x04  |   4  | int    | cy                                  |
+   +--------+------+--------+-------------------------------------+
+   | +0x08  |   4  | int    | minValue                            |
+   +--------+------+--------+-------------------------------------+
+   | +0x0c  |   4  | int    | maxValue                            |
+   +--------+------+--------+-------------------------------------+
+   | +0x10  |   8  | double | angleMin                            |
+   +--------+------+--------+-------------------------------------+
+   | +0x18  |   8  | double | angleMax                            |
+   +--------+------+--------+-------------------------------------+
+   | +0x20  |   8  | double | radPerUnit                          |
+   +--------+------+--------+-------------------------------------+
+   | +0x28  |   8  | double | radius                              |
+   +--------+------+--------+-------------------------------------+
+
+       radius   = |(zeroX, zeroY) - (cx, cy)|
+       angleMin = atan2(cy - zeroY, zeroX - cx)
+       angleMax = atan2(cy - fullY, fullX - cx)
+
+   Y IS NEGATED IN BOTH atan2 CALLS, so the angles are in the
+   ordinary maths convention even though screen Y grows downward.
+   Section 5 flips it back.
+
+   Both angles are then normalised into [0, 2pi), and ONE of them is
+   pushed a full turn negative so the sweep runs the short way:
+
+       reversed == 0   if (angleMin < angleMax) angleMax -= 2pi
+       reversed != 0   if (angleMax < angleMin) angleMin -= 2pi
+
+       radPerUnit = (angleMax - angleMin) / (maxValue - minValue)
+
+   which comes out NEGATIVE for a clockwise gauge.  Both shipped
+   dials pass reversed = 0.
+
+   THE RADIUS COMES FROM THE ZERO POINT ONLY.  The full-scale point
+   sets the angle and is not required to be the same distance out.
+
+4.2.  The two shipped dials
+
+   +----------+----------+--------+-----------+-------------------+
+   | Dial     | hub      | radius | range     | angle at zero     |
+   +==========+==========+========+===========+===================+
+   | speedo   | 144, 75  |  61.7  | 0..300    | 253.0 deg         |
+   | full     |          |        | km/h      |                   |
+   +----------+----------+--------+-----------+-------------------+
+   | tacho    |  58, 95  |  37.6  | 0..16000  | 253.0 deg         |
+   | full     |          |        | rpm       |                   |
+   +----------+----------+--------+-----------+-------------------+
+   | speedo   |  73, 38  |  32.0  | 0..300    | 255.5 deg         |
+   | half     |          |        | km/h      |                   |
+   +----------+----------+--------+-----------+-------------------+
+   | tacho    |  29, 49  |  20.9  | 0..16000  | 253.3 deg         |
+   | half     |          |        | rpm       |                   |
+   +----------+----------+--------+-----------+-------------------+
+
+   Hubs are relative to the cluster origin, after the type-1 shift.
+   The half-size rows were READ LIVE out of a paused MOTO at
+   g_hudDialSpeedo and g_hudDialTacho and agree with the layout
+   table to the bit [verified]:
+
+     speedo  cx 0x49 cy 0x26 max 0x12c  angleMin 4.4599
+             radPerUnit -0.011971  radius 32.0156
+     tacho   cx 0x1d cy 0x31 max 0x3e80 angleMin 4.42092
+             radPerUnit -1.78133e-4 radius 20.884, angleMax = pi/2
+
+   BOTH NEEDLES REST WITHIN THREE DEGREES OF EACH OTHER, pointing
+   down and slightly left - about 6:30 on a clock.  That is the
+   check worth running after any change to the layout table: if the
+   two diverge visibly at a standstill, a zero point is wrong.  It
+   is what caught the 188.
+
+   THE SWEEP RUNS CLOCKWISE ON SCREEN even though radPerUnit is
+   negative, because the Y flip of 4.1 turns a decreasing maths
+   angle into a clockwise one.  The speedo covers 200 degrees and
+   the tacho 163.
+
+   THE SPEEDO READS TO 300 KM/H and no bike reaches half of it, so
+   the needle lives in the first third of the sweep.  That is the
+   original's scale, not a mistake.
+
+5.  The needle
+
+5.1.  The four points
+
+   The needle is four points in DIAL-LOCAL POLAR FORM.  Each is an
+   (along, across) pair, placed by [verified, 0x00485284 onward]:
+
+       a = clamp(value, minValue, maxValue) * radPerUnit + angleMin
+       x = cx + along*cos(a) - across*sin(a)
+       y = cy - along*sin(a) - across*cos(a)
+
+   with each term truncated to int by __ftol before it is added, and
+   the cluster origin added afterwards.
+
+   +----+--------+---------------+---------------+
+   | v  | role   | along         | across        |
+   +====+========+===============+===============+
+   | 0  | back   | -5 * (1 + hi) | 0             |
+   +----+--------+---------------+---------------+
+   | 1  | tip    | (int) radius  | 0             |
+   +----+--------+---------------+---------------+
+   | 2  | left   | 0             | -3 * (1 + hi) |
+   +----+--------+---------------+---------------+
+   | 3  | right  | 0             | 3 * hi + 3    |
+   +----+--------+---------------+---------------+
+
+   so at full size the needle is a kite 10 px behind the hub, out to
+   the rim, 6 px either side.  Two triangles, (0,1,2) and (0,3,1), in
+   two shades so it reads as lit down one edge:
+
+       Color_Pack16(0x19, 0x10, 0)   the (0,1,2) half
+       Color_Pack16(0x1f, 0x10, 0)   the (0,3,1) half
+
+   THE TACHO NEEDLE USES THE BRIGHT COLOUR FOR BOTH, so only the
+   speedo needle is two-toned.
+
+5.2.  The shadow
+
+   The same four points minus the shadow offset - so DOWN AND RIGHT
+   by 3 at full size - flat black, queued at camZ 8 against the
+   needle's 4.  The queue walks back to front, so 8 lands behind.
+
+5.3.  The vertex fields
+
+   MR_Vertex, 0x1c, screen-space already [verified]:
+
+       +0x08 camZ    2048.0 with no z-buffer, 0.0 with one -
+                     EXCEPT the shadow vertices, which carry 1.0
+                     either way
+       +0x0c shade   0x3e000, i.e. intensity 31, full bright
+       +0x10 screenX
+       +0x14 screenY
+       +0x18 invZ    1/2048 or 1.0, matching camZ's branch
+
+   The camZ values do not order anything - the queue depth does - so
+   they only reach the rasterizer's perspective term.
+
+6.  The values
+
+   All three come from the VIEWED racer, not the local one
+   [verified]:
+
+       speed  g_racers[viewed] + 0x118   the measured speedometer
+       gear   g_racers[viewed] + 0x7c
+       tacho  g_racers[viewed] + 0x11c   FILD at 0x00485844
+
+   The speedometer is the ground-truth number Racer_UpdateDash
+   measures off the rear tyre, not engineSpeed - see
+   racers.txt 9.48.0.6.
+
+   The gear digit is written as a CHARACTER, and which one depends on
+   the type:
+
+       type 1    gear + '7'      ':', ';', '<' ...
+       type 2    gear + '0'      '0', '1', '2' ...
+
+   so type 1 indexes a glyph set further up the font rather than the
+   ASCII digits.
+
+6.0.  THE TACHO VALUE IS NORMALISED TO THE REDLINE
+
+   Hud_DrawCounter does NOT feed racer+0x11c to the dial. It rescales
+   it first [verified, 0x00485844]:
+
+       shown = racer+0x11c / RegimeMax * 16000
+
+   FILD racer+0x11c, FDIV g_bikeCarac+0x74 - that offset is field 29,
+   RegimeMax - then FMUL the dword at 0x005f14bc, which holds 0x3e80
+   = 16000 and is the dial's own full scale.
+
+   THE TWO NUMBERS ARE NOT THE SAME SCALE, which is the whole point.
+   racer+0x11c is real rpm and tops out at RegimeMax - 12000 on the
+   stock bike - while the dial sweeps 0..16000 (4.2). So the redline
+   is mapped onto FULL SWEEP, and a bike with a different RegimeMax
+   still uses the whole dial.
+
+   o SKIPPING IT PARKS THE NEEDLE AT THREE QUARTERS. 12000/16000, and
+     the needle never enters the red band at all. The port did this
+     until it was caught by eye - both games paused at 179 km/h in
+     gear 3 held tachoRpm 10913 and 10907, but MOTO displayed 14550
+     and the port 10907. 10913 / 12000 * 16000 = 14550.67.
+
+   o AND THE DATA MATCHING IS WHY IT SURVIVED. Every field feeding
+     the counter agreed to within rounding, so a field-by-field A/B
+     said the tacho was correct. The difference was in a step that
+     has no stored value - only the needle shows it.
+
+6.1.  The tacho slew limit
+
+   The tacho needle is limited to 3000 rpm of movement per frame
+   against the last displayed value in 0x004f0e10 [verified]:
+
+       d = tacho - lastShown
+       if (d >  3000) d =  3000
+       if (d < -3000) d = -3000
+       shown = max(lastShown + d, 0)
+       lastShown = shown
+
+   WHICH IS WHAT STOPS IT SNAPPING ACROSS THE DIAL ON A GEAR CHANGE.
+   The speedo needle has no such limit; Racer_UpdateDash already
+   damps that one, and only for an AI.
+
+6.2.  The two readout fonts are LCD art
+
+   Hud_DrawCounter asks Font_Get for three ids, and FONTS.BPT names
+   them [verified, MR_Font.txt 450]:
+
+   +------+------------------+------+------------------------------+
+   | Id   | Name             | Type | File                         |
+   +======+==================+======+==============================+
+   | 0x10 | SpeedLcdLowRes   | Pal  | FONTES\LOWRES\SPEEDLCD.FNT   |
+   |  15  | SpeedLcdHiRes    | Pal  | FONTES\HIRES\SPEEDLCD.FNT    |
+   +------+------------------+------+------------------------------+
+   | 0x17 | MotorLcdLowRes   | Pal  | FONTES\LOWRES\MOTORLCD.FNT   |
+   |  22  | MotorLcdHiRes    | Pal  | FONTES\HIRES\MOTORLCD.FNT    |
+   +------+------------------+------+------------------------------+
+   | 0x1c | CounterHiRes     | Pal  | FONTES\HIRES\SPEED.FNT       |
+   |  29  | CounterLowRes    | Pal  | FONTES\LOWRES\SPEED.FNT      |
+   +------+------------------+------+------------------------------+
+
+   Font_Get swaps each id for its twin on SmallFonts, so the code
+   asking for the LowRes member gets the HiRes one at 640x480.
+
+   THEY ARE Pal FACES, so every colour is in the face's own 256-entry
+   palette and none of it is set by Hud_DrawCounter.  A Pal face must
+   NOT be given foreground and background colours; that is the rule
+   GameMenu follows in the escape menu too.
+
+   READ OUT OF THE FILES [verified]:
+
+   +--------------+-------+-------+--------------------------------+
+   | Face         | first | count | palette                        |
+   +==============+=======+=======+================================+
+   | SPEEDLCD.FNT | 0x20  |  26   | 0 key, 1..15 dark grey to      |
+   |              |       |       | amber (198,148,8), 16 yellow   |
+   +--------------+-------+-------+--------------------------------+
+   | MOTORLCD.FNT | 0x30  |  14   | 0 key, 1..8 dark red to red    |
+   |              |       |       | (255,0,0), 9..15 red to grey   |
+   +--------------+-------+-------+--------------------------------+
+   | SPEED.FNT    | 0x30  |  12   | 0 key, 1..7 white to black,    |
+   |              |       |       | 8..15 olive to yellow          |
+   +--------------+-------+-------+--------------------------------+
+
+   INDEX 0 IS (0, 0, 255) IN ALL THREE and every glyph blitter skips
+   pixel value 0, so it is the colour key.  The speed digits are
+   AMBER and the gear digit is RED, in the art.
+
+   o SO THE GREEN LCD PLATE IS NOT IN THE FONT.  It is painted into
+     the dial face - the "counter" decor mesh of section 7 - and the
+     digits are drawn over it.  Without that mesh the readouts are
+     bare segments on the track, which is what the reconstruction
+     shows today.
+
+   o AND MOTORLCD STARTS AT 0x30 WITH FOURTEEN GLYPHS, which is what
+     makes gear + '7' sensible: gears 0..6 index the second half of
+     the face, 0x37 to 0x3d.
+
+6.2.1.  The two SpeedLcd faces are INVERTED, and that is the art
+
+   Rendered out of the files, glyph '1' [verified]:
+
+       LOWRES  8 x 10   cell is index 2 (36,33,23), near black.
+                        The DIGIT is drawn BRIGHT, indices 8..10.
+       HIRES  16 x 18   cell is index 15 (198,148,8), bright amber.
+                        The DIGIT is drawn DARK, indices 1..12.
+
+   So the small face is a bright digit on a dark panel and the large
+   one is a dark digit on a bright panel.  Neither is wrong; they are
+   different art.
+
+   THE CELL IS SLANTED.  Index 0 - the colour key - fills a
+   parallelogram notch at the top left and the bottom right of every
+   HiRes glyph, which is what gives the readout its italic lean.
+
+   AND THE HiRes CELL HAS A DARK BAND ALONG ITS TOP.  Row 0 is index
+   5 (74,59,19), rows 1 to 4 ramp 13, 14, 14, 14 and the panel proper
+   starts at row 5 with index 15.  Three digits side by side
+   therefore show a soft dark bar ABOVE them.
+
+   o IT IS IN THE FILE, NOT IN THE BLITTER.  FontPal_DrawGlyph
+     (0x00495840) is 898 bytes of which 113 differ from
+     Font_DrawGlyph, and every one of those is register allocation -
+     the inner loop is the same `if (b) *dst = colorLut[b]`.  There
+     is no per-row handling to miss.
+
+   o AND IT IS INVISIBLE AT LOWRES because that whole cell is dark
+     already.  A band that only appears with large fonts on is the
+     expected result of these two faces, not a porting defect.
+
+6.2.2.  The gear digit sits differently on the plate in each mode
+
+   The plate scales by (1.9, 2.0) while the gear text offset is a
+   separate authored pair per mode, so the two do not track:
+
+   +-------+-------------+--------------+---------------------+
+   | Mode  | gear at     | plate        | fraction across it  |
+   +=======+=============+==============+=====================+
+   | full  | 512, 446    | 462..641,    | 0.279, 0.754        |
+   |       |             | 345..479     |                     |
+   +-------+-------------+--------------+---------------------+
+   | half  | 569, 457    | 546..640,    | 0.245, 0.672        |
+   |       |             | 412..479     |                     |
+   +-------+-------------+--------------+---------------------+
+
+   THAT DRIFT IS THE ORIGINAL'S.  Every number in it is a raw
+   immediate, and MotorLcd's two faces are 21 and about 11 tall,
+   which moves the apparent centre further again.  A reconstruction
+   that matches the layout table will show it.
+
+6.3.  Both readouts are left aligned
+
+   Hud_DrawCounter passes flags 0x21 to Font_DrawTextInternal, which
+   hands them to Font_ApplyAlignment (0x00492c20) [verified]:
+
+       h = flags & 0x1f        v = flags & 0xe0
+
+       h == 2 or 4       x = (g_viewWidth - textW) / 2
+       h == 8 or 0x10    x = (g_viewWidth - x) - textW
+       otherwise         x unchanged
+
+       v == 0x40         y = (g_viewHeight - textH) / 2
+       v == 0x80         y = (g_viewHeight - y) - textH
+       otherwise         y unchanged
+
+   0x21 gives h = 1 and v = 0x20, and neither matches any case, so
+   BOTH COORDINATES PASS THROUGH UNTOUCHED.  The function's own
+   guard proves that is deliberate rather than a gap in the ladder:
+
+       if ((flags & 0x1f) != 1 || (flags & 0xe0) != 0x20)
+           Font_MeasureText(...)
+
+   0x21 is the one combination that skips the measure, because it is
+   the one that needs no width.
+
+   o THE FLAG IS NOT WHERE THE JUSTIFICATION LIVES, THOUGH.  The
+     format string at 0x004f10e0 is "%3d", not "%d" - read out of a
+     running MOTO - and SPEEDLCD's SPACE GLYPH IS 16 PIXELS WIDE,
+     the same as every digit.  So printf pads the number to three
+     characters, the padding renders as blank LCD cells, and the
+     readout grows LEFTWARD out of a fixed three-cell field.
+
+     That is why the face covers 0x20..0x39: 0x21 to 0x2f are
+     one-pixel filler and the only glyphs that matter are the space
+     and the ten digits.
+
+     So "right justified" is true of what you SEE and false of the
+     alignment flag.  Both halves matter: h == 8 or 0x10 is the flag
+     that would do it, and nothing in the counter asks for it.
+
+   o Font_ApplyAlignment IS NOT Text_ApplyAlignment (0x00417900).
+     Two alignment schemes with different bit layouts: this one
+     serves every Font_DrawText caller, that one serves the menu
+     widgets and the in-race menu.
+
+   o AND THE COUNTER'S COORDINATES ARE NEVER HALVED.
+     Font_DrawTextInternal halves x and y when its first argument is
+     0 and the mode is small; Hud_DrawCounter goes through the
+     wrapper at 0x00493fe0, which passes 1.  The half-size layout
+     table is the only halving there is.
+
+7.  The dial face is a track decor quad
+
+   THE CIRCLES, TICK MARKS, RED BAND, BLACK PIE AND THE GREEN LCD
+   PLATE BEHIND THE SPEED READOUT ARE ALL ONE TEXTURED QUAD.  It is
+   drawn by Hud_DrawSignMeshes (0x00486310) at queue depth 15 -
+   behind both needles - and Hud_DrawCounter draws none of it.
+
+   Read live out of a paused MOTO [verified]:
+
+       record  0x005d2eb8   mesh index 14, anchor (93, 0),
+                            +0x0c active = (CounterType == 1),
+                            +0x10 cleared
+       mesh    4 vertices, 2 faces, name "counter" at +0x70
+       verts   (0,0) (94,0) (94,67) (0,67), z within +-1.8
+       faces   ONE QUAD WOUND BOTH WAYS - vertexIndex 2,1,0,3 and
+               3,0,1,2, wrap slot set so both are quads
+       uv      texels (14,178) to (107,245) over a 256 page
+
+   THE TWO FACES ARE MIRRORED, NOT IDENTICAL.  Their UVs turn with
+   the winding: face 0 maps v2 to u 0.418 and face 1 maps v3 to it.
+   The original queues BOTH and lets the rasterizer's winding test
+   throw one away, which is the point of the pair - whichever way the
+   quad faces, exactly one of them draws.
+
+   o A PORT THAT QUEUES BOTH DRAWS TWO GAUGES MIRRORED ABOUT A
+     VERTICAL AXIS.  Ours did: cull_and_queue_faces is where the
+     winding test lives here, and queueing a primitive directly goes
+     round it.  See section 8.
+
+   AND IT SHIPS INSIDE EVERY .trk.  The string "counter" appears in
+   all eleven track files and nowhere else in the data except
+   DESIGN.BKF's directory entry for COUNTER\TRANSP.RAW.  So the
+   plate is an ORDINARY DECOR TEMPLATE, reached by name exactly the
+   way maybe_Trk_CountCameras reaches the CAMERAs - which also means
+   maybe_Hud_BindCornerSigns cannot run before a track is loaded, and
+   it does not: maybe_Game_InitRace (0x0047bf70) is its only caller.
+
+7.1.  The placement
+
+   The anchor is an INSET FROM THE BOTTOM RIGHT, not a position
+   [verified, 0x0048650c onward]:
+
+       offsetX = g_viewMaxX - anchorX * scaleX
+       offsetY = g_viewMaxY - anchorY * scaleY
+       screenX = vx * scaleX + offsetX
+       screenY = offsetY - vy * scaleY
+
+   so the mesh's +Y runs UP the screen, and (93, 0) with scale 1 puts
+   the plate at x 546..640, y 412..479 in a 640x480 frame.
+
+   THE PLATE IS AUTHORED AT THE HALF-SIZE LAYOUT [verified,
+   0x00486464]:
+
+       screenMode == 2 && !smallFonts    scale 1.9, 2.0
+       otherwise                         scale 1.0, 1.0
+
+   which is the other half of why the cluster is bigger with big
+   fonts on: 94 x 1.9 is 179 and 67 x 2.0 is 134, against the
+   full-size layout's 195 x 140 footprint.
+
+7.2.  The six corner signs share the mechanism
+
+   Slots 1 to 6 of the same 16-entry table hold g_45, d_45, g_90,
+   d_90, g_chica and d_chica - gauche and droite, 45 and 90 degree
+   corners and a chicane - all anchored at (320, 400), which the
+   formula above puts near the TOP of the frame.  They blink on a
+   timer counted down with g_frameDeltaScaled and are gated on
+   DisplaySignal.  Not reconstructed.
+
+8.  The port
+
+   src/hud.c.  The dials, needles, shadows, digits and the face are
+   all reconstructed.
+
+   +---------------------------+----------------------------------+
+   | hud_dial_init             | Hud_DialInit                     |
+   +---------------------------+----------------------------------+
+   | hud_counter_layout        | the section 3 table              |
+   +---------------------------+----------------------------------+
+   | hud_counter_draw_needles  | queued from the race 3D pass     |
+   +---------------------------+----------------------------------+
+   | hud_counter_draw_digits   | drawn into the overlay layer     |
+   +---------------------------+----------------------------------+
+   | hud_counter_draw_face     | Hud_DrawSignMeshes, slot 0 only  |
+   +---------------------------+----------------------------------+
+
+   ONE DIVERGENCE IN THE FACE, and it is about WHERE the winding
+   test happens rather than whether.  The original relies on its
+   rasterizer to drop the back-facing half of the plate; our back end
+   does not cull, so hud_counter_draw_face applies cull.c's own cross
+   product - same expression, same 1.0f - before queueing. Routing
+   through cull_and_queue_faces instead would work but would take the
+   queue depth from camZ and lose the original's 15.
+   | race_find_named_mesh      | the bind's strncmp walk, on      |
+   |                           | demand rather than as a table    |
+   +---------------------------+----------------------------------+
+
+   THE NEEDLES GO THROUGH THE QUEUE, not the framebuffer, because
+   that is where the original puts them.  Drawing them as 2D
+   triangles would put them under the track.
+
+   ONE FORCED DIVERGENCE: THE VERTICES ARE BACK-PROJECTED.  The
+   original submits SCREEN coordinates and uses camZ only as the 1/z
+   its texture mapper wants.  The port's scene path works in CAMERA
+   space - drawscene.c's fill_vertex reads camX/camY/camZ and lets
+   the device matrix project them, so that D3D9 can clip properly -
+   so a screen pixel has to be turned back into one:
+
+       camX = (px - g_viewCentreX) * z
+       camY = (g_viewCentreY - py) * z
+
+   inverting transform.c's own formula.  z is g_nearPlaneZ * 1.25,
+   just past the near plane, which puts the needles in front of
+   everything in the track; the queue depth still orders needle
+   against shadow.
+
+   THE OVERLAY HAS ITS OWN TEXTURE.  Sharing one with the 2D layer
+   put opaque leftovers immediately outside the rect a composite
+   uploads, and every sample that reached them - a linear tap, or
+   the driver rounding the dirty rect outward - drew a faint
+   rectangle around the readouts.  Point sampling removed three
+   sides and left the bottom, which is the tell that it was an
+   UPLOAD boundary and not only a filter tap.  A second texture,
+   cleared to alpha 0 once, has nothing to bleed from.
+
+   o WRITING camX = camY = 0 AND TRUSTING screenX DRAWS NOTHING.
+     Every vertex collapses onto the projection centre and the four
+     triangles come out degenerate - no error, no warning, an empty
+     corner of the screen.  That is how this first landed.
+
+   THE OVERLAY RECT IS MEASURED, NOT THE WHOLE CORNER.  It is the
+   union of the two text boxes plus a few pixels.  A rect that ran
+   from the cluster origin to the bottom-right of the frame was
+   wrong twice: it sheared the top off the gear digit, and its
+   composite quad sampled stale opaque texels out of the shared 2D
+   layer texture, drawing a faint rectangle around the corner.
+
+9.  Open questions
+
+   o THE TYPE-2 GEAR HINT BAR.  Under CounterType 2 the function
+     builds a run of repeated characters whose length is
+     g_mainWidth/8 and draws it at g_mainHeight/16 with a colour
+     chosen from a five-way shift-state ladder.  Read but not
+     transcribed; it is a shift-up prompt, not part of the cluster.
+
+   o WHETHER CounterType 3 EXISTS.  The layout branch is
+     "type == 2 ... else if (type != 0)", so a third value would get
+     the dial layout with the dials never initialised.  Nothing in
+     CONFIG.BPT or the menu produces one.
+
+   o THE HALF-HEIGHT BRANCH at the end of each needle block halves
+     every Y when 0x00624b14 is set and the hardware path is off.
+     An interlaced or half-vertical mode; not identified.

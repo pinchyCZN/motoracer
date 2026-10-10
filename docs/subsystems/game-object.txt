@@ -1,0 +1,1141 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            THE GAME OBJECT
+
+
+Abstract
+
+   A single global C++ object sits at the centre of the game: it owns
+   the frame loop, race setup, racer collision, the menu handover and
+   the display-mode change. Everything reaches it through one pointer
+   and one nine-slot vtable.
+
+   This note identifies the vtable at 0x004d04c8, which surfaced while
+   chasing the frame function in subsystems/mode-change.txt section 6.
+
+   +------------------------------+------------+
+   | Item                         | Address    |
+   +==============================+============+
+   | vtbl_MR_Game                 | 0x004d04c8 |
+   +------------------------------+------------+
+   | g_game, the instance         | 0x0052c478 |
+   +------------------------------+------------+
+   | g_pGame, the current pointer | 0x0052c0d4 |
+   +------------------------------+------------+
+   | Game_StaticCtor              | 0x00413f30 |
+   +------------------------------+------------+
+
+Table of Contents
+
+   1. It is a real C++ vtable
+   2. The nine slots
+   3. One instance, and the polymorphism is never used
+   4. Two code clusters
+   5. Which translation unit
+   6. Slot +0x0c is a resource release
+      6.1. There is no error recovery
+      6.2. The construct/destruct pair
+      6.3. What slot +0x04 actually loads
+      6.4. The starting grid, and it is not StartPosition
+      6.4.1. The reconstruction
+      6.5. What settles the direction, and the four progress fields
+      6.6. So how many bikes actually start?
+   7. Slot +0x1c is a display-mode request
+      7.1. The command word
+      7.2. A latent bug in the guard
+      7.3. Where the command comes from
+   8. Slot +0x14 is the tick, and drives the rest
+      8.1. Two deferred warnings, and where they come from
+      8.2. Finishing a race
+   9. Slot +0x10 is the input step
+      9.1. Live play and replay are the same code path
+   10. Open questions
+
+1.  It is a real C++ vtable
+
+   Three independent facts settle this rather than leaving it as a hand-
+   rolled dispatch table [verified].
+
+   First, the installer. Game_StaticCtor at 0x00413f30 has one statement
+   - it stores the table address into g_game - and its only reference in
+   the image is a data word at 0x004db090, an entry in the CRT static-
+   initialiser table that _initterm walks at startup. It is never called
+   from code. That is exactly what a global object's constructor looks
+   like when the class body is empty because all its state lives in
+   globals, as it does throughout this codebase.
+
+   Second, the call sites. Every dispatch is the textbook sequence:
+
+       MOV EAX,[g_pGame]         ; this
+       MOV ECX,EAX               ; __thiscall
+       MOV EBX,dword ptr [EAX]   ; load the vptr from offset 0
+       CALL dword ptr [EBX + N]  ; virtual call
+
+   Slots +0x00, +0x04, +0x08, +0x0c and +0x14 are all called this way,
+   from at least nine different functions.
+
+   Third, the vptr is at offset 0 of the object, and the methods are
+   __thiscall. No manually built table would be arranged that way by
+   accident.
+
+2.  The nine slots
+
+   +-------+------------+--------------------------+------------------------+
+   | Slot  | Address    | Name                     | What it does           |
+   +=======+============+==========================+========================+
+   | +0x00 | 0x0047bf30 | maybe_Game_ResetDefaults | stores 8 mode globals  |
+   +-------+------------+--------------------------+------------------------+
+   | +0x04 | 0x0047b420 | maybe_Game_LoadRace      | loads a whole race     |
+   +-------+------------+--------------------------+------------------------+
+   | +0x08 | 0x0047bf70 | maybe_Game_InitRace      | sets up a whole race   |
+   +-------+------------+--------------------------+------------------------+
+   | +0x0c | 0x0047d620 | -                        | the most-called slot   |
+   +-------+------------+--------------------------+------------------------+
+   | +0x10 | 0x0047ec40 | maybe_Game_ReadInput     | input, or replay       |
+   +-------+------------+--------------------------+------------------------+
+   | +0x14 | 0x0047d660 | maybe_Game_Tick          | one step of the game   |
+   +-------+------------+--------------------------+------------------------+
+   | +0x18 | 0x0047ecd0 | maybe_Game_CollideRacers | racer collision        |
+   +-------+------------+--------------------------+------------------------+
+   | +0x1c | 0x0047ec50 | maybe_Game_ApplyModeReq  | display-mode request   |
+   +-------+------------+--------------------------+------------------------+
+   | +0x20 | 0x0047ff90 | maybe_Game_RenderFrame   | draws one frame        |
+   +-------+------------+--------------------------+------------------------+
+
+   Taken together the interface reads as a game-session lifecycle:
+   reset, start a race, hand over to the menu, step the world, resolve
+   collisions, reconfigure the display, draw. Four of the nine have been
+   read; the names on those carry maybe_ because they are descriptions
+   of observed behaviour, not recovered symbols.
+
+   maybe_Game_CollideRacers is the most substantial of the four. It
+   walks every pair of racers once, using a 25 x 25 already-paired
+   bitmap on the stack, does a cheap heading test, then a swept
+   intersection at radius 48.0, and on a hit pushes the pair apart along
+   the contact normal and ORs an outcome bit - 4, 8, 0x10 or 0x20 - into
+   each racer's flag word. Its float argument is a time step, since
+   every speed it computes is a distance divided by it [verified].
+
+   Slot +0x10 is a thunk rather than a function body, which usually
+   means an inherited method reached through an adjustor. It has not
+   been followed.
+
+3.  One instance, and the polymorphism is never used
+
+   A raw byte scan settles the shape of the class hierarchy, and the
+   answer is that there isn't one [verified].
+
+   Each of the nine method addresses occurs exactly once anywhere
+   outside .text, and all nine occurrences are in this table. So no
+   second vtable shares any of these methods, and there is no derived
+   class in the image.
+
+   g_pGame has exactly two writers and both store the same literal,
+   &g_game. So the pointer only ever addresses the one static instance.
+
+   The machinery is nonetheless built to be swapped. Callers null-check
+   g_pGame before dispatching, and MenuPage01_Loading_Tick installs the
+   instance lazily if it finds the pointer null. That is the shape of a
+   current-mode pointer that was expected to take more than one kind of
+   object - a race mode, a replay mode, a demo mode - and never did, or
+   no longer does [inferred].
+
+4.  Two code clusters
+
+   The object's methods do not live together. The nine virtual methods
+   all sit in 0x0047b420 to 0x0047ff90. But the same object also
+   receives non-virtual __thiscall calls, at 0x00410a10, 0x00411010,
+   0x004119a0 and 0x00413450 - and Game_StaticCtor is at 0x00413f30, in
+   that same second cluster [verified].
+
+   So the constructor and the non-virtual methods are in one translation
+   unit and every virtual override is in another. Both clusters are
+   unanchored, so neither can be named yet. Worth keeping in mind when
+   attributing functions: this class straddles two of the gaps in
+   docs/code-map.txt.
+
+5.  Which translation unit
+
+   Not determinable from the assert anchors. No function in 0x0047b000
+   to 0x00481000 references any of the 13 leaked __FILE__ paths; the
+   only path-like strings in that range are asset format strings such as
+   "%s\%s.3df" and "Data\Design\Texts\HiRes.RAW" [verified].
+
+   What the anchors do give is a bound. Sorting them by the code that
+   references them puts the vtable's methods cleanly in the gap between
+   two known units:
+
+   +-----------------------+--------------------------+
+   | Anchor                | Code span                |
+   +=======================+==========================+
+   | screen3d\dd.cpp       | 0x00473da0 .. 0x00477b30 |
+   +-----------------------+--------------------------+
+   | menu\menuTools.cpp    | 0x00479260 .. 0x00479630 |
+   +-----------------------+--------------------------+
+   | THE VTABLE'S METHODS  | 0x0047b420 .. 0x0047ff90 |
+   +-----------------------+--------------------------+
+   | menu\pageProtocol.cpp | 0x00487070 .. 0x00488850 |
+   +-----------------------+--------------------------+
+
+   So the virtual methods belong to one or more unanchored translation
+   units linked between menuTools.cpp and pageProtocol.cpp. Do not read
+   that as meaning the class is menu code - it plainly is not, given it
+   owns racer collision - only that link order interleaves it with the
+   menu units.
+
+   Of the 13 known original filenames, event.cpp, frame3d.cpp and
+   player.cpp are all anchored elsewhere, so the class is in a file
+   whose name has not leaked at all [verified].
+
+6.  Slot +0x0c is a resource release
+
+   The most-dispatched slot turns out to be the smallest.
+   maybe_Game_FreeResources at 0x0047d620 is four statements [verified]:
+
+       FUN_004113c0();
+       FUN_0040c670();
+       maybe_AnimDecor_FreeAll();
+       for (i = 0; i < 4; i++)
+           Mesh_Free(&views[i]);   /* stride 0x70 */
+
+   Its role is fixed by its leaves rather than by its own body.
+   Mesh_Free frees five pointers out of one record and
+   nulls each; maybe_AnimDecor_FreeAll walks a nested structure freeing
+   every pointer and zeroing both counts. Both bottom out in the same
+   deallocator that Font_ReloadAll uses. Nothing in the chain allocates
+   or loads.
+
+   The four records at 0x00515ff0, stride 0x70, are almost certainly the
+   four split-screen views - four of everything is the recurring shape
+   in this engine, and maybe_Game_InitRace initialises four camera
+   records right next to them at 0x005161c0 [inferred].
+
+   maybe_AnimDecor_FreeAll is one of the few functions in this session
+   whose translation unit is actually known: 0x0048b740 falls inside the
+   animDecor.cpp assert-anchor span, so it is animated decor teardown
+   [verified].
+
+6.1.  There is no error recovery
+
+   Following slot +0x0c to its callers turned up something larger than
+   the slot itself.
+
+   App_Shutdown at 0x00473540 is the global teardown - it destroys the
+   menu, frees every font and then g_fontTable, releases a dozen
+   subsystem objects, and calls this slot. It has 47 call sites, and 44
+   of them are fatal-error paths following one identical epilogue
+   [verified]:
+
+       _sprintf(buf, ...);                 /* build the message */
+       Cdd_MessageBox(buf);
+       g_fatalError = 1;
+       Cdd_MessageBox("Aborting game.");
+       App_Shutdown();
+       _exit(1);          /* or ExitProcess(1) */
+
+   The last four steps also exist as a shared helper, App_Abort at
+   0x00471e00, six instructions long and now marked no-return. Most
+   sites open-code it anyway.
+
+   The three call sites that do NOT set g_fatalError - two in
+   Main_InitAndParseCommandLine and one in FUN_00415500 - are the normal
+   exit paths. So the same teardown serves both quitting and dying.
+
+   What fails, and how often:
+
+   +-----------------------------+-------+------------------------------+
+   | Function                    | Sites | What fails                   |
+   +=============================+=======+==============================+
+   | Bitmap_LoadFile             | 7     | a bitmap will not load       |
+   +-----------------------------+-------+------------------------------+
+   | MenuPage15_NameEntry_Enter  | 6     | menu resources               |
+   +-----------------------------+-------+------------------------------+
+   | MenuPage07_NetSessionList_* | 4     | network session listing      |
+   +-----------------------------+-------+------------------------------+
+   | FUN_00472590 / FUN_00472710 | 3     | surface creation             |
+   +-----------------------------+-------+------------------------------+
+   | Screen3D_BeginFrame         | 1     | a surface failure, mid-frame |
+   +-----------------------------+-------+------------------------------+
+   | maybe_Cdd_LoadRawToSurface  | 1     | a texture upload             |
+   +-----------------------------+-------+------------------------------+
+   | maybe_D3D_LoadRawToTexture  | 1     | a texture upload             |
+   +-----------------------------+-------+------------------------------+
+   | Lez_LoadFile                | 1     | a .lez resource              |
+   +-----------------------------+-------+------------------------------+
+   | Menu_AddTextButton          | 1     | allocating a button          |
+   +-----------------------------+-------+------------------------------+
+   | Menu_AddSpriteButton        | 1     | allocating a button          |
+   +-----------------------------+-------+------------------------------+
+   | others                      | 18    | assorted                     |
+   +-----------------------------+-------+------------------------------+
+
+   So every failure in this game ends the process. A bitmap that will
+   not load, a menu button that cannot be allocated, a network session
+   listing that fails - all of them print a box and exit. There is no
+   retry, no degraded path, no unwinding anywhere [verified].
+
+   Two entries in that table matter for the port. Screen3D_BeginFrame
+   aborts on a surface failure, and maybe_Screen3D_UpdateScreen aborts
+   when no 16 bpp 640x480 mode can be set - see subsystems/mode-
+   change.txt section 2.2, whose open question about that abort is now
+   answered: it exits the process, it does not unwind.
+
+   CORRECTION. This paragraph first described the Screen3D_BeginFrame
+   case as aborting on a LOST surface, and concluded that the engine
+   treats surface loss as fatal - which would be a serious obstacle to a
+   windowed port. That is wrong. Cdd_Present handles DDERR_SURFACELOST
+   properly, restoring the surfaces and retrying the present, and loops
+   on DDERR_WASSTILLDRAWING as well. Surface loss is recovered. What
+   Screen3D_BeginFrame actually aborts on has not been identified. See
+   subsystems/dd-present.txt section 2.
+
+   NOW IDENTIFIED. It aborts when Cdd_LockMain returns NULL - a failed
+   LOCK of the main surface, not a lost one. The message is
+   "BeginDisplay failed" at screen3d.cpp line 1302 [verified]. That is
+   consistent with the correction above: loss is recovered in
+   Cdd_Present, and a lock that fails outright has no recovery path at
+   all. See rasterizer-pipeline.txt section 38.0.2.
+
+   A windowed, resizable, modern port has to survive both of those.
+   Surface loss on a mode change or an alt-tab is routine under DirectX
+   9 and later, and this code treats it as fatal. That is a behaviour
+   change the port must make deliberately, not a bug to be preserved
+   [inferred].
+
+6.2.  The construct/destruct pair
+
+   Reading the first callee of slot +0x0c identified slot +0x04 as well,
+   without having to read it [verified].
+
+   maybe_Game_FreeRaceResources at 0x004113c0 is where the real work of
+   the teardown happens - the four-line slot function is only a
+   dispatcher. It closes the four help sub-menus, releases every sound
+   handle in the table at 0x00519ff8 resetting each to -1, walks the
+   racer table at 0x00581280 with its 0x3209 stride calling a per-racer
+   release, destroys four object arrays, and ends with eighteen
+   Mesh_Free calls taken three at a time over a 0x230
+   range in steps of 0x70.
+
+   The four arrays are the interesting part:
+
+   +--------------+---------------------+---------------------------------+
+   | Global       | Holds               | Destroyed by                    |
+   +==============+=====================+=================================+
+   | DAT_004dc0d8 | 0x79-byte objects   | _eh_vector_destructor_iterator_ |
+   +--------------+---------------------+---------------------------------+
+   | DAT_004dc0dc | 0x79-byte objects   | _eh_vector_destructor_iterator_ |
+   +--------------+---------------------+---------------------------------+
+   | DAT_004dc0e0 | 0x79-byte objects   | _eh_vector_destructor_iterator_ |
+   +--------------+---------------------+---------------------------------+
+   | DAT_004dc0e4 | polymorphic objects | each element's virtual dtor     |
+   +--------------+---------------------+---------------------------------+
+
+   The first three are genuine C++ new[] arrays: they are freed through
+   _eh_vector_destructor_iterator_ with an element size of 0x79 - 121
+   bytes - an element destructor at 0x0040e570, and the element count
+   read from the dword at ptr-4 that new[] stores. Three parallel arrays
+   of the same type, all sized DAT_00509b9c.
+
+   All four are allocated by one function, Trk_Load
+   at 0x0040d650, whose sole caller is FUN_0047b420 - vtable slot +0x04.
+   So the two slots are a matched pair:
+
+   +---------------+-------------------------------+------------------------------+
+   |               | Construct                     | Destruct                     |
+   +===============+===============================+==============================+
+   | Vtable slot   | +0x04                         | +0x0c                        |
+   +---------------+-------------------------------+------------------------------+
+   | Slot function | FUN_0047b420                  | maybe_Game_FreeResources     |
+   +---------------+-------------------------------+------------------------------+
+   | Worker        | Trk_Load | maybe_Game_FreeRaceResources                      |
+   +---------------+-------------------------------+------------------------------+
+   | Address       | 0x0040d650                    | 0x004113c0                   |
+   +---------------+-------------------------------+------------------------------+
+   | Size          | 2883 bytes                    | 787 bytes                    |
+   +---------------+-------------------------------+------------------------------+
+
+   That also explains the call pattern seen earlier:
+   MenuPage01_Loading_Tick calls slot +0x04 and tests the result, so the
+   construct half reports success or failure, which is what an allocator
+   should do.
+
+   One caution about the element count. DAT_00509b9c looks like another
+   never-written global - the reference database shows a single store,
+   the zeroing in the teardown. It is not. Trk_Load
+   pushes its ADDRESS at 0x0040db5f, handing it out by pointer to be
+   filled in, which no instruction-level write appears for. Worth
+   remembering before declaring the next such global dead [verified].
+
+6.3.  What slot +0x04 actually loads
+
+   Section 6.2 identified slot +0x04 as the construct half of a pair,
+   from its callee alone. Reading it confirms that and says what it
+   constructs: maybe_Game_LoadRace loads everything a race needs,
+   returning 0 on the first failure - which is why
+   MenuPage01_Loading_Tick tests the result [verified].
+
+   +------+-----------------------------------------------------+
+   | Step | Does                                                |
+   +======+=====================================================+
+   | 1    | four guarded loaders in the 0x00410xxx cluster      |
+   +------+-----------------------------------------------------+
+   | 2    | Trk_Load(g_trackName) - the .trk file               |
+   +------+-----------------------------------------------------+
+   | 3    | count segments whose short at +0xd8 is not negative |
+   +------+-----------------------------------------------------+
+   | 4    | decide g_opponentCount                              |
+   +------+-----------------------------------------------------+
+   | 5    | maybe_Game_CreateRacers, then the bike meshes       |
+   +------+-----------------------------------------------------+
+   | 6    | Menu_LoadFinalMeshes                                |
+   +------+-----------------------------------------------------+
+   | 7    | FUN_004100a0, which logs the "initRace" label       |
+   +------+-----------------------------------------------------+
+
+   So the race lifecycle splits cleanly across two slots. Slot +0x04
+   does the file I/O; slot +0x08, maybe_Game_InitRace, is the reset that
+   places racers on the grid afterwards. Either could reasonably be
+   called init, and the debug label "initRace" belongs to a third
+   function this one calls last.
+
+   The opponent count is decided here, and it settles a question left
+   open in subsystems/config-file.txt [verified]:
+
+   +----------------------------+---------------------------------------------+
+   | Condition                  | g_opponentCount                             |
+   +============================+=============================================+
+   | NETWORK (g_nSoloMode == 0) | entries equal to 3 in a table at 0x00508048 |
+   +----------------------------+---------------------------------------------+
+   | solo, g_nSelectedMode == 0 | 1                                           |
+   +----------------------------+---------------------------------------------+
+   | solo, otherwise            | 23, or 11 with g_cfgNbComputerCut           |
+   +----------------------------+---------------------------------------------+
+
+   THIS TABLE USED TO HAVE ITS BRANCHES THE WRONG WAY ROUND, calling
+   the first row "network off" and the other two "network". It is
+   exactly backwards: g_nSoloMode is 1 FOR SOLO AND 0 FOR LINK -
+   page 3 writes it, menu.h records it, and page 10 confirms it by
+   sending solo to the loading page and link to the lobby. So the
+   counted-players branch is the NETWORK one and the 23 belongs to a
+   SOLO race.
+
+   It matters because inverted it says a network game fields 23 AI,
+   which is the opposite of what happens, and it hides the fact that
+   the big default field is what a single player gets.
+
+   That note had flagged LastNbComp reading 23 as suspiciously large for
+   an opponent count and wondered whether the field meant something
+   else. It does not: 23 is the game's own maximum, and the
+   NbComputerCut setting exists to cut it to 11.
+
+   One structural detail falls out. Step 3 walks DAT_0052c108 with a
+   stride of 0xfc, reading a short at +0xd8. Both match the track
+   segment record that Trk_Load fills - the size and the very field it
+   reads - so DAT_0052c108 and DAT_0052c10c are the segment array and
+   its count [inferred].
+
+
+6.4.  The starting grid, and it is not StartPosition
+
+   THE LEVEL MANIFEST'S StartPosition IS A SPAWN, NOT THE GRID.
+   maybe_Game_CreateRacers places EVERY racer on it - three identical
+   maybe_Racer_PlaceWheels(racer, StartPositionX, Y, Z) calls, one per
+   branch - so after creation all 24 bikes are stacked on one point.
+   maybe_Game_InitRace then overwrites every one of them.
+
+   So nothing about the grid layout can be read out of Level.Spt, and
+   the obvious reading of StartPosition - "pole position" - is wrong.
+   [verified]
+
+   THE REAL LAYOUT IS TRACK-SEGMENT RELATIVE, and the whole thing
+   is a formula. The start segment, read at 0x0047c0d7:
+
+       start = Trk_WrapSegmentIndex(3 * g_racerCount
+                                      * g_nRaceDirection)
+
+   an IMUL by g_racerCount and an LEA [EAX+EAX*2] for the 3. It is a
+   PURE PRODUCT - not an offset from a start line, not from
+   StartPosition, not from anything. If the reverse flag 0x004dc144
+   is set there is one extra step at 0x0047c0f7.
+
+   Then, walking the roster backwards from racerCount-1 down to 1:
+
+       segment -= 3 * g_nRaceDirection      then Trk_WrapSegmentIndex
+
+       pos = segment.pos
+           + rotate((0, 0, 10), segment.matrix)
+           + lateral * segment.matrix.row0
+           + segment.matrix.translation
+
+       lateral = ((racerIndex & 1) == 0) ? +128 : -128
+
+   IT IS A STAGGERED SINGLE FILE, NOT ROWS OF TWO. This note said
+   twice that it was "two columns 256 units apart, one pair every
+   three segments" and that a 24-bike field was "twelve rows of
+   two". THAT IS WRONG. The loop takes the segment step for EVERY
+   racer, so each of the twenty-four gets its OWN segment three
+   apart and the lateral offset merely alternates which side it
+   sits on. Twenty-four positions strung out single file,
+   zig-zagging left and right.
+
+   The error came from reading the +-128 as a pairing rule when it
+   is only a side rule; nothing in the loop places two racers on
+   one segment.  [verified, 0x0047c0d7 and 0x0047c137 onward]
+
+   THE START VALUE AND THE DECREMENT COLLAPSE TOGETHER. Starting at
+   3*racerCount*dir and taking one step before placing each racer
+   means racer i simply lands on
+
+       segment(i) = 3 * i * g_nRaceDirection      wrapped
+
+   so the start value exists only so the FIRST decrement puts racer
+   racerCount-1 on 3*(racerCount-1). There is no separate notion of
+   pole position anywhere in it.
+
+   o RACER 1 IS THE LOCAL PLAYER. g_racers is 0x00581218, so index 1
+     is 0x00584421 - g_menuRacer, the record maybe_Game_CreateRacers
+     builds the local racer in. Index 0 is unused and the placement
+     loop stops at 1. So with 24 bikes the player is on segment 3 and
+     the last opponent on segment 72.
+
+   o AND THE PLAYER STARTS LAST. This was [inferred] until
+     maybe_Race_UpdateProgress (0x0047e3d0) was read - the consumer
+     of racer+0x31b5 that section 6.5 now covers. It settles the
+     direction outright: an INCREASING segment index is FORWARD in a
+     normal race, so segment 72 is ahead of segment 3 and the player
+     is at the back of twenty-four.  [verified]
+
+     That fits a game carrying a per-track RATTRAPAGE (catch-up)
+     block, but the fit was never the evidence and is not now.
+
+   o THE lateral IS WRITTEN AS A BRANCHLESS IDIOM, and it is worth
+     recognising because it appears three times in this function:
+
+         (-(uint)((i & 1) == 0) & 0x100) - 0x80
+
+     For an even i that is (0xffffffff & 0x100) - 0x80 = +128, and for
+     an odd one (0 & 0x100) - 0x80 = -128.
+
+   o g_nRaceDirection (0x004dc140) IS +1 OR -1. maybe_Game_LoadRace
+     sets it to -1, then to +1 when the reverse flag is clear. It
+     signs the segment step, so a reverse track stacks the grid the
+     other way along the segment list and it still ends up BEHIND the
+     line rather than in front of it.
+
+   o THE ORIENTATION HAS TWO ARMS, on g_nRaceReverse (0x004dc144) at
+     0x0047c281, and this is the part a port will miss:
+
+         forward   matOrientation = the segment matrix, all twelve
+         reverse   forward = normalise(segRow3 - segRow2)
+                   row0    = normalise(worldUp x forward)
+                   row1    = normalise(forward x row0)
+                   row3    = ZEROED
+
+     THE PAIR IS SYMMETRIC AND THAT IS THE TELL.  A racer's heading
+     is matOrientation row3 + row2 (maybe_Racer_ApplyDrive), so the
+     forward arm heads along segRow3 + segRow2 and the reverse arm
+     zeroes row3 so its heading is exactly the segRow3 - segRow2 it
+     was built from.  Reversing flips row2's contribution and
+     nothing else.
+
+     AND IT SHOWS UP ON THE PLAYER ALONE.  maybe_Racer_TickAI PLACES
+     an opponent every frame and rebuilds its orientation from the
+     line follower, so a field of AI corrects itself on frame one
+     and rides away backwards-correct while the player sits facing
+     up the road.  The symptom reads as "the player is broken" when
+     what is missing is one branch that applies to everyone.
+
+   o THE SAME FLAG INVERTS THE HALF-TRACK TEST that assigns
+     raceState 1 in maybe_Race_TickClock, at 0x0047de21.  One flag,
+     three consumers: the extra grid step, the orientation, and that
+     test.  race.h used to carry it as an unnamed parameter with its
+     writer unread; the writer is maybe_Game_LoadRace at 0x0047b460.
+
+   o BOTH THE COLUMNS AND THE STAGGER ARE GATED ON
+     g_nSelectedMode != 0. Mode 0 forces g_opponentCount to 1, so a
+     two-bike race needs neither and gets neither.
+
+   o THE 10.0 IS A FORWARD NUDGE off the segment origin, rotated into
+     the segment's own frame. Read at 0x0047c16b as the literal
+     0x41200000.
+
+6.4.1.  The reconstruction
+
+   src/grid.h and src/grid.c. grid_build fills its output BY RACER
+   INDEX - out[0] zeroed and unused, out[1] the local player - so
+   the indices stay aligned with the original's rather than being
+   packed from zero. One wasted slot is worth less than an
+   off-by-one waiting to happen.
+
+   ONE FLAG GIVES BOTH DIRECTION AND REVERSE. maybe_Game_LoadRace
+   derives g_nRaceDirection from the same DAT_00542878 that becomes
+   the reverse flag, so grid_build takes reverse and computes the
+   direction itself; passing two arguments would let them drift.
+   The port's g_reverseEnabled is 0x004dc068, which is what page 1
+   copies into DAT_00542878 - the same chain.
+
+   THE (0,0,10) TRANSFORM REDUCES. With the row-vector convention
+   this engine uses, v * M for v = (0,0,10) is 10 * row2, so the
+   general matrix call the original makes is just ten units along
+   the segment's forward axis.
+
+   o AND THE SEGMENT MATRIX HAS NO TRANSLATION TO ARGUE ABOUT.
+     Measured over ile01: all 788 segments carry an exactly zero
+     translation row and all three rotation rows are unit length.
+     So whether Vec3_TransformByMatrix34 applies a translation is
+     UNOBSERVABLE here, and the seg+0x30 addend the original adds
+     in the lateral step contributes nothing. Both are transcribed
+     anyway, so a hypothetical non-zero segment would behave as the
+     original does - but the ambiguity is recorded rather than
+     resolved, because the data cannot resolve it.
+
+   THE KNOWN-ANSWER CHECK is hand-computable on ile01, because its
+   first segments are a straight line along +Z with an identity
+   rotation and 512-unit spacing. Segment 3 is at (0, 0, 2048), so
+   racer 1 - odd index, so lateral -128 - must land on
+
+       (0,0,2048) + 10*(0,0,1) + (-128)*(1,0,0) = (-128, 0, 2058)
+
+   and the full expected set for a default solo race is
+
+       racer  1  seg  3  lat -128  pos   -128.0   0.0    2058.0
+       racer  2  seg  6  lat +128  pos    128.0   0.0    3594.0
+       racer  3  seg  9  lat -128  pos   -128.0   0.0    5130.0
+       racer 24  seg 72  lat +128  pos  -2437.6   0.0   36911.7
+
+   IT DOES, MEASURED. All four lines match to the decimal, and the
+   roster came back as 24 with the player at index 1.
+
+   o RACER 24 IS THE LINE THAT MATTERS. Segments 3, 6 and 9 all
+     carry an identity rotation, so those three would pass even if
+     the forward and lateral axes were swapped, transposed or
+     ignored. Segment 72 is yawed four degrees -
+     row0 = (0.9976, 0, -0.0698), row2 = (0.0698, 0, 0.9976) - so
+
+         (-2566.0, 0, 36910.7)
+           + 10 * (0.0698, 0, 0.9976)
+           + 128 * (0.9976, 0, -0.0698)   =  (-2437.6, 0, 36911.7)
+
+     and only a correct reading of which row is forward and which
+     is lateral lands on that. A known-answer test is worth only as
+     much as its hardest case.
+
+   NOT REPRODUCED: nothing consumes a slot. There is no racer
+   record to place one on, so grid_build hands back a position and
+   an orientation and stops there.
+
+6.5.  What settles the direction, and the four progress fields
+
+   maybe_Race_UpdateProgress (0x0047e3d0) runs every frame for every
+   racer. It advances the segment, accumulates signed progress,
+   fires the wrong-way warning, sweeps checkpoints and closes out
+   laps. It is also the only reader of racer+0x31b5.
+
+   THE PROOF IS HOW IT HANDLES REVERSE [verified]:
+
+       delta = newSegment - previousSegment
+       if (reverse == 0)  step =  delta        wrapped to signed
+       else               step = -delta        NEGATED
+
+       if (step < 1)  wrong way: Snd_QueueDelayedCues(0x46, 500)
+       else           forward:   clear the HUD warning
+
+   Negating the delta ONLY in reverse mode is what fixes the sense.
+   If an increasing index were backwards in a normal race, the
+   negation would be on the other branch and the wrong-way cue would
+   fire while driving correctly. Nothing else in the placement or
+   progression code states it, and the whole reading of the grid
+   turns on it.
+
+   THE FOUR FIELDS ARE ADJACENT AND EASY TO CONFUSE:
+
+   +---------+----------------------------------------------------+
+   | Offset  | Meaning                                            |
+   +=========+====================================================+
+   | +0x31b1 | THE SUB-SEGMENT FRACTION, and it is a FLOAT.  An   |
+   |         | out-parameter of Trk_FindSegmentForPoint, not a    |
+   |         | field anything writes by name                      |
+   | +0x31b5 | accumulated signed progress; step added each frame |
+   | +0x31b9 | HIGH-WATER MARK of +0x31b5, only ever raised       |
+   | +0x31bd | the previous segment index                         |
+   | +0x31c1 | THE CURRENT SEGMENT.  Passed in as the lookup hint |
+   |         | and overwritten with the result, every frame       |
+   +---------+----------------------------------------------------+
+
+   THE FIRST AND LAST ROWS ARE BOTH SETTLED BY ONE CALL SITE, and
+   an earlier version of this table had every row shifted up by one
+   [0x0047e422, verified]:
+
+       0047e422  LEA  EAX, [EBX + 0x31b1]   ; an OUT pointer
+       0047e42c  MOV  EDX, [EBX + 0x31c1]   ; the hint
+       0047e449  CALL 0x0040c7e0            ; Trk_FindSegmentForPoint
+       0047e44e  MOV  [EBX + 0x31c1], EAX   ; the result
+
+   so +0x31b1 is whatever the track writes through that pointer - a
+   float, read live as 0xc3fb0000, a clean -502.0 - and +0x31c1 is
+   not InitRace's segment but the running one.  src/racer.h names
+   them subSegment and segmentStart.
+
+   +0x31b9 IS AN ANTI-CHEAT CEILING. It is raised by
+
+       if (r+0x31b9 < r+0x31b5) r+0x31b9 = r+0x31b5;
+
+   and never lowered, so reversing drops +0x31b5 but cannot drop
+   this. The checkpoint sweep runs only when it is raised, which is
+   what stops a lap being gained by backing over a line and driving
+   forward again.
+
+   AND CHECKPOINTS ARE A PER-SEGMENT PROPERTY. The sweep walks every
+   segment between previous and current, stepping by
+   g_nRaceDirection, and for each whose short at +0xd8 is
+   non-negative adds the value at +0xda to the timer. There is no
+   separate checkpoint list - which is also what step 3 of
+   maybe_Game_LoadRace is counting when it walks the segment array
+   testing that same short.
+
+6.6.  So how many bikes actually start?
+
+   Twenty-four, by default, in a normal solo race - and that is a
+   surprising number that has been double-checked because it sounds
+   too high.
+
+   +--------------------------+----------+-------------------------+
+   | Race                     | On track | Where it comes from     |
+   +==========================+==========+=========================+
+   | solo, mode 0             |     2    | g_opponentCount forced 1|
+   | solo, other modes        |    24    | 23 opponents + player   |
+   | solo, NbComputerCut set  |    12    | 11 opponents + player   |
+   | network                  |  varies  | players in state 3      |
+   +--------------------------+----------+-------------------------+
+
+   AND 12 IS A PLAYER-FACING OPTION, not a hidden tuning knob.
+   NbComputerCut is the OPPONENTS row on the options page, which shows
+   24 or 12 - see menu-pages.txt section 2.4 and config-file.txt. So
+   a player who remembers a smaller field may simply have had it set,
+   but the two choices are 24 and 12, never a handful.
+
+   o THE LEVEL MANIFEST AGREES INDEPENDENTLY. Level.Spt carries
+     NbComputer = 23 on every shipped island, followed by exactly 23
+     ComputerSpeed floats - a per-opponent speed for each of them.
+     Two unrelated files sized for 23 is not a coincidence.
+
+   o THE COMMAND LINE CAN OVERRIDE IT, and this is the ONLY place a
+     small field is possible. MenuPage01_Loading_Tick reads
+     DAT_004dbf78, which Main_InitAndParseCommandLine writes and which
+     initialises to -1; in range 0..24 it is used verbatim, otherwise
+     the fallback above applies. But maybe_Game_LoadRace runs LATER
+     and recomputes g_opponentCount unconditionally, so on the normal
+     path the page 1 value is overwritten and the flag never reaches a
+     race. Worth knowing before anyone reproduces the page 1 branch
+     and wonders why it has no effect.  [verified]
+
+7.  Slot +0x1c is a display-mode request
+
+   maybe_Game_ApplyModeRequest at 0x0047ec50 is the third and last
+   resolution-changing path in the game, and the only one that names a
+   mode by index rather than by stepping [verified]:
+
+   +-----------------+-----------------------------+----------------------+
+   | Path            | Entry point                 | Chooses by           |
+   +=================+=============================+======================+
+   | options page    | MenuPage11_Options_Tick     | stepping pixel count |
+   +-----------------+-----------------------------+----------------------+
+   | F2 / F3 hotkeys | Input_OnKeyDown             | stepping pixel count |
+   +-----------------+-----------------------------+----------------------+
+   | command word    | maybe_Game_ApplyModeRequest | a direct index       |
+   +-----------------+-----------------------------+----------------------+
+
+   It takes a pointer to a packed 32-bit command word:
+
+       idx = *pCommand & 0xffff;
+       if ((*pCommand & 0xffff0000) != 0
+           && idx < g_displayModeCount
+           && g_displayModes[idx].bpp    == 0x10
+           && g_displayModes[idx].width  != g_mainWidth
+           && g_displayModes[idx].height != g_mainHeight) {
+           g_screenPixelCount   = g_displayModes[idx].pixels;
+           g_cfgScreenMode      = g_displayModes[idx].sizeClass;
+           g_videoSettingsDirty = 1;
+           g_displayModeIndex   = idx;
+       }
+
+   Like every other consumer of the table it copies both derived fields
+   straight out of the record, and it only raises the dirty flag - the
+   change itself lands at the end of the frame. See subsystems/mode-
+   change.txt.
+
+7.1.  The command word
+
+   g_pendingCommand at 0x004e891c has six references in the whole image.
+   The low half is a parameter and the high half is a flag set whose
+   non-zero-ness means a request is pending [verified].
+
+   It is produced by FUN_0043cf60, a callback that copies the word out
+   of a widget record at +0x3c. That function is never called directly -
+   it is stored as a function pointer into two slots of a widget, at
+   +0xf4 and +0x104, by FUN_0043c570. The widget records live in an
+   array hanging off DAT_004e8910 with a count at +0x5c, and their
+   stride is at least 0x134, so they are NOT MR_MenuButton records
+   despite the familiar +0x3c offset [verified].
+
+   It is consumed by FUN_004126a0, one of the game object's non-virtual
+   methods in the second code cluster:
+
+       if (g_pendingCommand != 0)
+           this->vtbl[+0x1c](&g_pendingCommand);
+       if (g_pendingCommand & 0x40000) ...
+
+   and cleared to 0 by maybe_Game_HandleMenu on its way out, together
+   with DAT_004e8918. So the word is a one-shot request posted by a
+   widget and drained by the game object's update.
+
+   Only one payload meaning has been decoded, the display-mode index.
+   Bit 0x40000 is tested immediately afterwards for something else
+   entirely and has not been read.
+
+7.2.  A latent bug in the guard
+
+   The last two conditions are joined with AND:
+
+       && g_displayModes[idx].width  != g_mainWidth
+       && g_displayModes[idx].height != g_mainHeight
+
+   The intent is plainly 'do nothing if this is the mode we are already
+   in', and that needs OR. As written the function also refuses any mode
+   that shares EITHER dimension with the current window: from 640x480 it
+   would reject 640x400 and 800x480 [verified].
+
+   It never fires, because no two of the three supported resolutions
+   share a dimension. But it is the second appearance of exactly this
+   mistake - Cdd_EnumVideoModes' smallest and largest scans use the same
+   both-must-differ test, and are equally harmless for the same reason.
+   See subsystems/dd-init.txt section 2.2.
+
+   Both would surface on a modern adapter reporting a wide spread of
+   modes, which makes them worth fixing rather than preserving when the
+   enumeration is replaced [inferred].
+
+   One more detail: the comparison is against g_mainWidth and
+   g_mainHeight, the window dimensions, not against the current entry in
+   the mode table. Nothing else read so far mixes the two.
+
+7.3.  Where the command comes from
+
+   The producer is a hidden resolution picker, and finding it closes the
+   whole chain from keypress to mode change [verified]:
+
+   +------+-----------------------------+----------------------------------+
+   | Step | Function                    | Does                             |
+   +======+=============================+==================================+
+   | 1    | maybe_Menu_ShowModePicker   | builds the item list             |
+   +------+-----------------------------+----------------------------------+
+   | 2    | maybe_Widget_CreateList     | opens the widget, type 0xd       |
+   +------+-----------------------------+----------------------------------+
+   | 3    | maybe_Widget_OnItemSelected | posts g_pendingCommand           |
+   +------+-----------------------------+----------------------------------+
+   | 4    | FUN_004126a0                | drains it, dispatches slot +0x1c |
+   +------+-----------------------------+----------------------------------+
+   | 5    | maybe_Game_ApplyModeRequest | sets the globals, raises dirty   |
+   +------+-----------------------------+----------------------------------+
+   | 6    | maybe_Game_RenderFrame      | end of frame: applies            |
+   +------+-----------------------------+----------------------------------+
+
+   maybe_Menu_ShowModePicker at 0x0043c2b0 is opened by SHIFT+F12,
+   Input_OnKeyDown case 0x7b, and closed by the same key. It counts the
+   16 bpp entries in g_displayModes, allocates that many NINE-byte item
+   records plus one, and fills them:
+
+       +0x00  char *label
+       +0x04  char  hotkey letter
+       +0x05  uint  command        <- an unaligned dword
+
+   Hotkeys are handed out from 'A' upward, skipping any letter already
+   bound in g_keyScanTable and stopping at 'X', so the picker never
+   steals a key the player has bound to a driving action. That is a
+   considerate detail for a debug overlay.
+
+   The command stored is index | 0xffff0000. So the high half that
+   maybe_Game_ApplyModeRequest tests for is literally 0xffff, and the
+   low half is the index straight into g_displayModes.
+
+   Labels are built with sprintf from the record's width and height
+   using the format "[%c]******[%4d X %-4d]", giving rows like
+   [A]******[ 640 X 480]. The header row is a matching "[ ]******[ X Y
+   ]".
+
+   A final item is appended carrying command 0xffffffff. Its low half is
+   0xffff, which fails the index bound check, so choosing it does
+   nothing - that is the cancel row, implemented by arithmetic rather
+   than by a special case.
+
+   This also identifies the widget of section 7.1. It is type 0xd, its
+   instance is DAT_004e8910, its item array hangs off +0x58 with a count
+   at +0x5c, and selecting a row runs maybe_Widget_OnItemSelected, which
+   marks the widget for teardown and copies the item's command into
+   g_pendingCommand [verified].
+
+   For the port this is the most convenient of the three paths to keep.
+   It already selects a mode by index out of the enumerated table, with
+   no stepping, no wrap-around and no hang - unlike
+   Cdd_FindModeByPixels. Whatever replaces the enumeration only has to
+   keep the table and the index meaningful [inferred].
+
+8.  Slot +0x14 is the tick, and drives the rest
+
+   This slot was named maybe_Game_HandleMenu on the strength of the two
+   debug labels it passes to Font_ReloadAll. Reading the body shows that
+   was wrong: it is one step of the game, and it is the slot that drives
+   the others. Renamed maybe_Game_Tick [verified].
+
+   From its in-game branch it calls, through its own vtable:
+
+   +-------------+--------------------------+-------------------------------+
+   | Called slot | Function                 | Arguments                     |
+   +=============+==========================+===============================+
+   | +0x10       | the thunk, unread        | -                             |
+   +-------------+--------------------------+-------------------------------+
+   | +0x18       | maybe_Game_CollideRacers | DAT_004e9808                  |
+   +-------------+--------------------------+-------------------------------+
+   | +0x20       | maybe_Game_RenderFrame   | DAT_004e9808, mask 0xfffffffe |
+   +-------------+--------------------------+-------------------------------+
+
+   So the nine-slot interface really is a game loop, and this is its
+   centre. It also settles a question left over from section 2: slot
+   +0x18's float argument is a time step, because the same DAT_004e9808
+   is handed to both the collision pass and the frame.
+
+   The shape of the function:
+
+       1  flush two deferred video-memory warnings, if pending
+       2  FUN_004126a0 - the same function that drains
+          g_pendingCommand, see section 7.1
+       3  if it returns 0, we are not in a race: re-init the joystick
+          when the input device is 2 or 4, and reload fonts with
+          "handleMenu is FALSE"
+       4  otherwise reload fonts with "handleMenu is TRUE" and run
+          the race step - physics, AI, sound, collision, render
+       5  clear g_menuPendingRequest and g_pendingCommand
+
+   The labels are the wrong way round from what they suggest:
+   "handleMenu is TRUE" is emitted on the IN-GAME branch, not the menu
+   one. That is a second reason to treat those strings as hints rather
+   than recovered symbols, the first being that one function emits two
+   different labels. See subsystems/mode-change.txt section 4.
+
+8.1.  Two deferred warnings, and where they come from
+
+   The tick opens by flushing message boxes that something else queued
+   [verified]:
+
+   +--------------+-------------------------------------------------------------------+
+   | Flag         | Message                                                           |
+   +==============+===================================================================+
+   | DAT_004e4f08 | [TEXTURES : NOT ENOUGH] [VIDEO MEMORY]                            |
+   +--------------+-------------------------------------------------------------------+
+   | DAT_00580a58 | [NOT ENOUGH VIDEO MEMORY] [DIRECT3D NOT AVAILABLE] [IN THIS MODE] |
+   +--------------+-------------------------------------------------------------------+
+
+   The second one connects two threads of this session. DAT_00580a58 is
+   set by maybe_Screen3D_UpdateScreen's third retry ladder - the one
+   that gives up on the hardware path and sets g_rendererMode to 1. So
+   that is the message the player actually sees when the game falls back
+   to the software renderer, and it is raised one frame AFTER the mode
+   change that failed, because only the tick shows it. See
+   subsystems/mode-change.txt section 2.2 [verified].
+
+   Worth keeping for the port: the wording blames video memory, but the
+   code path that raises it is reached whenever the hardware renderer
+   fails its guards for any reason. A modern port that cannot create a
+   device will show the player a misleading message unless that text is
+   revisited [inferred].
+
+8.2.  Finishing a race
+
+   The tail of the in-game branch is race-finish detection. When every
+   racer has finished it sets DAT_00509ba0, computes each finishing
+   position, and plays one of four jingles for the player [verified]:
+
+   +--------------+---------------------------------------------+
+   | Sound        | When                                        |
+   +==============+=============================================+
+   | 0x50 or 0x4f | position not yet resolved; chosen at random |
+   +--------------+---------------------------------------------+
+   | 0x48         | last place                                  |
+   +--------------+---------------------------------------------+
+   | 0x47         | below third                                 |
+   +--------------+---------------------------------------------+
+   | none         | third or better                             |
+   +--------------+---------------------------------------------+
+
+   The silence for a podium finish is presumably because a different
+   celebration plays elsewhere - MenuPage24_Podium_Enter exists [guess].
+
+9.  Slot +0x10 is the input step
+
+   The last unread slot, and the shortest thing in the vtable to
+   explain. The slot holds 0x0047ec40, whose entire body is JMP
+   0x004116f0 - no register or stack adjustment. So it is a plain jump
+   stub of the kind an incremental link emits, not an adjustor thunk,
+   and it implies nothing about the object layout [verified]. That
+   answers the question section 10 had been carrying about what it
+   adjusts to: nothing.
+
+   The body is maybe_Game_ReadInput. maybe_Game_Tick calls it once per
+   step, before collision and rendering, and its job is to produce this
+   step's player input - from the device, or from a replay stream.
+
+   It opens by resetting the local player's input record at 0x00584401 +
+   DAT_004dc0fc * 0x3209, which is the per-racer stride seen throughout
+   this note [verified]:
+
+   +-----------+-----------+------------------------------------------+
+   | Offset    | Reset to  | Holds                                    |
+   +===========+===========+==========================================+
+   | +0x584401 | unchanged | button bits; Input_OnKeyDown ORs into it |
+   +-----------+-----------+------------------------------------------+
+   | +0x584405 | 0         | a second button word                     |
+   +-----------+-----------+------------------------------------------+
+   | +0x584409 | 0x8000    | an axis, centred                         |
+   +-----------+-----------+------------------------------------------+
+   | +0x58440d | 0x8000    | an axis, centred                         |
+   +-----------+-----------+------------------------------------------+
+
+   The reset value of 0x8000 on the last two is what identifies them as
+   centred axes rather than flags, and +0x584401 is already known from
+   the other side: it is the word Input_OnKeyDown ORs an action bit into
+   when a driving key is pressed. See subsystems/input-bindings.txt
+   section 6.
+
+9.1.  Live play and replay are the same code path
+
+   g_dwReplayMode (0x004e9834) selects where the input comes from
+   [verified]:
+
+   +------+------------------------------------------------+
+   | Mode | Behaviour                                      |
+   +======+================================================+
+   | 0    | read the devices, then maybe_Replay_WriteInput |
+   +------+------------------------------------------------+
+   | 1    | maybe_Replay_ReadInput instead of the devices  |
+   +------+------------------------------------------------+
+
+   In live play it walks every racer and reads the device only for
+   devices 2 and 4 - the joystick types - zeroing the buttons and
+   centring both axes for everyone else. It then writes the result to
+   the replay stream. So the game records EVERY session, not only ones
+   the player asks to keep [inferred].
+
+   In playback the stream also supplies the TIME STEP. On a successful
+   read it sets DAT_004e9808, which maybe_Game_Tick then hands to both
+   the collision pass and the frame. A replay therefore reproduces its
+   original timing rather than running at the current frame rate, which
+   is what makes a recorded input stream deterministic enough to be
+   worth storing [inferred].
+
+   At end of stream it either renders one final frame through slot +0x20
+   with a stageMask of 0xffffffff - every stage, where the tick normally
+   passes 0xfffffffe - or shows a message and drops back to live play by
+   clearing g_dwReplayMode.
+
+   With this slot read, the nine-slot interface resolves into an
+   ordinary game loop:
+
+   +-------+--------------------------------------+
+   | Slot  | Stage                                |
+   +=======+======================================+
+   | +0x04 | load a race                          |
+   +-------+--------------------------------------+
+   | +0x08 | reset it, place racers on the grid   |
+   +-------+--------------------------------------+
+   | +0x00 | reset the mode globals               |
+   +-------+--------------------------------------+
+   | +0x10 | read input, or replay it             |
+   +-------+--------------------------------------+
+   | +0x14 | step - and drive the three below     |
+   +-------+--------------------------------------+
+   | +0x18 | collide the racers                   |
+   +-------+--------------------------------------+
+   | +0x1c | apply a pending display-mode request |
+   +-------+--------------------------------------+
+   | +0x20 | render a frame                       |
+   +-------+--------------------------------------+
+   | +0x0c | release everything                   |
+   +-------+--------------------------------------+
+
+10.  Open questions
+
+   o RESOLVED. All nine slots have now been read. See section 9 for the
+     last one and for the loop they form.
+     Slot +0x04's role is established by its callee - see section 6.2 -
+     but its own 477 bytes have not been read, so whether it does
+     anything besides allocating is unknown.
+
+   o RESOLVED. It is maybe_Game_ApplyModeRequest, and it carries a
+     latent guard bug. See section 7.
+
+   o The object's size and field layout are unknown. Only two fields
+     have been observed: +0x0c, which the T hotkey toggles, and +0x18,
+     cleared at the top of every frame. There is no allocation site to
+     bound it, since the instance is static.
+
+   o The four non-virtual methods in the second cluster have not been
+     read, and identifying that cluster's translation unit would
+     probably name the class.
+
+   o RESOLVED. It adjusts nothing - the thunk is a bare JMP, a link
+     artefact rather than a C++ adjustor. See section 9.
+   o The widget is type 0xd, built by maybe_Widget_CreateList, and its
+     instance is DAT_004e8910 - see section 7.3. Its record layout is
+     still unmapped beyond the four fields already known.
+
+   o Bit 0x40000 of g_pendingCommand is tested by FUN_004126a0 right
+     after the slot +0x1c call and has not been traced.
+
+   o DAT_004e8918 is cleared alongside g_pendingCommand and is OR-ed
+     with 4, 0x2000 and 0x8000 in FUN_004376d0. It looks like a
+     companion flag word.
+   o RESOLVED. The 0x79-byte class is a 3D mesh. Reconstructed and typed
+     as MR_Mesh; see structs/MR_Mesh.txt. Its destructor is the function
+     this note previously called maybe_FreeViewResources, now Mesh_Free.
+
+   o The polymorphic array at DAT_004dc0e4 holds objects with virtual
+     destructors - so a second class family exists here, unrelated to
+     the game object's own vtable.
+
+
+RACE COUNTDOWN
+--------------
+
+   The countdown between selecting a race and being able to move is
+   SIX SECONDS, not the three it appears to be, and it is two
+   globals [verified]:
+
+   +--------------+----------------------------------------------+
+   | 0x004dc0b4   | countdown flag - non-zero while it runs      |
+   +--------------+----------------------------------------------+
+   | 0x004dc0a8   | the clock in ms; 0x1770 = 6000 at race start |
+   +--------------+----------------------------------------------+
+   | 0x004e9810   | the frame delta subtracted from it each tick |
+   +--------------+----------------------------------------------+
+
+   Set at 0x00411293 and 0x0041129d in FUN_00411010, and consumed
+   by FUN_0047dae0, the race tick:
+
+       DAT_004dc0a8 -= DAT_004e9810;
+       if (DAT_004dc0a8 < 0 && DAT_004dc0b4)
+           DAT_004dc0b4 = 0;         /* the race begins here */
+
+   o AFTER THE COUNTDOWN THE SAME WORD BECOMES THE RACE CLOCK. The
+     branch that clears the flag reloads 0x004dc0a8 with the time
+     limit - 120000 in a network game, otherwise a per-difficulty
+     value from the table at 0x00515fe0.
+
+   o ONLY THE LAST TWO SECONDS ARE ANIMATED. maybe_Racer_UpdatePose
+     blends the rider start stance on (2000 - DAT_004dc0a8), which
+     is why six seconds looks like three.
+
+   o DRIVING THE CLOCK NEGATIVE STARTS THE RACE PROPERLY, because
+     the transition is then the game own. tools/mr_reset.py does
+     this to get back to a centred bike without waiting, using only
+     SEND_INPUT, GET_MEM and SET_MEM.

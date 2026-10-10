@@ -1,0 +1,171 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          THE ISLAND LIST
+
+
+Abstract
+
+   DATA\LIST.BPT names the tracks: how many there are, where their
+   data lives, which are unlocked out of the box, and how many laps
+   each one defaults to. It is a .bpt binary script, so it stores no
+   field names and a reader knows what each value means only from the
+   order Tracks_LoadList (0x00428d60) asks for them.
+
+   The whole file decodes, and the read order consumes it exactly -
+   333 of 333 bytes with nothing left over, which is the strongest
+   confirmation available that the sequence below is right.
+
+Table of Contents
+
+   1. The sequence
+   2. The record
+   3. The shipped list
+   4. What reads it
+   5. Open questions
+
+
+1.  The sequence
+
+   Tracks_LoadList reads, in this order [verified]:
+
+   +----------+-------------------+-------------------------------+
+   | Type     | Setting           | Lands in                      |
+   +==========+===================+===============================+
+   | string   | ListName          | g_szTrackListName, 0x1f max   |
+   | int      | PocketAvailable   | g_nPocketAvailable, 0x004dc03c|
+   | int      | ReverseAvailable  | g_nReverseAvailable,0x004dc040|
+   | int      | NumberIslande     | g_nTrackCount, 0x0051d298     |
+   +----------+-------------------+-------------------------------+
+
+   then NumberIslande repetitions of
+
+   +----------+-------------------+-------------------------------+
+   | string   | name              | record +0x004, 0x1f max       |
+   | string   | path              | record +0x024, 0x103 max      |
+   | string   | ON or OFF         | record +0x128, as 1 or 0      |
+   | int      | laps              | record +0x12c                 |
+   +----------+-------------------+-------------------------------+
+
+   The names in the first table are the ones the TEXT form would
+   carry; the binary form has none, and the loader calls
+   Settings_ReadString and Settings_ReadInt with them only so the
+   same function can read either form. See formats/bpt.txt.
+
+   o THE THIRD STRING IS A WORD, NOT A FLAG. The loader compares it
+     with "ON" at 0x004e1dbc - the same string the options page
+     prints - and stores the result of the compare. Anything that is
+     not "ON", case-insensitively, is off.
+
+2.  The record
+
+   Stride 0x130, allocated as one block of count * 0x130.
+
+   +--------+------+-------------------------------------------+
+   | Offset | Size | Meaning                                   |
+   +========+======+===========================================+
+   | 0x000  | 4    | art-load state, page 6's; 1 = not loaded  |
+   | 0x004  | 0x20 | name, "SPEED_BAY"                         |
+   | 0x024  | 0x104| path, "data\ile01\"                       |
+   | 0x128  | 4    | available, from the ON/OFF word           |
+   | 0x12c  | 4    | default lap count                         |
+   +--------+------+-------------------------------------------+
+
+   o THREE SITES READ +0x128 AND TWO RULES COME OUT OF IT.  It is
+     stored as 1 or 0, but it is not read as a plain bool:
+
+     +----------------------------+---------------------------+
+     | Site                       | Accepts                   |
+     +============================+===========================+
+     | Menu_ChooseStartTrack      | ==1, or g_nAllTracks-     |
+     | 0x00447920, page 6's enter | Selectable, or ==0 while  |
+     |                            | g_nSoloMode and           |
+     |                            | 0x004dbff8 are both clear |
+     +----------------------------+---------------------------+
+     | the two arrow walks,       | ==1, or g_nAllTracks-     |
+     | 0x00448b24 and 0x00448bf9  | Selectable                |
+     +----------------------------+---------------------------+
+     | the Continue guard,        | ==1, or g_nAllTracks-     |
+     | 0x00448110's dispatch      | Selectable                |
+     +----------------------------+---------------------------+
+
+     So OUTSIDE SOLO MODE THE ENTER-TIME CHOOSER IS THE LENIENT ONE
+     and can select a track the arrows would skip.  That is what
+     makes the Continue guard load-bearing rather than a duplicate
+     of the arrows - it is the only thing that refuses the race.
+
+   Field 0x000 is not in the file. Page 6's Enter writes 1 into every
+   record and then loads the selected track's art, and the tick loads
+   a track's pair the first time it is selected.
+
+   o THE PATH IS A PATH, complete with a leading "data\" and a
+     trailing separator, because the original hands it to fopen after
+     appending "map.lez" or "photo.lez". A reconstruction that reads
+     from the .BKF archives has to strip that prefix: what is left,
+     "ile01\", is already the archive stem plus a separator, which is
+     exactly the shape asset_load splits on. CLAUDE.md rule 10.
+
+3.  The shipped list
+
+   +-------------+---------------+-----+------+
+   | Name        | Path          | On  | Laps |
+   +=============+===============+=====+======+
+   | SPEED_BAY   | data\ile01\   | ON  | 4    |
+   | SNOW_RIDE   | data\ile05\   | ON  | 2    |
+   | ROCK_FOREST | data\ile03\   | OFF | 4    |
+   | LOST_RUINS  | data\ile04\   | OFF | 2    |
+   | WEST_WAY    | data\ile02\   | ON  | 4    |
+   | GREAT_WALL  | data\ile06\   | OFF | 3    |
+   | RED_CITY    | data\ile08\   | OFF | 3    |
+   | DIRT_ARENA  | data\ile09\   | ON  | 2    |
+   +-------------+---------------+-----+------+
+
+   ListName is "PLUGIN" and both availability flags are 0.
+
+   o THE ORDER IS NOT THE DIRECTORY ORDER. ile05 is second and ile02
+     is fifth, so the list is authored rather than enumerated, and
+     the arrows on page 6 walk it in this order rather than by
+     island number.
+
+   o FOUR OF THE EIGHT ARE UNLOCKED, and DATA has ILE01 through
+     ILE06 plus ILE08, ILE09, ILE10 and ILE11. So the list does not
+     name every island present - 10 and 11 are not in it at all.
+
+   o AND THE UNLOCK FLAGS START HERE, which is worth knowing before
+     looking for a save file. PocketAvailable and ReverseAvailable
+     are read out of this file, both 0 as shipped, and raised later
+     by gameplay - 0x004581a5 on a record, 0x00455224 whenever the
+     matching ENABLED flag is on. See config-file.txt section 4.
+
+   o decomp/DATA/LIST.BPT IS A PLAYED-ON COPY, NOT THE SHIPPED ONE
+     [verified]. It has all eight islands ON and both availability
+     flags at 1; the table above is the retail disc. So the file
+     records progress and is written back [inferred - our copy
+     differs from retail in exactly the fields gameplay raises, and
+     in no others]. Read the disc copy when the question is what the
+     game ships. This is the SPEED.BKF hazard one file over - see
+     CLAUDE.md, "The DATA folder is modified too".
+
+4.  What reads it
+
+   +---------------------------+--------------------------------+
+   | Tracks_LoadList 0x00428d60| the loader                     |
+   | MenuPage06_RaceSelect     | the arrows, the lap default,   |
+   |                           | and map.lez / photo.lez        |
+   | MenuPage23_DataDisk_Enter | compares against the count     |
+   | FUN_00455280, FUN_004580f0| race setup and results         |
+   +---------------------------+--------------------------------+
+
+   The datadisk adds LIST01.BPT and so on; page 11's DATADISK button
+   appears only when more than one Data\List*.bpt exists. Only the
+   base list is loaded by the reconstruction so far.
+
+5.  Open questions
+
+   o WHAT SELECTS WHICH LIST. Tracks_LoadList takes a script handle,
+     so something upstream opened a particular List file. The
+     datadisk page is the obvious candidate and is not read yet.
+
+   o 0x004dc058, the "every track is selectable" override that the
+     arrows and the CONTINUE button both consult. No writer has been
+     traced, so it is 0 and only the ON tracks can be reached.

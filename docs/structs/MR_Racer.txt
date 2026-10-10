@@ -1,0 +1,3254 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                              MR_RACER
+
+
+Abstract
+
+   Size: 0x3209 = 12,809 bytes [verified] - the stride
+   maybe_Game_CreateRacers walks from g_racers at 0x00581218.
+   Ghidra type applied: not yet.
+
+   One competitor. This note is the BLOCK MAP, not a field list: it
+   says what the twelve thousand bytes are made of and which of them
+   are arrays of something already understood. The individual
+   scalars are in subsystems/racers.txt and src/racer.h.
+
+   THE ANSWER TO "IS MOST OF IT BONE POSES" IS YES. 10,000 of the
+   12,809 bytes - 78 per cent - are one array: five skeleton blocks
+   of twenty MR_RacerPart records, each record carrying a 3x4
+   matrix. A further 1,552 bytes are four MR_ModelInstance records.
+   Only about 1,150 bytes at the end are the racer's own state.
+
+Table of Contents
+
+   1. The block map
+   2. The pose array
+   3. The four model instances
+      3.1. The racer's own state lives inside instance 0
+      3.2. The fourth instance is the skeleton's
+      3.3. A three-deep position history
+   4. The three per-slot arrays
+   5. The tail
+   6. The two root matrices
+      6.1. +0x2e55, the bike root, is where lean lives
+      6.2. +0x3085, the rider root
+      6.3. A correction: +0xbc has PITCH, and only lacks ROLL
+   7. The shadow - the racer owns its own mesh
+      7.1. The outline is built on the wheel contact points
+      7.2. Every vertex is dropped onto the ground separately
+      7.3. The draw forces the detail level
+      7.4. The second quad follows the rider
+   8. The crash - racer+0x30c1, and what hangs off it
+      8.1. It is the RIDER-OFF-THE-BIKE latch
+      8.2. Which settles three things that were open
+      8.3. What the watchpoint added over the alternative
+   9. The drivetrain - racer+0x12c, and the chain with it
+      9.1. Why no search would have found it
+      9.2. The chain
+      9.3. The gear ratios are indexed BACKWARDS
+      9.4. Which also closes the +0x124 discrepancy
+      9.5. racer+0xec is an ARGUMENT SLOT - a correction
+      9.6. Which the numbers then confirm exactly
+      9.7. FUN_0048e180 is the automatic gearbox
+      9.8. What is still open
+      9.9. racer+0x7c is the GEAR, and a drivetrain sub-object
+      9.10. A prediction that failed, and what it was worth
+   10. Hitting a wall - racer+0x18c and racer+0x31c5
+      10.1. maybe_Trk_ClipMoveAgainstWalls
+      10.2. The two racer fields
+   11. Being overtaken - racer+0x306d points at another racer
+      11.1. The gate
+      11.2. The block it maintains
+      11.3. Coverage, byte by byte
+   12. The stunt - racer+0x31f9, and why it kept hiding
+      12.1. Three fields, from maybe_Input_ReadDevice
+      12.2. Measured, with a watchpoint and then with a poke
+      12.3. Holding the flag drives the bike
+      12.4. Why an earlier attempt said the opposite
+      12.5. The wheelie angle is 44.6 degrees, and +0x2e39 is not it
+      12.6. The angle is never stored
+   13. Race progress - the checkpoint table
+      13.1. The split table at +0x2f89
+      13.2. racer+0x2ddd is the elapsed race time
+      13.3. racer+0x2f79 is the checkpoint index, and it is 16 bit
+      13.4. racer+0x31d9 is which lane the bike is in
+      13.5. The encounter block, measured
+      13.6. racer+0x2de1 is the BEST LAP, and the HUD found it
+      13.7. g_lapTimes at 0x005db290 - the lap board
+      13.8. The whole scheme, checked against the screen
+      13.9. What did not fire, and one number still missing
+      13.10. Three crashes caught, all at the speed cap
+      13.11. The HUD, mapped
+      13.12. A read that looked like a mystery and was not
+   14. The suspension block - racer+0x2e8d
+      14.1. What the carac fields settle
+      14.2. The layout
+      14.3. A trap: a float compared as an integer
+      14.4. And three runs that are NOT written while racing
+   15. Two pose-frame pointers - racer+0x304d and racer+0x3069
+      15.1. racer+0x3069 is the overtake glance
+      15.2. racer+0x304d, and a free find beside it
+      15.3. The camera object is g_anCamera at 0x005161c0
+      15.4. A negative result worth more than the positives
+      15.5. All the loose pose addresses are one table
+   16. The previous-frame family - Racer_SavePrevFrame
+      16.1. Six runs that nothing writes, and one false negative
+      16.2. The same crash, twice, bit for bit
+   17. The read-write sweep - three runs are dead, one was not
+      17.1. racer+0x2f71 is an effect pool slot
+      17.2. A crash while stunting, and it was NOT at the speed cap
+   18. The dirt bike - a different bike names five dead fields
+      18.1. racer+0x305d is the running STUNT ANIMATION, and the
+            road bike has none
+      18.2. The stunts are the artists SAUTDELIRE poses
+      18.3. The pose table runs past index 31
+      18.4. racer+0x3051 is a smoothing filter, sign-selected
+      18.5. racer+0x2dc0 and +0x2dc4 are a second ground-contact pair
+      18.6. racer+0x2f75 is a second Fx pool slot
+      18.7. What stayed dead, on a second bike and a second track
+      18.8. Crashes, normalised - the stunt separates the population
+   19. The stunt run - how a trick starts, and how it ends
+      19.1. A stunt ends on a table-driven timer
+      19.2. g_abStuntPoseTable, and its base is one dword earlier
+      19.3. You can only start a stunt in the air
+      19.4. racer+0x31f9 is NOT a stable "is stunting" flag - a
+            correction to 18.8
+      19.5. The first airborne crash, and no stunt was running
+      19.6. Two more runs are dead, and the airborne sample repeats
+      19.7. The finish, observed for the first time
+   20. A field found with no watchpoint at all
+      20.1. racer+0x31d5 is a charge/decay meter, not dead space
+      20.2. The third determinism proof, at whole-race scale
+      20.3. The stunt POSE is cosmetic - it does not feed the physics
+      20.4. What is still zero, and one hook that never fired
+   21. The poison sweep - and three fields that were never dead
+      21.1. The method
+      21.2. racer+0x000c is a flag, and it is read
+      21.3. racer+0x2da0 was never unknown - the MAP had lost it
+      21.4. racer+0x2e29 is a lean-mode flag
+      21.5. 48 bytes are now VERIFIED dead, not inferred
+      21.6. A fourth determinism proof, under adversarial conditions
+   22. The pocket bike, backwards - the dead space holds
+      22.1. 52 of 52 survived
+      22.2. racer+0x2f7b is the lap counter, settled
+      22.3. racer+0x31b5 is the track total progress count
+      22.4. The pocket bike never leaves the ground
+      22.5. Stale state survives between races
+      22.6. A crash below the floor, on a bike that cannot stunt
+   23. THE HEAD OF THE RECORD - +0x0, +0x4, +0x8, +0x118
+   24. Open questions
+
+1.  The block map
+
+   +--------+--------+---------------------------------------------+
+   | Offset | Bytes  | What                                        |
+   +========+========+=============================================+
+   | 0x0000 |     36 | flags. +0x0 drawn this frame, +0x4 solo     |
+   |        |        | mode, +0x8 human player, +0x18 and +0x1c    |
+   |        |        | FLT_MAX                                     |
+   +--------+--------+---------------------------------------------+
+   | 0x0024 |    388 | MR_ModelInstance [0] - the bike body        |
+   +--------+--------+---------------------------------------------+
+   | 0x01a8 |    388 | MR_ModelInstance [1] - the front wheel      |
+   +--------+--------+---------------------------------------------+
+   | 0x032c |    388 | MR_ModelInstance [2] - the rear wheel       |
+   +--------+--------+---------------------------------------------+
+   | 0x04b0 |    388 | MR_ModelInstance [3] - no mesh, see 3.2     |
+   +--------+--------+---------------------------------------------+
+   | 0x0634 |      4 | DISTANCE TO THE CAMERA, divided by the      |
+   |        |        | projection zoom. maybe_Racer_SelectLod      |
+   +--------+--------+---------------------------------------------+
+   +--------+--------+---------------------------------------------+
+   | 0x0638 |      4 | THE SKELETON SLOT / LOD index. 0, 2, 3, 4   |
+   |        |        | from maybe_Racer_SelectLod by distance; 1   |
+   |        |        | ONLY when racer+0x319d is set               |
+   +--------+--------+---------------------------------------------+
+   | 0x063c | 10,000 | MR_RacerPart pose[5][20] - THE POSE ARRAY   |
+   +--------+--------+---------------------------------------------+
+   | 0x2d4c |     20 | int partCount[5]                            |
+   +--------+--------+---------------------------------------------+
+   | 0x2d60 |     20 | void *[5]                                   |
+   +--------+--------+---------------------------------------------+
+   | 0x2d74 |     20 | void *[5] - freed by Racer_Create           |
+   +--------+--------+---------------------------------------------+
+   | 0x2d88 |  1,153 | the tail - physics, name, geometry, race    |
+   |        |        | progress. See section 5                     |
+   +--------+--------+---------------------------------------------+
+
+   THE CONSTRUCTOR CONFIRMS IT DIRECTLY. Racer_Ctor (0x0045b840)
+   is the C++ constructor, and a constructor NAMES its members
+   rather than indexing them [verified]:
+
+       FUN_0048bbc0()  x4      the four MR_ModelInstance members.
+                               The fourth is LEA ECX,[ESI+0x4b0] at
+                               0x0045b881, which is the only
+                               instruction in the whole image that
+                               forms that address.
+
+       _eh_vector_constructor_iterator_(this + 399, 100, 100,
+                                        FUN_00463d10, FUN_00463d60)
+
+                               399 DWORDS is +0x63c, and the
+                               arguments say 100 elements of 100
+                               bytes.
+
+   So the pose array is declared as MR_RacerPart[100] and used as
+   [5][20]. That is a FOURTH independent confirmation of a base and
+   a dimension that three other arguments had already agreed on -
+   and it is the only one that comes from a declaration rather than
+   from arithmetic.
+
+   IT SUMS TO 0x3209 WITH NOTHING LEFT OVER, and three of the
+   boundaries are load-bearing rather than assumed:
+
+   o 0x0024 + 4*0x184 = 0x0634. Racer_Create writes the livery to
+     +0x170, +0x2f4, +0x478 and +0x5fc, which is +0x14c inside four
+     records spaced exactly 0x184 apart [verified].
+
+   o 0x063c + 5*20*100 = 0x2d4c, which is where the part COUNT
+     array starts. The array dimension and the thing that follows
+     it agree to the byte [verified].
+
+   o 0x2d4c + 3*5*4 = 0x2d88, and the first non-zero byte after it
+     is at 0x2db8. Three arrays of five, back to back.
+
+2.  The pose array
+
+   Five blocks of twenty MR_RacerPart, 100 bytes each. A part is
+   addressed as
+
+       racer + 0x63c + (slot*20 + part)*100
+
+   and holds a joint pivot, three euler angles, a 3x4 matrix, a
+   vertex range and its own MR_Primitive face array. The full
+   layout, the tree the parts form, and how the phase was settled
+   are in MR_RacerPart.txt.
+
+   READ LIVE, ONLY TWO OF THE FIVE BLOCKS ARE POPULATED
+   [verified]:
+
+   +------+--------+-------+---------------------------------------+
+   | Slot | Offset | Parts | State                                 |
+   +======+========+=======+=======================================+
+   |   0  | 0x063c |   17  | g_pathSkl. FULLY POSED - angles and   |
+   |      |        |       | matrices                              |
+   +------+--------+-------+---------------------------------------+
+   |   1  | 0x0e0c |   17  | g_pathSklHand. Topology and pivots    |
+   |      |        |       | only; +0x0c..+0x47 all zero           |
+   +------+--------+-------+---------------------------------------+
+   |   2  | 0x15dc |    0  | every byte zero                       |
+   +------+--------+-------+---------------------------------------+
+   |   3  | 0x1dac |    0  | every byte zero                       |
+   +------+--------+-------+---------------------------------------+
+   |   4  | 0x257c |    0  | every byte zero                       |
+   +------+--------+-------+---------------------------------------+
+
+   o THE ARRAY IS 20 WIDE AND corps.skl USES 17. The three spare
+     slots per block are real, allocated space, not padding: the
+     count at +0x2d4c is 17 and the cleanup loop in Racer_Create
+     runs twenty times.
+
+   o THAT ACCOUNTS FOR THE 6,000-BYTE ZERO REGION. An earlier
+     sweep recorded "5,928 bytes of zero at +0x1624" as an
+     unexplained hole. It is slots 2, 3 and 4 - 0x15dc to 0x2d4c
+     is exactly 6,000 bytes - and the sweep simply started 0x48
+     late because slot 2's first record begins with three null
+     pointers before its first non-zero field.
+
+   o SLOTS 2..4 ARE NOT LODs, AND THE BIKE MANIFEST SAYS SO. It
+     names two skeletons and then THREE MESHES - medium, low and
+     very low .3df files - so a racer far enough away is drawn as
+     a fixed mesh rather than articulated, and only slots 0 and 1
+     are ever indexed. racer+0x638 holding 4 on a distant racer is
+     the LOD ladder, not a slot. See formats/skl-rot.txt 5.2.
+
+   o AND ON A SPEED BIKE SLOT 1 IS THE SAME FILE. MOTOSPD.BPT
+     names data\speed\corps.skl at BOTH index 2 and index 3, so a
+     Speed racer loads one skeleton into two blocks. The KTM names
+     mHand\corps.skl at index 3 and would differ. See
+     formats/skl-rot.txt 5.1.
+
+3.  The four model instances
+
+   Racer_Create calls ModelInstance_Init on three of them
+   [verified]:
+
+   +-------+--------+---------------------+------------------------+
+   | Index | Offset | Mesh                | Position read live     |
+   +=======+========+=====================+========================+
+   |   0   | 0x0024 | DAT_0053a6a8, body  | (-128,  -0.0,  2058)   |
+   |   1   | 0x01a8 | g_meshRoueAvant     | (-128,   0.0,  2142)   |
+   |   2   | 0x032c | g_meshRoueArriere   | (-128,   0.0,  1974)   |
+   |   3   | 0x04b0 | none - it is the    | (-128,  84.0,  2058)   |
+   |       |        | SKELETON, see 3.2   |                        |
+   +-------+--------+---------------------+------------------------+
+
+   The wheels straddle the body in z - 1974 and 2142 about 2058 -
+   which is a 168-unit wheelbase and confirms the two wheel
+   instances are placed rather than left at the origin.
+
+   THE INSTANCE CARRIES MORE THAN MR_ModelInstance.txt RECORDS.
+   Read across all four, three fields are the same shape in every
+   one and none is in that note [verified]:
+
+       +0x0c, +0x18, +0x24    A POSITION HISTORY - current,
+                              previous, previous-but-one. All three
+                              read alike on a stationary bike; the
+                              shift is in section 3.3
+       +0x94                  1.0
+       +0x98                  a 3x4 MATRIX, identity at rest
+
+   The matrix at +0x98 is the one src/racer.h calls racer+0xbc -
+   0x24 + 0x98 is 0xbc. So the racer's orientation matrix is
+   instance 0's, and every instance has one.
+
+3.1.  The racer's own state lives inside instance 0
+
+   This is the part of the map most likely to mislead a port, so it
+   is worth stating plainly. Several fields documented as racer
+   fields fall INSIDE instance 0's 388 bytes:
+
+   +---------------+----------------+--------------------------------+
+   | racer offset  | instance 0 off | what it is                     |
+   +===============+================+================================+
+   | +0x0030       | +0x000c        | position                       |
+   | +0x0068       | +0x0044        | the active flag - which is the |
+   |               |                | flag ModelInstance_Init sets   |
+   | +0x00b4       | +0x0090        | RealSpeedMax                   |
+   | +0x00bc       | +0x0098        | the orientation matrix         |
+   | +0x0108       | +0x00e4        | pointer to the racer itself    |
+   | +0x0110       | +0x00ec        | the steering input             |
+   | +0x0114-0x124 | +0x00f0-0x0100 | the speeds and the tachometer  |
+   +---------------+----------------+--------------------------------+
+
+   EVERY ONE OF THOSE LANDS ON A DWORD ModelInstance_Init MERELY
+   ZEROES. The initialiser clears +0xe4, +0xe8, +0xec, +0xf0,
+   +0xf4, +0xf8, +0xfc, +0x100, +0x104 and +0x108 in a run and
+   never writes them again - and that run is exactly the self
+   pointer, the steering and the speed family.
+
+   TWO READINGS, AND NOTHING HERE PICKS BETWEEN THEM [inferred]:
+
+   o MR_ModelInstance is a BASE CLASS with fields the menu pages
+     never touch, and a racer is one of them with a bike bolted
+     on; or
+
+   o the racer writes its own state into space the instance
+     initialiser only clears, and the overlap is opportunistic.
+
+   Either way a port must not treat instance 0 as an opaque
+   MR_ModelInstance and then add the racer's scalars after it -
+   that would double-count 388 bytes and put every later offset
+   wrong. Instances 1 and 2 read 0 at +0x90 and +0xec where
+   instance 0 holds 80.0 and the steering, which is the check.
+
+3.2.  The fourth instance is the SKELETON's
+
+   Instance 3 has no mesh - +0x34 is zero and nothing ever writes it
+   - and for a while that made it look vestigial. It is not. It is
+   the placement and cull record for the geometry that does NOT live
+   in an MR_Mesh: the bike-and-rider skeleton in the pose array.
+
+   THREE THINGS ESTABLISH IT.
+
+   o ITS LIVERY DRIVES THE SKELETON DRAW. maybe_Racer_Draw
+     walks the pose array part by part and, for each part with a
+     non-zero faceCount, dispatches on racer+0x5fc - which is
+     instance 3's +0x14c [verified, 0x00461a30]:
+
+         for (i = 0; i <= partCount[slot]; i++) {
+             p = racer + 0x63c + (slot*20 + i)*100;
+             if (p->faceCount == 0) continue;
+             if (racer[0x5fc] >= 0)
+                 CullAndQueueFaces  (verts, p->faces,
+                                     p->faceCount, racer[0x5fc]);
+             else
+                 CullAndQueueFacesEx(verts, p->faces,
+                                     p->faceCount, 1);
+         }
+
+     That is the SAME two-variant dispatch on the sign of the
+     livery that ModelInstance_Draw uses - see
+     MR_ModelInstance.txt 3.1 - applied to the skeleton instead of
+     to a mesh. So the RIDER is recoloured with the bike.
+
+     The loop also re-confirms the part layout from a third
+     function: it reaches faceCount as +0x698 and faces as
+     +0x69c, which are 0x63c + 0x5c and 0x63c + 0x60.
+
+   o IT IS PLACED AT THE CENTRE OF THE BIKE AND RIDER.
+     maybe_Racer_PlaceWheels writes its position as [verified]:
+
+         inst3.pos = racer.pos + matrix.translation + 84 * up
+
+     where up is matrix row 1 and 84 is RoueAxeDistance * 48.0 -
+     the double at 0x004d0ea0. THE WHEELS USE THE SAME 84 along the
+     forward axis, +48 and -48 times the same RoueAxeDistance. So
+     the four instances sit at the centre of a sphere and at three
+     points on it, which is what a cull centre looks like.
+
+   o RACER_CREATE TREATS IT LIKE THE BODY, NOT LIKE A WHEEL. The
+     livery goes to instance 0 and instance 3 unconditionally,
+     while the two wheels get -1 unless param_4 is set - and
+     param_4 is forced to -1 when the bike's PersoAnim is 1.
+     Always-drawn geometry gets an always-set level.
+
+   SO A RACER IS FOUR PLACED THINGS: a body mesh, two wheel meshes,
+   and a skeleton. Three of them carry a pointer to an MR_Mesh and
+   the fourth carries a pose array instead. [inferred - the
+   livery use is verified, the label is the reading that
+   explains all three observations]
+
+   o WHAT IS STILL ODD is that instance 3's POSITION is maintained
+     every frame and never read. See section 3.3.
+
+3.3.  A three-deep position history, two deep of it used
+
+   maybe_Racer_UpdateGroundContact (0x00468ca0) opens by shifting,
+   for instances 1, 2 and 3 [verified]:
+
+       inst+0x24 = inst+0x18          oldest    = previous
+       inst+0x18 = inst+0x0c          previous  = current
+
+   THAT SETTLES WHAT +0x18 AND +0x24 ARE. They are not three copies
+   of the position, which is how they read in a single dump - they
+   are a history, and a dump taken while the bike is stationary
+   makes all three identical.
+
+   o THE OLDEST SLOT IS WRITE-ONLY. +0x1cc, +0x350 and +0x4d4 are
+     written here and referenced nowhere else in the image. Three
+     searches, three write-only results. The engine keeps two
+     frames and pays to shift three.
+
+   o INSTANCE 0 IS NOT IN THE SHIFT. The body's +0x18 and +0x24 are
+     left alone, which fits: the racer's own position at +0x30 is
+     instance 0's +0x0c and has its own history elsewhere, at
+     +0x3c.
+
+4.  The three per-slot arrays
+
+   Twenty bytes each, five entries, indexed by skeleton slot. Read
+   live [verified]:
+
+   +--------+---------------------------------------------------+
+   | 0x2d4c | 17, 17, 0, 0, 0 - the part count per block        |
+   +--------+---------------------------------------------------+
+   | 0x2d60 | two heap pointers then three nulls                |
+   +--------+---------------------------------------------------+
+   | 0x2d74 | two heap pointers then three nulls                |
+   +--------+---------------------------------------------------+
+
+   Racer_Create frees +0x2d74 and +0x2d78 by name rather than in a
+   loop, which is what first identified the pair. Seeing them as
+   entries 0 and 1 of a five-wide array indexed the same way as
+   everything else is the tidier reading and matches the two arrays
+   either side.
+
+5.  The tail
+
+   racer+0x2d88 to the end, 1,153 bytes. Mostly known scalars, plus
+   two things worth naming:
+
+   +----------+------------------------------------------------------+
+   | +0x2da8  | speed, m/s                                           |
+   | +0x2dd4  | THE PLAYER NAME, ASCII, NUL-terminated. Read live it |
+   |          | held the name set in the options                     |
+   | +0x2e1d  | lean angle, radians                                  |
+   | +0x2e39  | front-end pitch, radians                             |
+   | +0x2e3d  | REAR WHEEL SPIN, an euler triple - only [0] moves.   |
+   |          | Racer_SpinWheels advances it by contact distance     |
+   |          | over rayonAr; racerdraw composes it onto the rear    |
+   |          | wheel's matrix                                       |
+   | +0x2e49  | FRONT WHEEL SPIN, the same over rayonAv              |
+   | +0x2e55  | THE BIKE'S ROOT MATRIX, 3x4 - orientation, lean AND  |
+   |          | the stunt pitch. Sections 6 and 12.5                 |
+   | +0x3085  | THE RIDER'S ROOT MATRIX, 3x4 - see section 6         |
+   | +0x2ea9  | 6 MR_Vertex then 2 MR_Primitive - THE SHADOW,        |
+   |          | see section 7                                        |
+   | +0x30ed  | 4 MR_Vertex then 2 MR_Primitive at +0x311d - a       |
+   |          | second, conditional shadow quad                      |
+   | +0x31b1  | subSegment, progress, progressMax, prevSeg, curSeg   |
+   +----------+------------------------------------------------------+
+
+   THE GEOMETRY AT +0x2ea9 IS THE SHADOW, and it is now read
+   rather than guessed - see section 7. The guess above was right
+   and its reasoning was half wrong: the outline is a HEXAGON on
+   the two wheel contact points, not a rectangle, and the y values
+   of 4 and 8 are per-vertex lift biases applied after each corner
+   is dropped onto the track surface, not a flat plane.
+
+6.  THE TWO ROOT MATRICES
+
+   The pose array holds two trees - part 0 corps and part 3 Pilote
+   - and the reason is now clear: THEY ARE HANDED DIFFERENT ROOT
+   MATRICES. Each has its own 3x4 in the tail, and both are members
+   Racer_Ctor initialises to the identity [verified].
+
+   +----------+--------------------------------------------------+
+   | +0x2e55  | THE BIKE'S ROOT. Orientation WITH LEAN           |
+   +----------+--------------------------------------------------+
+   | +0x3085  | THE RIDER'S ROOT                                 |
+   +----------+--------------------------------------------------+
+
+6.1.  +0x2e55, the bike root, is where lean actually lives
+
+   maybe_Racer_UpdateLean (0x00469c60) BUILDS IT. At 0x0046a560 it
+   crosses two vectors, normalises, and copies the three basis rows
+   into +0x2e55, +0x2e59, +0x2e5d and on - twelve floats ending at
+   +0x2e81 [verified].
+
+   maybe_Racer_Draw then uses it as the matrix for everything
+   downstream, from 0x0045f2d7:
+
+       EAX = EBX + 0x2e55
+
+   and part 0 - corps, the bike - is walked with it.
+
+   THIS SETTLES A GAP src/racer.h HAS CARRIED SINCE THE LEAN WAS
+   FOUND. That header says the orientation matrix carries no roll
+   and "the draw code composes it in", without saying where. It is
+   composed HERE, and it is STORED - so a port does not have to
+   rebuild it, it can read +0x2e55.
+
+   o BUT THE MENU PATH OVERWRITES IT. maybe_Racer_Draw takes the
+     LOD as its last argument, and when that is NOT -1:
+
+         [EBX + 0x638] = lodArg
+         Matrix34_Copy2(dst = EBX + 0x2e55, src = EBX + 0xbc)
+
+     - the leaned matrix is replaced by the plain orientation.
+     FUN_00458b80, the in-race draw loop, passes -1 and so leaves
+     UpdateLean's matrix alone. A menu page that names a LOD gets a
+     bike with no lean, which is exactly right for one standing on
+     a turntable. [verified]
+
+6.2.  +0x3085, the rider root, is copied in as an argument
+
+   Between the two Skl_BuildPartMatrices calls, at 0x00460f22
+   [verified]:
+
+       CALL Skl_BuildPartMatrices        part 0, corps
+       SUB  ESP, 0x30                    room for a 12-float arg
+       LEA  ECX, [EBX + 0x3085]
+       PUSH ECX
+       CALL Matrix34_Copy                onto the new stack slot
+       CALL Skl_BuildPartMatrices        part 3, Pilote
+
+   So the rider is NOT parented to the bike. He is a second root
+   with his own world matrix, which is what lets him keep a pose
+   through a crash while the bike does something else.
+
+   Read live it was a clean axis permutation:
+
+       [  0   0  -1 ]
+       [ -1   0   0 ]
+       [  0   1   0 ]
+
+   which is a valid rotation, not junk - but it was read with the
+   race stopped, so what it holds while riding is unread.
+   FUN_004683e0 writes it at 0x00468b55 and reads it at four sites,
+   so it is dynamic.
+
+6.3.  +0xbc has PITCH, and only lacks ROLL
+
+   "YAW ONLY" is the reading the tarmac island gives - the track is
+   flat there, so m11 sits at 1.0 with zeros around it even
+   mid-corner - and it does not generalise.
+
+   Read live on the off-road track [verified]:
+
+       row0  (  0.64365,   0.00000,  -0.76532 )
+       row1  (  0.37170,   0.87414,   0.31261 )
+       row2  (  0.66899,  -0.48568,   0.56264 )
+
+   row1 is nowhere near (0,1,0) - the bike is PITCHED, nose down
+   over a bump. What IS exactly zero is ROW 0'S Y. The lateral axis
+   is horizontal, always.
+
+   AND THAT IS EXACTLY WHAT THE CONSTRUCTION GUARANTEES.
+   maybe_Racer_UpdateGroundContact builds the matrix by crossing
+   (front wheel contact - rear wheel contact) with WORLD UP - see
+   its plate comment - so the lateral row can never acquire a y
+   component. Pitch and yaw come from the two ground points; roll
+   cannot.
+
+   o THE PRECISE STATEMENT IS "NO ROLL", NOT "YAW ONLY", and the
+     difference matters for a port: a reconstruction that builds
+     +0xbc as a pure Y rotation will sit flat on every jump face
+     and every bump on the dirt tracks.
+
+7.  THE SHADOW - the racer owns its own mesh
+
+   racer+0x2ea9 was recorded in section 5 as "six vec3s and
+   MR_Primitive records, almost certainly the shadow". It is, and
+   the whole of it is now read [verified].
+
+   FOUR ARRAYS, ALL CONSTRUCTED BY NAME IN Racer_Ctor - which is
+   what identifies them, since nothing indexes +0x2ea8 and a
+   displacement search finds no writer:
+
+   +----------+--------+--------------------------------------------+
+   | Offset   | Count  | What                                       |
+   +==========+========+============================================+
+   | +0x2ea9  |   6    | MR_Vertex - the bike shadow outline        |
+   +----------+--------+--------------------------------------------+
+   | +0x2ef1  |   2    | MR_Primitive - its two textured faces      |
+   +----------+--------+--------------------------------------------+
+   | +0x30ed  |   4    | MR_Vertex - a second, conditional quad     |
+   +----------+--------+--------------------------------------------+
+   | +0x311d  |   2    | MR_Primitive                               |
+   +----------+--------+--------------------------------------------+
+
+   Racer_Ctor runs the vec3 constructor six times from
+   LEA EBX,[ESI+0x2ea9] and the primitive constructor twice from
+   LEA EBX,[ESI+0x2ef1], then four and two more for the second
+   pair.
+
+7.1.  The outline is built on the wheel contact points
+
+   maybe_Racer_BuildShadow (0x00461aa0), called from both physics
+   ticks [verified]:
+
+       lat = (40, 0, 0)  transformed
+       lon = (0, 0, 40)  by racer+0xbc
+
+       v0 = front(+0x1b4) + lon - lat
+       v1 = front(+0x1b4) + lon + lat
+       v3 = rear (+0x338) - lon + lat
+       v4 = rear (+0x338) - lon - lat
+       v2, v5 = the midpoints, averaged with 0.5
+
+   SO IT IS A STRETCHED HEXAGON ON THE TWO WHEEL CONTACT POINTS,
+   +-40 units wide - not a rectangle on the racer origin, and not a
+   projection of the bike's own geometry. front is +0x1b4 and rear
+   is +0x338, the contact points
+   maybe_Racer_UpdateGroundContact computes.
+
+7.2.  Every vertex is dropped onto the ground separately
+
+       for i in 0..5:
+           seg  = Trk_FindSegmentForPoint(racer[0x31c1], v[i])
+           v[i] = FUN_0040c960(seg, v[i])
+           v[i].y += (i == 2 || i == 5) ? 8.0 : 4.0
+
+   The two MIDPOINTS are lifted twice as far as the four corners,
+   which is what keeps the middle of the shadow off the ground on a
+   crest. The constants are 0x004d1020 = 8.0 and 0x004d0f80 = 4.0.
+
+   o AND A LIVE READ CONFIRMS IT, INCLUDING WHICH TWO. On the
+     off-road track the six y values came back
+
+         -3.72  -3.75  +1.00  -2.42  -2.40  +1.02
+
+     The two standing about four units proud are v2 and v5 -
+     exactly the pair this code singles out - and the rest of the
+     spread is the terrain. The outline measured 80 units wide,
+     which is the 2 x 40. [verified]
+
+   o THAT IS THE STRONGEST KIND OF CHECK AVAILABLE HERE. The
+     region was found by scanning for non-zero bytes, guessed at
+     as a shadow, and the code then predicted a four-unit step on
+     two specific vertices out of six. Nothing about a scan could
+     have produced that.
+
+7.3.  The draw forces the detail level
+
+   maybe_Racer_DrawShadow (0x00461f70), one caller,
+   maybe_Race_DrawRacers, so once per racer per frame [verified]:
+
+       v = Screen3D_TransformVertsFlat(view, this+0x2ea9, 6, 0x1f);
+       save = g_cfgDetailLevel;
+       g_cfgDetailLevel = 3;
+       Screen3D_CullAndQueueFacesEx(v, this+0x2ef1, 2, 1);
+       g_cfgDetailLevel = save;
+
+   o g_cfgDetailLevel IS OVERRIDDEN TO 3 AND PUT BACK. Whatever
+     the player's setting, a shadow culls at level 3. It is the
+     only override of that global in the racer path, and a port
+     that misses it will drop the shadow at low detail.
+
+   o THE SHADE IS 0x1f, FLAT - the same literal
+     ModelInstance_Draw passes, so shadows are unlit - and the
+     view transform is the same camera-relative one, from cam+0x68
+     with cam+0x98 subtracted first.
+
+7.4.  The second quad follows the rider
+
+   Gated on maybe_g_appInitStarted and racer+0x30c1. It is built
+   from Racer_GetYaw and a euler rather than from the wheel
+   contacts, centred on the vec3 at racer+0x30b5 - which sits
+   immediately after the RIDER root matrix at +0x3085 - and its
+   four corners are set to the track height plus 2.0.
+
+   IT IS THE FALLEN RIDER'S SHADOW. racer+0x30c1 is the crash
+   latch - 1 while the rider is off the bike - so this quad is
+   drawn only then, and it is centred on +0x30b5 rather than on the
+   wheel contacts because he is no longer on the wheels. See
+   section 8. [verified]
+
+8.  THE CRASH - racer+0x30c1, and what hangs off it
+
+   THE FIRST FIELD FOUND WITH A HARDWARE WATCHPOINT, and it took one
+   short ride. racer+0x30c1 was read at twenty-odd sites across the
+   tick, the pose update and the draw, and gated the second shadow
+   quad, but nothing said what it MEANT. Watching it for writes
+   named the writer in a single hit:
+
+       d0#1 eip=00467e85 esi=00584421 old=00000000 new=00000001
+
+   maybe_Racer_BeginCrash (0x00467e30) writes it at 0x00467e7f, a
+   six-byte MOV - and 0x467e7f + 6 is 0x467e85 exactly, which is the
+   trap-after-retire rule confirmed against a known answer at the
+   same time as the field was identified.
+
+8.1.  It is the RIDER-OFF-THE-BIKE latch
+
+   maybe_Racer_BeginCrash returns immediately if the flag is already
+   set, so setting it IS entering the state [verified]:
+
+   +----------+--------------------------------------------------+
+   | +0x30c1  | 1 while the rider is off the bike. The latch.    |
+   +----------+--------------------------------------------------+
+   | +0x30c5  | 400.0                                            |
+   +----------+--------------------------------------------------+
+   | +0x30c9  | float[3] - the rider's LAUNCH DIRECTION, the     |
+   |          | impact vector with 0.6 added to Y, normalised    |
+   +----------+--------------------------------------------------+
+   | +0x30d5  | THE TIMER - speed in m/s times 0.15              |
+   | +0x30d9  | a second copy of it                              |
+   +----------+--------------------------------------------------+
+   | +0x30dd  | +pi/2 or -pi/2 - WHICH SIDE HE FALLS             |
+   +----------+--------------------------------------------------+
+   | +0x30e1  | a euler triple, (0, +0x30dd, +0x30dd)            |
+   +----------+--------------------------------------------------+
+   | +0x31a1  | float[3] - a second copy of the impact vector    |
+   | +0x31ad  | 1                                                |
+   +----------+--------------------------------------------------+
+
+   Cleared by FUN_0045e940 and FUN_0046bf80, the two physics ticks,
+   at the top of the frame - the same place they clear +0x319d.
+
+   o THE FALL SIDE COMES FROM THE LEAN. +0x30dd is chosen from the
+     sign of racer+0x2e31, falling back to racer+0x2e1d - the lean -
+     and only if the bike was dead upright does it pick with the RNG
+     at FUN_00458ce0. A rider dropped mid-corner goes over the
+     inside, deterministically.
+
+   o THE TUMBLE LASTS AS LONG AS YOU WERE FAST. +0x30d5 is speed
+     times 0.15, and maybe_Racer_UpdatePose counts it down as the
+     progress fraction of the animation - which is the same +0x30d5
+     that formats/skl-rot.txt 5.1.4 found as "an animation timer"
+     without knowing where it came from.
+
+8.2.  Which settles three things that were open
+
+   o THE SECOND SHADOW QUAD IS THE FALLEN RIDER'S. Section 7.4 had
+     it as "a second ground quad that follows the rider rather than
+     the bike", tagged inferred, because +0x30c1 was unknown. It
+     gates on the crash latch, so it is drawn only while he is off
+     the bike. [now verified]
+
+   o AND THE RIDER ROOT MATRIX AT +0x3085 IS BUILT HERE, from
+     Racer_GetYaw and that +-pi/2 roll. Section 6.2 found the rider
+     had his own root and could not say what drove it. This is what
+     drives it, and it is why the pose array is two trees: the bike
+     keeps its orientation while the rider rolls away from it.
+
+   o mHand IS THE CRASH SKELETON, from the code rather than from a
+     trace. maybe_Racer_UpdateCrash (0x004683e0) has its ENTIRE body
+     behind JZ on +0x30c1, and at 0x00468c7d - the last instruction
+     before the JZ target - it raises +0x319d, the flag that selects
+     pose block 1. A function that only runs while the rider is off
+     the bike is what turns on the skeleton whose only additions are
+     his HANDS. formats/skl-rot.txt 5.1.9 reached the same
+     conclusion from speed decay and an on-ground flag; the two are
+     independent.
+
+8.3.  What the watchpoint added over the alternative
+
+   A displacement search had already listed the writers of +0x30c1 -
+   FUN_004681d0 four times, FUN_00467e30, FUN_0045bb30. That list
+   was TRUE and it was not an answer: six sites with no way to know
+   which one mattered, and the one that did was not the one with
+   four hits.
+
+   The watchpoint reported the writer that ACTUALLY FIRED, in the
+   state the user could produce on purpose, with the racer in ESI
+   and the transition in old/new. One ride, one hit, one function to
+   read.
+
+9.  THE DRIVETRAIN - racer+0x12c, and the whole chain with it
+
+   FOUND BY tools/mr_find.py --at 124, which reads a value and looks
+   for every other copy of it. racer+0x124, the speed, turned up a
+   SECOND copy four bytes further on at +0x12c that nothing had
+   recorded. Pulling that thread produced the gear, the engine speed,
+   the tachometer scale and the gear ratio table.
+
+9.1.  Why no search would have found it
+
+   NO INSTRUCTION IN THE IMAGE NAMES racer+0x12c. Searching the
+   displacement returns the MR_ModelInstance constructor writing an
+   unrelated instance+0x12c, and nothing else.
+
+   The field is written THROUGH A POINTER. Its one caller does
+
+       0x00468c56  LEA EDX, [ESI + 0x12c]
+       0x00468c60  CALL maybe_Gearbox_SpeedToEngine
+
+   and the callee writes *param_2 - only when the rev limiter fires.
+   That is the third field this session to be invisible to a
+   displacement search, after the shadow vertex array and the float
+   sub-segment fraction at +0x31b1.
+
+9.2.  The chain
+
+   maybe_Gearbox_SpeedToEngine (0x0048deb0) converts road speed to
+   engine speed through the current gear, and clamps both at the
+   redline [verified]:
+
+       ratio  = carac field 29 + gear
+       engine = MoteurVitesseMax / (ratio * VitesseMaxBoite) * speed
+       if (engine > MoteurVitesseMax) {
+           engine = MoteurVitesseMax;
+           *speed = ratio * VitesseMaxBoite / MoteurVitesseMax * engine;
+       }
+
+   +----------+--------------------------------------------------+
+   | +0x007c  | THE CURRENT GEAR. maybe_Racer_BeginCrash sets it |
+   |          | to 1 - a crash drops you into first.             |
+   +----------+--------------------------------------------------+
+   | +0x00ec  | the ENGINE-side speed. On the AI path only, it   |
+   |          | doubles as a scratch slot - see 9.5 and 9.10     |
+   +----------+--------------------------------------------------+
+   | +0x011c  | the TACHOMETER,                                  |
+   |          | engine/MoteurVitesseMax * RegimeMax. THE SCALE   |
+   |          | IS PER BIKE - carac field 29, 12000 on the road  |
+   |          | bikes and 10000 on the dirt ones - NOT a         |
+   |          | constant 12000. See racers-convergence.txt       |
+   |          | 9.46.17.                                         |
+   +----------+--------------------------------------------------+
+   | +0x0124  | road speed, m/s                                  |
+   +----------+--------------------------------------------------+
+   | +0x012c  | THE GEARBOX'S road speed - the one the limiter   |
+   |          | writes back to                                   |
+   +----------+--------------------------------------------------+
+
+   CHECKED NUMERICALLY, live, bike 0 in second gear [verified]:
+
+       +0x12c  21.566311      carac[6]  MoteurVitesseMax  7.0
+       +0x0ec   4.124700      carac[19] VitesseMaxBoite  61.0
+       +0x07c   2             carac[31] gear-2 ratio      0.6
+
+       7.0 / (0.6 * 61.0) * 21.566311 = 4.1247   = +0x0ec
+       4.1247 / 7.0 * 12000           = 7071     = +0x11c, read 7070
+
+   The first equation closes to four figures and is certain. THE
+   SECOND ONE WAS WHERE THIS WENT WRONG - see 9.5: 4.1247/7*12000
+   coming out near the tachometer was a coincidence of magnitude,
+   not a derivation, and the tachometer is computed somewhere else
+   entirely.
+
+9.3.  The gear ratios are indexed BACKWARDS out of another array
+
+   The ratio is fetched as MinAdherenceDerap[gear - 13], and
+   MinAdherenceDerap is carac fields 42-44. So the index is really
+   field 29 + gear, reaching back into fields 30-35.
+
+   o READING THAT AS AN ARRAY OVERRUN WOULD BE WRONG. Fields 30 and
+     31 hold 0.30 and 0.60, which are gear ratios and are used as
+     gear ratios. The compiler simply based the access on the array
+     it had a symbol for. formats/bpt-carac.txt lists 30-35 as
+     unnamed; they are the ratio table.
+
+   o AND FIELD 29 IS 12000.0 - the redline src/racer.h had already
+     recorded from the tachometer side, without knowing where the
+     number lived.
+
+9.4.  Which also closes the +0x124 discrepancy
+
+   The roadmap has carried "why +0x124 and +0x118/3.6 disagree
+   slightly - there is a second writer at 0x00468c33" since the speed
+   fields were mapped. That writer is
+
+       0x00468c22  FLD   [ESI + 0x124]
+       0x00468c28  FMUL  double [0x004d11b8]        = 0.9
+       0x00468c33  FSTP  [ESI + 0x124]
+
+   inside maybe_Racer_UpdateCrash, so it only runs while the rider is
+   off the bike. THE SPEED IS DAMPED BY 0.9 A FRAME DURING A CRASH,
+   independently of the speedometer at +0x118 - which is exactly when
+   and why the two diverge.
+
+   o AND IT IS THE SAME 0.9 THE WATCHPOINT MEASURED. The trace on
+     +0x319d in formats/skl-rot.txt 5.1.8 recorded ratios of 0.9002,
+     0.9000 and 0.9002 between successive frames and called it "a
+     per-frame multiply". This is the multiply, and 0x004d11b8 is
+     0.9 exactly. A number measured from outside and a constant read
+     from inside, agreeing.
+
+9.5.  racer+0xec IS AN ARGUMENT SLOT, and calling it the engine
+      speed was wrong
+
+   SECTION 9.2 ABOVE LISTED +0x00ec AS "ENGINE SPEED, 0 ..
+   MoteurVitesseMax". THAT WAS AN OVER-READING and it is corrected
+   here rather than quietly edited, because the way it went wrong is
+   the interesting part: the semantics were inferred from the NAME OF
+   THE CONSTANT the value is clamped against. MoteurVitesseMax sounds
+   like a rev limit, so its clamp target got called an engine speed.
+   Nothing had read what the field is used FOR.
+
+   FUN_00467930 is what it is used for [verified]:
+
+       save   = racer[0xec];
+       racer[0xec] = racer[0x118] * (1/3.6);      needle km/h -> m/s
+       if (racer[0xec] < 0) racer[0xec] = 0;
+       FUN_0048e180(racer + 0x24, &racer[0x7c]);  the auto gearbox
+       racer[0xec] = save;                        PUT BACK
+       racer[0x11c] = ftol(...);                  the tachometer
+
+   THE VALUE IS SAVED, OVERWRITTEN WITH A ROAD SPEED, USED, AND
+   RESTORED. So +0xec is partly an argument slot: FUN_0048e180 takes
+   its speed from this[0xc8] rather than as a parameter, and the
+   caller has to stage it there.
+
+   o WHICH IS WHY ONE LIVE SAMPLE COULD NOT SETTLE IT. Read between
+     frames, +0xec holds the RESTORED value - FUN_0048deb0's output,
+     4.1247 - while the gear and the tachometer were computed from
+     the temporary, 17.911. Both numbers are in the record at once
+     and they mean different things.
+
+9.6.  Which the numbers then confirm exactly
+
+   Reading racer+0x7c = 2 and racer+0x11c = 7070 live, and working
+   BACKWARDS through FUN_0048e180 [verified]:
+
+       rev fraction  = 7070 / 12000        = 0.5892
+       speed         = 0.5892 * 0.38 * 80  = 17.911 m/s = 64.5 km/h
+       gear bands    = 1->2 at 14.40, 2->3 at 26.40 m/s
+       17.911 m/s falls in GEAR 2          - and +0x7c reads 2
+
+   The stored +0xec of 4.1247 would have given gear 1. So the
+   temporary is what the gearbox saw, the restore is what the dump
+   shows, and the two agree with the code to the integer.
+
+9.7.  FUN_0048e180 is the AUTOMATIC GEARBOX
+
+   __thiscall on racer+0x24 - so this[0x54] is racer+0x78, the bike
+   index, and this[0xc8] is racer+0xec, the speed. Its second
+   argument is where to write the gear, and the caller passes
+   &racer[0x7c].
+
+   It picks a gear by comparing speed against fractions of
+   RealSpeedMax and returns a 0..1 REV FRACTION, which becomes the
+   tachometer [verified]:
+
+   +--------+-----------------+------------------+------------------+
+   | Gear   | shifts up at    | rev range top    | at RealSpeedMax  |
+   |        | (x RealSpeedMax)|                  | 80, km/h         |
+   +========+=================+==================+==================+
+   |   1    |      0.18       |      0.23        |      51.8        |
+   |   2    |      0.33       |      0.38        |      95.0        |
+   |   3    |      0.48       |      0.53        |     138.2        |
+   |   4    |      0.62       |      0.67        |     178.6        |
+   |   5    |      0.74       |      0.79        |     213.1        |
+   |   6    |      -          |      1.00        |      -           |
+   +--------+-----------------+------------------+------------------+
+
+       rev = speed / (rangeTop * RealSpeedMax), clamped to 0..1
+       tachometer = rev * 12000, with a floor of 800 - the idle
+
+   o DIRT BIKES HAVE FIVE GEARS, NOT SIX. The PersoAnim branch uses
+     its own bands - rev tops 0.2, 0.35, 0.5, 0.8, 1.0 - and stops
+     at five. That is a real gameplay difference between the two
+     bike families and it is decided here, not in the carac table.
+
+   o THE SHIFT POINT AND THE REV TOP ARE DIFFERENT NUMBERS, stored
+     as a double and a float interleaved at 0x004d1ca8, stride 16.
+     Shifting up at 0.18 while the gear's range runs to 0.23 is what
+     stops the needle snapping to zero on every change.
+
+9.8.  What is still open
+
+   o WHAT FUN_0048deb0's OUTPUT MEANS. It writes +0xec as
+     MoteurVitesseMax / (ratio * VitesseMaxBoite) * speed, which is
+     0.19126 * 21.566 = 4.1247 and matches the stored value exactly
+     - so the arithmetic is certain and the QUANTITY is not. It is
+     not the same thing FUN_0048e180 reads out of the same field.
+
+   o AND FUN_0045e940 DOES racer[0x124] = racer[0xec] near its top,
+     which would put that 4.1247 into the speed. Either the two run
+     in an order that makes it consistent or one of them is doing
+     something not yet understood. Flagged rather than explained.
+
+\n\n9.9.  racer+0x7c IS THE GEAR, and there is a drivetrain sub-object
+
+   The whole drivetrain is addressed off racer+0x24 - instance 0 -
+   which is why none of it answers a search for racer offsets. Every
+   field here was found by watching racer+0x7c and reading ESI out of
+   the hits [verified]:
+
+   +-----------+---------------+--------------------------------+
+   | racer     | as the code   | what                           |
+   |           | addresses it  |                                |
+   +===========+===============+================================+
+   | +0x0078   | this[0x54]    | bike index                     |
+   | +0x007c   | this[0x58]    | THE CURRENT GEAR, 1..NbSpeed   |
+   | +0x0080   | this[0x5c]    | shift timer, counted down      |
+   | +0x0084   | this[0x60]    | shift state: 0 idle, 1 up,     |
+   |           |               | 2 down                         |
+   | +0x0088   | this[0x64]    | gates the multi-gear downshift |
+   | +0x008c   | this[0x68]    | how many gears the downshift   |
+   |           |               | wants                          |
+   | +0x0090   | this[0x6c]    | the speed saved across a change|
+   | +0x00ec   | this[0xc8]    | the ENGINE-side speed          |
+   | +0x012c   | this[0x108]   | the ROAD-side speed            |
+   +-----------+---------------+--------------------------------+
+
+   maybe_Gearbox_TickShift (0x0048e6e0) is the state machine:
+
+       if (state && (timer -= dt) < 1) {
+           state 1:  if (gear < carac.NbSpeed) gear++;
+           state 2:  gear = max(1, gear - pending);
+           racer[0xec]  = SpeedToEngine(&racer[0x12c], gear, racer[0xec]);
+           racer[0x12c] = FUN_0048dd90(&racer[0xec], gear, racer[0x12c]);
+       }
+
+   o A SHIFT IS NOT INSTANT. The gear moves only when the timer
+     expires - the clutch delay - and a downshift can skip several
+     gears at once.
+
+   o carac.NbSpeed IS THE GEAR COUNT, and this is exactly where the
+     copy protection bites. CLAUDE.md records that Carac_Load
+     subtracts 1.0 from NbSpeed when g_protectionPassed is 0, "one
+     gear fewer, silently". The comparison it changes is the
+     if (gear < NbSpeed) above.
+
+   o +0xec AND +0x12c ARE TWO SIDES OF ONE SPEED. On every change
+     both are recomputed through the new ratio, each from the other.
+     That settles 9.8: the pair is road-side and engine-side, and
+     FUN_0048dd90 is the inverse of maybe_Gearbox_SpeedToEngine.
+
+9.10.  A prediction that failed, and what it was worth
+
+   Section 9.7 read maybe_Gearbox_AutoSelect's band table and it was
+   tested by accelerating and comparing the gear against it. IT DID
+   NOT MATCH - two of seven samples - and the mismatch is the useful
+   part.
+
+   maybe_Gearbox_AutoSelect has exactly ONE caller, FUN_00467930, and
+   that function returns early when the racer is a human in a solo
+   race:
+
+       if (racer[8] == 0) { ...needle smoothing... }
+       else if (racer[4] != 0) { racer[0x11c] = ...; return; }
+       ... only here does the auto gearbox run ...
+
+   SO THE AUTOMATIC GEARBOX NEVER RUNS FOR THE LOCAL PLAYER. The band
+   table in 9.7 is real and it governs the AI and network play; the
+   player's gear comes from maybe_Gearbox_TickShift and the shift
+   keys.
+
+   o AND THAT ALSO EXPLAINS +0xec's TWO READINGS. On the AI path
+     FUN_00467930 stages a road speed into +0xec, calls the auto
+     gearbox and restores it - so the field is a scratch argument
+     slot THERE. On the player path that code never executes and
+     +0xec is simply the engine-side speed. Both readings were
+     right about different racers, which is why one live sample
+     could not choose between them.
+
+10.  HITTING A WALL - racer+0x18c and racer+0x31c5
+
+   Found by asking what in the tail is non-zero, changing, and NOT
+   named by the map - a coverage sweep the three tools make cheap.
+   292 of the tail's 1,153 bytes came back unaccounted for, and the
+   biggest coherent run of them was here.
+
+   BOTH FIELDS ARE OUT-PARAMETERS. Neither is ever written by name;
+   a displacement search finds only the initialiser in FUN_0045bb30
+   and a handful of LEAs. That is the fifth field this session
+   invisible to a search, after the shadow vertices, the float
+   progress, the gearbox speed and the gear.
+
+10.1.  maybe_Trk_ClipMoveAgainstWalls
+
+   0x0040ca80, called from both physics ticks [verified]:
+
+       int ClipMoveAgainstWalls(trk, seg, from, to,
+                                hitPoint, dir, normal)
+
+       for each of the two side walls:
+           if (the destination is outside the plane) {
+               *hitPoint = where the move crossed it;
+               *normal   = the wall plane;
+               *dir     -= (*dir . *normal) * *normal;
+               normalise(*dir);
+               return 1;
+           }
+
+   o THE SLIDE IS THE WHOLE POINT. Taking out the component of the
+     direction along the normal and renormalising is what makes a
+     bike SCRAPE along a wall rather than stop dead against it.
+
+   o THE TWO WALL PLANES ARE AT SEGMENT +0x60 AND +0x70, stride
+     0xfc - the same 252 bytes the decor index at +0xb4 walks. Two
+     of the four planes MR_TrkSegment.txt has had open.
+
+10.2.  The two racer fields
+
+   +----------+--------------------------------------------------+
+   | +0x018c  | THE MOVEMENT DIRECTION, a unit vector. Rebuilt   |
+   |          | each frame from the position delta, and SLID     |
+   |          | along the wall by the clip above                 |
+   +----------+--------------------------------------------------+
+   | +0x31c5  | THE WALL NORMAL of the last collision, unit      |
+   +----------+--------------------------------------------------+
+
+   Read live, both measured exactly 1.000000 long [verified]:
+
+       +0x018c   (-0.75494, -0.33836,  0.56176)   |v| = 1.000000
+       +0x31c5   (-0.87237, -0.00000, -0.48885)   |v| = 1.000000
+
+   o THE NORMAL'S Y IS EXACTLY ZERO, which is what a vertical wall
+     requires and is a stronger check than the magnitude: a vector
+     that merely happened to be unit-length would not also be
+     exactly horizontal.
+
+   o AND THE PUSHBACK IS 32 UNITS. maybe_Racer_UpdateGroundContact
+     does racer.position += racer[0x31c5] * 32.0 when the clip
+     reports a hit - the constant at 0x004d1024. That is what puts
+     the bike back inside the track after it crosses a wall.
+
+11.  BEING OVERTAKEN - racer+0x306d points at another racer
+
+   The one POINTER left unclaimed in the tail, and it holds
+   0x0058a833 - which is g_racers + 0x961b, exactly racer 3 at
+   offset 0. A racer record pointing at another racer record.
+
+   Read and written in maybe_Racer_UpdatePose and nowhere else.
+
+11.1.  The gate
+
+       EAX = this[0x306d];             the racer remembered last frame
+       if (EAX != other) goto record;  a DIFFERENT one - just remember
+       if (dist >= 262144.0) goto record;
+       if (other[0x118] - this[0x118] <= 20.0) goto record;
+
+       ... build our forward vector from the wheel contact points,
+           this[0x1b4] minus this[0x338] ...
+
+   record:
+       this[0x3079] = 400.0;
+       this[0x3075] = DAT_0050bbc8;
+       this[0x3071] = <a stack value>;
+       this[0x306d] = other;
+
+   So the interesting branch needs THREE things at once [verified]:
+
+   o THE SAME RACER AS LAST FRAME. Storing the pointer and comparing
+     it next frame is what makes this a SUSTAINED encounter rather
+     than a one-frame brush. That is the whole reason the field
+     exists.
+
+   o WITHIN RANGE. 0x48800000 is 262144.0, and the value compared
+     against it comes off the stack - a squared distance on the
+     evidence of the magnitude, not read.
+
+   o AND THE OTHER RACER 20 km/h FASTER. 0x004d0f98 is 20.0, and the
+     subtraction is theirs minus ours, both from +0x118, the
+     speedometer. So this fires when somebody is going considerably
+     faster than you and staying near you.
+
+11.2.  The block it maintains
+
+   +----------+--------------------------------------------------+
+   | +0x306d  | the other racer - a pointer into g_racers        |
+   | +0x3071  | a value carried in from the caller's stack       |
+   | +0x3075  | a copy of the global at 0x0050bbc8               |
+   | +0x3079  | 400.0 - a timer, the same constant the crash     |
+   |          | latch puts at +0x30c5                            |
+   +----------+--------------------------------------------------+
+
+   Read live between encounters, +0x3071 through +0x3080 are ZERO
+   while +0x306d still holds racer 3 - so the pointer is kept after
+   the encounter ends and the rest is cleared. That is consistent
+   with it being the "who was it last time" comparison and not a
+   live reference.
+
+   o WHAT IT ANIMATES IS NOT READ. It is in the pose blender and it
+     sets a 400.0 timer, so a reaction stance - the rider glancing
+     at a bike coming past - fits everything here. Nothing has been
+     seen on screen and no .rot has been tied to it. [inferred]
+
+11.3.  Coverage, byte by byte
+
+   The map now claims 12,268 of the racer's 12,809 bytes, 96 per
+   cent, leaving 65 bytes that are non-zero or changing and that
+   nothing names - +0x2e3d and +0x2e49 left this table when they
+   were identified as the two wheel spin angles. The remainder is mostly small:
+
+   +----------+--------------------------------------------------+
+   | +0x2db0  | a float, moving. Read 84.095                     |
+   | +0x2df5  | THREE COPIES of maybe_Racer_PlaceWheels' three   |
+   | +0x2e01  | float arguments, at +0x2df5, +0x2e01 and +0x2e11.|
+   | +0x2e11  | All read -235.4465 in x. Purpose unread          |
+   | +0x31d1  | set to 200.0 in several places and decaying      |
+   +----------+--------------------------------------------------+
+
+   o THE FIRST SWEEP OVERSTATED THIS AT 292 BYTES, because it walked
+     on 4-byte boundaries through a tail whose fields sit at 1 mod 4
+     - so it reported the byte BEFORE a known field as unknown, and
+     printed its value shifted by one byte into nonsense. Marking
+     every byte each known field occupies and reporting only what
+     nothing claims cut it to 89 and made the values readable. A
+     coverage tool that is one byte out is worse than none: it
+     invents work.
+
+12.  THE STUNT - racer+0x31f9, and why it kept hiding
+
+   The wheelie the third button does. It is a LEVEL and an EDGE flag,
+   not one field, and neither turned up in any earlier sweep because
+   the input reader addresses them absolutely.
+
+12.1.  Three fields, from maybe_Input_ReadDevice
+
+   The decompiler shows that function writing 0x584415 and 0x584411,
+   which look like globals and are not: iVar3 is racer * 0x3209, so
+   iVar3 + 0x584415 is g_racers + racer*0x3209 + 0x31fd. They ARE
+   racer fields, written through a base the decompiler folded away.
+
+       prev = racer[0x31fd];
+       racer[0x31fd] = 0;                 rebuilt every read
+         ... case 6: racer[0x31fd] = 1;   ACTION 6 is down
+       if (prev != racer[0x31fd]) {
+           if (racer[0x31fd] == 0) racer[0x31f9] = 0;      released
+           else { racer[0x31f9] = 1;                       HELD
+                  racer[0x3201] = 1; }                     PRESSED
+       }
+
+   +----------+--------------------------------------------------+
+   | +0x31fd  | action 6 down this frame - raw, rebuilt each read|
+   | +0x31f9  | THE STUNT IS HELD - level                        |
+   | +0x3201  | THE STUNT WAS JUST PRESSED - edge                |
+   +----------+--------------------------------------------------+
+
+   AND THE CONSUMERS SPLIT ALONG THE SAME LINE. +0x31f9 goes to
+   maybe_Racer_Tick and maybe_Racer_UpdateGroundContact - the
+   physics. +0x3201 goes to maybe_Racer_UpdatePose twice and is then
+   CLEARED there, at 0x0045e372 - an edge consumed by the animation.
+
+12.2.  Measured, with a watchpoint and then with a poke
+
+   A watchpoint on +0x31f9 while the button was pressed three times
+   caught three clean pairs [verified]:
+
+       eip=00431456   old=0 -> new=1      the press
+       eip=004328b0   old=1 -> new=0      the release
+
+   o THOSE ARE THE KEYBOARD PATH, not maybe_Input_ReadDevice. That
+     function is the joystick reader; the keyboard writes the same
+     two fields from 0x00431456 and 0x004328b0. Reading only the
+     decompiled joystick path would have named the fields correctly
+     and the writers wrongly.
+
+   o AND A WATCH ON +0x3201 CAUGHT ONLY THE CLEARS - six hits, all
+     old=0 new=0, at 0x0045e37c in the pose blender. It is cleared
+     every frame whether or not it was set, so a watch on it needs
+     the "changed" filter or the budget goes on no-ops.
+
+12.3.  Holding the flag drives the bike
+
+   Poking +0x31f9 to 1 for ten frames FROM A FRESH RESET, with no
+   throttle input at all [verified]:
+
+   +-------------------+-------------+-------------+
+   |                   | on the grid | 10 frames   |
+   +===================+=============+=============+
+   | +0x31f9           |      0      |      1      |
+   | speed, m/s        |    0.010    |    7.844    |
+   | front-end pitch   |   -0.000    |   -0.095    |
+   | position z        |     2040    |     2208    |
+   +-------------------+-------------+-------------+
+
+   and pose parts 3 THROUGH 14 all re-posed while parts 0 and 1 did
+   not - the whole rider re-animated, the bike frame and fork
+   untouched.
+
+   o THE FLAG ALONE ACCELERATES THE BIKE. Nothing was holding the
+     throttle. A wheelie is a drive input as well as a pose.
+
+12.4.  Why an earlier attempt said the opposite
+
+   The same poke tried earlier came back was=0 now=0 and was written
+   up as inconclusive. The reason is in
+   maybe_Racer_UpdateGroundContact: its wall-collision branch does
+
+       racer[0x31f9] = 0;
+
+   so TOUCHING A WALL CANCELS THE STUNT. The first attempt ran forty
+   frames from wherever the bike happened to be, reached the first
+   turn of the off-road track and hit it - and the flag was cleared
+   by the game before the snapshot.
+
+   o WHICH IS ALSO A GAMEPLAY FACT worth having: you cannot hold a
+     wheelie through a wall scrape, and that is what makes stunting
+     on a narrow track punishing.
+
+   o THE FIX WAS THE USER'S: reset first, then ten frames rather
+     than forty. A held write only loses to the game if the game
+     writes; keeping the run short enough that it does not is
+     cheaper than fighting it.
+
+12.5.  THE WHEELIE ANGLE IS 44.6 DEGREES, AND +0x2e39 IS NOT IT
+
+   12.3 above quoted the front-end pitch at +0x2e39 moving to -0.095
+   radians and let that stand as the wheelie. IT CANNOT BE.
+   +0x2e39 is clamped at +-pi/16, which is 11.25 degrees, so the
+   field structurally cannot express a wheelie - and 0.095 rad is
+   5.4 degrees, which is not a stunt, it is a bump.
+
+   The check that should have been made before quoting it is whether
+   the field's RANGE can hold the answer. It could not.
+
+   THE ANGLE IS IN THE MATRIX THAT GETS DRAWN. Measured off
+   racer+0x2e55, whose row 2 is the forward axis, so its y is
+   sin(pitch) [verified]:
+
+   +------------------+-------------------+-------------------+
+   | after            | +0x00bc           | +0x2e55 BIKE ROOT |
+   +==================+===================+===================+
+   | on the grid      |   -0.29 deg       |   -0.29 deg       |
+   | 6 frames         |   -0.34 deg       |  +35.81 deg       |
+   | 16 frames        |   -0.34 deg       |  +44.62 deg       |
+   | 32 frames        |   -0.37 deg       |  +44.63 deg       |
+   +------------------+-------------------+-------------------+
+
+   o IT SATURATES AT ABOUT 44.6 DEGREES and holds there.
+
+   o AND +0x00bc NEVER MOVES. The orientation matrix carries none of
+     it - which is consistent with 6.3: that matrix is built from
+     the two wheel CONTACT points, and a bike on its back wheel has
+     no front contact to build from.
+
+   o SO SECTION 6.1 UNDERSTATES +0x2e55. It is not "orientation with
+     lean" - it is orientation with lean AND the stunt pitch, and it
+     is the only place either appears. A port that composes only
+     +0x00bc and the lean scalar gets a bike that cannot wheelie.
+
+12.6.  The angle is never stored
+
+   Searching the whole live record for 0.7789 - the 44.63 degrees in
+   radians - finds nothing but a rider pose angle that happens to be
+   near it, and searching for its sine finds only the matrix element
+   itself [verified].
+
+   So the stunt pitch is COMPOSED INTO THE MATRIX AND DISCARDED,
+   exactly as the steering angle is - see src/racer.h on 0x0045fb65,
+   where the triple and the matrix are both stack temporaries. Two
+   of the three rotations a bike visibly does are stored nowhere.
+
+   o WHAT IS STORED IS THE STATE, NOT THE ANGLE. maybe_Racer_Tick
+     copies racer+0x31f9 to racer+0x2e85 at 0x0045d6e1, and +0x2e85
+     is what the rest of the frame reads. FUN_0045e940 also sets it
+     when +0x1a4 exceeds RealSpeedMax, so it is "stunting OR
+     overspeeding" rather than purely the button. Read live mid
+     wheelie it is 1. [verified]
+
+13.  RACE PROGRESS - the checkpoint table, found by riding a lap
+
+   Four watchpoints armed before a lap, read after it. Three of the
+   four fired and between them they name the whole progress block -
+   none of which a start-drive-crash loop had ever touched.
+
+13.1.  The split table at +0x2f89
+
+   Racer_Ctor fills 48 dwords from +0x2f89 with -1, which is the
+   shape of a table meaning "nothing recorded yet". FUN_00412e50
+   fills it [verified]:
+
+       CMP  EAX, 0x30                    48, the table size
+       MOV  EBP, EAX
+       JG   skip                         out of range, drop it
+       ECX = racer[0x2ddd]               the elapsed time
+       [racer + EBP*4 + 0x2f89] = ECX
+
+   Read live after one lap with three checkpoints crossed:
+
+       [0]  19856 ms = 19.86 s
+       [1]  35588 ms = 35.59 s
+       [2]  47882 ms = 47.88 s
+       [3..47] zero
+
+   o SO IT IS ONE ENTRY PER CHECKPOINT CROSSING, cumulative, in
+     order - not one per lap. 48 entries covers sixteen laps of a
+     three-checkpoint track.
+
+   o AND THE BOUND IS CHECKED. An index past 48 is dropped rather
+     than written, so a very long race stops recording instead of
+     running off the end of the racer.
+
+13.2.  racer+0x2ddd is the elapsed race time
+
+   The value the table records, in milliseconds, and zeroed by
+   Racer_Ctor. Read live at 50570 while the three splits above stood
+   at 19856, 35588 and 47882 - so it is a running clock, not a lap
+   timer that resets.
+
+   o IT IS NOT PART OF THE PLAYER NAME. The coverage map claimed 20
+     bytes from +0x2dd4 for the name string; the name read as seven
+     characters plus a NUL, which is nine, and +0x2ddd is the next
+     field. Over-claiming in the map hid a field rather than
+     revealing one - the opposite failure to the byte-misaligned
+     sweep, and just as quiet.
+
+13.3.  racer+0x2f79 is the checkpoint index, and it is 16 BIT
+
+   FUN_0047e3d0 at 0x0047e82e [verified]:
+
+       AX = [EBX + 0x2f79]        a WORD
+       INC AX
+       [EBX + 0x2f79] = AX
+       if (AX >= DAT_004e9844)
+           [EBX + 0x2f79] = 0
+
+   Watched across a lap it went 1 -> 2 -> 3 -> 0 -> 1, and
+   0x004e9844 reads 3 - the checkpoint count for this track, which
+   formats/level-spt.txt records as NbCheckPoint, 3 to 5.
+
+   o A 16-BIT FIELD IN A RECORD OF DWORDS. +0x2f7b is a second word
+     beside it, and Racer_Ctor zeroes both as words. A dword read of
+     +0x2f79 would pick up both and look like nonsense.
+
+13.4.  racer+0x31d9 is which LANE the bike is in
+
+   maybe_Trk_LaneOfRacer (0x0046d340) dots the racer's position
+   against the current segment's plane and buckets the result into
+   three bands of 240 units, so 720 across [verified]:
+
+       0, 1, 2   the third of the track width
+       -1        outside all three - OFF THE TRACK
+
+   Watched across a lap it read 0 1 2 1 0 1 2 1 0, which is a rider
+   weaving. The -1 makes it an off-track test as well as a lane
+   index, and it is cheaper than any geometry a port would otherwise
+   write.
+
+13.5.  The encounter block, measured
+
+   +0x3071 and +0x3075 both fired, and +0x3071 is SIGNED:
+
+       +0.927 +0.945 +0.954 +0.959     climbing, against racer 10
+       -0.908 -0.856 -0.775 -0.685     falling, against racer 12
+       -0.820 -0.882 -0.931            against racer 2
+
+   In [-1, +1] and changing sign with the other racer - a DOT
+   PRODUCT, not a distance. Section 11 guessed "closeness" from four
+   positive samples; the negative ones rule that out.
+
+   +0x3075 sat near 0.0337 and crept, and +0x306d walked
+   2, 4, 2, 5, 2, 3, 8, 7 - every value an exact racer base, the
+   pack going past.
+
+13.6.  racer+0x2de1 is the BEST LAP, and the HUD found it
+
+   Reading numbers off the screen and searching for them is a
+   different move from anything else in this note, and it worked
+   first try. The HUD showed "lap 1 time 00:47:88" and "best lap
+   computer 00:42:95"; 47882 turned up in racer 1 at TWO places -
+   +0x2f91, which is split table entry 2, and +0x2de1, which nothing
+   claimed.
+
+   Racer_Ctor initialises +0x2de1 to 0x7f7f7f7f, which is the
+   classic "no time yet" sentinel, and it is lowered as laps
+   complete. Read across every racer mid-race [verified]:
+
+   +-------+---------------+--------------------------------------+
+   | racer | +0x2de1       |                                      |
+   +=======+===============+======================================+
+   |   0   | 0x7f7f7f7f    | the unused slot - never raced        |
+   |   1   |  47882 ms     | the player, and the HUD's lap 1 time |
+   |   3   |  47552        |                                      |
+   |   6   |  42959 ms     | THE HUD'S "best lap computer 42:95"  |
+   |   8   | 0x7f7f7f7f    | no lap completed yet                 |
+   |  10   |  44062        |                                      |
+   |  12   |  48314        |                                      |
+   +-------+---------------+--------------------------------------+
+
+   o SO THE HUD'S "BEST LAP COMPUTER" IS THE MINIMUM OF THE AI
+     RACERS' +0x2de1, and racer 6 held it exactly.
+
+   o THIRTEEN SLOTS, TWELVE RACERS. Slots 1 to 12 are live and slot
+     0 is the unused one this project has recorded since the grid
+     work - here it shows as the only racer with a sentinel best lap
+     AND a zero clock, which is a cleaner signature than anything
+     used before.
+
+   o AND +0x2ddd IS THE SAME IN EVERY RACER - 53098 across all
+     thirteen. It is the RACE clock mirrored into each record, not a
+     per-racer elapsed time. Section 13.2 called it "the elapsed
+     race time", which is right, but the mirroring is the part a
+     port needs: it is one number stored twelve times.
+
+   o ONE HUD NUMBER IS STILL UNPLACED. The screen also showed
+     00:31:72 below the best lap, and 31720 appears nowhere in any
+     racer or in four spans of globals. A target time or a saved
+     track record are the obvious guesses and neither is checked.
+
+13.7.  g_lapTimes at 0x005db290 - the lap board
+
+   Sweeping the whole 2.19 MB data segment for the player's best lap
+   found it twice: once at racer 1 + 0x2de1, and once at 0x005db2b4,
+   which is in no racer at all. That second home is a GLOBAL LAP
+   BOARD [verified]:
+
+       g_lapTimes[racer][lap]      base 0x005db290, stride 0x20
+
+   Thirteen rows of eight dwords, milliseconds, read live during
+   lap 3:
+
+   +-------+---------+---------+---------+
+   | racer |  lap 1  |  lap 2  |  lap 3  |
+   +=======+=========+=========+=========+
+   |   0   |    -    |    -    |    -    |
+   |   1   |  47.88  |  43.89  |   5.20  |
+   |   6   |  42.96  |  42.06  |  11.96  |
+   |   8   |  56.89  |  40.09  |    -    |
+   |  10   |  44.06  |  43.69  |   9.23  |
+   +-------+---------+---------+---------+
+
+   o ROW 1 MATCHED THE SCREEN EXACTLY. The HUD read "lap 2 00:43:89"
+     and "lap 3 00:05:20"; the row holds 43894 and 5204. The third
+     column is the lap IN PROGRESS, counting up.
+
+   o ROW 0 IS EMPTY, which is the unused slot again - a third
+     independent signature for it after the zero clock and the
+     sentinel best lap.
+
+   o EIGHT COLUMNS. A race is up to eight laps and the board is
+     sized for it, the same way the per-racer split table is sized
+     for 48 checkpoints.
+
+13.8.  The whole scheme, checked against the screen
+
+   Three structures hold the same information three ways, and they
+   agree to the millisecond [verified]:
+
+       racer+0x2f89[i]   cumulative race time at checkpoint i
+       g_lapTimes[r][l]  the duration of lap l
+       racer+0x2de1      the best of them
+
+   For the player after two laps:
+
+       splits   19.86  35.59  47.88 | 67.45  79.05  91.78
+       lap 1 = 47.882                 = split[2]
+       lap 2 = 91.776 - 47.882 = 43.894
+       g_lapTimes[1][1] = 43894       agrees
+       racer+0x2de1     = 43894       agrees, and it is the best
+       the screen       = 00:43:89    agrees
+
+   o THREE CHECKPOINTS PER LAP, so a lap boundary is every third
+     split and the lap time is split[3k+2] - split[3k-1]. That is
+     what makes 13.1's "one entry per checkpoint" and the HUD's lap
+     times the same fact rather than competing readings.
+
+13.9.  What did not fire, and one number still missing
+
+   o BUMPING A RIDER IS NOT CRASHING ONE. A code hook on
+     maybe_Racer_BeginCrash's entry - which catches ANY racer,
+     unlike a watchpoint that has to name one - recorded ZERO hits
+     across a lap in which a rider was deliberately bumped. The
+     crash path is only entered when somebody actually goes down.
+
+   o THE HUD'S THIRD TIME, 00:31:72, IS NOT IN .data. Swept twice
+     across 0x004db000 to 0x0070c000 as 31720 ms, 3172 hundredths,
+     31.72f and a 16-bit 3172 - nothing but a fragment of a pointer
+     table at 0x004e32d4. Since the racers and the lap board are
+     both in .data and this is not, the likely home is the HEAP -
+     a track record loaded from a saved file rather than computed.
+     Unresolved. [guess]
+
+13.10.  Three crashes caught, all at the speed cap
+
+   The code hook on maybe_Racer_BeginCrash finally fired: three hits
+   in one lap, and ECX read 0x00584421 on every one - racer 1, the
+   player. Captured at each [verified]:
+
+   +--------+-------------+--------------+---------------------+
+   | crash  | +0x30c1     | +0x124 speed | +0x2ddd race clock  |
+   +========+=============+==============+=====================+
+   |   1    |      0      |  109.567     |  112963 ms          |
+   |   2    |      0      |  109.559     |  123367 ms          |
+   |   3    |      0      |  108.486     |  140218 ms          |
+   +--------+-------------+--------------+---------------------+
+
+   o THE LATCH READS 0 AT EVERY HIT, which is the guard working:
+     maybe_Racer_BeginCrash returns immediately if it is already
+     set, so a hit at its ENTRY can only ever see 0. Three hits
+     means three separate crashes, not one crash trapped three
+     times.
+
+   o ALL THREE HAPPENED AT THE SPEED CAP. RealSpeedMax for this
+     bike is 110.0 and the three crash speeds were 109.567, 109.559
+     and 108.486 - flat out, every time.
+
+   o AND AN AI CRASH DID NOT REGISTER. The rider reported bumping
+     another racer forward without downing him, and separately a
+     rider going down after hitting the player's bike. Neither
+     produced a hit for any racer other than 1. Whether AI crashes
+     take a different path or simply did not happen inside the
+     armed window is not established. [open]
+
+13.11.  The HUD, mapped
+
+   Reading numbers off the screen and matching them settled five
+   fields at once, and corrected one name [verified]:
+
+   +---------------------+------------+------------------------+
+   | on screen           | field      |                        |
+   +=====================+============+========================+
+   | speed 271           | +0x118     | and +0x124 * 3.6       |
+   | "tach" 5            | +0x007c    | IT IS THE GEAR         |
+   | (the real tacho)    | +0x011c    | read 8133              |
+   | lap 3  00:48:07     | g_lapTimes | [1][2] = 48080         |
+   | lap 4  00:08:65     | g_lapTimes | [1][3] =  8650         |
+   | best lap            | +0x2de1    | 43894                  |
+   +---------------------+------------+------------------------+
+
+   o THE SMALL NUMBER BESIDE THE SPEED IS THE GEAR, not a
+     tachometer. It read 5 while +0x11c held 8133 - a five-digit
+     rev count the HUD does not show as a number. Worth knowing
+     before a port draws the wrong one.
+
+13.12.  A read that looked like a mystery and was not
+
+   racer+0xb4, RealSpeedMax, read 46.0 earlier in the session and
+   110.0 now, on what appeared to be the same bike. It is not a
+   field that moves: the BIKE INDEX at +0x78 had changed from 0 to
+   1, and carac field 18 of bike 1 is 110.00 exactly.
+
+   o SO REALSPEEDMAX IS CARAC FIELD 18, confirmed by matching the
+     copy Racer_Create makes against the table it copies from.
+
+   o AND THE AI ARE HANDICAPPED IN THE SAME FIELD. Racer 2 carries
+     75.00 where the player has 110.00 - which is the difference
+     first noticed when a --all search for 80.0 matched only the
+     player, and is now sourced.
+
+   o THE LESSON IS THE CHEAP ONE: a field that changes between two
+     readings has usually had its INPUT changed, not its meaning.
+     Checking +0x78 first would have cost one read.
+
+14.  THE SUSPENSION BLOCK - racer+0x2e8d, found by watching a replay
+
+   A 32-byte run at +0x2e89 had no reference anywhere in the image -
+   not one instruction names it as a displacement - so no amount of
+   reading Ghidra could have reached it. One hardware watchpoint,
+   armed on the two live bytes at +0x2e8d while a REPLAY ran,
+   answered it in eight hits and explained twenty-eight of the
+   thirty-two bytes at once.
+
+   The three EIPs it caught, all inside FUN_00466a80, now
+   Racer_UpdateSuspension [verified]:
+
+   +------------+--------------------------------------------------+
+   | 0x00466b93 | clears +0x2e8d to 0                              |
+   +------------+--------------------------------------------------+
+   | 0x00466d06 | writes the lag angle                             |
+   +------------+--------------------------------------------------+
+   | 0x00466d18 | writes it again, after the clamp                 |
+   +------------+--------------------------------------------------+
+
+   ECX and ESI both read 0x00584421 on every hit - racer 1, the
+   local player - which is what confirms the function is
+   __fastcall(racer) rather than taking a global.
+
+14.1.  What the carac fields settle
+
+   The identity is not a guess: the function reads five bike
+   characteristics whose names say exactly what it is. Ressor is
+   the French ressort, a spring, and Cadre is the bike's frame.
+
+   +-------------------------+-------------------------------------+
+   | RessorAmplitudeDec      | amplitude decay per frame           |
+   +-------------------------+-------------------------------------+
+   | RessorAmplitudeFactor   | divides amplitude into phase        |
+   +-------------------------+-------------------------------------+
+   | RessorAmplitudeMin      | the amplitude floor                 |
+   +-------------------------+-------------------------------------+
+   | RetardCadre             | how slowly the frame follows        |
+   +-------------------------+-------------------------------------+
+   | AngleSuspension         | the clamp on the output             |
+   +-------------------------+-------------------------------------+
+
+14.2.  The layout
+
+   +---------+---------------------------------------------------+
+   | Offset  | Meaning                                           |
+   +=========+===================================================+
+   | +0x2e89 | still unexplained - the only dword of the run     |
+   |         | this did not settle [open]                        |
+   +---------+---------------------------------------------------+
+   | +0x2e8d | THE SUSPENSION ANGLE, the output. Cleared, then   |
+   |         | set to (+0x2ea1 - target), passed through         |
+   |         | FUN_00458da0 and clamped to +-AngleSuspension     |
+   +---------+---------------------------------------------------+
+   | +0x2e91 | vertical bounce = sin(+0x2e99) * +0x2e9d          |
+   +---------+---------------------------------------------------+
+   | +0x2e95 | spring compression, forced <= 0 every frame       |
+   +---------+---------------------------------------------------+
+   | +0x2e99 | spring PHASE, snapped to 0x3fc90fdb = pi/2 when   |
+   |         | the amplitude overruns                            |
+   +---------+---------------------------------------------------+
+   | +0x2e9d | spring AMPLITUDE. Multiplied by                   |
+   |         | RessorAmplitudeDec each frame, floored at         |
+   |         | RessorAmplitudeMin                                |
+   +---------+---------------------------------------------------+
+   | +0x2ea1 | the SMOOTHED chassis heading. Wrapped into +-pi,  |
+   |         | then moved toward the target by 1/RetardCadre -   |
+   |         | so the frame lags the wheels                      |
+   +---------+---------------------------------------------------+
+   | +0x2ea5 | a heading reference, subtracted from              |
+   |         | FUN_0045ca00's return before +0x2e39, the fork    |
+   |         | dive, is added                                    |
+   +---------+---------------------------------------------------+
+
+   o SO THE VISIBLE BODY ROLL IS A DECAYING SINE, not a physical
+     spring integration. Amplitude decays geometrically toward a
+     floor and phase is reset to pi/2 on overrun, which is a 1997
+     shortcut worth knowing before anyone ports it to a real
+     spring-damper and wonders why it looks different.
+
+14.3.  A trap: a float compared as an integer
+
+   The two wrap loops test (uint)f > 0x80000000. That is the SIGN
+   BIT reinterpreted - the idiom for "is this float negative"
+   without leaving the integer unit - not a magnitude comparison.
+
+   Transcribed literally as an unsigned compare it still works, but
+   read as a magnitude test it inverts the wrap. The same idiom
+   appears on +0x2ea1 directly and on the local copy.
+
+14.4.  And three runs that are NOT written while racing
+
+   The same batch watched +0x2d88, +0x2e25 and +0x2e35 for about
+   twenty seconds of racing and every one of them took ZERO hits
+   [verified].
+
+   That is a real result, not a failed experiment. Whatever those
+   forty bytes are, they are not touched by the per-frame path, so
+   they are set at race init, on an event that did not occur, or in
+   a mode this session was not in. Chasing them with a write watch
+   during ordinary racing will not work; the next attempt should be
+   mode=rw, to catch a READER instead.
+
+15.  TWO POSE-FRAME POINTERS - racer+0x304d and racer+0x3069
+
+   THERE ARE THREE. racer+0x305d is the running stunt pose and
+   was named later, in section 18. All three hold &g_pilotRot[n]
+   or 0, and they sit 16 bytes apart - +0x304d, +0x305d,
+   +0x3069 - though the fields between them do not line up as a
+   uniform record, so the spacing may be coincidence. [open]
+
+   Both were unexplained runs. Both turned out to hold POINTERS into
+   the .rot pose-frame buffers, written by maybe_Racer_UpdatePose,
+   and both were caught by watchpoints during a replay [verified].
+
+   THE GIVEAWAY WAS THAT THE VALUE NEVER CHANGED. Eight hits on
+   +0x304d all reported old == new == 0x0051d678: the field is
+   rewritten with the SAME constant every frame. A sweep looking for
+   bytes that MOVE would never have found it, and mr_gaps - which
+   reports "non-zero OR changing" - would have shown it as a
+   constant nobody had claimed.
+
+15.1.  racer+0x3069 is the overtake glance
+
+   Three EIPs in maybe_Racer_UpdatePose, cycling [verified]:
+
+       0045de37  CMP EAX, 0x3f333333        |x| < 0.7, as an integer
+       0045de45  MOV [ESI+0x3069], 0x51ee4c g_abPoseGlanceA
+       0045de57  MOV [ESI+0x3069], 0x51ef40 g_abPoseGlanceB, if +ve
+       0045de61  MOV [ESI+0x3079], 0x43c80000   = 400.0
+       0045dee1  MOV [ESI+0x3069], 0           cleared
+
+   THE RIDER TURNING HIS HEAD toward a bike drawing alongside. The
+   gate is a narrow angle - |x| < 0.7 - and the sign of a stack
+   value picks which of the two head poses to blend.
+
+   o WHICH IS LEFT AND WHICH IS RIGHT IS NOT ESTABLISHED. Only that
+     a sign chooses. [open]
+
+   o AND THEY ARE g_pilotRot[29] AND [30] - the last two entries
+     of the rider pose table at 0x0051d2a8, stride 0xf4, 31
+     entries. See 15.5.
+
+   o AND IT CONFIRMS racer+0x3079 INDEPENDENTLY. The 400.0 written
+     two instructions later is the encounter timer this document
+     already carried as "set to 400.0" - now seen being set, in the
+     same breath as the glance it times.
+
+   o AN EARLIER PASS HAD ALREADY FOUND THE GLANCE from
+     the other end - "the sign of a cross product picks 0x0051ee4c
+     or 0x0051ef40" - without knowing which racer field held the
+     result. The watchpoint supplied the missing half.
+
+15.2.  racer+0x304d, and a free find beside it
+
+   Written unconditionally at 0x0045d97d with 0x0051d678, which is
+   g_pilotRot[4] - staticPied, the pose Rot_ApplyToRacer already
+   copies in the bike-select menu. See 15.5. The instruction right
+   after it is what makes the site worth reading:
+
+       0045d97d  MOV [ESI+0x304d], 0x51d678
+       0045d987  MOV EDX, [ESI+0x2f85]      <- and TEST/JNZ on it
+       0045d995  MOV EAX, [ESI+0x2de5]      <- the RACE STATE
+
+   So +0x2f85 - a field read in a dozen places with no writer found
+   - is a FLAG maybe_Racer_UpdatePose branches on, tested right
+   beside the race state. Still not identified, but now placed.
+   [open]
+
+15.3.  The camera object is g_anCamera at 0x005161c0
+
+   Camera_Update (0x004700e0) and Camera_UpdateChase (0x0046f840)
+   are both __thiscall on it - ECX read 0x005161c0 on all sixteen
+   hits across a whole replay [verified]. Its first 32 bytes:
+
+   +--------+----------------------------------------------------+
+   | +0x00  | 0            constant across every hit             |
+   +--------+----------------------------------------------------+
+   | +0x04  | 0xffffffff   constant                              |
+   +--------+----------------------------------------------------+
+   | +0x08  | 3            constant - a mode? [open]             |
+   +--------+----------------------------------------------------+
+   | +0x0c  | 2            constant - a kind? [open]             |
+   +--------+----------------------------------------------------+
+   | +0x10  | 0            constant                              |
+   +--------+----------------------------------------------------+
+   | +0x14  | POSITION X - moved 0x104c0 -> 0xffa2 over 8 frames |
+   +--------+----------------------------------------------------+
+   | +0x18  | POSITION Y - moved 0x1d53  -> 0x2840               |
+   +--------+----------------------------------------------------+
+   | +0x1c  | POSITION Z - moved 0x12940 -> 0x127bf              |
+   +--------+----------------------------------------------------+
+
+   Three dwords moving smoothly and monotonically frame to frame
+   while five never change at all is what identifies a position
+   rather than a set of flags. They are integer world units.
+
+15.4.  A negative result worth more than the positives
+
+   racer+0x31dd, the field this project has been calling THE CAMERA
+   INDEX, took ZERO writes across an entire replay - one that
+   visibly cut between an orbiting camera and fixed trackside
+   cameras [verified, cap 16, mode w].
+
+   SO REPLAY CAMERA SELECTION DOES NOT GO THROUGH THAT FIELD. Where
+   it does go is open, and g_anCamera+0x08 / +0x0c are the obvious
+   next thing to watch.
+
+   o THIS IS THE KIND OF ANSWER ONLY A WATCHPOINT GIVES, and only a
+     trustworthy one. Before the per-slot pools an empty slot was
+     ambiguous - it could always have been crowded out by a hot
+     neighbour. It cannot be now, so a zero means zero. See
+     tools/mrhook/README.txt 9.3.
+
+   o racer+0x305d also took zero writes in the same run.
+
+15.5.  All the loose pose addresses are one table
+
+   Chasing +0x304d turned up something bigger than the field. Every
+   "pose frame buffer" this project had written down as a loose
+   address is an entry in g_pilotRot at 0x0051d2a8 - 31 entries of
+   0xf4 = 244 bytes, count read live at 0x005191e0 [verified]:
+
+   +------+------------+-------------------------------------------+
+   | [ 1] | 0x0051d39c | negative-lean stance, blended with [2]    |
+   +------+------------+-------------------------------------------+
+   | [ 2] | 0x0051d490 | negative-lean stance                      |
+   +------+------------+-------------------------------------------+
+   | [ 4] | 0x0051d678 | staticPied - and racer+0x304d holds its   |
+   |      |            | ADDRESS, rewritten every frame            |
+   +------+------------+-------------------------------------------+
+   | [ 5] | 0x0051d76c | positive-lean stance                      |
+   +------+------------+-------------------------------------------+
+   | [ 6] | 0x0051d860 | positive-lean stance, blended with [5]    |
+   +------+------------+-------------------------------------------+
+   | [16] | 0x0051e1e8 | the crash pose of formats/skl-rot.txt     |
+   +------+------------+-------------------------------------------+
+   | [29] | 0x0051ee4c | overtake glance A                         |
+   +------+------------+-------------------------------------------+
+   | [30] | 0x0051ef40 | overtake glance B                         |
+   +------+------------+-------------------------------------------+
+
+   EVERY ONE DIVIDES EXACTLY BY 244 FROM THE BASE. That is what
+   makes it a table and not a coincidence, and the glance pair being
+   the last two entries is a further check.
+
+   o FOUR DOCUMENTS CARRIED THESE AS UNRELATED CONSTANTS -
+     skl-rot.txt, runtime-capture.txt, a struct note since retired
+     and this one. Nothing was wrong in any; nobody had divided.
+
+   o THE LESSON IS CHEAP AND GENERAL: when several unexplained
+     addresses cluster within a few kilobytes, subtract them and
+     divide by the smallest gap before doing anything else. It cost
+     one arithmetic check to collapse eight facts into one.
+
+16.  THE PREVIOUS-FRAME FAMILY - Racer_SavePrevFrame
+
+   A watchpoint on racer+0x2dbc reported eight hits with old == new
+   == 1 every time, from two sites. A field rewritten with an
+   unchanging value is the second one this replay work has turned up
+   - see 15.2 - and again the value was not the point, the WRITER
+   was.
+
+   Racer_SavePrevFrame (0x00465fa0, __fastcall(racer)) copies this
+   frame's state into "previous" slots. Every line is a pair, so one
+   function named eight fields at once [verified]:
+
+   +------------------+--------------------------------------------+
+   | +0x140 .. +0x16c | the orientation matrix, PREVIOUS frame     |
+   +------------------+--------------------------------------------+
+   | +0x048 .. +0x053 | position TWO frames ago                    |
+   +------------------+--------------------------------------------+
+   | +0x03c .. +0x047 | position LAST frame                        |
+   +------------------+--------------------------------------------+
+   | +0x1c0 .. +0x1cb | front wheel contact, previous              |
+   +------------------+--------------------------------------------+
+   | +0x344 .. +0x34f | rear wheel contact, previous               |
+   +------------------+--------------------------------------------+
+   | +0x2da4          | previous +0x2da0                           |
+   +------------------+--------------------------------------------+
+   | +0x2dbc          | ON THE GROUND, previous frame              |
+   +------------------+--------------------------------------------+
+
+   o SO +0x2dbc IS JUST +0x2db8 ONE FRAME OLD, which is why it reads
+     1 continuously: the bike is on the ground almost always.
+
+   o THE ORDER IS LOAD-BEARING. +0x48 is filled from +0x3c BEFORE
+     +0x3c is filled from +0x30, so those three are a genuine
+     two-deep position history rather than two copies of one frame.
+     A reconstruction that reorders them silently loses a frame.
+
+   o AND IT ENDS WITH A DENORMAL FLUSH: if (uint)racer[+0x124] >
+     0x80000000 then racer[+0x124] = 0. That is the float sign bit
+     read as an integer once more - "if the speed went negative,
+     clamp it" - not a magnitude test. Third occurrence of the idiom
+     in this struct; see 14.3.
+
+16.1.  Six runs that nothing writes, and one false negative
+
+   Watched for two laps of a replay with mode=w, zero hits each
+   [verified]: racer+0x2de9 and racer+0x31e1. They join +0x2d88,
+   +0x2e25, +0x2e35 and +0x305d, each watched the same way in an
+   earlier batch. SIX runs, 76 bytes, none written while racing.
+
+   THAT IS LONG ENOUGH TO BE A FINDING RATHER THAN A GAP. The next
+   pass on them should be mode=rw to catch a READER, because a field
+   nothing writes and nothing reads is dead space and worth saying
+   so.
+
+   o SUPERSEDED FOR racer+0x305d, WHICH IS NOT DEAD. It is the
+     running stunt animation, and it takes no writes on a ROAD bike
+     because the road bike ships no stunt poses at all. Section 18.
+     The lesson is in 18.1: one writer on a rare path is
+     indistinguishable from no writer, and the fix is to arrange the
+     event rather than to watch harder.
+
+   o AND racer+0x2f71 IS NOT ON THAT LIST, though an earlier draft
+     of this section put it there. IT WAS NEVER ACTUALLY WATCHED -
+     it was carried over from a batch that was cleared before it
+     ran, and nobody checked. It does change: the low half read 4 at
+     the start of a replay and 12 two laps later, so something
+     writes it and the claim was simply false.
+
+     THE MISTAKE IS WORTH MORE THAN THE FIELD. A "zero hits" result
+     is only evidence if the slot was armed, ran, and was drained -
+     and the arm log is the only thing that says so. Carrying an
+     offset between batches by memory is how an untested field
+     becomes a verified negative. Check the tag in the GET_DATABP
+     state line against the offset before believing a zero.
+
+16.2.  The same crash, twice, bit for bit
+
+   The crash hook fired once more, on a SECOND playback of the same
+   recording [verified]:
+
+       speed  0x42db21b8 = 109.5659      clock 85408 ms
+       wall normal x     = 0.99201       stunt +0x31f9 = 0
+
+   Identical to the run recorded in the previous session - the same
+   IEEE pattern at the same millisecond. Section 6 of
+   subsystems/replay.txt proved determinism against the LIVE race;
+   this proves it between two replays of the same file, which is the
+   weaker claim but the one a regression test would actually rest
+   on.
+
+   o AND THIS CRASH WAS NOT A WHEELIE. +0x31f9 read 0, against a
+     wall normal of 0.992 on x - a nearly axis-aligned wall. So the
+     stunt is not implicated in every crash, which is worth saying
+     because 2.1 of replay.txt found one that was.
+
+17.  THE READ-WRITE SWEEP - three runs are dead, one was not
+
+   16.1 argued that a run nothing WRITES should be re-watched in
+   mode=rw to see whether anything READS it. One lap of a replay,
+   four slots [verified]:
+
+   +----------+-------+------------------------------------------+
+   | Field    | Hits  |                                          |
+   +==========+=======+==========================================+
+   | +0x2d88  |  0/12 | not read, not written - DEAD             |
+   +----------+-------+------------------------------------------+
+   | +0x2de9  |   0/8 | not read, not written - DEAD             |
+   +----------+-------+------------------------------------------+
+   | +0x2e25  |   0/8 | not read, not written - DEAD             |
+   +----------+-------+------------------------------------------+
+   | +0x2f71  |   8/8 | LIVE - see 17.1                          |
+   +----------+-------+------------------------------------------+
+
+   x86 HAS NO READ-ONLY BREAKPOINT, so mode=rw traps on any access
+   and a read shows up as a hit with old == new. Three slots taking
+   ZERO hits therefore means nothing touched those bytes at all for
+   a whole lap - not the physics, not the renderer, not the AI.
+
+   o PARTLY WRONG - SEE 21.1. +0x2d88 is 24 dead bytes and one
+     live flag at +0x2da0; +0x2e25 is 8 dead bytes and one live
+     flag at +0x2e29. A poison sweep found both. The bullet
+     below is kept because its REASONING is still right - a
+     zero-hit rw watch is real evidence - and its ERROR is
+     instructive: it generalised from one watched byte to a
+     28-byte run.
+
+   o SO 52 BYTES OF THIS STRUCT ARE DEAD IN A RACE. +0x2d88 (28
+     bytes after +0x2d88's tail was reclaimed), +0x2de9 (12) and
+     +0x2e25 (12). They may be written at race init or used by a
+     mode this session never entered - multiplayer and the attract
+     demo are both unexercised - but the per-frame path does not
+     read them either, which is a much stronger statement than "no
+     writer found".
+
+   o A RECONSTRUCTION CAN LEAVE THEM AS PADDING and lose nothing
+     that a race depends on. That is worth having in writing,
+     because "unknown" and "unused" are very different costs.
+
+17.1.  racer+0x2f71 is an effect pool slot
+
+   Eight hits, two instructions, and the pattern told the story
+   before the disassembly did: 0x0046722c WROTE it three times and
+   0x00467451 READ it five, and the values walked
+
+       12 -> 14 -> 0 -> 2
+
+   wrapping at 15. A field that counts 0..15 and wraps is an index.
+
+   maybe_Fx_AllocSlot (0x00457350) is the allocator [verified]:
+
+       i = g_nFxNext;
+       g_nFxNext = (g_nFxNext + 1 > 0xf) ? 0 : g_nFxNext + 1;
+       pool[i].field_28 = 0;
+       pool[i].field_2c = 0;
+       return i;
+
+   The pool is 16 records of 0x582 = 1410 bytes at 0x00544000, and
+   g_nFxNext (0x004e9bd0) is GLOBAL - so all twelve racers draw from
+   one set of sixteen and a busy moment recycles a slot out from
+   under an older one.
+
+   o THE DECOMPILER TYPES maybe_Fx_AllocSlot AS void AND IT IS NOT.
+     iVar1 is left in EAX and the caller stores it straight into
+     racer+0x2f71. A `void` in Ghidra output is a claim about the
+     prototype, not about the register.
+
+   o WHAT THE EFFECT IS, is not established. The index is pushed to
+     FUN_00457390 at 0x00467459 immediately before the code loads
+     the FRONT WHEEL CONTACT POINT at racer+0x1b4, and allocation is
+     gated on racer+0x2da0. A tyre trail, spray or skid mark fits
+     all of that - but nothing has been seen drawn, so it stays
+     [inferred].
+
+17.2.  A crash while stunting, and it was NOT at the speed cap
+
+   The crash hook caught a second one, this time with the stunt flag
+   captured alongside [verified]:
+
+   +-------------+-----------+---------+---------+--------+
+   | clock       | speed     | wall.x  | +0x31f9 | seg    |
+   +=============+===========+=========+=========+========+
+   |  85408 ms   | 109.5659  |  0.992  |    0    |  779   |
+   +-------------+-----------+---------+---------+--------+
+   | 131518 ms   |  85.7096  | -0.868  |    1    |   49   |
+   +-------------+-----------+---------+---------+--------+
+
+   EVERY CRASH THIS PROJECT HAD CAUGHT UNTIL NOW WAS AT THE SPEED
+   CAP - 108.5 to 109.6 against a RealSpeedMax of 110.0, five of
+   them. This one is 85.7, twenty-two per cent below the cap, and it
+   is the one where racer+0x31f9 read 1.
+
+   o WHICH IS THE FIRST QUANTITATIVE SUPPORT for the rider's claim
+     that the stunt "makes the bike much more vulnerable to
+     crashing". It is one sample and it proves nothing on its own;
+     what it does is separate the two populations, so the next
+     armed replay has a hypothesis to test rather than an
+     impression.
+
+   o AND IT NEEDED THE CAPTURE TO SEE. The same hook without
+     ECX+31f9:4 would have recorded an unremarkable crash at an
+     unremarkable speed.
+
+18.  THE DIRT BIKE - a different bike names five dead fields
+
+   17 reported four runs re-watched in mode=rw, three of them dead.
+   The next replay was recorded on the CROSS bike and a jump-heavy
+   track rather than the road bike, and the rider's reasoning was
+   explicit: a bike that does big jumps exercises code the road bike
+   never reaches. It does, and it settled five fields.
+
+   THIS IS THE MOST PRODUCTIVE SINGLE CHANGE OF VARIABLE THIS PROJECT
+   HAS MADE. Not a better instrument - the same four watchpoints and
+   four hooks - just a different bike in front of them.
+
+18.1.  racer+0x305d is the running STUNT ANIMATION, and the road
+       bike has none
+
+   +0x305d took zero writes over a whole road-bike replay in mode=w,
+   which 16.1 recorded as "nothing writes this". The rw watch caught
+   eight READS, all at one instruction [verified]:
+
+       0045e0ac   MOV EBP,[ESI+0x305d]
+       0045e0b2   TEST EBP,EBP
+       0045e0b4   JZ   0045e1bd          <- taken all eight times
+
+   Reading the writer's side of maybe_Racer_UpdatePose then gave the
+   whole block at 0x0045e030 [verified]:
+
+       if (racer[+0x3201] != 0            stunt PRESSED, edge
+        && racer[+0x3205] == 0            NOT pressed last frame
+        && racer[+0x305d] == 0) {         none already running
+           id = g_anStuntPoseIndex[racer[+0x3061]];
+           racer[+0x3065] = id;
+           racer[+0x305d] = g_pilotRot + id * 0xf4;
+           racer[+0x3055] = DAT_0050bbc8;
+           racer[+0x3061] = rand() % g_nStuntPoseCount;
+       }
+
+   +----------+--------------------------------------------------+
+   | +0x3051  | smoothed pose blend - see 18.4                   |
+   +----------+--------------------------------------------------+
+   | +0x3055  | a copy of the global at 0x0050bbc8, stamped when |
+   |          | the stunt starts. +0x3075 gets the same global   |
+   |          | when the overtake glance starts, so the two      |
+   |          | animation blocks mark their start the same way.  |
+   +----------+--------------------------------------------------+
+   | +0x305d  | THE RUNNING STUNT POSE - &g_pilotRot[id], or 0   |
+   +----------+--------------------------------------------------+
+   | +0x3061  | the NEXT stunt, drawn in advance                 |
+   +----------+--------------------------------------------------+
+   | +0x3065  | the pose id, was "animation index"               |
+   +----------+--------------------------------------------------+
+   | +0x3205  | the stunt button PREVIOUS frame - the edge gate  |
+   +----------+--------------------------------------------------+
+
+   o SO IT IS ONLY EVER WRITTEN WHEN A STUNT STARTS, and a mode=w
+     watch over a race where none started is silent by construction.
+     That is the shape of a false negative worth recognising: a
+     field with one writer on a rare path looks identical to a field
+     with no writer at all.
+
+   o +0x3205 MAKES IT A RISING EDGE. maybe_Racer_UpdatePose ends
+     with racer[+0x3205] = racer[+0x3201] then clears +0x3201, so
+     requiring +0x3205 == 0 means "pressed now and not last frame".
+     Holding the button does not spam animations. That is a
+     debounce, and it belongs with the previous-frame family of
+     section 16 even though Racer_SavePrevFrame does not write it.
+
+   o AND THE STUNT IS CHOSEN AT RANDOM, one draw ahead. +0x3061
+     holds the index the NEXT press will use, so the draw happens
+     when a stunt starts rather than when the button goes down.
+
+18.2.  The stunts are the artists SAUTDELIRE poses
+
+   g_anStuntPoseIndex (0x00580d0c) is 48 records of 16 bytes whose
+   first dword is a g_pilotRot index, and g_nStuntPoseCount
+   (0x005cf4fc) held 9. (The record actually BEGINS one dword
+   earlier, at 0x00580d08 - see 19.2. This label points at field
+   +4, which was the only field with a known reader at the time.)
+   Read live, the nine indices were [verified]:
+
+       33  34  35  36  39  40  41  43  44
+
+   Both are filled by maybe_Bike_ReadManifest at 0x0042a1ef, which
+   walks the bike manifest and appends an entry whenever a name
+   BEGINS WITH AN UNDERSCORE - 0x0042a1ba compares the first byte
+   against 0x5f and the second is converted from ASCII by SUB 0x30.
+   So the stunt list is DATA, not code, and it is per bike.
+
+   Which the shipped .rot files confirm outright [verified]:
+
+   +------------+----------------+-----------------------------+
+   | bike dir   | SAUTDELIRE*.ROT| total .rot                  |
+   +============+================+=============================+
+   | KTMCROSS   |       10       |             37              |
+   +------------+----------------+-----------------------------+
+   | KTMPKT     |        2       |             28              |
+   +------------+----------------+-----------------------------+
+   | SPEED      |        0       |             19              |
+   +------------+----------------+-----------------------------+
+   | SPEEDPKT   |        0       |             10              |
+   +------------+----------------+-----------------------------+
+   | PODIUM     |        0       |             12              |
+   +------------+----------------+-----------------------------+
+
+   SAUT DELIRE is "crazy jump". THE ROAD BIKES SHIP NONE OF THEM, so
+   on a road bike the stunt list is empty and the block at
+   0x0045e030 can never fire - which is exactly why every road-bike
+   replay this project ran left +0x305d looking dead.
+
+   o SO THE FIELD WAS NOT HIDING, THE CONTENT WAS ABSENT. No amount
+     of better instrumentation on the road bike would have found it.
+     Changing the bike did.
+
+   o THE COUNTS DO NOT QUITE AGREE - ten SAUTDELIRE files against a
+     count of 9. One may not be listed in the manifest this track
+     loaded, or the manifest may name them differently. [open]
+
+18.3.  The pose table runs past index 31
+
+   An earlier pass had the stance array as "32 frames of 244
+   bytes from 0x0051d2a8 to 0x0051f128". The stunt indices reach 44,
+   and 0x0051d2a8 + 44 * 0xf4 = 0x0051fc98 reads back a well-formed
+   record - part count 17, the same first dword as g_pilotRot[4] and
+   g_pilotRot[33] [verified, live].
+
+   THAT FIGURE WAS READ COVERAGE, NOT A BOUND. It came from a sweep
+   that found every one of 32 frames being read, which says those 32
+   are used - not that the array ends there. A correction rather
+   than a contradiction, but the array is at least 45 entries.
+
+18.4.  racer+0x3051 is a smoothing filter, sign-selected
+
+   Four writers, one of them per-frame at 0x0045dc1f [verified]:
+
+       0045dc01   FLD   [ESP+0x10]            the target
+       0045dc05   FSUB  [ESI+0x3051]
+       0045dc0b   FMUL  [0x004d0f88]          the coefficient
+       0045dc11   FADD  [ESI+0x3051]
+       0045dc1f   MOV   [ESI+0x3051],EAX
+       0045dc25   TEST  EAX,EAX               <- the sign, as an int
+       0045dc27   MOV   EAX,0x51d954          = &g_pilotRot[7]
+       0045dc2c   JG    0045dc3d
+
+   a += (target - a) * k, the first-order low-pass every engine of
+   this era used for camera lag and pose lag. Read live it sat at
+   0.99938 airborne and 0.0 on the grid.
+
+   o THE SIGN TEST IS THE FLOAT-SIGN-AS-INTEGER IDIOM AGAIN, fourth
+     occurrence in this struct - see 14.3. Both branches then push
+     the SAME pose, g_pilotRot[7], so the sign is choosing how it is
+     applied and not which pose it is. Which way is [open].
+
+18.5.  racer+0x2dc0 and +0x2dc4 are a second ground-contact pair
+
+   +0x2dc0 had never been watched at all. It was picked because it
+   sits immediately after +0x2db8 "on the ground" and +0x2dbc "on
+   the ground, previous frame", and a jumping bike is the instrument
+   for anything to do with ground contact. Sixteen hits, three game
+   instructions [verified]:
+
+   +------------+---------------------------------------------+
+   | 0x00468cac | racer[+0x2dc0] = 0  UpdateGroundContact top |
+   +------------+---------------------------------------------+
+   | 0x00468cb6 | racer[+0x2dc4] = 0   likewise               |
+   +------------+---------------------------------------------+
+   | 0x004694e9 | racer[+0x2dc0] = 1   contact found          |
+   +------------+---------------------------------------------+
+   | 0x004694f3 | racer[+0x2dc4] = 1   contact found          |
+   +------------+---------------------------------------------+
+   | 0x004668c9 | ECX = racer[+0x2dc0], then [+0x3f8] = 0     |
+   +------------+---------------------------------------------+
+
+   The cycle repeated four times in the trace - cleared, set, read -
+   which is one per frame.
+
+   o THEY ARE CLEARED THEN SET; +0x2db8 IS NOT. +0x2db8 is assigned
+     0 or 1 on the two exits of maybe_Racer_UpdateGroundContact,
+     while +0x2dc0 and +0x2dc4 are zeroed unconditionally on entry
+     and only raised on the contact path. A frame that leaves early
+     therefore leaves +0x2db8 STALE and the pair CLEAR. That is a
+     real difference in meaning and a reconstruction has to keep it.
+
+   o WHICH ALSO MEANS THEY CANNOT BE READ FROM INSIDE THAT
+     FUNCTION. The hook on 0x004694d5 captured the pair as 0/0 on
+     the ground, because the entry had already cleared it.
+
+18.6.  racer+0x2f75 is a second Fx pool slot
+
+   17.1 identified +0x2f71 as an index into a 16-slot effect pool.
+   +0x2f75 sits beside it and read 11 while +0x2f71 read 10, and the
+   disassembly is unambiguous [verified]:
+
+       0046722c   MOV  [ESI+0x2f71],EAX
+       00467232   CALL maybe_Fx_AllocSlot
+       00467241   MOV  [ESI+0x2f75],EAX
+
+   TWO CONSECUTIVE ALLOCATIONS, so a racer holds two of the sixteen
+   slots. Twelve racers cannot each hold two, so the pool is
+   oversubscribed by design and recycles - consistent with 17.1's
+   note that a busy moment steals a slot from an older effect.
+
+   o AND IT SETTLES THE PROTOTYPE. maybe_Fx_AllocSlot was typed void
+     by the decompiler; here its result is stored twice from EAX.
+     The DB now says int. 17.1 predicted this; this is the second
+     independent confirmation.
+
+18.7.  What stayed dead, on a second bike and a second track
+
+   Captured by hook at the moment the bike LEFT THE GROUND, which is
+   the frame most likely to move a suspension or airborne field
+   [verified]:
+
+   +----------+-------+-------------------------------------------+
+   | +0x2d88  |  28   | all zero, airborne and grounded           |
+   +----------+-------+-------------------------------------------+
+   | +0x2e25  |  12   | all zero                                  |
+   +----------+-------+-------------------------------------------+
+   | +0x2e35  |   4   | all zero                                  |
+   +----------+-------+-------------------------------------------+
+
+   So the 52 bytes 17 called dead are dead on the cross bike too,
+   over a jump. That is a genuinely stronger claim than the original
+   one - two bikes, two tracks, and now sampled at the airborne
+   transition specifically rather than at whatever frame a
+   watchpoint happened to fire on.
+
+18.8.  Crashes, normalised - the stunt separates the population
+
+   SUPERSEDED. THE "stunt" COLUMN BELOW IS NOT TRUSTWORTHY.
+   racer+0x31f9 has two writers fighting each frame, so its
+   value depends on where in the frame it is sampled - see
+   19.4. The speeds and the normalisation stand; the
+   correlation drawn from the flag does not. Left in place
+   because the reasoning is worth seeing next to its
+   correction.
+
+   17.2 had one crash below the speed cap and it was the stunting
+   one, from a single sample. Three more crashes were caught here,
+   and the cross bike's RealSpeedMax is 46.0 against the road bike's
+   110.0 - so the raw speeds are not comparable and the fraction of
+   the bike's own cap is [verified, racer+0xb4 read live]:
+
+   +-------+---------+----------+---------+--------+
+   | bike  | cap     | speed    | % cap   | stunt  |
+   +=======+=========+==========+=========+========+
+   | road  |  110.0  | 109.567  |  99.6%  |   0    |
+   +-------+---------+----------+---------+--------+
+   | road  |  110.0  | 109.559  |  99.6%  |   0    |
+   +-------+---------+----------+---------+--------+
+   | road  |  110.0  | 108.486  |  98.6%  |   0    |
+   +-------+---------+----------+---------+--------+
+   | road  |  110.0  |  85.710  |  77.9%  |   1    |
+   +-------+---------+----------+---------+--------+
+   | cross |   46.0  |  44.531  |  96.8%  |   1    |
+   +-------+---------+----------+---------+--------+
+   | cross |   46.0  |  43.227  |  94.0%  |   0    |
+   +-------+---------+----------+---------+--------+
+   | cross |   46.0  |  36.455  |  79.2%  |   1    |
+   +-------+---------+----------+---------+--------+
+
+   SEVEN DISTINCT CRASHES. Every one with the stunt flag clear is at
+   94 per cent of the bike's own top speed or above; the only two
+   below 80 per cent both have it set.
+
+   o NORMALISING IS WHAT MADE THE DIRT DATA USABLE. 36.455 and
+     85.710 look nothing alike and are 79.2 and 77.9 per cent of
+     their own caps. Comparing raw speeds across bikes would have
+     buried the pattern.
+
+   o IT IS STILL SEVEN SAMPLES AND STILL NOT A MECHANISM. Nothing
+     here shows the stunt CAUSING a crash; it shows that no crash
+     has been observed below 94 per cent of cap without it. The
+     hypothesis to test is a widened collision volume or a reduced
+     grip term while +0x31f9 is set, and that is a question for the
+     code, not for more replays. [inferred]
+
+   o AND NONE OF THE THREE WAS A LANDING. All three captured
+     racer+0x2db8 and +0x2dbc as 1 and 1 - on the ground this frame
+     and last. The crash-on-landing case the cross bike was expected
+     to produce did not occur in the armed window. [open]
+
+19.  THE STUNT RUN - how a trick starts, and how it ends
+
+   18 found racer+0x305d by catching the code that STARTS a stunt.
+   What ends one was still unknown: nothing read so far cleared the
+   pointer. A replay ridden on the cross bike with eight deliberate
+   tricks, and run to completion, settled that and four other things.
+
+19.1.  A stunt ends on a table-driven timer
+
+   A mode=w watch on racer+0x305d filled its budget with EIGHT
+   COMPLETE CYCLES, alternating between two instructions [verified]:
+
+       0045e07c   set    old 0    new = &g_pilotRot[id]
+       0045e1b1   clear  old ptr  new 0
+
+   The second was new. 0x0045e1a7 writes racer+0x305d = 0, and it is
+   reached only when the compare above it fails:
+
+       0045e196   MOV EAX,[ESI+0x3065]        the running pose id
+       0045e19c   SHL EAX,4                   * 16
+       0045e19f   CMP [EAX+0x580d14],EBX      duration vs elapsed
+       0045e1a5   JGE 0045e1b1                still running
+       0045e1a7   MOV [ESI+0x305d],0          EXPIRED - end it
+
+   So the animation runs for a fixed time taken from a table, and
+   clearing the pointer is what ends it.
+
+   o AND THE WHOLE BLOCK IS GATED ON THE POINTER. 0x0045e0ac tests
+     racer+0x305d and its JZ lands at 0x0045e1bd, just past the last
+     instruction of the block. Nothing between 0x0045e0ba and
+     0x0045e1b7 executes unless a stunt is in progress.
+
+19.2.  g_abStuntPoseTable, and its base is one dword earlier
+
+   The table is 16-byte records based at 0x00580d08 - NOT 0x00580d0c,
+   which is where 18.2 put it. 0x00580d0c is field +4 of the record,
+   and it was labelled from the only reference known at the time.
+   Read live [verified]:
+
+   +-----+--------+---------+-----------------+
+   | id  |  hand  |  phase  |  duration (ms)  |
+   +=====+========+=========+=================+
+   | 33  |    0   |    1    |       800       |
+   +-----+--------+---------+-----------------+
+   | 34  |    1   |    1    |       800       |
+   +-----+--------+---------+-----------------+
+   | 35  |    1   |    1    |       800       |
+   +-----+--------+---------+-----------------+
+   | 36  |    0   |    3    |      1200       |
+   +-----+--------+---------+-----------------+
+   | 37  |    0   |    0    |         0       |
+   +-----+--------+---------+-----------------+
+   | 38  |    0   |    0    |         0       |
+   +-----+--------+---------+-----------------+
+   | 39  |    1   |    1    |       800       |
+   +-----+--------+---------+-----------------+
+   | 40  |    0   |    1    |       800       |
+   +-----+--------+---------+-----------------+
+
+   +----------+---------------------------------------------------+
+   | rec+0x00 | hand skeleton id -> racer+0x319d at 0x0045e1b7    |
+   +----------+---------------------------------------------------+
+   | rec+0x04 | THE STUNT LIST, indexed by list position          |
+   +----------+---------------------------------------------------+
+   | rec+0x08 | a phase count, 1 or 3                             |
+   +----------+---------------------------------------------------+
+   | rec+0x0c | duration in ms, and it is phase * 400             |
+   +----------+---------------------------------------------------+
+
+   o IDS 37 AND 38 HOLD ALL-ZERO RECORDS, and they are exactly the
+     gaps in the nine-entry list {33,34,35,36,39,40,41,43,44} that
+     18.2 read out of g_anStuntPoseIndex. Two independent reads of
+     different memory agreeing is worth more than either alone.
+
+   o THE DURATIONS CHECK OUT AGAINST THE OBSERVED ENDINGS. EBX at
+     each of the eight clears was 831, 1234, 825, 2259, 833, 828,
+     1227 and 825 ms against tabulated 800, 1200, 800, 1200, 800,
+     800, 1200 and 800. SEVEN ENDED WITHIN ONE 33 ms FRAME of the
+     table. The eighth overran by a second and is unexplained -
+     a crash interrupting the pose update is the obvious guess and
+     it has not been checked. [open]
+
+   o FIELD +0x04 IS INDEXED DIFFERENTLY FROM THE REST, which is why
+     18.2 read it as a standalone array. maybe_Bike_ReadManifest
+     writes it at [0x580d0c + listPosition*16] while every consumer
+     reads the other fields at [base + poseId*16]. Two logical
+     arrays sharing one record array - ugly, and real.
+
+19.3.  You can only start a stunt in the air
+
+   A hook on 0x0045e057, which executes only when a stunt actually
+   begins, caught all eight starts. racer+0x2db8 and racer+0x2dbc -
+   on the ground now, and last frame - read 0 and 0 on EVERY ONE
+   [verified].
+
+   The pose ids taken were 33, 36, 40, 36, 39, 33, 36, 40, and the
+   same eight ids appear in the same order in the watchpoint's set
+   hits. Two instruments, one sequence.
+
+   Speed at the moment of the trick, against the cross bike's
+   RealSpeedMax of 46.0:
+
+       34.9  35.2  40.3  22.6  26.1  40.3  27.7  27.2
+       76%   77%   88%   49%   57%   88%   60%   59%
+
+   o SO IT IS A JUMP TRICK IN THE STRICT SENSE - the code will not
+     start one while a wheel is down. That matches the artists'
+     name for the poses, SAUTDELIRE, and it means the road bikes
+     lack the animations AND the opportunity.
+
+   o AND IT IS NOT SPEED GATED. 22.6 to 40.3 m/s, half the range of
+     the bike.
+
+19.4.  racer+0x31f9 is NOT a stable "is stunting" flag - a
+       correction to 18.8
+
+   The stunt flag has two writers fighting each other every frame
+   [verified]:
+
+   +------------+------------------------------------------------+
+   | 0x00457951 | maybe_Replay_ReadInput SETS it from the replay |
+   |            | record's bit 0x80. 0x00457960 is the else-arm. |
+   +------------+------------------------------------------------+
+   | 0x004693f3 | maybe_Racer_UpdateGroundContact CLEARS it on   |
+   | 0x00469763 | BOTH exits - grounded and airborne alike -     |
+   |            | gated on racer+0x8 and racer+0x4, human and    |
+   |            | solo.                                          |
+   +------------+------------------------------------------------+
+
+   Watched with changed=true it toggled 1 then 0 then 1 on
+   CONSECUTIVE 33 ms frames while the button was held.
+
+   o SO WHAT racer+0x31f9 READS DEPENDS ON WHERE IN THE FRAME YOU
+     SAMPLE IT, and 18.8 sampled it at maybe_Racer_BeginCrash's
+     entry. That table's "stunt" column is therefore measuring
+     sample position as much as rider intent, and the correlation
+     it reported - no crash below 94 per cent of cap without the
+     flag - IS NOT SAFE. It is not disproved either; it is
+     unfounded, which is worse than either.
+
+   o THE RELIABLE TEST IS racer+0x305d != 0. It is a pointer with
+     exactly one setter and one clearer, both inside
+     maybe_Racer_UpdatePose, and it is stable across the frame. The
+     crash hook now captures it, and 19.5 is the first data taken
+     that way.
+
+   o AND THE LESSON GENERALISES. A field written by two subsystems
+     in the same frame has no single value, only a value at a point
+     in the frame. Before correlating anything against a flag,
+     check how many writers it has - a displacement search for the
+     offset costs one query and would have caught this.
+
+19.5.  The first airborne crash, and no stunt was running
+
+   Three crashes, with the ground pair and the stunt pointer
+   captured alongside [verified]:
+
+   +----------+---------+--------+-----------+---------+---------+
+   | speed    | % cap   | ground | prev      | +0x305d | +0x3065 |
+   +==========+=========+========+===========+=========+=========+
+   |  20.296  |  44.1%  |   0    |     0     |    0    |   39    |
+   +----------+---------+--------+-----------+---------+---------+
+   |  45.861  |  99.7%  |   1    |     1     |    0    |   39    |
+   +----------+---------+--------+-----------+---------+---------+
+   |  45.864  |  99.7%  |   1    |     1     |    0    |   39    |
+   +----------+---------+--------+-----------+---------+---------+
+
+   o THE FIRST IS THE AIRBORNE CRASH THIS PROJECT HAD NEVER SEEN.
+     On the ground reads 0 and so does the previous frame, so the
+     bike was in flight for at least two frames when the crash
+     began - and at 44 per cent of top speed, far below anything
+     recorded on the ground.
+
+   o NO STUNT ANIMATION WAS RUNNING IN ANY OF THE THREE. +0x305d
+     read 0 every time, which is now a meaningful statement rather
+     than a sampling artefact. +0x3065 reads 39 throughout because
+     it holds the LAST id used and is never cleared.
+
+   o SO THE STUNT-VULNERABILITY QUESTION IS OPEN AGAIN and needs a
+     different instrument: a watch on racer+0x30c1, the crash
+     latch, with the stunt POINTER captured - or simply riding a
+     lap that crashes during a trick and one that does not. [open]
+
+19.6.  Two more runs are dead, and the airborne sample repeats
+
+   Watched mode=rw for a COMPLETE race with eight stunts, ZERO hits
+   each [verified]: racer+0x2e89 (4 bytes) and racer+0x31e1 (8).
+   Neither read nor written by anything, all race.
+
+   Captured at the frame the bike left the ground, all zero
+   [verified]: racer+0x000c (12), racer+0x2d88 (28), racer+0x2de9
+   (12), racer+0x2e0d (4). racer+0x0020 read 1.0f, constant.
+
+   o SUPERSEDED BY 21.5, WHICH PUTS IT AT 48 VERIFIED BYTES.
+     +0x000c, +0x2da0 and +0x2e29 came off this list when a
+     poison sweep showed all three are written with ZERO - the
+     one thing neither a neighbouring watchpoint nor an
+     all-zero capture can see.
+
+   o WHICH PUTS THE DEAD-SPACE TOTAL AT 76 BYTES over three bikes
+     and three tracks: +0x000c, +0x2d88, +0x2de9, +0x2e0d, +0x2e25,
+     +0x2e35, +0x2e89, +0x31e1. A reconstruction can pad all of it.
+
+   o racer+0x0018 IS NOT A CONSTANT PAIR OF FLT_MAX. It read
+     0x7bffffff beside 0x7f7fffff, so the first of the two has been
+     lowered - a running minimum initialised to FLT_MAX. Already
+     inside a claimed range, but the note calling both of them
+     FLT_MAX is wrong.
+
+19.7.  The finish, observed for the first time
+
+   No replay had ever reached the end before - the previous one was
+   recorded under mr_freeze and timed out, see replay.txt 6.3. A
+   hook on 0x0047eb6f, where maybe_Race_UpdateProgress writes
+   racer+0x2de5 = 2, caught eight racers crossing [verified]:
+
+   +--------+--------------+-------------+----------+
+   | racer  | finish       | best lap    | +0x2f7b  |
+   +========+==============+=============+==========+
+   |   12   |  3:08.326    |  1:32.504   |    2     |
+   +--------+--------------+-------------+----------+
+   |   10   |  3:08.528    |  1:32.570   |    2     |
+   +--------+--------------+-------------+----------+
+   |   11   |  3:09.353    |  1:33.641   |    2     |
+   +--------+--------------+-------------+----------+
+   |    8   |  3:10.148    |  1:33.396   |    2     |
+   +--------+--------------+-------------+----------+
+   |    7   |  3:11.407    |  1:34.355   |    2     |
+   +--------+--------------+-------------+----------+
+   |    2   |  3:11.870    |  1:33.378   |    2     |
+   +--------+--------------+-------------+----------+
+   |    4   |  3:14.087    |  1:36.904   |    2     |
+   +--------+--------------+-------------+----------+
+   |    5   |  3:15.245    |  1:35.199   |    2     |
+   +--------+--------------+-------------+----------+
+
+   ESI holds the racer INDEX at this site and EBX the racer base,
+   which is how the column above is derived rather than guessed.
+
+   o racer+0x2f7b IS THE LAP COUNTER. It read 2 for every finisher,
+     and 188326 ms of racing against a 92504 ms best lap is two
+     laps. 13.x had it as "a SIGNED 16-bit counter beside the
+     checkpoint index - lap?"; this is strong support, though only
+     a three-lap race would settle it outright. [inferred]
+
+   o racer+0x31b5 READ 1432 FOR ALL EIGHT - the track's total
+     progress count, identical across racers as it should be.
+
+   o AND racer+0x31b1 IS NEGATIVE AT THE FINISH, -374 to -509 as a
+     float, while it is described as progress. Either it wraps past
+     the end or the name is wrong. [open]
+
+   o THE PLAYER IS NOT IN THIS LIST. The cap of eight cut it off,
+     and racers 1, 3, 6 and 9 finished later. Doing eight tricks
+     costs places.
+
+20.  A FIELD FOUND WITH NO WATCHPOINT AT ALL
+
+   Hardware watchpoints were unavailable for this run - the agent's
+   SET_DATABP and SET_MEM were refused by a host permission gate, so
+   only hooks could be armed. That turned out to matter less than
+   expected, because the field that fell out had never been missed
+   for want of a watchpoint. It had been missed for want of being
+   looked at in the right MOMENT.
+
+20.1.  racer+0x31d5 is a charge/decay meter, not dead space
+
+   +0x31d5 read zero at the countdown, zero airborne, and zero on
+   the ground - three samples across three sessions, all zero, and
+   it was on its way to being written down as padding. Captured at
+   the FINISH, for eight racers at once [verified]:
+
+   +--------+-----------+-----------+
+   | racer  | +0x31d5   | +0x2db4   |
+   +========+===========+===========+
+   |   12   |     0.0   |    0      |
+   +--------+-----------+-----------+
+   |   10   |   240.0   |    0      |
+   +--------+-----------+-----------+
+   |   11   |    49.60  |    0      |
+   +--------+-----------+-----------+
+   |    8   |     0.747 |    0      |
+   +--------+-----------+-----------+
+   |    7   |     0.0   |    0      |
+   +--------+-----------+-----------+
+   |    2   |   240.0   |    0      |
+   +--------+-----------+-----------+
+   |    4   |     0.0   |    0      |
+   +--------+-----------+-----------+
+   |    5   |     0.0   |    0      |
+   +--------+-----------+-----------+
+
+   FUN_0046cd20 owns it, and the shape is unmistakable [verified]:
+
+       0046d1ed   FADD  [ESI+0x31d5]        ramp UP
+       0046d1f3   FSTP  [ESI+0x31d5]
+       0046d1ff   FCOMP [ESP+0x10]          against a ceiling
+       0046d210   MOV   [ESI+0x31d5],EAX    CLAMP to it
+       ...
+       0046d233   FMUL  [0x004d1308]        dt * k
+       0046d239   FSUBR [ESI+0x31d5]        decay DOWN
+       0046d23f   FSTP  [ESI+0x31d5]
+       0046d25a   MOV   [ESI+0x31d5],EAX    CLAMP at the floor
+
+   A meter that charges to a ceiling and bleeds off at a rate
+   proportional to the frame time. 240.0 is the ceiling - two racers
+   sat exactly on it - and 49.60 and 0.747 are two more caught
+   part-way down. The same function reads racer+0x2db8 at
+   0x0046d1b3, so the charging is tied to ground contact.
+
+   o WHAT IT MEASURES IS NOT ESTABLISHED. It sits beside +0x31d1,
+     which 13.x has as "set to 200.0 in several places, then
+     decays", so the two are probably a pair of the same kind.
+     [open]
+
+   o THE LESSON IS ABOUT SAMPLING, NOT INSTRUMENTS. Four zero
+     readings had been taken - grid, airborne, grounded, and a
+     watchpoint - and every one of them was during a lap. Nothing
+     had ever read this struct at the moment a race ENDS. A field
+     that is only interesting at the finish is invisible to every
+     mid-lap instrument, however good.
+
+   o AND IT WAS FREE. The capture rode along on a hook armed for a
+     different question - confirming the lap counter. Adding a
+     suspected-dead run to the spare capture slots of a hook you
+     are arming anyway costs nothing and has now paid twice.
+
+20.2.  The third determinism proof, at whole-race scale
+
+   The same recording was played back again with the same finish
+   hook. All eight finish times and all eight best laps came back
+   BIT-IDENTICAL to 19.7, and the three crash speeds came back
+   identical to 19.5 - 20.296, 45.861 and 45.864 [verified].
+
+   replay.txt 6 proved determinism over one crash; this proves it
+   over 195 seconds, twelve racers and a full finishing order.
+
+20.3.  The stunt POSE is cosmetic - it does not feed the physics
+
+   One thing did NOT reproduce. At the third crash the stunt
+   bookkeeping differed between the two playbacks [verified]:
+
+   +-----------+------------------+------------------+
+   |           | first playback   | second playback  |
+   +===========+==================+==================+
+   | +0x3065   | 39               | 41               |
+   +-----------+------------------+------------------+
+   | +0x3061   | 5                | 3                |
+   +-----------+------------------+------------------+
+   | speed     | 45.864           | 45.864           |
+   +-----------+------------------+------------------+
+   | clock     | identical        | identical        |
+   +-----------+------------------+------------------+
+
+   18.1 established that the stunt is drawn with rand(), and
+   camera.txt 6.3 established that rand() is not part of the replay
+   state. So WHICH trick plays differs between playbacks of one
+   recording.
+
+   o AND THE PHYSICS DID NOT MOVE. Different animation, identical
+     crash speed to the last bit, identical clock, identical
+     finishing order. THE STUNT POSE DOES NOT FEED BACK INTO THE
+     SIMULATION - it is display only.
+
+   o WHICH IS A REAL ANSWER TO 19.5's OPEN QUESTION, or half of
+     one. The rider's belief that stunting raises the crash risk
+     cannot be about the POSE. It could still be about the stunt
+     FLAG racer+0x31f9, which comes from the replay input stream
+     and IS deterministic - that is the half still open.
+
+   o THIS IS THE MOST USEFUL KIND OF NEGATIVE RESULT: a variable
+     that changed by itself, for free, between two runs that were
+     otherwise identical. No experiment had to be designed. It is
+     worth watching for non-reproducing fields on every repeat
+     playback, because each one is a natural experiment.
+
+20.4.  What is still zero, and one hook that never fired
+
+   Sampled at the frame the bike left the ground, all zero for the
+   third bike and track [verified]: racer+0x000c (12), racer+0x2d88
+   (28), racer+0x2de9 (12), racer+0x2e25 (12), racer+0x2e35 (4).
+   racer+0x2db4 read 0 for all eight finishers as well.
+
+   o A HOOK ON 0x0045be09, a register-sourced writer of the race
+     state, took ZERO HITS across a completed race. FUN_0045bdf0
+     never ran. RACE STATE 3 REMAINS UNOBSERVED after four
+     sessions and three separate writers hooked - the remaining
+     candidates are maybe_Game_InitRace and FUN_00455280, and
+     FUN_00463ca0, which 19.x showed is a bulk apply from a
+     26-byte-per-racer buffer and so is almost certainly the
+     NETWORK path. If that is right, state 3 cannot occur in a
+     solo race at all and no amount of solo replay will find it.
+     [inferred]
+
+   o AND THE 1-BYTE WATCHPOINT CAVEAT SHOULD BE STATED PLAINLY.
+     Every "dead" verdict on a multi-dword run rests on a watch of
+     ONE byte plus captures showing the rest stay zero. A write of
+     zero to an unwatched byte would trap nothing and change no
+     captured value. So "unwritten" is verified for the watched
+     byte and INFERRED for its neighbours. The clean way to settle
+     it is a poison sweep - fill the runs with 0xA5, run a lap,
+     read back - which needs SET_MEM.
+
+21.  THE POISON SWEEP - and three fields that were never dead
+
+   20.4 warned that every dead-space verdict on a multi-dword run
+   rested on watching ONE byte, and that a write of ZERO to any of
+   its neighbours would be invisible to a watchpoint AND to a hook
+   capture full of zeros. That warning was correct, and the sweep
+   built to test it found three live fields inside runs this
+   document had called dead.
+
+21.1.  The method
+
+   Fill every suspected-dead byte with 0xA5, run a complete race,
+   read it back. 68 bytes across five runs, in one pass [verified,
+   2026-09-05]:
+
+   +----------+-------+--------------------------------------------+
+   | +0x000c  |  12   | ALL TWELVE ZEROED                          |
+   +----------+-------+--------------------------------------------+
+   | +0x2d88  |  28   | 24 intact, LAST DWORD +0x2da0 ZEROED       |
+   +----------+-------+--------------------------------------------+
+   | +0x2de9  |  12   | intact                                     |
+   +----------+-------+--------------------------------------------+
+   | +0x2e25  |  12   | 8 intact, MIDDLE DWORD +0x2e29 ZEROED      |
+   +----------+-------+--------------------------------------------+
+   | +0x2e35  |   4   | intact                                     |
+   +----------+-------+--------------------------------------------+
+
+   48 of 68 survived. Twenty did not, and every one of the three
+   writers writes ZERO - which is exactly the case both previous
+   instruments were blind to.
+
+   o WHY IT BEATS FOUR WATCHPOINTS. x86 gives four debug registers
+     and a 1-byte watch speaks only for its own byte. The poison
+     speaks for every byte at once, at byte granularity, and it
+     turns "written with the value it already had" into a visible
+     change. Two of the three finds are in dwords no watchpoint had
+     ever been placed on, and no realistic number of watchpoint
+     sessions would have reached them.
+
+   o AND IT DOUBLES AS A READER TEST. 0xA5A5A5A5 is -2.9e-16 as a
+     float - harmless if loaded - but emphatically non-zero as a
+     flag or an index. If any surviving byte were read and acted
+     on, the race would have diverged. It did not: see 21.5.
+
+   o THE COST IS ONE SET_MEM PER RUN AND THE UNDO IS FREE, because
+     SET_MEM returns the bytes it clobbered.
+
+21.2.  racer+0x000c is a flag, and it is read
+
+   Cleared every frame in maybe_Racer_Tick, conditionally
+   [verified]:
+
+       0045d775   MOV  ECX,[ESI+0x180]
+       0045d77b   TEST ECX,0x7fffffff     is that float +-0.0 ?
+       0045d781   JNZ  0045d78b
+       0045d783   XOR  EAX,EAX
+       0045d785   MOV  [ESI+0x0c],EAX
+       0045d788   MOV  [ESI+0x10],EAX
+
+   and READ as a flag in the same function:
+
+       0045d28d   MOV  EAX,[EDI+0xc]
+       0045d290   TEST EAX,EAX
+       0045d292   JNZ  0045d355
+       0045d298   MOV  EAX,[EDI+0x124]    else test speed against 1.0
+
+   o THE WATCHPOINT SAW BOTH SITES, once the poison told us where to
+     put it. Sixteen hits, alternating writer and reader, one pair
+     per frame - and the FIRST hit reads old=a5 new=00, which is the
+     poison being cleaned up in front of us.
+
+   o THE RACE DID NOT DIVERGE ONLY BECAUSE THE WRITER RUNS FIRST.
+     Had the reader seen 0xA5A5A5A5 it would have taken the JNZ.
+     That is luck of ordering, not evidence of harmlessness.
+
+   o TEST ECX,0x7fffffff IS THE FLOAT-AS-INTEGER IDIOM, fifth
+     occurrence in this struct - see 14.3.
+
+   o racer+0x0014 IS ALSO ZEROED and this pair writes only 8 bytes,
+     so it has another writer. Unidentified. [open]
+
+21.3.  racer+0x2da0 was never unknown - the MAP had lost it
+
+   maybe_Racer_Tick writes it 1 at 0x0045d6ae and 0 at 0x0045d6ba,
+   Racer_SavePrevFrame copies it to +0x2da4, and 17.1 already
+   recorded that Fx allocation is gated on it. It is referenced by
+   name in three places in this document.
+
+   IT WAS NEVER ADDED TO mr_dump_racer's TABLE, so the coverage tool
+   kept reporting it as part of an unclaimed 28-byte gap, and three
+   sessions of dead-space reasoning were built on top of that gap
+   without anyone noticing the field inside it was documented.
+
+   o THIS IS A RULE 5b DIVERGENCE IN MINIATURE. The fact was in
+     docs/ and in the DB and NOT in the tool, so the tool quietly
+     contradicted both. A field known in prose but missing from the
+     map is worse than an unknown one, because the map is what gets
+     believed.
+
+   o THE CHECK IS CHEAP: anything docs/ names by offset should
+     resolve in mr_dump_racer. Nothing enforced that until now.
+
+21.4.  racer+0x2e29 is a lean-mode flag
+
+   Set to 1 at 0x00466293, cleared at 0x004662ec and 0x0046636f, all
+   in FUN_00466240; initialised by Racer_Ctor. The consumer is
+   maybe_Racer_UpdateLean [verified]:
+
+       0046ac24   MOV  ECX,[ESI+0x2e29]
+       0046ac2a   TEST ECX,ECX
+       0046ac2c   JNZ  0046ac41            set - one path
+       0046ac2e   MOV  EAX,0x41a00000      clear - use 20.0f
+
+   A real behavioural flag in the lean model.
+
+   o WHAT DISTINGUISHES THE TWO MODES IS THE STEERING PATH, and
+     that is now settled. FUN_00466240 is maybe_Racer_ApplySteering:
+     it sets leanMode on its ANALOG path, where the steering angle
+     comes straight off axis1, and clears it on both DIGITAL paths,
+     where the angle is ramped by RoueAccelerationAngulaire. So 1
+     means an analog stick is steering this racer and 0 means
+     buttons are. See subsystems/racers.txt 9.9.2. [verified]
+
+21.5.  48 bytes are now VERIFIED dead, not inferred
+
+   These held 0xA5 for an entire race and the race came out
+   bit-identical to two previous playbacks - same eight finish
+   times, same eight best laps, same racer+0x31d5 values, same three
+   crash speeds and clocks [verified]:
+
+   +----------+-------+-------------------------------------------+
+   | +0x2d88  |  24   | to +0x2d9f                                |
+   +----------+-------+-------------------------------------------+
+   | +0x2de9  |  12   |                                           |
+   +----------+-------+-------------------------------------------+
+   | +0x2e25  |   4   |                                           |
+   +----------+-------+-------------------------------------------+
+   | +0x2e2d  |   4   |                                           |
+   +----------+-------+-------------------------------------------+
+   | +0x2e35  |   4   |                                           |
+   +----------+-------+-------------------------------------------+
+
+   NEITHER WRITTEN NOR READ, and the second half of that is the new
+   part. A watchpoint negative says nothing trapped one byte; this
+   says the whole run carried garbage through a full race and
+   nothing downstream noticed. A reconstruction can pad all 48.
+
+   o racer+0x0020 IS ALSO CLEAR, by a different argument: an rw
+     watchpoint on it took ZERO hits across the same race. It was
+     deliberately NOT poisoned, because it holds 1.0f rather than
+     zero and is therefore a value rather than a gap. Unread so far,
+     but do not treat it as padding on this evidence alone.
+
+   o THE UNCLAIMED TOTAL IS NOW 52 BYTES, all of it carrying a
+     negative result rather than a shrug.
+
+21.6.  A fourth determinism proof, under adversarial conditions
+
+   Sixty-eight bytes of the player's racer were filled with garbage
+   and the race still finished identically - eight finish times to
+   the millisecond, eight best laps, three crash speeds to the last
+   bit of the float.
+
+   THAT IS A STRONGER STATEMENT THAN THE THREE BEFORE IT, because
+   this run was actively perturbed and the previous ones were not.
+   And the stunt id at the third crash came out 35, against 41 and
+   39 in the two earlier playbacks - so 20.3 holds up too: the pose
+   is drawn from rand(), varies freely between playbacks, and does
+   not touch the simulation.
+
+22.  THE POCKET BIKE, BACKWARDS - the dead space holds
+
+   21 verified 48 bytes dead by poison sweep, on one bike and one
+   track, forwards. The obvious objection is that a negative from one
+   configuration is a negative about that configuration. So the next
+   replay changed everything that could be changed at once: the
+   POCKET bike, REVERSE mode, a different track, four laps instead of
+   two. Both modes had to be unlocked first - see tools/mr_cheats.py.
+
+22.1.  52 of 52 survived
+
+   Every remaining unclaimed byte was filled with 0xA5 and read back
+   after a complete four-lap race [verified]:
+
+   +----------+-------+-----------+
+   | Run      | Bytes | Result    |
+   +==========+=======+===========+
+   | +0x0020  |   4   | INTACT    |
+   +----------+-------+-----------+
+   | +0x2d88  |  24   | INTACT    |
+   +----------+-------+-----------+
+   | +0x2de9  |  12   | INTACT    |
+   +----------+-------+-----------+
+   | +0x2e25  |   4   | INTACT    |
+   +----------+-------+-----------+
+   | +0x2e2d  |   4   | INTACT    |
+   +----------+-------+-----------+
+   | +0x2e35  |   4   | INTACT    |
+   +----------+-------+-----------+
+
+   And four rw watchpoints on the four dwords no watch had ever
+   covered - +0x2d90, +0x2d98, +0x2df1, +0x2e2d - took ZERO HITS
+   between them.
+
+   o SO THE DEAD SPACE IS DEAD ACROSS THE CONFIGURATION SPACE, not
+     just in one race. Two bikes with a 2.2x difference in top speed,
+     three tracks, both directions, two-lap and four-lap. That is as
+     close to a general statement as static reading plus replay can
+     get.
+
+   o racer+0x0020 WAS POISONED THIS TIME and survived. 21.5 held it
+     back because it carries 1.0f rather than zero and might be a
+     value rather than a gap. It carried 0xA5A5A5A5 - a tiny negative
+     denormal - through four laps with no visible effect and no
+     access trapped. It is not read during a race.
+
+   o ONLY +0x2d8c AND +0x2d94 HAVE NEVER BEEN UNDER A WATCHPOINT, and
+     both are interior bytes of a run that has now survived two
+     poison sweeps. There is no experiment left worth designing here.
+
+22.2.  racer+0x2f7b is the lap counter, settled
+
+   19.7 read 2 for every finisher of a two-lap race and called it
+   strong support, noting that only a race of a different length
+   would settle it. This was a FOUR-lap race, and every one of the
+   eight finishers read 4 [verified].
+
+   Two lengths, two values, eight racers each. Settled.
+
+22.3.  racer+0x31b5 is the racer's ACCUMULATED PROGRESS
+
+   1432 on the cross track, 3153 here, identical across all eight
+   finishers in both races [verified].
+
+   THIS SECTION USED TO READ THAT AS "a property of the TRACK, not of
+   the racer", and that is the wrong inference from the right data.
+   The eight racers agree because THEY ALL FINISHED - they covered
+   the same segments the same number of times.  1432 is
+   segmentCount x laps, which is what accumulated progress has to be
+   at the flag.
+
+   o READ MID-RACE IT IS NOT CONSTANT.  Eight seconds into a race on
+     ile01, racer 1 holds 3 with its current segment also 3
+     [verified, live].  A per-track constant would already be at its
+     final value.
+
+   o AND Race_ComputeStandings SORTS ON IT, which only makes sense
+     for a per-racer quantity: the racing bucket's key is
+     (racer+0x31b5 << 12) | fraction.  See race-standings.txt 3.
+
+   o racer+0x31b1 IS THE FRACTION, and it is a FLOAT -
+     maybe_Race_UpdateProgress hands the track a pointer to it at
+     0x0047e422 and the track writes through it.  Read live: 0xc3fb0000,
+     a clean -502.0.  It is negative at the finish on a third track
+     and on a reversed one, so 19.7's "either it wraps or the name is
+     wrong" resolves as the name being wrong.
+
+22.4.  The pocket bike never leaves the ground
+
+   The hook on 0x0046974b, the store that clears racer+0x2db8 when
+   contact is lost, took ZERO HITS over four laps [verified]. On the
+   cross bike the same hook filled its budget of eight almost
+   immediately.
+
+   o WHICH IS A STRUCTURAL FACT, not a riding style. Four laps of a
+     road circuit on a pocket bike produced not one airborne frame.
+     Anything gated on the airborne path - the stunt trigger of 19.3,
+     the +0x31f9 clear at 0x00469763 - simply never runs for this
+     combination.
+
+22.5.  Stale state survives between races
+
+   racer+0x3065, the running stunt pose id, read 41 throughout this
+   race. The pocket bike has NO stunt poses at all -
+   g_nStuntPoseCount read 0, and SPEEDPKT ships no SAUTDELIRE files -
+   so nothing in this race could have written it. 41 is a leftover
+   from the CROSS bike race that ran before it [verified].
+
+   o THE RACER RECORD IS NOT FULLY CLEARED BETWEEN RACES. That is
+     worth knowing for two reasons. A reconstruction that zeroes the
+     struct on race start will diverge from the original in any field
+     the original leaves alone. And any field read at the START of a
+     race may be carrying a value from the PREVIOUS one, which is a
+     class of bug that only shows up on the second race.
+
+   o racer+0x305d WAS 0 THROUGHOUT, correctly - the pointer is
+     cleared when an animation ends and no animation could start.
+     So the pair behaves exactly as 19.1 describes: the POINTER is
+     state, the ID is a leftover.
+
+22.6.  A crash below the floor, on a bike that cannot stunt
+
+   Two crashes, against this bike's RealSpeedMax of 100.0
+   [verified]:
+
+   +-----------+---------+---------+----------+
+   | clock     | speed   | % cap   | +0x305d  |
+   +===========+=========+=========+==========+
+   | 2:09.871  | 94.626  |  94.6%  |    0     |
+   +-----------+---------+---------+----------+
+   | 2:42.975  | 85.675  |  85.7%  |    0     |
+   +-----------+---------+---------+----------+
+
+   18.8 claimed every crash without the stunt flag was at 94 per cent
+   of cap or above, and 19.4 withdrew that because the flag it rested
+   on is sampled unreliably. THIS KILLS THE FLOOR OUTRIGHT: 85.7 per
+   cent, on a bike with no stunt animations in its asset set, so no
+   stunt of any kind was possible.
+
+   o THE WITHDRAWAL IN 19.4 WAS THEREFORE RIGHT FOR A SECOND REASON.
+     Not only was the flag mis-sampled, the pattern it appeared to
+     show does not hold. A correlation drawn from seven samples of
+     one bike did not survive the eighth and ninth from another.
+
+   o WHAT REMAINS IS THE RIDER'S ORIGINAL OBSERVATION, unexplained
+     and now unsupported by anything measured. If it is real the
+     evidence has to come from the collision or grip code, not from
+     more replays. [open]
+
+23.  THE HEAD OF THE RECORD - +0x0, +0x4, +0x8, +0x118
+
+   Four fields at the very front, all settled, and none of them
+   findable by grepping a displacement because three sit at or
+   near offset zero.
+
+23.1.  +0x8 is humanPlayer and +0x4 is soloMode, and Racer_Create
+       says what each means
+
+   Racer_Create (0x0045bf70) stores two of its arguments straight
+   into the head [verified]:
+
+       0045bf70  MOV EAX, [ESP+4]        arg2
+       0045bf7c  MOV [ECX + 0x8], EAX    +0x8 = arg2
+       0045bf83  MOV ECX, [ESP+0xa8]     arg3
+       0045bf8a  MOV [ESI + 0x4], ECX    +0x4 = arg3
+
+   and maybe_Game_CreateRacers (0x00410a50) supplies them:
+
+   +----------------------+----------------------+------+------+
+   | case                 | call                 | +0x8 | +0x4 |
+   +======================+======================+======+======+
+   | solo, local player   | Create(this, 1, 1)   |  1   |  1   |
+   +----------------------+----------------------+------+------+
+   | solo, each opponent  | Create(p,    0, 1)   |  0   |  1   |
+   +----------------------+----------------------+------+------+
+   | network, per slot    | Create(p, slot!=0, 0)| 0/1  |  0   |
+   +----------------------+----------------------+------+------+
+
+   In the network case arg2 is whether that slot of the table at
+   0x00508030 holds a real connected player, SO +0x8 MEANS "A
+   HUMAN IS RIDING THIS ONE".  Read live it agrees exactly: racer
+   1 has +0x8 = 1 and racers 2 and 3 have 0, with all three
+   showing +0x4 = 1 because the session is solo [verified].
+
+   AND +0x4 IS 0 AT CREATION IN A NETWORK GAME, then set to 1 for
+   OUR OWN SLOT ALONE by maybe_Game_StartRacePending at
+   0x00410f65 - see netplay-relay.txt 3.6, which reads that site
+   from the other end.  The two together are the whole rule: zero
+   for everyone, one for the rider at this keyboard.
+
+   THE PORT DIVERGES HERE DELIBERATELY - port-divergences.txt.
+   racer_place_from_grid sets it to 1 on every racer, because
+   race_lap_visible gates the lap close-out on it and a remote
+   racer with 0 never completes a lap, so a net race could not
+   end.  Retail does not need that: its netplay is unfinished.
+
+23.2.  +0x118 is the SPEEDOMETER, in whole km/h
+
+   +0x124 is written per frame at 0x0046948a in FUN_00468ca0,
+   from an INTEGER two fields earlier [verified]:
+
+       0046947c  MOV  EAX, [ESI + 0x118]    an INT, not a float
+       00469480  FILD dword [ESP + 0x10]    integer -> float
+       00469484  FMUL double [0x004d0f70]
+       0046948a  FSTP [ESI + 0x124]
+
+   0x004d0f70 IS 0.27777777777777779, WHICH IS 1/3.6 EXACTLY -
+   the km/h to m/s conversion and nothing else.  So:
+
+   +-----------+--------------------------------------------------+
+   | +0x118    | THE SPEEDOMETER - speed in whole km/h, integer   |
+   +-----------+--------------------------------------------------+
+   | +0x124    | the same speed in m/s, +0x118 / 3.6              |
+   +-----------+--------------------------------------------------+
+   | +0x2da8   | the physics speed, m/s, un-rounded               |
+   +-----------+--------------------------------------------------+
+
+   Read together with the game paused [verified]:
+
+       +0x2da8  = 2.5321 m/s  = 9.1155 km/h -> rounds to 9
+       +0x118   = 9           km/h, integer
+       +0x124   = 2.5095 m/s  = 9.0342 km/h
+
+   WHICH IS WHY +0x124 AND +0x2da8 DISAGREE SLIGHTLY.  They are
+   the same speed in the same units out of the same maximum, and
+   not the same field: +0x124 has been through a rounding to whole
+   km/h and back.  Do not substitute one for the other.
+
+23.3.  +0x0 tracks distance, and it is the draw gate
+
+   Racer_Create does NOT write it, so it was settled by watching.
+   Flags for racers 1..7 against their segment gap behind the
+   player, sampled every 60 frames from a reset [verified]:
+
+   +-------------+----------------------+---------------------+
+   | after       | segment gap          | +0x0 for racers 1..7|
+   +=============+======================+=====================+
+   | reset       | 0 to 18              | 1 1 1 1 1 1 1       |
+   +-------------+----------------------+---------------------+
+   | 60 frames   | 0 to 30              | 1 1 1 1 1 1 1       |
+   +-------------+----------------------+---------------------+
+   | 120 frames  | 0 to 60              | 1 0 0 0 0 0 0       |
+   +-------------+----------------------+---------------------+
+   | 300 frames  | 0 to 173             | 1 0 0 0 0 0 0       |
+   +-------------+----------------------+---------------------+
+
+   EVERY RACER STARTS AT 1 AND DROPS TO 0 AS IT PULLS AWAY, and
+   the player is always 1 - he is never far from himself.  The
+   transition is somewhere between a gap of 30 and one of 46
+   segments; the exact threshold is not read.
+
+   AND A READER IS NOW KNOWN, which the measurement pass could not
+   find.  Hud_DrawRacerCallouts (0x00483670) skips a racer whose
+   +0x0 is zero, alongside +0x68 for active - so the caption goes
+   when the rider goes.  That makes the field a DRAWN-THIS-FRAME
+   gate rather than a distance reading as such, and the two
+   descriptions are the same thing from either end: a racer far
+   enough ahead is culled, and a culled racer is not drawn.  The
+   port calls it drawnThisFrame and clears it for everyone each
+   frame in race_draw_3d.
+
+   racer 0 IS 0 IN EVERYTHING - +0x0, +0x8, +0x68 - which is the
+   unused slot the grid loop skips, and a useful control: it shows
+   what an untouched record looks like.
+
+24.  Open questions
+
+   o WHETHER racer+0x638 IS ONE FIELD OR TWO. Racer_Create uses it
+     to select a skeleton block and maybe_Racer_Draw writes a LOD
+     index to it. Only two blocks exist and a LOD of 4 was
+     observed. If they are the same field then a distant racer
+     indexes an empty block, which would be a bug; if they are the
+     same field and the draw only writes it when it is about to
+     use it, they may never collide. Not settled.
+
+   o CONFIRMING THAT BLOCK 1 IS THE CRASH SKELETON. Of the eight
+     sites that write racer+0x319d only two fire in play -
+     0x0045e2b9 and 0x00468c7d - and the state they fire in is on
+     the ground with the speed decaying by exactly 0.9 a frame.
+     That is a fall, not a stunt, but no run has yet crashed
+     WITHOUT also doing a wheelie. formats/skl-rot.txt 5.1.7-5.1.9.
+
+   o racer+0x30d5, an animation timer, and racer+0x3065, an index
+     into a 16-byte-stride table at 0x00580d08. Both new, both
+     found chasing the flag.
+
+   o ANSWERED: WHAT INSTANCE 3 IS - the skeleton's placement and
+     cull record. Section 3.2.
+
+   o WHY INSTANCE 3'S POSITION IS MAINTAINED AND NEVER READ, and
+     why the oldest history slot is written in three instances and
+     read in none. Section 3.3.
+
+   o WHETHER THE RACER'S SCALARS ARE INSTANCE FIELDS - section
+     3.1.
+
+   o ANSWERED: racer+0x634 is the distance to the camera over the
+     projection zoom, written by maybe_Racer_SelectLod, and the
+     three thresholds 1000, 2500 and 3000 pick the LOD.
+
+   o WHO WRITES THE GEOMETRY AT +0x2ea8, which would settle the
+     shadow.

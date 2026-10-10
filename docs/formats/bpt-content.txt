@@ -1,0 +1,294 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      WHAT THE .BPT FILES CONTAIN
+
+
+Abstract
+
+   Every .bpt in DATA now decodes end to end. This note records what
+   each one holds. The format itself is in formats/bpt.txt and the bike
+   characteristic tables, which live inside the banks rather than in
+   DATA, are in formats/bpt-carac.txt.
+
+   All fifteen files consume to exactly their last byte under
+   tools/bpt.py --records, which is the check that the parse is right: a
+   wrong string decision desynchronises the mask stream and the file no
+   longer ends cleanly [verified].
+
+Table of Contents
+
+   1. The files
+   2. The track list
+   3. The championships
+   4. The bike manifests
+   5. Saved configuration
+   6. Open questions
+
+1.  The files
+
+   +--------------+-------+---------+--------------------------------------------+
+   | File         | Items | Strings | Holds                                      |
+   +==============+=======+=========+============================================+
+   | CONFIG.BPT   | 51    | 1       | saved player configuration                 |
+   +--------------+-------+---------+--------------------------------------------+
+   | FONTS.BPT    | 569   | 143     | font declarations; see structs/MR_Font.txt |
+   +--------------+-------+---------+--------------------------------------------+
+   | LIST.BPT     | 36    | 25      | the eight base tracks                      |
+   +--------------+-------+---------+--------------------------------------------+
+   | LIST01.BPT   | 36    | 25      | track list for the two-island data disk    |
+   +--------------+-------+---------+--------------------------------------------+
+   | CHAMPA.BPT   | 73    | 24      | championship A, 12 races                   |
+   +--------------+-------+---------+--------------------------------------------+
+   | CHAMPB.BPT   | 193   | 64      | championship B, 32 races                   |
+   +--------------+-------+---------+--------------------------------------------+
+   | CHAMPC.BPT   | 193   | 64      | championship C, 32 races                   |
+   +--------------+-------+---------+--------------------------------------------+
+   | CHAMPA01.BPT | 73    | 24      | championship A, data-disk track set        |
+   +--------------+-------+---------+--------------------------------------------+
+   | CHAMPB01.BPT | 193   | 64      | championship B, data-disk track set        |
+   +--------------+-------+---------+--------------------------------------------+
+   | CHAMPC01.BPT | 193   | 64      | championship C, data-disk track set        |
+   +--------------+-------+---------+--------------------------------------------+
+   | MOTOSPD.BPT  | 58    | 58      | asset manifest, Speed bike                 |
+   +--------------+-------+---------+--------------------------------------------+
+   | MOTOKTM.BPT  | 90    | 72      | asset manifest, KTM cross bike             |
+   +--------------+-------+---------+--------------------------------------------+
+   | PKTSPEED.BPT | 58    | 58      | asset manifest, Speed pocket bike          |
+   +--------------+-------+---------+--------------------------------------------+
+   | PKTKTM.BPT   | 69    | 63      | asset manifest, KTM pocket bike            |
+   +--------------+-------+---------+--------------------------------------------+
+
+   The two CONFIG files are the same structure with different values.
+   One is named in the repository as a copy; both are somebody's saved
+   settings rather than shipped defaults.
+
+2.  The track list
+
+   LIST.BPT opens with a tag string, two zeroes and a count, then one
+   record per track: display name, data directory, an ON or OFF flag,
+   and one integer [verified].
+
+   +-------------+-------------+------+-------+
+   | Name        | Directory   | Flag | Value |
+   +=============+=============+======+=======+
+   | SPEED_BAY   | data\ile01\ | ON   | 4     |
+   +-------------+-------------+------+-------+
+   | SNOW_RIDE   | data\ile05\ | ON   | 2     |
+   +-------------+-------------+------+-------+
+   | ROCK_FOREST | data\ile03\ | OFF  | 4     |
+   +-------------+-------------+------+-------+
+   | LOST_RUINS  | data\ile04\ | OFF  | 2     |
+   +-------------+-------------+------+-------+
+   | WEST_WAY    | data\ile02\ | ON   | 4     |
+   +-------------+-------------+------+-------+
+   | GREAT_WALL  | data\ile06\ | OFF  | 3     |
+   +-------------+-------------+------+-------+
+   | RED_CITY    | data\ile08\ | OFF  | 3     |
+   +-------------+-------------+------+-------+
+   | DIRT_ARENA  | data\ile09\ | ON   | 2     |
+   +-------------+-------------+------+-------+
+
+   The tag is "PLUGIN". Four tracks are ON and four are OFF, and the
+   trailing integer takes the values 2, 3 and 4. Neither field's meaning
+   is established. MotoRacer splits its tracks between a road bike and a
+   motocross bike, so the flag plausibly selects the category, but
+   nothing read so far confirms it [guess].
+
+   LIST01.BPT is the data disk's list. Its tag is "TWO_NEW_ISLANDS" and
+   it swaps two tracks out for two new ones [verified]:
+
+   +-------------+-------------+------+-------+
+   | Name        | Directory   | Flag | Value |
+   +=============+=============+======+=======+
+   | FUN_FAIR    | data\ile10\ | ON   | 4     |
+   +-------------+-------------+------+-------+
+   | SEA_OF_SAND | data\ile11\ | ON   | 2     |
+   +-------------+-------------+------+-------+
+   | SPEED_BAY   | data\ile01\ | ON   | 4     |
+   +-------------+-------------+------+-------+
+   | SNOW_RIDE   | data\ile05\ | ON   | 2     |
+   +-------------+-------------+------+-------+
+   | WEST_WAY    | data\ile02\ | ON   | 4     |
+   +-------------+-------------+------+-------+
+   | GREAT_WALL  | data\ile06\ | OFF  | 3     |
+   +-------------+-------------+------+-------+
+   | RED_CITY    | data\ile08\ | OFF  | 3     |
+   +-------------+-------------+------+-------+
+   | DIRT_ARENA  | data\ile09\ | ON   | 2     |
+   +-------------+-------------+------+-------+
+
+   So the add-on does not extend the roster to ten. It keeps eight
+   entries and drops ROCK_FOREST and LOST_RUINS to make room for
+   FUN_FAIR and SEA_OF_SAND. The island directories confirm the naming:
+   ile01 through ile09 for the originals, ile10 and ile11 for the
+   additions, with ile07 unused.
+
+3.  The championships
+
+   A championship file is a count followed by that many race records.
+   Each record is a track name, four integers, and a second track name
+   that is usually NONE [verified].
+
+   +--------+-------+---------------------+
+   | File   | Races | Tracks used         |
+   +========+=======+=====================+
+   | CHAMPA | 12    | 6, each raced twice |
+   +--------+-------+---------------------+
+   | CHAMPB | 32    | 8                   |
+   +--------+-------+---------------------+
+   | CHAMPC | 32    | 8                   |
+   +--------+-------+---------------------+
+
+   CHAMPA runs SPEED_BAY, SNOW_RIDE, WEST_WAY, DIRT_ARENA, ROCK_FOREST
+   and LOST_RUINS, then repeats the same six. The first of the four
+   integers is 0 through the first pass and 1 through the second, so it
+   reads as the round number [inferred]. CHAMPB and CHAMPC add RED_CITY
+   and GREAT_WALL and run to 32 races.
+
+   The 01 variants are the data-disk sets and follow their own track
+   list: they use FUN_FAIR and SEA_OF_SAND and drop ROCK_FOREST and
+   LOST_RUINS, matching LIST01.BPT exactly.
+
+   The second name is NONE in almost every record. Where it is not, it
+   repeats the name of the following record's track, which suggests a
+   link between consecutive races rather than a property of one race
+   [guess].
+
+4.  The bike manifests
+
+   The four bike files are almost entirely strings: an ordered manifest
+   of every asset the bike needs [verified]. MOTOSPD.BPT, for the Speed
+   bike, lists 58 and they fall into groups:
+
+   +------------------------------+--------------------------------------------+
+   | Group                        | Examples                                   |
+   +==============================+============================================+
+   | texture banks                | bnk00_00.raw, bnk00_01.raw                 |
+   +------------------------------+--------------------------------------------+
+   | skeleton                     | corps.skl                                  |
+   +------------------------------+--------------------------------------------+
+   | wheels                       | rouear.3df and .map, roueav.3df and .map   |
+   +------------------------------+--------------------------------------------+
+   | body, three levels of detail | medium\corps, kawalow, kawavlow            |
+   +------------------------------+--------------------------------------------+
+   | cockpit                      | guidon, cockpit                            |
+   +------------------------------+--------------------------------------------+
+   | riding animations            | static, gauche, droite, saut, derap*       |
+   +------------------------------+--------------------------------------------+
+   | crash and finish             | chuteDos, fin2, fin3, fin7, fin8, finautre |
+   +------------------------------+--------------------------------------------+
+   | podium animations            | data\podium\a1 through f1                  |
+   +------------------------------+--------------------------------------------+
+   | characteristics              | MotoCarac then carac1.spt to carac8.spt    |
+   +------------------------------+--------------------------------------------+
+
+   That last group is the join to formats/bpt-carac.txt. Each bike names
+   eight carac files, the eight per-bike characteristic tables of 73
+   values each, and they live inside the bike's bank rather than in
+   DATA. Four bikes times eight tables is the 32 CARAC files already
+   documented [verified].
+
+   MOTOKTM.BPT carries twelve more entries than MOTOSPD.BPT, all of them
+   stunt animations named sautdelire, and several are prefixed with _1_,
+   _2_ or _3_. The prefix is on the string itself, not a separate field,
+   so the loader must strip it. The pocket-bike files reuse the full-
+   size bikes' animation paths in places, for example PKTSPEED referring
+   to data\speed\ for its finish animations.
+
+   A _<DIGIT>_ ENTRY IS FOLLOWED BY TWO VALUES, and a reader that does
+   not consume them desynchronises the stream. maybe_Bike_ReadManifest
+   calls FUN_00425080 twice for exactly those entries. "___name" is NOT
+   one of them - isdigit('_') is false - so it carries no values, and
+   MOTOKTM has both forms:
+
+       _1_data\ktmcross\sautdelire.rot     800   0
+       _3_data\ktmcross\sautdelire5c.rot  1200   0
+       ___data\ktmcross\sautdelire5b.rot    (none)
+
+   [verified]
+
+   +----------+---------+---------+--------------+--------------+
+   | manifest | strings | records | marker after | values to    |
+   |          |         |         | n strings    | skip         |
+   +==========+=========+=========+==============+==============+
+   | MOTOSPD  |      58 |      58 |           49 |            0 |
+   +----------+---------+---------+--------------+--------------+
+   | PKTSPEED |      -  |      -  |           49 |            0 |
+   +----------+---------+---------+--------------+--------------+
+   | PKTKTM   |      -  |      -  |           54 |            6 |
+   +----------+---------+---------+--------------+--------------+
+   | MOTOKTM  |      72 |      90 |           63 |           18 |
+   +----------+---------+---------+--------------+--------------+
+
+   THE STREET MANIFESTS HAVE NONE, which is why a sequential reader
+   looks correct until a KTM track is loaded. The original never
+   notices: it finds MotoCarac by KEY with Settings_ReadString and
+   rewinds the file first, so the stunt list cannot mislead it. Any
+   port that scans for the marker instead must handle this.
+
+5.  Saved configuration
+
+   CONFIG.BPT is a player name followed by about fifty settings. The two
+   copies in DATA differ in ways that read as real preferences: a sample
+   rate of 11025 against 22050, and three volume values of 32 against 19
+   [verified]. One stores a five-character player name and the other
+   DSIZZZ.
+
+   This resolves a question left open in formats/bpt.txt. The leading
+   value of CONFIG.BPT was recorded there as a plain count of 5 that
+   matched nothing in the file. It is not a count: it is the length
+   prefix of the player name that follows. The same applies to the
+   leading 23 in
+   MOTOSPD.BPT, which is the length of data\speed\bnk00_00.raw
+   [verified].
+
+5a. Pocket mode is a second bike manifest
+
+   LEVEL.BPT NAMES TWO, and a reader that takes only the first can
+   never load a pocket bike:
+
+       record 7   FileMoto, keyed     data\motoSpd.spt
+       record 8   unkeyed follow-on   data\PktSpeed.spt
+
+   ILE01 gives motoSpd/PktSpeed, ILE05 gives motoKTM/pktKTM, so all
+   four of the manifests in DATA are reachable this way. There is no
+   FilePocket key - record 8 trails FileMoto exactly as the .map
+   paths trail each mesh key.  [verified]
+
+   THE CHOICE IS ONE GLOBAL. Game_LoadBikeAndBanks at 0x0040a5bb:
+
+       MOV EAX,[g_nPocketBikeSelected]   0x004dc078
+       TEST EAX,EAX
+       JZ  push 0x51d068                 record 7, full size
+       PUSH 0x51d0a8                     record 8, pocket
+
+   read live as 1 with pocket selected in the menu.  [verified]
+
+   SO POCKET IS NOT A BIKE VARIANT. It is a different manifest
+   naming different models, banks, .rot animations and carac files -
+   which is why a port that ignores it shows the full-size bike no
+   matter what the menu says.
+
+
+6.  Open questions
+
+   o The ON/OFF flag and the trailing 2, 3 or 4 in the track list are
+     unexplained. Reading MenuPage23_DataDisk_Tick or
+     MenuPage06_RaceSelect_Tick, which parse these files, would settle
+     both.
+
+   o Three of the four integers in a championship race record are 0 in
+     every file. Only the first varies, and only between 0 and 1.
+
+   o The second track name in a race record is NONE in almost every
+     case. What the exceptions mean is unknown.
+
+   o RESOLVED. maybe_Bike_ReadManifest at 0x00429e20 strips them while
+     reading the PilotRot list: an entry starting '_' followed by a
+     digit has the digit stored as a separate index in a parallel table,
+     and the path is taken from character 3 onward. See subsystems/bike-
+     assets.txt section 1.
+
+   o ANSWERED. All 51 records are named, from the call order in
+     Settings_LoadAll. See subsystems/config-file.txt.

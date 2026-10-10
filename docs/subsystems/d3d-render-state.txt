@@ -1,0 +1,494 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                           D3D RENDER STATE
+
+
+Abstract
+
+   The hardware path changes render state in two places: a bulk block
+   written once per execute buffer, and six small emitters called from
+   inside the queue walk in D3D_DrawScene. The bulk block was already
+   recorded in d3d-execute-buffers.txt section 2. This note covers the
+   six, which were unnamed, undocumented, and are the half of the
+   hardware seam that renderer.txt section 3.4 was missing.
+
+   Between them they decide blending, texture filtering and dithering
+   for every primitive the game draws, and they answer two questions
+   this project had left open - what DAT_0053be0c selects, and what
+   bit 3 of the primitive-kind feature table means.
+
+   +-----------------------------+------------+
+   | Item                        | Address    |
+   +=============================+============+
+   | D3D_SetBlendMode            | 0x0041dde0 |
+   +-----------------------------+------------+
+   | D3D_SetBlendModeFlatAlpha   | 0x0041e000 |
+   +-----------------------------+------------+
+   | D3D_SetBlendModeSrcAlpha    | 0x0041e1b0 |
+   +-----------------------------+------------+
+   | D3D_SetTextureFilter        | 0x0041e2b0 |
+   +-----------------------------+------------+
+   | D3D_SetDither               | 0x0041e380 |
+   +-----------------------------+------------+
+   | D3D_InvalidateBatch         | 0x0041e730 |
+   +-----------------------------+------------+
+   | D3D_EmitRenderStates        | 0x0041a0a0 |
+   +-----------------------------+------------+
+   | the consumer, D3D_DrawScene | 0x004af570 |
+   +-----------------------------+------------+
+
+Table of Contents
+
+   1. Two layers of state
+   2. The instruction, and where it is written
+      2.1. Four render states not previously catalogued
+   3. Blend mode is chosen by primitive kind
+      3.1. The half blend, and why both factors are INVSRCALPHA
+      3.2. The alpha byte is stamped into the flat colour
+   4. The four caches
+      4.1. The batch key is the interesting one
+   5. Texture filtering is bit 3 of the feature table
+   6. Dithering
+   7. What a D3D9 back end does with this
+   8. Open questions
+
+
+1.  Two layers of state
+
+   D3D_EmitRenderStates at 0x0041a0a0 runs once per execute buffer,
+   from D3D_BeginExecuteBuffer, and installs twelve or thirteen states
+   in one instruction - shade mode, Z enable, Z func, fill mode,
+   specular, antialias and the rest. Those are the defaults for the
+   whole buffer and they do not change while it is being filled
+   [verified].
+
+   The six emitters in this note are called from inside the bucket walk
+   in D3D_DrawScene, once per primitive, and each appends a further
+   D3DOP_STATERENDER ahead of the geometry it applies to. They are
+   therefore the dynamic layer: everything that varies between one
+   primitive and the next [verified].
+
+   +------------+------------------------------------+------------------------------------------+
+   | Address    | Name and arguments                 | Render states it can emit                |
+   +============+====================================+==========================================+
+   | 0x0041dde0 | D3D_SetBlendMode(enable, useAlpha) | SRCBLEND DESTBLEND ALPHABLENDENABLE      |
+   |            |                                    | STIPPLEDALPHA ALPHATESTENABLE            |
+   |            |                                    | TEXTUREMAPBLEND                          |
+   +------------+------------------------------------+------------------------------------------+
+   | 0x0041e000 | D3D_SetBlendModeFlatAlpha(enable)  | the same set, minus the PowerVR choice   |
+   +------------+------------------------------------+------------------------------------------+
+   | 0x0041e1b0 | D3D_SetBlendModeSrcAlpha(enable)   | ALPHABLENDENABLE SRCBLEND DESTBLEND      |
+   |            |                                    | ALPHATESTENABLE TEXTUREMAPBLEND          |
+   +------------+------------------------------------+------------------------------------------+
+   | 0x0041e2b0 | D3D_SetTextureFilter(linear)       | TEXTUREMAG TEXTUREMIN                    |
+   +------------+------------------------------------+------------------------------------------+
+   | 0x0041e380 | D3D_SetDither(enable, force)       | DITHERENABLE                             |
+   +------------+------------------------------------+------------------------------------------+
+   | 0x0041e730 | D3D_InvalidateBatch()              | none - one store, see section 4.1        |
+   +------------+------------------------------------+------------------------------------------+
+
+   FIVE of the six are __thiscall on g_pCd3d (0x00624afc), and every
+   call site in D3D_DrawScene loads ECX from that global before the
+   call [verified]. An earlier revision of this note said all six; that
+   was wrong. D3D_InvalidateBatch is __stdcall and takes no arguments -
+   it writes one global and never touches the Cd3d object. Grouping it
+   with the other five describes what it does, not how it is called.
+
+   THE FIVE NOW CARRY MR_Cd3d * ON this. The signature pass
+   had recorded that as impossible and section 8.6 closes it: a
+   __thiscall auto-this cannot be retyped as a parameter, but it can be
+   typed by putting the method in a GhidraClass whose name matches the
+   structure. Their bodies now read
+
+       this->pInstrCursor
+
+   where they read *(int *)(param_1 + 8) before, so the cursor
+   arithmetic in section 2 is legible directly in the decompiler rather
+   than only in this note.
+
+   Note the two sides live in different translation units. D3D_DrawScene
+   at 0x004af570 is in the screen3d\screen3d.cpp region; all six
+   emitters, and the geometry emitters they sit alongside, are in
+   Dsi_d3d.cpp. So the hardware seam is a file boundary too, which is
+   convenient for a port: Dsi_d3d.cpp is the file to replace, and
+   screen3d.cpp is the caller that stays. See code-map.txt.
+
+
+2.  The instruction, and where it is written
+
+   Each emitter writes a D3DINSTRUCTION and its payload straight into
+   the execute buffer through a cursor held in the Cd3d object, and
+   advances it. Two cursors are now confirmed [verified]:
+
+   +-----------+-----------------------------------------------------+
+   | Field     | Use                                                 |
+   +===========+=====================================================+
+   | Cd3d+0x04 | vertex write cursor, stepped 0x20 per D3DTLVERTEX   |
+   +-----------+-----------------------------------------------------+
+   | Cd3d+0x08 | instruction write cursor, stepped 4 for the header  |
+   |           | then 8 per D3DSTATE                                 |
+   +-----------+-----------------------------------------------------+
+
+   The encoding is the one already recorded in d3d-execute-buffers.txt
+   section 2 - BYTE bOpcode = 8 D3DOP_STATERENDER, BYTE bSize = 8,
+   WORD wCount, then wCount records of { DWORD stateType, DWORD value }.
+   The emitters compute wCount up front and write it before the
+   payload rather than patching it afterwards, which is why the count
+   appears as a literal 3, 4, 5 or 6 in the disassembly [verified].
+
+2.1.  Four render states not previously catalogued
+
+   The table in d3d-execute-buffers.txt section 2 was drawn from
+   D3D_EmitRenderStates alone. These four appear only in the dynamic
+   layer and should be read as additions to it [verified]:
+
+   +------+-----+------------------------------------------------+
+   | Hex  | Dec | D3DRENDERSTATE_                                |
+   +======+=====+================================================+
+   | 0x11 | 17  | TEXTUREMAG                                     |
+   +------+-----+------------------------------------------------+
+   | 0x12 | 18  | TEXTUREMIN                                     |
+   +------+-----+------------------------------------------------+
+   | 0x13 | 19  | SRCBLEND                                       |
+   +------+-----+------------------------------------------------+
+   | 0x14 | 20  | DESTBLEND                                      |
+   +------+-----+------------------------------------------------+
+
+   With those, every state number the binary emits decodes against
+   D3DRENDERSTATETYPE, and every value against D3DBLEND,
+   D3DTEXTUREFILTER, D3DTEXTUREBLEND, D3DSHADEMODE or D3DCMP. Nothing
+   in the stream is a private encoding.
+
+
+3.  Blend mode is chosen by primitive kind
+
+   The selection is a flat ladder on the primitive kind word at +0x3a,
+   at 0x004afaac to 0x004afb65 [verified]:
+
+   +---------------------+------------------------------+-----------------------------+
+   | Kind                | Call                         | Resulting SRC / DEST        |
+   +=====================+==============================+=============================+
+   | 0x44, 0x45          | D3D_SetBlendModeFlatAlpha(1) | INVSRCALPHA / INVSRCALPHA   |
+   +---------------------+------------------------------+-----------------------------+
+   | 0x0c                | D3D_SetBlendMode(1, 0)       | ONE / SRCCOLOR              |
+   +---------------------+------------------------------+-----------------------------+
+   | 0x2c, 0x3e          | D3D_SetBlendMode(1, 1)       | INVSRCALPHA / INVSRCALPHA,  |
+   |                     |                              | or SRCALPHA / INVSRCALPHA   |
+   |                     |                              | on PowerVR                  |
+   +---------------------+------------------------------+-----------------------------+
+   | textured, and the   | D3D_SetBlendModeSrcAlpha(1)  | SRCALPHA / INVSRCALPHA      |
+   | bank carries alpha  |                              |                             |
+   +---------------------+------------------------------+-----------------------------+
+   | everything else,    | D3D_SetBlendMode(0, 0)       | blending off                |
+   | including 0 and 5   |                              |                             |
+   +---------------------+------------------------------+-----------------------------+
+
+   The textured-with-alpha row is the only conditional one. It is
+   taken when -Alpha (DAT_004dc1c0) or DAT_004dc1bc is set, AND the
+   bank record flags word has both bit 0x10 and bit 0x02, AND the
+   primitive is textured. Otherwise that case falls through to
+   blending off [verified].
+
+   "TEXTURED" HERE IS THE STATE MASK'S BIT 0, which D3D_DrawScene
+   builds FROM THE KIND ALONE - set for anything that is not kind 0, 5
+   or 0x0c - without asking whether a texture is actually bound
+   [verified]. That is NOT the same test as the colour-route selector
+   of structs/MR_Vertex.txt section 6.5, which additionally requires a
+   bound texture slot. The two overlap and a primitive can satisfy one
+   and not the other.
+
+   THOSE TWO BITS NOW HAVE MEANINGS. texture-banks.txt section 5.2
+   decodes MR_Bank.flags from the two functions that set it:
+
+       0x02  the texture source is 16-bit
+       0x10  a colour key was applied
+
+   So the condition reads "a colour-KEYED 16-BIT texture", which is
+   exactly the case that needs real per-texel alpha rather than the
+   half blend of section 3.1 - a keyed texture has genuinely
+   transparent texels, and blending them at a flat 50 percent would
+   show the key colour through. The rule is not arbitrary.
+
+   The address given in an earlier draft as 0x004f954c is the flags
+   field of BANK 0. The bank array base is 0x004f92f8 and flags is at
+   +0x254; that draft treated 0x004f9300 as the base, which made every
+   offset 8 bytes short. See texture-banks.txt section 1.
+
+   So there are exactly three blends in the whole hardware renderer:
+   half, add-modulate, and conventional source alpha. Everything else
+   is opaque.
+
+3.1.  The half blend, and why both factors are INVSRCALPHA
+
+   SRCBLEND and DESTBLEND are BOTH set to 6 D3DBLEND_INVSRCALPHA on
+   non-PowerVR hardware. That looks like a mistake and is not
+   [verified].
+
+   The alpha the primitive carries is 0x80 - see section 3.2 - so
+   1 - srcAlpha is 0.5, and the blend evaluates to
+
+       dst = 0.5 * src + 0.5 * dst
+
+   a symmetric half blend. PowerVR gets SRCALPHA / INVSRCALPHA, the
+   conventional pair, which with the same 0.5 produces the identical
+   result. Two routes to one appearance, presumably because one of the
+   two combinations was unsupported or wrong on some 1997 part
+   [inferred - the code states the split, not the reason].
+
+   o For a port this is worth reading twice. The naive translation
+     "SRCBLEND was INVSRCALPHA, so set D3DBLEND_INVSRCALPHA" is
+     faithful, but the INTENT is a 50 percent blend, and it only comes
+     out at 50 percent because the alpha is hardcoded to 0x80. If a
+     port ever lets that alpha vary, the non-PowerVR pair stops being
+     equivalent to the PowerVR one and the two diverge.
+
+   The odd one out is kind 0x0c, which takes ONE / SRCCOLOR -
+   additive modulated by the source colour, a brightening blend rather
+   than a transparency one.
+
+3.2.  The alpha byte is stamped into the flat colour
+
+   Immediately before the state selection, D3D_DrawScene forces the
+   top byte of the primitive colour at DAT_00709370 [verified]:
+
+       *(byte *)(prim + 0x3f) = 0xff;          /* the record own copy */
+       if (kind == 0x2c || kind == 0x3e || kind == 0x0c ||
+           (kind == 0x44 && g_devDoesAlphaFlatStippled))
+           *(byte *)0x00709373 = 0x80;         /* alpha = 0x80 */
+
+   0x00709373 is the high byte of DAT_00709370, so this sets the alpha
+   of the flat colour to 0x80 for exactly the kinds that will be
+   blended. That is where the 0.5 of section 3.1 comes from, and it is
+   the reason the half blend works out.
+
+
+4.  The four caches
+
+   The dynamic layer would emit a state block per primitive if it were
+   naive. It is not - each emitter holds a cached copy of what it last
+   sent and skips the write when nothing changed [verified]:
+
+   +------------+--------------------+---------------------------------------+
+   | Global     | Caches             | Seeded by                             |
+   +============+====================+=======================================+
+   | 0x004e4f2c | blend on / off     | D3D_EmitRenderStates, to 0            |
+   +------------+--------------------+---------------------------------------+
+   | 0x004e4f34 | texture filter     | D3D_SetTextureFilter itself           |
+   +------------+--------------------+---------------------------------------+
+   | 0x004e4f38 | dither             | D3D_EmitRenderStates, to              |
+   |            |                    | (DAT_004e4f14 == 1)                   |
+   +------------+--------------------+---------------------------------------+
+   | 0x004e4f3c | the open batch key | everything, to -100                   |
+   +------------+--------------------+---------------------------------------+
+
+   The first three are ordinary redundant-state elimination. The
+   fourth is not a state at all.
+
+4.1.  The batch key is the interesting one
+
+   D3D_EmitTriangle does not emit one instruction per triangle. It
+   opens a D3DOP_TRIANGLE header with wCount 0, remembers its address
+   in DAT_0053bcf0, and increments that count in place for every
+   subsequent triangle - so a run sharing one texture costs one
+   header. What closes a batch is the key it is handed differing from
+   DAT_004e4f3c.
+
+   D3D_InvalidateBatch writes -100 into that key, a value no real key
+   takes, which forces the next triangle or line to re-emit
+   TEXTUREHANDLE and start a fresh header. Every state emitter ends by
+   writing it inline, for the obvious reason: a state change that
+   landed in the middle of an open batch would otherwise apply to
+   triangles already counted in it [verified].
+
+   D3D_DrawScene also calls it standalone at two points the emitters
+   do not cover [verified]:
+
+   o the texture slot bound for a bank changed - the cache for that is
+     per-bank at 0x004f9620 + bank*0x338
+   o the assembled state mask changed, where the mask is bit 0
+     textured, bit 3 blended, bit 4 has a texture slot
+
+   That mask is also what D3D_EmitTriangle tests bit 0 of to decide
+   whether to emit a real texture handle or zero.
+
+   o For a port: this is a batching optimisation, not semantics. A
+     D3D9 back end that sets state per draw call and never batches
+     produces identical output, more slowly. The one thing to preserve
+     is the ORDER - state before the geometry it applies to - which
+     falls out naturally from any immediate-mode translation.
+
+
+5.  Texture filtering is bit 3 of the feature table
+
+   D3D_SetTextureFilter emits TEXTUREMAG and TEXTUREMIN together, both
+   set to 2 D3DFILTER_LINEAR or 1 D3DFILTER_NEAREST. There is no
+   mipmapping - the values 3 to 6 of D3DTEXTUREFILTER, which are the
+   MIP ones, are never written anywhere in the state stream
+   [verified].
+
+   It has two callers, and each answers a question [verified]:
+
+   o D3D_EmitRenderStates passes DAT_0053be0c directly, once per
+     buffer. So DAT_0053be0c is the bilinear filtering switch.
+     renderer-mode.txt recorded stored renderer mode 2 as "mode 0 with
+     DAT_0053be0c = 1" and could not say what distinguished the two
+     hardware variants. It is filtering: mode 0 is hardware point
+     sampled, mode 2 is hardware bilinear. The global is written by
+     Main_InitAndParseCommandLine and Settings_LoadAll, persisted by
+     Settings_SaveAll, and toggled live by a key in Input_OnKeyDown at
+     0x00431a91 / 0x00431a9f.
+
+   o D3D_DrawScene passes ((&DAT_006d1f88)[kind] & 8) == 0, per
+     primitive, and only when DAT_0053be0c is non-zero. So bit 3 of
+     the primitive-kind feature table of renderer.txt section 3.5.3
+     means "do not filter this kind". That is one of the eight bits
+     decoded.
+
+   Note the array is dwords - the access is [kind*4 + 0x6d1f88] - so
+   the feature table is 0x46 dwords, not bytes.
+
+   The function also declines to emit anything if the requested value
+   already matches DAT_004e4f34, and forces the value to 0 when
+   DAT_0053be0c is clear, so filtering off is sticky rather than
+   re-asserted per primitive.
+
+
+6.  Dithering
+
+   D3D_SetDither emits DITHERENABLE alone, guarded by the cache at
+   DAT_004e4f38 unless its second argument forces the write. Its
+   configuration global is DAT_004e4f14, the -NoDither setting
+   [verified].
+
+   D3D_DrawScene skips the call entirely when DAT_004e4f14 is -1, and
+   otherwise passes 0 in place of DAT_004e4f14 when the vertex flag
+   bit 0x40000000 is set. So that vertex bit suppresses dithering for
+   its primitive - a per-primitive override of a global setting
+   [verified].
+
+   The same bit is passed to D3D_EmitTriangle and D3D_EmitLine in the
+   high byte of their first argument, so it is read twice for two
+   purposes.
+
+   RESOLVED. The bit means FULL BRIGHT. D3D_WriteVertex reads the same
+   vertex word and, when bit 30 is set, writes a white diffuse colour
+   instead of looking up a shade - see structs/MR_Vertex.txt section
+   6.2 [verified]. Suppressing dither for it is consistent: an
+   unshaded white vertex has no gradient to dither.
+
+   The word at vertex +0x0c is packed - an 8-bit intensity at bits
+   10..17, bit 30 full bright, bit 31 "the low 24 bits are a literal
+   colour". That section has the whole layout.
+
+
+7.  What a D3D9 back end does with this
+
+   Every state in the dynamic layer has a direct D3D9 equivalent, and
+   nothing here is execute-buffer specific except the encoding
+   [verified as to the source side]:
+
+   +--------------------------+------------------------------------------------+
+   | Existing state           | D3D9                                           |
+   +==========================+================================================+
+   | SRCBLEND / DESTBLEND     | D3DRS_SRCBLEND / D3DRS_DESTBLEND, same enum    |
+   |                          | values                                         |
+   +--------------------------+------------------------------------------------+
+   | ALPHABLENDENABLE         | D3DRS_ALPHABLENDENABLE                         |
+   +--------------------------+------------------------------------------------+
+   | ALPHATESTENABLE          | D3DRS_ALPHATESTENABLE - always 0 here          |
+   +--------------------------+------------------------------------------------+
+   | DITHERENABLE             | D3DRS_DITHERENABLE                             |
+   +--------------------------+------------------------------------------------+
+   | TEXTUREMAG / TEXTUREMIN  | SetSamplerState MAGFILTER / MINFILTER          |
+   +--------------------------+------------------------------------------------+
+   | TEXTUREMAPBLEND          | no equivalent - see below                      |
+   +--------------------------+------------------------------------------------+
+   | STIPPLEDALPHA            | dropped - no equivalent, and it is a fallback  |
+   +--------------------------+------------------------------------------------+
+   | TEXTUREHANDLE            | SetTexture                                     |
+   +--------------------------+------------------------------------------------+
+
+   Two need a decision rather than a translation:
+
+   o TEXTUREMAPBLEND was removed after DirectX 6 in favour of texture
+     stage states. The binary only ever sets it to 2 MODULATE or 1
+     DECAL, chosen once in D3D_EnumDeviceCallback from the device
+     dwTextureBlendCaps bit D3DPTBLENDCAPS_MODULATE - modulate if
+     supported, decal otherwise. On any modern part modulate is
+     supported, so a port hardcodes the modulate stage setup:
+     COLOROP = MODULATE, COLORARG1 = TEXTURE, COLORARG2 = DIFFUSE
+     [verified as to what the binary chooses].
+
+   o STIPPLEDALPHA is only emitted when the device lacks
+     DoesAlphaFlatBlend, i.e. it is the 1997 fallback for hardware
+     that could not blend a flat alpha and faked it with a stipple
+     pattern. A modern back end always has real blending, so this
+     whole branch - and the wCount 6 and 4 variants that carry it -
+     can be dropped. Dropping it is what makes the emitters simpler in
+     a port, not more complex.
+
+   ALPHABLENDENABLE takes DAT_004e4f10, which Cd3d_Ctor sets to the
+   constant 1 and nothing ever changes, so it reads as a literal TRUE
+   [verified].
+
+
+8.  Open questions
+
+   o RESOLVED. All eight bits of the feature table at DAT_006d1f88 are
+     decoded in detail-levels.txt - it is the level-of-detail system.
+     Bit 3 is corroborated there by a second consumer, FUN_004232e0 at
+     0x00423393, which computes DoesFilter && !(bits & 8) using the
+     device capability that d3d-textures.txt section 8.11 names from
+     the game's own diagnostic format strings.
+   o What sets the vertex flag bit 0x40000000 that suppresses
+     dithering, and what it marks geometrically.
+   o THREE OF THE FIVE ARE NOW IDENTIFIED, from their software span
+     fillers [verified]:
+         0x0c  untextured translucent polygon - dst/2 + flatColour/2
+         0x2c  colour-keyed textured, 50/50 blended, AFFINE
+         0x3e  the same, PERSPECTIVE-CORRECT
+     They are the three kinds carrying feature bit 4, which
+     detail-levels.txt section 2.6 establishes as translucency, and
+     0x2c and 0x3e differ by exactly bit 5 - the perspective bit. So
+     the hardware half blend of section 3.1 and the software half
+     blend are one operation seen from two back ends.
+   o 0x44 and 0x45 are still unidentified, but the search has been
+     narrowed considerably and NO PRODUCER WAS FOUND. Four methods
+     came up empty [verified]:
+
+       1  no immediate store of 0x44 or 0x45 to memory exists anywhere
+          in the image - a scan of all 239,429 instructions for
+          MOV [mem], 0x44 and MOV [mem], 0x45 returns nothing
+       2  the four face constructors (FUN_00422be0, FUN_00422c80,
+          FUN_00422d20, FUN_00422ed0) are never called with either
+          kind; the kinds their fifteen call sites pass are
+          0, 1, 2, 8, 0x0c, 0x0d, 0x10, 0x15, 0x26 and 0x27
+       3  the .map loader cannot produce them - mesh-3df-map.txt
+          section 5 lists the kinds its flag bits select, and neither
+          is among them
+       4  neither has a g_spanTable record, so the software rasterizer
+          could not draw one if it existed
+
+     What DOES reference them is D3D_DrawScene, which routes both to
+     D3D_SetBlendModeFlatAlpha and stamps alpha 0x80 into 0x44's flat
+     colour when the device reports DoesAlphaFlatStippled. Their
+     presence in the feature table proves nothing, since Screen3D_Open
+     builds an entry for all 0x46 kinds by construction.
+
+     So they look like DEAD KINDS - a hardware blend path with no
+     geometry that selects it [inferred]. That is not proven: a kind
+     written through a register rather than an immediate would escape
+     method 1, and 0x44 and 0x45 are too common as small integers to
+     search for as register loads. The honest position is that the
+     obvious producers have been ruled out and the non-obvious ones
+     have not been searched.
+
+     o FOR A PORT: implement D3D_SetBlendModeFlatAlpha anyway - it is
+       four render states - but do not spend effort reproducing
+       whatever selects it until something is seen to.
+   o Why kind 0x0c alone takes ONE / SRCCOLOR, and whether it is the
+     only additive primitive in the game.
+   o DAT_004e4f24 and DAT_004e4f28, adjusted at the top of
+     D3D_DrawScene, are not identified. They look like a buffer count
+     and a high-water mark [guess].

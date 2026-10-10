@@ -1,0 +1,3774 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       THE MENU PAGE STATE MACHINE
+
+
+Abstract
+
+   The menus are a table-driven state machine. A single table of 28
+   records at 0x004dbb38 holds an enter, tick and leave handler for each
+   page, and three small functions in menu.cpp drive it. This note
+   records the table layout, all 68 handlers, what each page is, and the
+   transition graph between them.
+
+   The table was found by the data-pointer sweep in docs/ghidra-db-
+   repairs.txt section 7.2.2. Eleven of its handlers were reachable only
+   through it and had never been disassembled, including a 4884-byte
+   function that nothing in the database had seen.
+
+   Twenty of the 27 live pages are identified from the menu sprites they
+   load. See section 3 for how, and docs/subsystems/menu-resources.txt
+   for the resource table itself.
+
+Table of Contents
+
+   1. The table
+      1.1. Record layout
+         1.1.1. The field order is tick before enter
+      1.2. How a page runs
+         1.2.1. Leave cannot animate, so transitions are not leave
+                handlers
+      1.3. The three driver functions
+   2. The 28 pages
+   2.1. The sprite pointer table
+   2.2. Page 14 against retail
+      2.2.1. The animation tables
+      2.2.2. The phase gates the model draws
+      2.2.3. Which axis each half of the ellipse spin turns about
+      2.2.4. The title meshes are double-sided billboards
+      2.2.5. Matrix34_FromEuler was mis-transcribed, and how it was
+             caught
+   2.3. Page 15, transcribed
+        2.3.1. Page 15 is modal, and not through the text
+               capture
+      2.3.1. The keyboard grid
+      2.3.2. The fly-in
+      2.3.3. THE MESHES ARE MIRRORED TWICE, AND THE TWO CANCEL
+         2.3.3.1. The mirror runs on EVERY entry, not just the first
+      2.3.4. What the reconstruction has
+      2.3.5. The tick: the wave, the selection and the exit
+      2.3.6. Not yet read
+   2.4. Page 11, the options screen
+      2.4.1. Enter, which is small and transcribable now
+      2.4.2. The tick, and what it needs
+      2.4.3. RESOLVED: the labels are in .data, six per language
+      2.4.4. The rows are interactive, and the index is the id
+      2.4.5. The volumes are the Windows mixer, and ours are not
+      2.4.6. What the reconstruction does, and what it says instead
+   2.5. Page 5, mode select - transcribed
+      2.5.1. One flag decides the whole page
+      2.5.2. The sprites, and a convention that reverses
+      2.5.3. The music does not restart, and that is the point
+      2.5.4. What the reconstruction has
+   2.6. Page 6, race select - transcribed
+      2.6.1. Three pages in one, and the lap forcing explains it
+      2.6.2. The time-attack toggle comes and goes
+      2.6.3. The distance is reset by the TRACK, not by the page
+      2.6.4. The track art is per track and loaded on demand
+      2.6.5. The buttons, and they are rebuilt every frame
+      2.6.6. What the reconstruction has
+   2.7. Page 10, bike select - transcribed except the bike
+      2.7.1. The eight bikes are the eight carac files
+      2.7.2. The stat bars, and where the numbers come from
+      2.7.3. The gearbox is two three-state rows
+      2.7.4. The bike, and the four constants that make it work
+         2.7.4.1. Four constants the decompiler had hidden
+         2.7.4.2. Why the bike drew white, and it was not page 10
+         2.7.4.3. The liveries are palettes, and that is why the mask
+                  is 7
+         2.7.4.4. The bike pivoted about its rear wheel
+         2.7.4.5. Blurry wheels: a missing half texel, and a filter
+         2.7.4.6. The bike change is a camera pan, not a moving bike
+            2.7.4.6.1. The two constants, and why they are scaled by
+                       the cosine
+            2.7.4.6.2. The eight frames, drawn out
+            2.7.4.6.3. What the reconstruction does
+         2.7.4.7. The camera is lifted twice, by different amounts
+      2.7.5. What is still not here
+      2.7.6. The empty panel, and what does NOT fill it
+   2.8. Page 2, protocol - graphics and CANCEL
+   2.9. Page 9, results - the screen a quit race lands on
+      2.9.1. The sprites
+      2.9.2. The button set is the mode
+      2.9.3. Where each button goes
+      2.9.4. The two captions, and their colours
+      2.9.5. The congratulation, and the INIT placeholder
+   3. How the pages were identified
+      3.1. Method
+      3.2. Defining resources per page
+      3.3. What the name prefixes mean
+   4. Transitions
+      4.1. The startup chain
+      4.2. Sources that are not page handlers
+      4.3. The cinematic intro, scoped
+         4.3.1. The shatter, end to end
+            4.3.1.1. MenuGlass_BuildShards, and how random it is
+            4.3.1.2. Menu_DrawTransitionEffect, per frame
+            4.3.1.3. What fills bank 2
+               4.3.1.3.1. Why OUR shatter looked resampled, and it was two
+                    separate things
+      4.3.1.4. Retail shatters BLACK on the D3D path, and why
+         4.3.2. Page 25 needs almost nothing new
+         4.3.3. Order of work
+         4.3.4. What page 25 enter does, transcribed
+         4.3.5. Page 25 tick: the tables, and the three branches
+         4.3.6. The D/S/I spiral, and why it read as impenetrable
+         4.3.7. The logo sprite is loaded and never drawn
+         4.3.8. Mesh_CenterOnBounds, and why the letters piled up
+         4.3.9. The depth buffer was fed a constant
+         4.3.10. The keyed blend switched the depth buffer off
+   5. Naming in the database
+   6. Open questions
+   7. Which pages need the renderer
+      7.1. Page 1 is the one whose DRAWING is sprite-only
+      7.1.1. What the reconstruction has, and the two things it does
+             not
+
+1.  The table
+
+   g_menuPageTable, 0x004dbb38 to 0x004dbcf7. 28 records of 16 bytes.
+   The index is the current page number, held in the menu object at byte
+   offset +0x3c [verified].
+
+1.1.  Record layout
+
+   +--------+------+------+-------------+--------------------------------------------+
+   | Offset | Size | Type | Name        | Notes                                      |
+   +========+======+======+=============+============================================+
+   | 0x00   | 4    | int  | initialised | 0 until the enter handler has run          |
+   +--------+------+------+-------------+--------------------------------------------+
+   | 0x04   | 4    | fn   | fnTick      | called every frame; never NULL in practice |
+   +--------+------+------+-------------+--------------------------------------------+
+   | 0x08   | 4    | fn   | fnEnter     | called once on entry; may be NULL          |
+   +--------+------+------+-------------+--------------------------------------------+
+   | 0x0c   | 4    | fn   | fnLeave     | called on exit; may be NULL                |
+   +--------+------+------+-------------+--------------------------------------------+
+
+   All three handlers are called with no arguments and return nothing.
+   They reach the menu object through a global, not through a parameter.
+
+   The initialised flag lives inside the record rather than in the menu
+   object, so it is per page. Both Menu_SetPage and Menu_GotoPage clear
+   it for the incoming page, which is what makes the enter handler run
+   again on every visit [verified].
+
+1.1.1.  The field order is tick before enter
+
+   WORTH STATING SEPARATELY BECAUSE IT CATCHES PEOPLE. The record order
+   is initialised, fnTick, fnEnter, fnLeave - the TICK pointer comes
+   first, before the enter pointer, which is not the order the handlers
+   run in.
+
+   Read straight out of the record at 0x004dbc18 [verified]:
+
+       +0x00  0            initialised
+       +0x04  0x00446b80   MenuPage14_Title_Tick
+       +0x08  0x004465f0   MenuPage14_Title_Enter
+       +0x0c  0x00446b40   MenuPage14_Title_Leave
+
+   Section 2's table lists its address columns in RUN order - enter,
+   tick, leave - which is the readable choice for a reader and the
+   wrong one for anybody cross-referencing a raw record. Check which
+   you are looking at before assuming an address is a tick.
+
+
+1.2.  How a page runs
+
+   Menu_Tick, once per frame [verified]:
+
+       if (!page.initialised) {
+           reset the menu object list
+           if (page.fnEnter) page.fnEnter();
+           page.initialised = 1;
+       }
+       if (page.fnTick) page.fnTick();
+
+   Menu_GotoPage, on a transition [verified]:
+
+       if (page.initialised) {
+           if (page.fnLeave) page.fnLeave();
+           page.initialised = 0;
+       }
+       Menu_SetPage(newIndex);
+
+   The leave handler is guarded by the same flag that gates the enter
+   handler, so leave runs if and only if enter ran. That is the
+   invariant the whole table depends on, and it is enforced in both
+   places the flag is cleared.
+
+1.2.1.  Leave cannot animate, so transitions are not leave handlers
+
+   Menu_GotoPage calls the leave handler and then Menu_SetPage in the
+   same call, with nothing between them [verified]. So leave returns
+   and the page has ALREADY changed - there is no frame in which a
+   leave handler is still running.
+
+   o THEREFORE A MULTI-FRAME EXIT EFFECT CANNOT BE A LEAVE HANDLER.
+     The glass-shatter seen between pages in retail footage
+     [observed] has to be driven from somewhere that runs every frame.
+     Menu_UpdateTransition (0x0040c500, 86 bytes) is called from every
+     page tick and is the only candidate with the right shape.
+
+   The leave handlers bear this out: MenuPage14_Title_Leave is 50
+   bytes and MenuPage15_NameEntry_Leave 165 - teardown sizes, not
+   animation.
+
+   The same division explains the ENTER handler. It runs once, on the
+   frame the page becomes current, and sets up; the animation lives in
+   the TICK, which advances its parameters every frame. Page 14 is the
+   worked example: enter loads and calls MenuPage14_Title_ResetAnim to
+   zero the parameters, and the tick integrates them.
+
+1.3.  The three driver functions
+
+   +------------+-----------------------------+------------------------------------------------+
+   | Address    | Name                        | Role                                           |
+   +============+=============================+================================================+
+   | 0x00409c00 | Menu_Tick                   | per-frame pump; runs enter then tick           |
+   +------------+-----------------------------+------------------------------------------------+
+   | 0x00409f70 | Menu_SetPage                | set index, clear the target's flag; no leave   |
+   +------------+-----------------------------+------------------------------------------------+
+   | 0x00409eb0 | Menu_GotoPage               | run leave, then tail into Menu_SetPage         |
+   +------------+-----------------------------+------------------------------------------------+
+   | 0x00409a30 | maybe_Menu_StartAttractDemo | idle timeout on the title page; goes to page 1 |
+   +------------+-----------------------------+------------------------------------------------+
+
+   Menu_SetPage does more than set an index on its first call of a menu
+   session. It disables widescreen, saves the previous screen mode, sets
+   g_cfgScreenMode to 2 and calls FUN_00499ba0(0, 0, 0x280, 0x1e0, 0,
+   0), which is 640x480, then Menu_LoadResources. So the menus run at
+   the highest of the three supported modes regardless of the configured
+   race resolution [verified].
+
+   IT IS A SAVE, AND THERE ARE TWO RESTORES [verified]. The three
+   globals go to fixed copies at 0x00409fa8..0x00409fb3 and are forced
+   to 4:3 640x480 at 0x00409fb9..0x00409fcd:
+
+       g_cfgWidescreen169  0x004dc0d4  ->  0x00504e80
+       g_cfgScreenMode     0x004dc0c8  ->  0x00504bc4
+       DAT_004dc028        0x004dc028  ->  0x0050487c
+
+   MenuPage01_Loading_Tick copies them back at 0x0040ba3e, and
+   maybe_Event_WndProc at 0x00432f9b - both on the way OUT of the
+   menu. MenuPage11_Options_Tick edits the COPY, which is why the
+   16/9 row appears to do nothing until a race loads. See
+   camera.txt 1.18.
+
+   Menu_Tick special-cases page 14, the title screen: after 30000 ms
+   with no input, or whenever g_demoMode is set, it calls
+   maybe_Menu_StartAttractDemo [verified].
+
+2.  The 28 pages
+
+   A dash means the record holds NULL for that handler.
+
+   +------+----------+----------+----------+----------------------------------+----------+
+   | Page | Enter    | Tick     | Leave    | Reading                          | Tag      |
+   +======+==========+==========+==========+==================================+==========+
+   | 0    | -        | -        | -        | sentinel - leaving the menus     | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 1    | -        | 0040b3f0 | -        | loading screen                   | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 2    | 00486860 | 00486a60 | 00486a40 | protocol - pick a DirectPlay     | verified |
+   |      |          |          |          | service provider                 |          |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 3    | 004422c0 | 00442790 | 00442730 | main menu                        | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 4    | -        | 0040bc40 | -        | second exit into the game        | inferred |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 5    | 00447250 | 00447710 | -        | mode select                      | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 6    | 00447a30 | 00448110 | 004480d0 | race select                      | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 7    | 00449100 | 00449680 | 0044a370 | multiplayer session list         | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 8    | 0044a930 | 0044aee0 | 0044aeb0 | network race lobby               | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 9    | 0044cfd0 | 0044d540 | 0044d510 | race results and standings       | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 10   | 0044e480 | 0044ed30 | 0044ecf0 | bike select                      | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 11   | 00443000 | 00443200 | -        | options                     (*)  | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 12   | 00444b10 | 00444f30 | -        | controller configuration    (*)  | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 13   | 004458a0 | 004459d0 | -        | diagnostics                      | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 14   | 004465f0 | 00446b80 | 00446b40 | title screen                     | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 15   | 00487070 | 00487bb0 | 00488790 | name entry, with the cheat check | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 16   | 0044ffd0 | 0044fdb0 | 00450050 | message page, exits to 24        | inferred |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 17   | 00450290 | 00450080 | 00450310 | message page, exits to 24        | inferred |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 18   | 00450550 | 00450340 | 004505d0 | message page, exits to 24        | inferred |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 19   | 00488850 | 00488970 | 00488840 | unidentified - smallest handler  | guess    |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 20   | 00450600 | 00450800 | -        | championship load                | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 21   | 00450d20 | 00450f40 | -        | championship save                | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 22   | 0044a390 | 0044a4f0 | 0044a4e0 | routing or placeholder page      | guess    |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 23   | 00451d10 | 004514e0 | 00451fc0 | data disk                        | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 24   | 00452240 | 00452f80 | 00452eb0 | podium                           | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 25   | 004537d0 | 00453c50 | 00453bf0 | Delphine logo, the first page    | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 26   | 00444be0 | 00444cd0 | 00444f20 | options confirm or abort         | guess    |
+   +------+----------+----------+----------+----------------------------------+----------+
+   | 27   | -        | -        | -        | empty tail record                | verified |
+   +------+----------+----------+----------+----------------------------------+----------+
+
+   (*) THESE TWO TICK HANDLERS WERE TRUNCATED IN THE DATABASE until the
+   repair in docs/ghidra-db-repairs.txt section 10. Ghidra had promoted
+   their switch case bodies to separate functions, so
+   MenuPage12_ControllerConfig_Tick decompiled as 468 bytes of a
+   2230-byte function, and MenuPage11_Options_Tick as 4991 of
+   6316.
+
+   o 6316, NOT 6280.  MenuPage11_Options_Tick runs 0x00443200 to
+     0x00444aab inclusive, and 0x00444aab is the RET; 0x00444aac
+     is the first entry of its jump table, reading 0x00444514.
+     The 4884 figure that was in src/menu.c is the same boundary
+     from the other side - 0x00443200 + 4884 is exactly
+     0x00444514 - so the pre-repair function stopped where the
+     table began.  Three different figures for one function, each
+     a different idea of where it ends.
+
+   Nothing in this note rested on that - both pages are identified from
+   the sprites they load, not from their bodies - but anyone reading
+   either handler must be working against the repaired version. Confirm
+   the sizes above before trusting a decompilation of them.
+
+   Page 0 is empty and is not a page at all. Setting it is how the menu
+   system is left for the game, and pages 1 and 4 are the only two that
+   do so [verified].
+
+   Page 15 is worth singling out. Its enter handler loads a separate 3D
+   mesh for every letter, data\menu\font3d\l%c.3df, plus a backspace
+   glyph, so it is a text entry page rendered in 3D. Its tick compares
+   the entered text against a table of codes, each of which is a word
+   spelled backwards AND ENTERED THAT WAY [verified]. The matching
+   unlock indicators, rev_on/rev_off and poc_L/poc_D, are sprites on
+   the main menu, page 3.
+
+   THERE ARE THREE CODES, NOT TWO. This paragraph used to name only
+   CESREVER and CTEKCOP. The table at 0x004f1250 carries a count of 3
+   at 0x004f1248 and three 12-byte entries of
+   {const char *text, int *target, int value}:
+
+   +------------+------------------+---------------+-------+
+   | You type   | Which is         | Sets          | To    |
+   +============+==================+===============+=======+
+   | CESREVER   | REVERSE reversed | 0x004dc050    |   1   |
+   | CTEKCOP    | POCKET reversed  | 0x004dc054    |   1   |
+   | CDNALSI    | ISLAND reversed  | 0x004dc058    |   1   |
+   +------------+------------------+---------------+-------+
+
+   *** THE PLAYER TYPES THE BACKWARDS SPELLING. *** The stored string
+   IS the code. Two earlier versions of this note got the direction
+   wrong in opposite ways - one said the game matches "by walking the
+   typed name in reverse", the other that "the player types the word
+   forwards" - and neither is what the code does. There is no reversal
+   anywhere [verified, at instruction level, 0x00488648]:
+
+       PUSH 0x5161b0      ; g_playerName, exactly as typed
+       MOV  EAX,[ESI]     ; the table string, e.g. "CESREVER"
+       PUSH EAX
+       CALL 0x004bf8f0    ; __strcmpi
+       TEST EAX,EAX
+       JNZ  next
+
+   and the copy that fills g_playerName just before it is a plain
+   forward strcpy of the eight typed characters.
+
+   o SO TYPING REVERSE DOES NOTHING, which is exactly how this was
+     caught: the reconstruction was correct and the note was not, so
+     the code was entered the way the note described and the menu did
+     not change. A wrong comment is worse than no comment, because it
+     gets believed and tested against.
+
+   o AND THE MISREADING IS EASY TO REPEAT. "REVERSE spelled backwards"
+     is a true statement about the DATA that says nothing about the
+     comparison, and both earlier notes turned it into a claim about
+     behaviour without checking the compare.
+
+   Three consecutive dwords, which is what a row of unlock flags looks
+   like. ISLAND had no indicator sprite identified on page 3, which is
+   probably why it was missed - the other two were found from the
+   sprite end rather than from the table.
+
+   o AND A MATCH DOES NOT LEAVE THE PAGE. The tick calls
+     Menu_GotoPage(g_menu, 0xf) - page 15 again - so the code is
+     consumed, the flag is set, and the player lands back at an empty
+     box. That is the whole reason page 15 is the only page in the
+     table that transitions to itself, which section 4 records as a
+     curiosity without explaining it.
+
+2.1.  The sprite pointer table
+
+   Menu_LoadResources fills an array of MR_Sprite* at 0x00504880,
+   INDEXED BY MANIFEST RESOURCE ID, and every page reads its sprites
+   out of it [verified]. The base is loaded as a register in
+   Menu_LoadResources, Menu_Tick, Menu_GotoPage, Menu_UpdateHover and a
+   dozen page handlers.
+
+   o THIS MAKES EVERY DAT_00504xxx GLOBAL IN A PAGE HANDLER READABLE.
+     Subtract 0x00504880, divide by four, and look the id up in
+     menures.c. That was worth finding once: 26 page handlers are
+     written against this array and none of them names a resource.
+
+   Page 14's slots check out four ways, which is what confirmed the
+   base:
+
+   +--------------+-----+----------------+---------------------------+
+   | Address      | Id  | Resource       | And its use agrees        |
+   +==============+=====+================+===========================+
+   | 0x00504b70   | 188 | title.lez      | first of four layers      |
+   +--------------+-----+----------------+---------------------------+
+   | 0x00504b7c   | 191 | title4.lez     | last; enter draws 4,3,2,1 |
+   +--------------+-----+----------------+---------------------------+
+   | 0x005049b0   |  76 | start.lez      | bound to VK_RETURN at     |
+   |              |     |                | y = 430                   |
+   +--------------+-----+----------------+---------------------------+
+   | 0x005049d4   |  85 | Pointeur.lez   | drawn only when           |
+   |              |     |                | fullscreen and enumerated |
+   +--------------+-----+----------------+---------------------------+
+
+   The last two are the strongest: a button sprite bound to the Return
+   key and a mouse pointer gated on fullscreen are exactly what those
+   two names predict.
+
+2.2.  Page 14 against retail
+
+   The project cannot run the game - CLAUDE.md rule 8 - so behaviour
+   that only shows at run time has no evidence path from here. A
+   comparison against a retail longplay recording supplies some, and it
+   is tagged [observed] to keep it distinct from [verified]: it is
+   empirical, but the observation is of a RETAIL BUILD which may be
+   3.20 rather than our 3.22, and it is somebody's video rather than
+   our binary.
+
+   WHAT THE THREE MESHES ARE [observed]:
+
+   +-----------+------------------------------------------------------+
+   | Mesh      | What it does on screen                               |
+   +===========+======================================================+
+   | ellipse   | the centre oval, white/green chequer. Zooms toward   |
+   |           | the camera while rotating about the vertical axis,   |
+   |           | then stops                                           |
+   +-----------+------------------------------------------------------+
+   | moto      | the upper "moto" logo. Slides in from the RIGHT      |
+   +-----------+------------------------------------------------------+
+   | racer     | the lower "racer" logo. Slides in from the LEFT      |
+   +-----------+------------------------------------------------------+
+
+   o THAT IS THE BEST LEAD ON THE MODEL INSTANCE STRUCT. The tick
+     animates three 0x184-byte records along per-object curves, and
+     until now what those curves produced was unknown. One is a
+     zoom-and-spin that decelerates to a stop, two are lateral slides
+     from opposite sides. A layout that does not produce those three
+     motions is the wrong layout, which turns struct reading from
+     guesswork into something checkable.
+
+   The tick's per-object branch supports it: only object 0 gets the
+   special case that writes a rotation of -PI/2 and PI into
+   pfVar11[1..2] below a threshold and a different pair above it, which
+   is the one that changes its orientation as it goes. Objects 1 and 2
+   take only the position lerp.
+
+2.2.1.  The animation tables
+
+   MenuPage14_Title_ResetAnim (0x00446460) fills three parallel arrays
+   of three, indexed by model instance. THEY ARE ZERO IN THE IMAGE, so
+   they look like dead data until the writer is found [verified]:
+
+   +---------+---------------------+---------------------+----------+
+   | Object  | Start               | End                 | Duration |
+   +=========+=====================+=====================+==========+
+   | ellipse | (60, 42, -40000)    | (60, 42, -800)      | 1.0 s    |
+   +---------+---------------------+---------------------+----------+
+   | moto    | (-12000, 44, -798)  | (42, 44, -798)      | 1.2 s    |
+   +---------+---------------------+---------------------+----------+
+   | racer   | (12000, 25, -798)   | (40, 25, -798)      | 1.4 s    |
+   +---------+---------------------+---------------------+----------+
+
+   Grand Prix branding uses a second set; see the plate.
+
+   THE ELLIPSE COVERS 39200 UNITS IN ONE SECOND straight at the camera,
+   which is the zoom the recording shows. The other two translate in x
+   only.
+
+   o THE TABLE AGREES WITH THE RECORDING, and an earlier version of
+     this note said it did not. The view matrix for this page is a 180
+     degree yaw - see MR_ModelInstance.txt section 3.4 - so it NEGATES
+     x. Moto's world x of -12000 is a CAMERA x of +12000, the right of
+     the screen; racer's +12000 becomes -12000, the left. Which is
+     what the footage shows.
+
+     The retracted claim compared a WORLD coordinate against a SCREEN
+     direction with the transform between them left out.
+
+2.2.2.  The phase gates the model draws
+
+   The tick draws each instance only while the phase is below its
+   index plus one, at 0x00446e00..0x00446e99 [verified]:
+
+       if (phase < 1)  ModelInstance_Draw(0x00540500)
+       if (phase < 2)  ModelInstance_Draw(0x00540684)
+       if (phase < 3)  ModelInstance_Draw(0x00540808)
+
+   The three pointers are 0x184 apart, which is
+   sizeof(MR_ModelInstance), so they are instances 0, 1 and 2 of one
+   array. The decompiler prints all three calls identically because it
+   loses the pointer arithmetic; only the ECX loads distinguish them.
+
+   THIS IS THE HANDOFF FROM 3D TO 2D. The phase is the count of
+   finished animations and the durations are 1.0, 1.2 and 1.4, so
+   instance 0 finishes first, the phase rises to 1, and instance 0
+   stops being drawn - in the same frame that the tick switches the
+   title sprite to the next layer. Each model draws until the artwork
+   that replaces it is on screen, then gets out of the way.
+
+   Omitting the gate leaves a finished model drawing on top of the
+   sprite that replaced it. There is no separate "stop drawing" step
+   to look for; this is it.
+
+2.2.3.  Which axis each half of the ellipse spin turns about
+
+   The mesh is a quad in the YZ plane (section 2.2.4), so its normal is
+   local X and the clearest way to read the animation is to follow that
+   normal. The rest pose (0, pi/2, 0) puts it at (0, 0, -1) - face-on.
+
+   +-------------+---------------------------+----------------------+
+   | Half        | normal sweeps to          | Axis                 |
+   +=============+===========================+======================+
+   | u < 0.5     | (0, sin turn, -cos turn)  | HORIZONTAL, 180 deg  |
+   | u >= 0.5    | (cos B, 0, -sin B)        | VERTICAL, 180 deg    |
+   +-------------+---------------------------+----------------------+
+
+   Horizontal flip first, then a vertical rotation - which is the order
+   the retail recording shows [observed]. An earlier draft of this
+   section had the two the wrong way round and recorded the difference
+   as a discrepancy against retail; it was not a discrepancy, it was
+   the mis-transcribed euler matrix of section 2.2.5.
+
+   Each half turns 180 degrees and passes through edge-on at its
+   midpoint. Because the mesh is double-sided the far face takes over
+   there rather than the object disappearing.
+
+   The end pose is face-on: at u = 1 the term is 2pi + pi/2, which is
+   pi/2 modulo a full turn. The reconstruction's trig macros mask with
+   0x3fff so the out-of-range index wraps rather than reading past the
+   table.
+
+
+2.2.4.  The title meshes are double-sided billboards
+
+   All three are four vertices and TWO faces of opposite winding, 78
+   bytes each [verified, read out of PAGES.BKF]:
+
+       ELLIPSE.3DF  version 1, vertexCount 4
+         v0 (-0.47,  92.45,  157.08)
+         v1 (-0.47,  92.45, -176.82)
+         v2 (-0.47, -70.20, -176.82)
+         v3 (-0.47, -70.20,  157.08)
+         face0  n=4 flags=0x0004  indices [0, 3, 2, 1]
+         face1  n=4 flags=0x0004  indices [0, 1, 2, 3]
+
+   MOTO.3DF and RACER.3DF have the identical shape, differing only in
+   the y and z extents. The paired .map is 896 bytes = 512 header +
+   2 x 128 records + 128 conventional padding, so it adds no geometry.
+
+   TWO CONSEQUENCES.
+
+   o THE OBJECT CAN NEVER BE CULLED AWAY. Whichever way it faces, one
+     of the two windings passes the facing test. A title mesh that
+     disappears is not being culled - it is degenerate on screen, or it
+     is not being submitted.
+
+   o X IS CONSTANT ON ALL FOUR VERTICES, so the quad lies in the YZ
+     plane and its normal is local X. The two faces are the light side
+     and the dark side.
+
+2.2.5.  Matrix34_FromEuler was mis-transcribed, and how it was caught
+
+   The nine products in the reconstruction had rot[0] and rot[1]
+   driving each other's terms. The correct nine, from the x87 block at
+   0x0048c0fb..0x0048c187 with A = rot[0], B = rot[1], C = rot[2]:
+
+       m[0] =  cosC*cosB
+       m[1] =  sinC*cosA + cosC*sinB*sinA
+       m[2] =  sinC*sinA - cosC*sinB*cosA
+       m[3] = -sinC*cosB
+       m[4] =  cosC*cosA - sinC*sinB*sinA
+       m[5] =  sinC*sinB*cosA + cosC*sinA
+       m[6] =  sinB
+       m[7] = -cosB*sinA
+       m[8] =  cosB*cosA
+
+   m[6] is the value left on the x87 stack and stored just past the
+   block, which is why a hand-trace that stops at 0x0048c187 finds only
+   eight stores and looks wrong.  [verified]
+
+   TWO CHECKS THAT PASSED ANYWAY, and both are worth remembering:
+
+   o ORTHONORMALITY PROVES NOTHING HERE. The wrong form is also
+     orthonormal with determinant +1 for every input - it is a
+     rotation matrix, just not this one. "Each row squares to 1, so a
+     mis-transcribed sign would break it" was the argument in the code
+     comment, and it was false.
+
+   o THE DECOMPILER APPEARS TO CONFIRM WHATEVER YOU BRING TO IT.
+     Ghidra does not model the x87 stack; extraout_ST0, extraout_ST1
+     and extraout_ST0_00 in ModelInstance_Draw are placeholders, not
+     values. Mapping them onto c0/s0/c1/s1/c2/s2 by eye reproduces the
+     reading you already had. Simulate the instruction sequence
+     instead - stack, FXCH, FADDP and all - and the expressions fall
+     out unambiguously.
+
+   WHAT SETTLED IT WAS A PHYSICAL CONSTRAINT. Every flat billboard in
+   the game is planar in X - ELLIPSE, MOTO, RACER, DSINT, CAM and
+   CADRE1 all have zero x extent - so the rest rotation (0, pi/2, 0)
+   must be the quarter turn that faces one at a camera on +Z. The old
+   form returned the IDENTITY for that input, leaving every billboard
+   edge-on; the correct one maps local X to (0, 0, -1).
+
+   By contrast MESHES\VITRE.3DF, the glass for the shatter transition,
+   is planar in Z at 640.8 x 480.3 - authored in the screen plane at
+   the design resolution. The two conventions coexist and are a good
+   way to tell a billboard from a screen overlay.
+
+   THE VISIBLE SYMPTOMS THIS EXPLAINS, all of page 14 [observed]:
+   the ellipse collapsing to a knife-edge sliver and never resolving;
+   the two animation halves appearing to use the wrong axes and in the
+   wrong order; the sliding logos reading reversed, and thinning to
+   nothing as they approach screen centre - which is what perspective
+   does to a quad whose normal is world X as the line of sight swings
+   onto it. The logos never rotate at all, so they held the broken
+   rest pose for their whole slide.
+
+   Everything else in the chain was checked against the binary while
+   hunting this and matches the reconstruction: the .3df layout and
+   Load3df (0x00420590), Mesh_Scale (0x004204b0), Camera_LookAt
+   (0x0046e140) and its eye of (0,0,4500) written to camera+0x98 at
+   0x00446982, the composition in ModelInstance_Draw, the projection
+   in Screen3D_TransformVertsFlat (0x0049b2c0), and the facing test in
+   Screen3D_CullAndQueueFaces (0x0049c110).  [verified]
+
+   OTHER RETAIL BEHAVIOUR NOT YET REPRODUCED [observed]:
+
+   o A CINEMATIC INTRO PRECEDES THE TITLE [observed]. A moving
+     camera, the DSI letters rotating one at a time with text, and
+     then the scene SHATTERS LIKE GLASS to reveal page 14. Not
+     reconstructed; scoped in section 4.3.
+
+   o RESOLVED - the START button's unhovered stipple, and hover.
+     Menu_Draw (0x0040c1f0) builds a state word per button and
+     switches on it to choose both the sprite and the draw MODE
+     [verified]:
+
+         bit 2   shares the hovered button's groupId
+         bit 1   IS the hovered button
+         bit 0   boundVar == boundValue
+         blink phase forces the state to 0
+
+         state 0   spriteB ? mode 5 : mode 3
+         state 2   spriteB ? mode 5 : mode 5
+         state 4, 5                  mode 2
+         state 3   draws nothing at all
+
+     START has only a spriteA and no bound variable or group, so it
+     reaches state 0 or state 2 only: MODE 3 UNHOVERED, MODE 5
+     HOVERED. Mode 3 is stipple-plus-key - the chequerboard - and
+     mode 5 is the "use the sprite's own kind" sentinel, i.e. solid.
+     The stipple was never missing from the sprite layer; the mode
+     SELECTION was.
+
+     o AND EVERY ARM THAT DRAWS spriteB MOVES IT FIRST:
+
+           pos = Sprite_GetPosition(spriteA);
+           Sprite_SetPosition(spriteB, pos, 0);
+           Sprite_Draw(spriteB, ...);
+
+       at 0x0040c43a and again in the case 5 arm [verified]. SO A
+       PAGE NEVER POSITIONS ITS HIGHLIGHT SPRITE - page 10 places
+       autofla at y 564 and manufla at y 615 and leaves them there,
+       because the draw puts them where they belong.
+
+       That was missed at first, and the reconstruction compensated
+       by tweening both halves of every pair together. Harmless on
+       pages 3 and 5, where both halves shared a move; FATAL on page
+       10, where the flash sprites have no move of their own and were
+       drawn eighty pixels below the screen. Hovering a gearbox row
+       appeared to do nothing and the row seemed to go dark, because
+       the bright sprite was offscreen and the normal one suppressed.
+
+     Menu_HitTest (0x0040c0c0) does the hover. For a kind-2 button it
+     tests the sprite's PLACED rect - its first four ints - inclusive
+     on all four edges, against the cursor at 0x00519fe8/0x00519fea:
+
+         s->x <= mx && s->y <= my &&
+         mx <= s->x + s->width && my <= s->y + s->height
+
+     so a sprite that moves drags its hit box with it. Kind-1 (text)
+     buttons carry their own rect instead. Menu_UpdateHover
+     (0x004099a0) calls it, stores the index, and on a CHANGE plays
+     sound 0x29 and sets needsRedraw.
+
+     NOT REPRODUCED: g_menuInputBlocked, which short-circuits the
+     whole test to -1, and the hitTestDirty cache.
+
+   o AND START IS A REAL BUTTON, WHICH IT HAD NOT BEEN. Enter
+     registers it at 0x00446a43 [verified]:
+
+         Menu_AddSpriteButton(g_menu, start, 0, -1, 0x0d,
+                              -1, 0, NULL, 0, -1, -1, 0)
+
+     The 0x0d is VK_RETURN as the button's OWN key code, and the
+     -1, -1 position means Menu_Draw leaves the sprite where Enter
+     put it. So Return is not a special case in the page, it is this
+     button's keyboard shortcut, and the click and the key arrive in
+     the same activation slot.
+
+     The reconstruction had been hit-testing the sprite by hand for
+     the hover and testing for VK_RETURN by hand for the action. That
+     gave a button that LOOKED right - it lit on hover - AND COULD
+     NOT BE CLICKED, because the hover was local to the tick and
+     nothing routed a click to it. Going through the widget list
+     deleted more code than it added.
+
+   o THE STRAPLINE IS AT THE TOP AND YELLOW. The colour is confirmed
+     from the binary - Font_SetColors is called with (255,255,0) on
+     black at 0x004f0de8 and 0x004f0dd8 [verified] - so only the
+     position rests on the recording.
+
+
+2.3.  Page 15, transcribed
+
+   MenuPage15_NameEntry_Enter (0x00487070). The first page in the
+   reconstruction built on MR_MenuSceneObject rather than on
+   MR_ModelInstance - pages 14 and 25 call Mesh_LoadPair and
+   ModelInstance_Init directly, and page 15 goes through the menuTools
+   layer instead. See structs/MR_MenuSceneObject.txt.
+
+   LOADED ONCE, guarded by a flag at 0x004f1284, so re-entering the
+   page does not reload. 30 meshes in total:
+
+   +---------------------------+---------+--------------------------+
+   | data\menu\font3d\l%c.3df  | 26      | one per letter, 'a'..'z' |
+   |          (and .map)       |         | into the table at        |
+   |                           |         | 0x005f1880               |
+   +---------------------------+---------+--------------------------+
+   | backspac.3df / .map       |  1      | 0x005f18e8 = table[26]   |
+   +---------------------------+---------+--------------------------+
+   | valid.3df / .map          |  1      | 0x005f18ec = table[27]   |
+   +---------------------------+---------+--------------------------+
+   | cadre.3df / .map          |  1      | 0x004f1288, the frame    |
+   +---------------------------+---------+--------------------------+
+   | curseur.3df / .map        |  1      | 0x004f128c, the cursor   |
+   +---------------------------+---------+--------------------------+
+
+   So the table at 0x005f1880 is 28 entries and the two extra glyphs
+   are part of it, not separate - which is what makes the 4x7 grid
+   below come out exactly full.
+
+   A FAILED LOAD IS FATAL: each one that returns NULL formats an
+   assert against "D:\Dsed\mr320\menu\pageProtocol.cpp" at lines 0x1cf,
+   0x1d3, 0x1d8, 0x1dd and 0x1e2, then aborts the game. That file is
+   already one of the thirteen known translation units and code-map.txt
+   already attributes 0x00487xxx-0x004888bf to it, so these five lines
+   corroborate the attribution rather than adding to it. The line
+   numbers are new and place the loader around line 460 of the file.
+
+2.3.1.  The keyboard grid
+
+   Enter builds 28 rest positions into 0x005f18f0, a vec3 each, from
+   four rows of seven [verified, the constants read out of .rdata]:
+
+       x = col * (1/6) * 1100 - 550       col 0..6
+       y = (3 - row) * (1/3) * 500 - 250   row 0..3
+       z = 0
+
+   giving a grid 1100 wide and 500 tall centred on the origin, with
+   183.33 between columns and 166.67 between rows. 4 x 7 = 28 = the
+   26 letters plus backspace plus valid.
+
+   THE NAME SLOTS ARE SEPARATE, at 0x005f6378, and there are nine:
+
+       x = i * 140 - 490      i 0..8
+       y = -325
+       z = -600
+
+   Eight of them are the name being typed - the name is clamped to 8
+   characters - and the ninth is written after the loop at i = 8.
+   Each slot is a scene object of its own whose mesh pointer is COPIED
+   from the corresponding letter object (+0x18 to +0x18), so the slots
+   share the letter meshes rather than reloading them.
+
+2.3.2.  The fly-in
+
+   This is the effect that reads as the reverse of the glass shatter.
+   Every one of the 28 objects is first SCATTERED [verified]:
+
+       r1, r2, r3  each rand() * (1/32768) * 2 - 1, so -1..1
+
+       position = ( r1 * 2048,
+                    r2 * 512 + 2250,
+                    r3 * 1024 + 4096 )
+       rotation = ( r1 * 2 * 2pi, r2 * 2 * 2pi, r3 * 2 * 2pi )
+
+   so the glyphs start spread across x +/-2048, high at y 2250 +/-512
+   and far back at z 4096 +/-1024, each turned by up to two full turns
+   on every axis. Then both channels are started at once:
+
+       StartVecMove   (obj, {0,0,0},      2.0s, mode 1)
+       StartTargetMove(obj, gridPos[i],   2.0s, mode 1)
+
+   Mode 1 is the sine ease, so they accelerate out of the scatter and
+   settle into the grid over two seconds without overshoot.
+
+   o ONE RANDOM DRAW FEEDS BOTH CHANNELS. r1, r2 and r3 are used for
+     the position AND for the rotation, so a glyph that starts far
+     left is also the one spun hardest about X. The scatter is
+     correlated, not independent, and reproducing it with six draws
+     would look subtly different.
+
+2.3.3.  THE MESHES ARE MIRRORED TWICE, AND THE TWO CANCEL
+
+   This is the trap in the page and it is worth stating plainly.
+
+   MenuTools_CreateSceneObject (0x004794b0) loads through
+   Load3dfAndMap, which applies Mesh_MirrorXAndFlipWinding - the
+   handedness conversion that makes the title logos read the right way
+   round. Enter THEN calls FUN_0047ad40 on every one of the 28
+   objects, and that function is the same operation again: it builds a
+   matrix from four constant g_cosTable entries - cos(0), cos(90),
+   cos(180), cos(270) = 1, 0, -1, 0 - which multiplies out to exactly
+   (x,y,z) -> (-x,y,z), and then calls Face_ReverseWinding once per
+   face [verified].
+
+   Two mirrors and two winding reversals, so page 15's glyphs end up
+   in the .3df's OWN handedness while every other 3D menu page's
+   meshes end up mirrored.
+
+   o A PORT THAT MISSES THE SECOND ONE DRAWS THE ALPHABET BACKWARDS,
+     and on a keyboard that is unmistakable - unlike the camera on
+     page 25, where the same class of error read as "hollow" and cost
+     two sessions to attribute. The letters are the one place this
+     mistake cannot hide, which makes page 15 a useful check on the
+     mirror logic generally.
+
+   o IT IS NOT A NO-OP TO BE OPTIMISED AWAY. The reconstruction does
+     both, because the original does both and because the day either
+     side changes, a cancelled pair is the thing that tells you.
+
+2.3.3.1.  The mirror runs on EVERY entry, not just the first
+
+   Enter's once-guard at 0x004f1284 closes before the normalise,
+   scale and mirror loop, so all three run each time the page is
+   entered [verified]. The scale is effectively idempotent - a mesh
+   already fitted to a 62 half-extent normalises to a factor of 1.0 -
+   but the mirror is not: it flips every call.
+
+   o AND PAGE 15 RE-ENTERS ITSELF. Section 2 records that a matched
+     cheat calls Menu_GotoPage(0xf), this same page. So typing
+     REVERSE, POCKET or ISLAND runs Enter a second time and, on this
+     reading, leaves the entire alphabet mirrored.
+
+     [inferred] The code path is verified; the visible result is a
+     prediction, because rule 8 forbids running the game to check it.
+     If anyone ever does check, this is the thing to look at.
+
+   THE RECONSTRUCTION DOES NOT REPRODUCE IT. src/menu.c puts the
+   three mesh mutations inside its own guard so they happen once.
+   Same choice as the black-glass transition of section 4.3.1.4:
+   motion and gameplay are reproduced, cosmetic defects are not.
+
+2.3.4.  What the reconstruction has
+
+   ENTER IS IN, in src/menu.c: the 30 meshes load through the new
+   scene layer (src/scene.h), one glyph sets the scale and the other
+   27 inherit it, both mirrors are applied, the 4x7 grid is built, and
+   all 28 glyphs scatter and ease into it over two seconds. The page
+   is registered and reachable - [DEBUG] startpage=14, then ENTER.
+
+   All 30 assets resolve out of MENU.BKF as FONT3D\L?.3DF and friends
+   [verified against the archive directory], so a blank page means a
+   loader fault and not a missing file.
+
+2.3.5.  The tick: the wave, the selection and the exit
+
+   THE WAVE is what makes the letters look alive, and it is driven by
+   three animated scene objects with no mesh rather than by a clock
+   [verified, the double loop at 0x00487dac]:
+
+   +------------+-----------+------------------------------------+
+   | 0x005f6480 | vec[0]    | free-running spin, 2*pi rad/s      |
+   | 0x005f63e8 | target[0] | 0 -> 120.0 over 2 s, linear        |
+   | 0x005f1690 | vec[1]    | free-running spin, 2*pi rad/s      |
+   +------------+-----------+------------------------------------+
+
+       z      = cos(phase) * amplitude
+       phase += pi/6      per column     0x004d1b60
+       phase += 2*pi/14   per row        0x004d1b68
+
+   and z is written into each glyph's target[2] every frame. The two
+   steps do not divide into one another, so the crest travels
+   diagonally across the keyboard instead of in a straight line.
+
+   o THE RAMP IS GATED ON THE FLY-IN FINISHING, tested on ONE object:
+     "if (obj[0].vecActive == 0)". All 28 started together with the
+     same duration, so the first standing in for all is sound. The
+     ripple therefore grows out of the landing rather than snapping
+     on.
+
+   o THE ZEROING IS IN THE WAVE BRANCH ONLY, and that distinction is
+     the whole fly-in. The tick has two arms; in the landed arm an
+     unselected glyph has all three rotation components set to zero
+     every frame, and in the flying-in arm it is only advanced. So
+     the rotation the scatter set is left to animate while the
+     letters are on their way in, and pinned flat once they arrive.
+     Zeroing in both arms - which the reconstruction did at first -
+     throws the tumble away one frame after it is computed, and the
+     letters slide in perfectly flat. The scatter and the ease were
+     both correct and neither was the problem.
+
+   o AND ONLY vec[1] IS WRITTEN FOR THE SELECTED GLYPH, not all
+     three, so a selected letter that is still flying in keeps
+     tumbling on X and Z while its Y is driven by the spinner.
+
+   THE SELECTION is 0..27, where 26 is backspace and 27 is valid -
+   the two function keys are simply the last two cells of the grid,
+   so the arrows walk onto them like any other. Each frame the
+   selected glyph takes the highlight spinner's vec[1] and every
+   other glyph has all three components zeroed, so being selected is
+   RECOMPUTED from the index rather than stored on the glyph.
+
+       arrows      left -1 wrap to 27, right +1 wrap to 0,
+                   up -7 wrap +21, down +7 wrap -21
+       A-Z / a-z   (key | 0x20) - 0x61, types it directly
+       space       ACTIVATE WHATEVER IS SELECTED - type the letter,
+                   or backspace, or finish
+       RET         finish, when the name is non-empty
+       backspace   delete, without needing the cell selected
+
+   o A MOUSE CLICK IS EXACTLY THE SPACE CASE. The click arm tests
+     DAT_005083b8 == 2 and then runs the same three-way branch on the
+     selection that space does, calling the same FUN_00487a70. Since
+     selection already follows the pointer by proximity, clicking a
+     letter and typing it are the same operation with the selection
+     set two different ways.
+
+   TYPING, from FUN_00487a70 [verified]. Four things move:
+
+       1  the slot borrows the glyph mesh by pointer (+0x18)
+       2  it starts at the glyph CURRENT rotation and GRID cell, then
+          flies to the name line over 1 s, spin easing to zero
+       3  THE TYPED LETTER is teleported to (0, 800, 500) and flies
+          back to its own cell over 1.5 s - it leaps out of the
+          keyboard and drops back in
+       4  the cursor steps to the next slot over 0.2 s, LINEAR
+
+   o STEP 4 IS THE ONLY UNEASED MOVE ON THE PAGE, which is what makes
+     the cursor read as a caret rather than as another flying object.
+
+   o AND TYPING MOVES THE SELECTION onto the letter typed, as the
+     last thing FUN_00487a70 does. So the frame chases the keyboard.
+
+   Backspace throws the removed slot back to the park position with a
+   random spin - three draws scaled by 2*pi and then by 3 - and puts
+   the selection on the backspace cell.
+
+   o MOUSE SELECTION IS NEAREST-POINT, NOT A HIT TEST. The tick
+     copies all 28 glyph positions to 0x005f1728, projects them with
+     Screen3D_TransformVertsFlat, and picks the smallest squared
+     distance to the cursor. The cursor snaps to the closest letter
+     rather than having to be over one - which is the right choice
+     for glyphs that are rippling in and out of the screen.
+
+   ON LEAVING it sets the projection base to 1911.0, not back to the
+   480 default, so page 3 inherits that.
+
+   o AND THAT LINE HAS TO MOVE IN A PORT WHOSE TICK IS NOT LAST.
+     The original does it inside the tick, immediately before
+     Menu_BeginTransition, which is safe there because the exit
+     block is the LAST thing in the tick - Screen3D_EndFrame and the
+     final Screen3D_DrawScene have already run, so the new base only
+     reaches the next page.
+
+     The reconstruction calls menu_tick from menu_draw and draws the
+     3D later, inside the scene bracket. Setting the base in the
+     tick therefore applied it to the SAME frame, and the glass
+     captured a screen with the letters 1911/1024 = 1.87x too large -
+     a shatter carrying an image that had never been on screen.
+     src/menu.c does it in page15_leave instead, which runs after
+     glass_capture_if_pending.
+
+     o PAGE 25 WAS THE CONTROL. Its exit changes no projection and
+       its capture was always exact, which is what placed the fault
+       in what page 15 did rather than in the capture itself. Two
+       pages using the same mechanism with one difference between
+       them is the cheapest diagnosis available.
+
+2.3.6.  Not yet read
+
+   Still in the tick (0x00487bb0):
+
+
+   o The tick (0x00487bb0, 3040 bytes) - typing, the cheat compare
+     against the three codes of section 2, the cursor, and the draw.
+   o FUN_0047af50, the menu camera build, called with rotation
+     {0,0,0} and position {0,0,-2400}. It writes two 3x4 matrices;
+     see structs/MR_MenuCamera.txt.
+   o FUN_00479470, which builds the name-slot objects.
+   o RESOLVED - FUN_00404e10 is Snd_QueueDelayedCues, and the call
+     queues the voice line entrname 600 ms after Enter. It is
+     variadic; see audio-cues.txt section 1.3.
+   o Three globals whose role is inferred from context only:
+     0x005f647c, 0x005f6528, 0x005f1a44 (the name length).
+
+2.3.1.  Page 15 is modal, and not through the text capture
+
+   page15_on_key types A-Z straight off the grid, folding case the
+   way the original does with (key | 0x20) - 0x61.  main.cpp runs
+   its debug block AHEAD of menu_on_key, and three of those keys
+   are letters - F fullscreen, M mute, Q the escape menu - so
+   three letters could not be typed into a name.  The comment that
+   justified taking them said the name page "picks letters off an
+   on-screen grid with the arrows rather than typing them", which
+   stopped being true when the typing arm was added.
+
+   menu_page_modal is tested after ESCAPE and before the debug
+   block: on a modal page every key goes to menu_on_key and
+   anything it refuses is swallowed, so no shortcut can fire.
+
+   FUNCTION KEYS ARE LET THROUGH, VK_F1..VK_F24.  None of them can
+   be part of a name and F5 single-stepping is worth keeping on
+   every page.  The digits, the brackets and the backslash are
+   suppressed with the letters; page15_on_key refuses them and they
+   stop there, which is right for a name field.
+
+   NOT THE MODAL TEXT CAPTURE, and the difference is worth keeping
+   straight.  menu_capture_begin owns a character buffer and is what
+   the netplay chat and relay address use.  Page 15 cannot use it:
+   the name is NINE 3D GLYPH OBJECTS, one per slot, each animated
+   per keystroke by p15_type_letter and p15_backspace through
+   scene_update - so the page has to keep owning its own buffer.
+   What it needed was the modal half, not the text half.
+
+   AND ESCAPE DIFFERS BETWEEN THE TWO, deliberately.  In the
+   capture, ESCAPE cancels the field (menu_capture_cancelled).  On a
+   modal page it stays the game's quit, because main.cpp tests
+   VK_ESCAPE before menu_page_modal.  Do not make one match the
+   other.
+
+2.4.  Page 11, the options screen
+
+   MenuPage11_Options_Enter (0x00443000) and _Tick (0x00443200).
+   NO LEAVE HANDLER - the page table record has none, which is worth
+   noting before writing one.
+
+   Read far enough to scope it and then stopped, because it depends
+   on a subsystem that does not exist yet. This section records what
+   was found so the next attempt starts from here.
+
+2.4.1.  Enter, which is small and transcribable now
+
+   Four sprites, positioned and not animated [verified]:
+
+   +-----+--------------+----------+
+   | Id  | Resource     | Position |
+   +=====+==============+==========+
+   | 60  | optitre.lez  | 0, 0     |
+   | 170 | btinfo.lez   | 25, 420  |
+   | 183 | DATADISK.lez | 275, 420 |
+   | 70  | accept.lez   | 500, 420 |
+   +-----+--------------+----------+
+
+   then three more things:
+
+   o THE INPUT COLUMN. g_cfgInputDevice maps to g_bindingColumn as
+     1 -> 0, 4 -> 1, 2 -> 2. Three devices, three columns of key
+     bindings, and the mapping is not the identity.
+
+   o A DATADISK SCAN. It builds a pattern from an empty prefix at
+     0x004e8380 plus "Data\\List*.bpt", walks it with
+     _findfirst / _findnext, and atoi()s each matching NAME into a
+     short array at 0x0051a420, counting into 0x004dc04c. So the
+     expansion content the page can offer is discovered from the
+     filesystem at entry rather than from a fixed list.
+
+   o A CAPABILITY CLAMP. If the hardware path is up and the device
+     reports no texture support, g_cfgDetailLevel is forced to 0.
+
+2.4.2.  The tick, and what it needs
+
+   4884 bytes, and the largest page handler in the table. It calls
+   Menu_AddTextButton at TWENTY-PLUS sites - the count is above the
+   search limit - so the options are TEXT ROWS, not sprites. That is
+   a widget the reconstruction does not have: Menu_AddTextButton
+   (0x0040bd60) takes a position, a char *text, an MR_Font *, a
+   nav-neighbour word, a draw argument, a key code and a repeat flag,
+   and computes its hit rectangle by MEASURING THE TEXT through
+   FUN_00492a90.
+
+   It uses fonts 9 and 12, both fetched in Enter and given a colour
+   pair through their vtable.
+
+   VALUES ARE FORMATTED, and the format strings are the clearest
+   statement of what the page controls [verified, .rdata]:
+
+       "320*240"  "512*384"  "640*480"   the three supported modes
+       "%d*%d"                           a mode not in that list
+       "%d(Tex)+%d"                      counts, textured plus flat
+       "%5.2f(Tex)+%5.2f"                the same as milliseconds
+       "%d %s"  "%d %s / %d %s /%s"  "+"  "24"  "12"
+
+   o CHANGING THE MODE REBUILDS 3D STATE. The tick calls
+     Cdd_FindModeByPixels, and also Mesh_Ctor, Load3df,
+     MenuGlass_BuildShards and MenuTools_FreeSceneObject - so a
+     resolution change tears down and rebuilds the glass shards and
+     a mesh. Any port has to do the same or the transition breaks
+     after the first mode change.
+
+2.4.3.  RESOLVED: the labels are in .data, six per language
+
+   Recorded first as a blocker - every reference to 0x0053b6xx is a
+   READ, no writer resolves, so the labels have no identified source
+   - and then found. THE CONCLUSION WAS WRONG.
+
+   The strings live in .data at 0x004e0b80..0x004e2118, SIX PER ROW,
+   one per language, English last in each group and in capitals:
+
+   +------------+-------------------------+
+   | Address    | English label           |
+   +============+=========================+
+   | 0x004e2108 | DIFFICULTY :            |
+   | 0x004e2018 | CONTROLLER :            |
+   | 0x004e1f58 | DETAIL LEVELS :         |
+   | 0x004e1ee8 | OPPONENTS :             |
+   | 0x004e1e94 | D3D :                   |
+   | 0x004e1e88 | VOICES :                |
+   | 0x004e1e48 | SOUNDS :                |
+   | 0x004e1e08 | MUSIC :                 |
+   | 0x004e1cf8 | SCREEN MODE :           |
+   | 0x004e1c8c | 16/9 MODE :             |
+   | 0x004e1bc8 | WAVE OUTPUT :           |
+   | 0x004e0cb0 | MASTER VOLUME :         |
+   | 0x004e0c44 | WAVE VOLUME :           |
+   | 0x004e0bd0 | CD AUDIO VOLUME :       |
+   | 0x004e19d8 | SESSIONS REFRESH RATE : |
+   +------------+-------------------------+
+
+   The runtime table at 0x0053b6xx is filled with pointers into this
+   block by language, which is the loader the write-chasing missed.
+
+   VALUES TOO, in the same grouping: EASY / MEDIUM / HARD,
+   KEYBOARD / JOYSTICK / JOYPAD - three devices, not two - 8 bits,
+   16 bits, FILTERED, NOT DETECTED. The six-language grouping is
+   also why several neighbouring strings look truncated in a naive
+   ASCII dump: the French and Swedish ones carry accented bytes.
+
+   o THE SEARCH WAS TOO CLEVER. It ruled out the .rsrc string table,
+     the .rdata block beside the printf formats, and every .BKF
+     member by extension, then concluded the strings were not there.
+     What it never did was grep the whole executable for one of the
+     words. Ruling out three places is not looking everywhere, and
+     the cheapest test available was the one skipped.
+
+   o AND IT PRODUCED CONFIDENT WRONG DOCUMENTATION. The blocker was
+     written up in detail, with evidence, and was wrong - which is
+     worse than leaving it open, because the next reader inherits
+     the conclusion along with reasoning that looked sound.
+
+   o THE SPACE BEFORE THE COLON IS IN THE DATA. It had been guessed
+     from French typography and happened to be right; it is now
+     verified. The trailing space is NOT uniform - the three volume
+     rows end without one, and that is transcribed as found.
+
+2.4.4.  The rows are interactive, and the index is the id
+
+   MenuPage11_Options_Tick clears the button list and rebuilds all
+   twenty-three buttons EVERY FRAME, then switches on the activated
+   index. So the order of the adds is load-bearing: inserting one
+   button changes the meaning of every case after it [verified].
+
+   +----+-----------------------+-----------+-------------------------------+
+   | Id | What                  | Position  | What activating it does       |
+   +====+=======================+===========+===============================+
+   |  0 | DIFFICULTY value      | 300, 100  | g_cfgDifficulty, cycle 0..2   |
+   |  1 | CONTROLLER value      | 300, 120  | g_bindingColumn, cycle 0..2   |
+   |  2 | BtConfig sprite       | 475, 120  | apply column, then page 12    |
+   |  3 | DETAIL LEVELS value   | 300, 140  | g_cfgDetailLevel 0..4, shown  |
+   |    |                       |           | as 1..5                       |
+   |  4 | OPPONENTS value       | 300, 160  | g_cfgNbComputerCut, 24 or 12  |
+   |  5 | D3D value             | 300, 180  | ON -> FILTERED -> OFF, and    |
+   |    |                       |           | rebuilds the glass shards     |
+   |  6 | VOICES value          | 300, 200  | FUN_00408f30                  |
+   |  7 | SOUNDS value          | 300, 220  | FUN_00408b30                  |
+   |  8 | MUSIC value           | 300, 240  | FUN_00409410                  |
+   |  9 | SCREEN MODE value     | 300, 260  | windowed cycles               |
+   |    |                       |           | g_screenModeCopy; fullscreen  |
+   |    |                       |           | walks g_displayModes          |
+   | 10 | 16/9 MODE value       | 300, 280  | g_nCfgWide169 ^= 1            |
+   | 11 | WAVE OUTPUT value     | 300, 300  | FUN_00409570                  |
+   | 12 | MASTER VOLUME "-"     | 300, 320  | Mixer_VolumeDown(0)           |
+   | 13 | MASTER VOLUME "+"     | 400, 320  | Mixer_VolumeUp(0)             |
+   | 14 | WAVE VOLUME "-"       | 300, 340  | Mixer_VolumeDown(2)           |
+   | 15 | WAVE VOLUME "+"       | 400, 340  | Mixer_VolumeUp(2)             |
+   | 16 | CD VOLUME "-"         | 300, 360  | Mixer_VolumeDown(1)           |
+   | 17 | CD VOLUME "+"         | 400, 360  | Mixer_VolumeUp(1)             |
+   | 18 | SESSIONS "-"          | 300, 380  | g_cfgEnumSession, clamp 0     |
+   | 19 | SESSIONS "+"          | 400, 380  | clamp 30                      |
+   | 20 | accept sprite         | 500, 420  | apply column, then page 3     |
+   | 21 | btinfo sprite         |  25, 420  | page 13, diagnostics          |
+   | 22 | DATADISK sprite       | 275, 420  | page 23 - ONLY IF the count   |
+   |    |                       |           | is above one                  |
+   +----+-----------------------+-----------+-------------------------------+
+
+   o THE HIT TEST RUNS ON THE PREVIOUS FRAME LIST. Menu_HitTest is
+     called at 0x00443247, BEFORE Menu_ClearButtons, and its result
+     colours this frame labels - yellow 0x004f0de8 when the row
+     button is hovered, white 0x004f0dd4 otherwise. That is only safe
+     because the list is rebuilt identically every frame, and it
+     leaves the highlight one frame stale where nothing can see it.
+
+   o Menu_ClearButtons DOES NOT CLEAR THE ACTIVATION. It writes
+     buttonCount at +0x40 and needsRedraw at +0x30 and nothing else
+     [verified, 0x0040bd40]. A click lands in the window procedure
+     between two ticks, so a clear that dropped it would make a
+     per-frame page dead to the mouse. Our menu_clear_buttons had
+     been clearing it, which was harmless only while every page built
+     its buttons once in Enter.
+
+   o repeatOnHold HAS NO INITIAL DELAY AND NO RATE LIMIT. Menu_Tick
+     re-activates the hovered button on every frame the mouse bit is
+     set in both this frame and the last [verified, 0x00409c00]. The
+     eight stepper buttons set it; nothing else on the page does.
+
+     Two globals in that block look like a repeat timer - 0x00504878
+     takes timeGetTime and 0x00504e7c is zeroed beside it - and BOTH
+     ARE WRITE-ONLY across all 239,438 instructions. Whatever was
+     meant to read them never shipped, so the repeat rate is simply
+     the frame rate.
+
+     THAT CANNOT BE TRANSCRIBED. A volume runs 0..32 in steps of one,
+     so at a modern frame rate a single click lasts five or six
+     frames and jumps a fifth of the range. The reconstruction uses a
+     delay then a fixed rate in SECONDS - see src/README.txt section
+     50.2 - which is a stated divergence and the only way the row
+     behaves the same on two different machines.
+
+2.4.5.  The volumes are the Windows mixer, and ours are not
+
+   Mixer_GetVolume (0x00470c70), Mixer_VolumeUp (0x00470d90) and
+   Mixer_VolumeDown (0x00470e90) drive a mixer line through
+   mixerGetControlDetailsA and mixerSetControlDetails. The page never
+   sees anything but a 0..max integer, and Mixer_Init (0x004708c0)
+   writes 0x20 into all three max fields, so the range is 0..32 and
+   the step is 1 [verified].
+
+   THE STORED VALUE IS A PLAIN INT IN THAT SAME 0..32 RANGE. It is
+   NOT a byte and not a percentage: CONFIG.BPT records 18, 19 and 20
+   are MasterVolume, CDVolume and WaveVolume, they default to 32, and
+   Settings_LoadAll hands each straight to Mixer_SetVolume
+   (0x00470cf0) with the channel number - the MasterVolume call is at
+   0x0042b2d5 [verified]. One of the two saved CONFIG.BPT files in
+   DATA has all three at 19, which is somebody's chosen level and a
+   second confirmation of the range.
+
+   The bar is drawn by SHRINKING one sprite, not by scaling it:
+
+       shrink = 100 - volume * 100 / max
+
+   Sprite_Draw removes that percentage from the right, so full volume
+   is shrink 0, the whole bitmap. There is no separate track art.
+
+   THE CHANNEL NUMBERS ARE NOT ROW ORDER: master passes 0, the WAVE
+   row passes 2 and the CD row passes 1.
+
+   o THE RECONSTRUCTION DOES NOT DRIVE THE SYSTEM MIXER. Moving the
+     Windows volume from inside a game is 1997 behaviour, and the CD
+     volume has nothing to drive now that the tracks are local files.
+     audio.c holds the three values instead. That is a deliberate
+     divergence and it is the only one on this page.
+
+2.4.6.  What the reconstruction does, and what it says instead
+
+   Thirteen rows and the volumes work, and every one of them
+   persists - see config-file.txt section 4.1 for the [OPTIONS]
+   table. Four buttons do not work, and each LOGS why rather than
+   doing nothing or, worse, appearing to work:
+
+   +------------------+--------------------------------------------+
+   | Button           | Why not                                    |
+   +==================+============================================+
+   | 2  BtConfig      | page 12 is not built                       |
+   | 5  D3D           | the OFF arm is the software rasterizer we  |
+   |                  | do not have, so the row is fixed at ON     |
+   | 21 btinfo        | page 13 is not built                       |
+   | 22 DATADISK      | page 23 is not built                       |
+   +------------------+--------------------------------------------+
+
+   o TWO ROWS CYCLE AND STORE WITHOUT BEING APPLIED: SCREEN MODE and
+     WAVE OUTPUT. Both had been left inert on the grounds that a
+     value which changes but does nothing looks like a working
+     setting. They are stored now because the setting itself is real
+     - the resolution work and the audio back end will each read one
+     - and each logs a line naming what is still missing when it is
+     changed.
+
+   o THAT IS THE LINE, AND IT IS WORTH STATING. Storing a setting
+     nothing reads yet is a gap. Drawing a value the code does not
+     produce is a fake, which is what rule 5a forbids. The D3D row
+     stays fixed at ON for exactly that reason: there is no second
+     renderer for it to select.
+
+   o ESCAPE ON ACCEPT IS OURS. Every button on this page registers
+     MENUKEY_NONE in the original, which leaves no keyboard way off
+     the page at all.
+
+   o THE DATA DISK SCAN IS REPRODUCED. Enter _findfirst()s
+     Data\List*.bpt, counts the matches into g_nDataDiskCount and
+     atoi()s each name into g_anDataDiskIds at 0x0051a420; the button
+     appears only when the count is above one. A stock install has
+     exactly LIST.BPT, so it is hidden - our decomp/DATA also has
+     LIST01.BPT and will show it. The id table itself is not
+     reproduced because nothing reads it until page 23 exists.
+
+2.5.  Page 5, mode select - transcribed
+
+   MenuPage05_ModeSelect_Enter (0x00447250) and _Tick (0x00447710).
+   No leave handler.
+
+2.5.1.  One flag decides the whole page
+
+   g_nSoloMode at 0x004dbffc is written by page 3 and by nothing
+   else in the menus - 1 from SOLO at 0x00442df3, 0 from LINK at
+   0x00442e06 [verified]. Every difference on page 5 follows from
+   it:
+
+   +---------+-------------------------------+---------------+
+   | Shape   | Modes offered                 | Back goes to  |
+   +=========+===============================+===============+
+   | solo    | practice, single, champship   | page 3        |
+   | network | single, championship          | page 7        |
+   +---------+-------------------------------+---------------+
+
+   o PRACTICE IS NOT HIDDEN, IT IS LEFT OFFSCREEN. The prologue
+     places it at x -242 and the network branch simply never moves
+     it in or registers a button for it. There is no visibility
+     flag to find, which is worth knowing before looking for one.
+
+   o AND THE MODE NUMBER MEANS DIFFERENT THINGS IN THE TWO SHAPES.
+     The tick computes it as buttonIndex - 1, so with practice
+     absent the network list starts at single race:
+
+         solo     0 practice, 1 single race, 2 championship
+         network  0 single race, 1 championship
+
+   o WHICH LEAVES THE CHAMPIONSHIP CLEAR LOOKING WRONG. Choosing a
+     mode that is "neither 0 nor 1" zeroes the reverse and pocket
+     enable flags at 0x004dc068 and 0x004dc078, plus 0x004dc08c and
+     0x00509ba8. In a solo game that is exactly championship. In a
+     NETWORK game it is never true at all, because the only modes
+     there are 0 and 1. Whether that is deliberate or a renumbering
+     that was not carried through is not settled; transcribed as
+     found.
+
+     It clears the IN-MEMORY flags and does not persist them, which
+     is the same rule page 3 follows when it toggles the same two.
+
+2.5.2.  The sprites, and a convention that reverses
+
+   +-----+-----------+------------+--------------------------------+
+   | Id  | File      | Global     | Role                           |
+   +=====+===========+============+================================+
+   |  0  | paralax1  | 0x00504880 | backdrop, kind 4, scroll -1, 1 |
+   |  8  | selmode   | 0x005048a0 | title, drops in from y -80     |
+   |  9  | practic2  | 0x005048a4 | practice spriteA, IDLE         |
+   | 10  | practice  | 0x005048a8 | practice spriteB, HOVERED      |
+   | 11  | single2   | 0x005048ac | single spriteA                 |
+   | 12  | single    | 0x005048b0 | single spriteB                 |
+   | 13  | champio2  | 0x005048b4 | championship, non-BMG          |
+   | 14  | champion  | 0x005048b8 |                                |
+   | 15  | Grdprix2  | 0x005048bc | the BMG pair                   |
+   | 16  | Grdprix   | 0x005048c0 |                                |
+   | 81  | Btback    | 0x005049c4 | at 270, 430, key VK_ESCAPE     |
+   +-----+-----------+------------+--------------------------------+
+
+   o THE NUMBERED FILE IS THE IDLE ONE HERE, which is the reverse of
+     what page 3 teaches. There the pair is SOLO_D and SOLO_OK and
+     the _D is spriteA; here Enter passes (id 9, id 10) - practic2
+     then practice - so PRACTIC2 is the idle art and practice.lez is
+     the highlight. All four pairs put the numbered file first.
+
+     That is read off the argument pairs, not inferred from the
+     names. Guessing from the names would have inverted every
+     highlight on the page and looked like a hover bug.
+
+   o EVERY MODE SLIDES IN FROM A DIFFERENT EDGE, all landing on
+     y 115 over one second: practice from x -242, championship from
+     x 700, and single race from BELOW at y 595. In the network
+     shape the two that remain start further out, -263 and 715, and
+     land closer together at 121 and 331.
+
+2.5.3.  The music does not restart, and that is the point
+
+   Enter ends with CdAudio_PlayTrackCue(3, 3) and
+   Snd_QueueDelayedCues(1, 600, 0x54) [verified].
+
+   MODE 3 IS BOTH BITS - repeat, AND do not restart a track that is
+   already playing. The title screen starts track 3 with mode 2 and
+   pages 3 and 5 both re-request it with mode 3, so the menu music
+   runs unbroken from the title through the glass transitions rather
+   than restarting on every page.
+
+   0x54 is selectmd, queued 600 ms out - about when the slide-in
+   finishes. See audio-cues.txt for the eleven-entry menu speech
+   bank at 0x004db780 that id comes from.
+
+2.5.4.  What the reconstruction has
+
+   Both shapes, the slide-ins, the hover pairs, the back button and
+   the activation switch including the championship clear. The two
+   destinations that are not built say so:
+
+   +------------------------+------------------------------------+
+   | Where                  | State                              |
+   +========================+====================================+
+   | any mode -> page 6     | race select is not built; the mode |
+   |                        | is stored and the click logs       |
+   | back -> page 7         | session list is not built. Only    |
+   |                        | reachable in a network game, which |
+   |                        | needs page 2 first                 |
+   +------------------------+------------------------------------+
+
+   ALL THREE OF ENTER'S OTHER CLEARS ARE IDENTIFIED NOW.  0x004dc08c
+   is g_selectedTrack and 0x00509ba8 is the championship race index,
+   both cleared beside the two unlock flags - so choosing a mode
+   resets the track and the position in the championship.  0x004e90c8
+   is g_bResultsPageSeen, and its one reader is
+   MenuPage06_RaceSelect_Tick at 0x00448d70 [verified].
+
+   NOT REPRODUCED: the port clears neither the track nor the
+   championship index here.
+
+2.6.  Page 6, race select - transcribed
+
+   MenuPage06_RaceSelect_Enter (0x00447a30), _Tick (0x00448110) and
+   _Leave (0x004480d0).
+
+2.6.1.  Three pages in one, and the lap forcing explains it
+
+   All three modes come here and g_selectedMode decides what the
+   page is:
+
+   +---+---------------+-------------------------------------------+
+   | 0 | practice      | arrows, a lap counter, a time-attack      |
+   |   |               | toggle                                    |
+   | 1 | single race   | arrows; the lap count is FORCED           |
+   | 2 | championship  | no arrows at all, plus a LOAD button and  |
+   |   |               | its own title sprite                      |
+   +---+---------------+-------------------------------------------+
+
+   The forcing is the whole reason mode 1 has no + and -:
+
+       if (g_soloMode && g_selectedMode != 0)
+           g_nRaceLaps = track[selected].defaultLaps;
+
+   runs at the TOP OF EVERY TICK [verified, 0x00448149]. A change
+   would be overwritten before it could be drawn, so only practice
+   lets the distance be set. That also settles what the user sees:
+   in a championship the track cannot be chosen at all.
+
+2.6.2.  The time-attack toggle comes and goes
+
+   The toggle is a button only while the chosen distance is no
+   longer than the track default:
+
+       if (track.defaultLaps < g_nRaceLaps)  g_nTimeAttack = 0;
+       else                                  add the toggle button
+
+   [verified, 0x00448061]. So raising the laps past the default
+   both hides the button AND turns time attack off - one branch
+   doing two things, which is easy to miss reading either half.
+
+   It is drawn as one of two sprites, attackon or attackof, passed
+   as BOTH spriteA and spriteB so the hover does not change it. The
+   state is in which sprite is chosen, not in the draw mode.
+
+2.6.3.  The distance is reset by the TRACK, not by the page
+
+   MenuPage06_RaceSelect_Tick has exactly ONE write to g_nRaceLaps -
+   0x00448189, the mode 1/2 forcing in 2.6.1 - and the enter path
+   does not touch it at all.  So in PRACTICE the chosen distance
+   survives starting the race, leaving it, and coming back; it is
+   lost only when a different island is selected [observed].
+
+   THE PORT RESET IT ON ENTRY and that threw the selection away
+   between the menu and the grid - every practice ran the track
+   default however the arrows were set.  menu.c now latches which
+   track the distance belongs to and resets only when that changes.
+
+   o AND THE RACE HAS TO READ THE GLOBAL.  race_load took
+     track[selected].defaultLaps directly, which is the same value
+     for modes 1 and 2 - the forcing guarantees it - and the WRONG
+     one for practice.  There is no second source: the menu owns
+     the distance.
+
+2.6.4.  The track art is per track and loaded on demand
+   Enter allocates two MR_Sprite per island in one block - 2 * count
+   of 0x74 each - and marks every record unloaded. Only the selected
+   track loads its map.lez and photo.lez; the tick loads a pair the
+   first time that track is reached.
+
+   o A FAILED LOAD RETRIES FOREVER in the original, because the
+     value it writes on failure is the same one that means "not
+     loaded yet". The reconstruction keeps a third state so a
+     missing file is reported once.
+
+   o THE CHANGE IS A CROSS-FADE IN TWO DIRECTIONS. The incoming map
+     slides in from x -200 and the incoming photo from x 740, while
+     the outgoing map leaves UPWARDS to y -400 and the outgoing
+     photo DOWNWARDS to y 580, all over half a second. A new change
+     is refused while any pair is still moving.
+
+   o TWO SPRITES RIDE ON OTHERS. maptxt is placed 43 pixels above
+     the map wherever the map is, and the TIME ATTACK stamp sits at
+     +22, +37 inside the photo. Both use Sprite_GetPosition
+     (0x0043faa0), which is "return this" - the position is the
+     first two fields of MR_Sprite, so the getter is the object.
+
+2.6.5.  The buttons, and they are rebuilt every frame
+
+   +-------------------+---------+------------------------------------+
+   | Button            | Key     | Does                               |
+   +===================+=========+====================================+
+   | Btback            | ESCAPE  | page 9 when a championship is      |
+   |                   |         | under way, else page 5 - see below |
+   | continue          | RETURN  | page 10, bike select - REFUSED     |
+   |                   |         | silently on a locked track         |
+   | left / right      | L / R   | step the selection, skipping       |
+   |                   |         | locked tracks; laps reset to the   |
+   |                   |         | new default; plays cue 0x28        |
+   | BtHiscor          | -       | page 9                             |
+   | moin / plus       | - / +   | practice only, laps 1..8           |
+   | attackon/attackof | -       | practice only, and conditional     |
+   | BtLoad            | -       | championship only, page 20         |
+   +-------------------+---------+------------------------------------+
+
+
+   BACK IS TWO CONDITIONS AND NOT ONE [verified, 0x00448d70]:
+
+       if (g_nSelectedMode == 2 && DAT_004e90c8)  page 9
+       else                                       page 5
+
+   DAT_004e90c8 is written in two places and read in this one:
+
+       0 at the tail of MenuPage05_ModeSelect_Enter  0x00447700
+       1 at the tail of MenuPage09_Results_Enter     0x0044d4fc
+
+   so it means THE STANDINGS HAVE BEEN SHOWN SINCE THE LAST VISIT
+   TO MODE SELECT - a championship part-way through.  A fresh one
+   backs out to mode select like every other mode; only one
+   already under way returns to the standings, because that is
+   where it came from.
+
+   o TESTING THE MODE ALONE IS THE TRAP, and it is the one the
+     port fell into: it sends the first round of a championship
+     to a standings page that has nothing to show.  The flag is
+     what separates the two, and it is set in EVERY mode - the
+     mode test in front of it does the narrowing.
+
+   Page 6 is the only page in the game that registers VK_ADD and
+   VK_SUBTRACT, which structs/MR_MenuButton.txt section 3.1 had
+   already noted from the key census alone. The resource evidence -
+   moin, plus, moiflach, pluflach - and the key evidence were
+   gathered independently and agree.
+
+   o THE PRESS FLASH IS ONE FRAME. Each stepper has a third sprite
+     - moiflach, pluflach, attakfla, left_l, right_l - drawn at the
+     button position on the frame the press is handled and not
+     after. It is not a hover state.
+
+2.6.6.  What the reconstruction has
+
+   All three modes, the slide-ins at both of the original speeds,
+   the track walk with its locked-track skipping, the lap counter
+   and its two digits, the time-attack toggle including the way it
+   disappears, the press flashes and the whole activation switch.
+
+   THE ISLAND LIST IS REAL. src/bpt.c decodes DATA\LIST.BPT and
+   src/tracks.c holds the result, so the eight islands, their paths,
+   their unlock flags and their lap defaults are the shipped data
+   rather than a table typed in here. formats/list-bpt.txt has the
+   file; the map and photo art resolves out of ILE01.BKF and its
+   siblings by name.
+
+   NOT REPRODUCED:
+
+   o the championship record read - in mode 2 Enter copies reverse
+     and pocket out of 0x00508934 + 0x00509ba8 * 0x50, which is the
+     championship definition and is not decoded;
+   o 0x004dc058, the "every track is selectable" override, which has
+     no traced writer;
+   o pages 9, 10 and 20, all three of which this page can reach.
+
+2.7.  Page 10, bike select - transcribed except the bike
+
+   MenuPage10_BikeSelect_Enter (0x0044e480), _Tick (0x0044ed30) and
+   _Leave (0x0044ecf0).
+
+2.7.1.  The eight bikes are the eight carac files
+
+   g_nSelectedBike (0x00584499) runs 0..7 and indexes g_bikeCarac,
+   which Carac_Load fills from the eight carac scripts the island
+   bike manifest names under "MotoCarac" [verified]. That settles
+   the open question formats/bpt-carac.txt had left standing about
+   what the eight variants are for.
+
+   THE CHAIN FROM A TRACK TO ITS BIKES IS FOUR FILES DEEP, and every
+   link is a .bpt:
+
+       LIST.BPT             island path, "data\ile01\"
+       ILE01\LEVEL.BPT      record 7 is the bike manifest
+       MOTOSPD.BPT          marker "MotoCarac", then eight names
+       SPEED\CARAC1..8.BPT  index 0 MotoType, 1 to 4 the stat bars
+
+   o RECORD 7 SPLITS THE GAME IN HALF. ile01, 02, 03 and 08 name
+     motoSpd.spt; ile04, 05, 06 and 09 name motoKTM.spt. Four road
+     tracks and four dirt ones, derived rather than assumed.
+
+   o THE MARKER IS SCANNED FOR, NOT INDEXED. "MotoCarac" is record
+     49 in MOTOSPD and PKTSPEED, 81 in MOTOKTM and 60 in PKTKTM,
+     because the animation list before it differs per bank. A fixed
+     index would read four different things.
+
+   o THE SELECTION DOES NOT WRAP, unlike page 6. Left is refused at
+     0 and right at 7, and at the end the arrow does nothing at all
+     - no sound, no flash.
+
+2.7.2.  The stat bars, and where the numbers come from
+
+   Four bars, drawn with the SAME SHRINK the volume sliders use and
+   in fact the same sprite - featacc.lez is resource 50, which page
+   11 borrows:
+
+       shrink = (Gfx_x * -100) / 100 + 100
+
+   which is 100 - Gfx_x, so a stat of 100 draws the whole bar.
+
+   A BIKE CHANGE SLIDES THEM. The old four shrinks are saved, the
+   new ones computed, and a ONE SECOND tween runs between them; the
+   1000 ms is verified from the two timeGetTime stores. The curve is
+   fsin(u * K1 - K2) with two constants the decompiler could not
+   resolve, and the reconstruction uses pi and pi/2 as the only pair
+   that maps u = 0..1 monotonically onto -1..1 [inferred].
+
+   o READ THE STATS FROM A STOCK COPY. decomp/DATA/SPEED.BKF is
+     tampered with, and two of the eight edited values are exactly
+     these: bike 2 reads 50/75/100/100 on the stock disc and
+     100/100/100/100 in ours. See formats/bpt-carac.txt.
+
+2.7.3.  The gearbox is two three-state rows
+
+   Each row has a lit sprite, a shaded one and a flash, and
+   g_nAutoGearbox (0x004dc0a0) decides which pair is registered:
+
+   +-----------+---------------------+---------------------+
+   | Setting   | AUTO row            | MANU row            |
+   +===========+=====================+=====================+
+   | automatic | auto + autofla      | manusha + manufla   |
+   | manual    | autosha + autofla   | manu + manufla      |
+   +-----------+---------------------+---------------------+
+
+   So the SHADING shows the selection and the flash is only the
+   hover - hovering tells you nothing about which is chosen.
+
+   The three are measurably distinct, decoded out of MENUUS.BKF and
+   averaged over their 95x50 pixels [verified]:
+
+   +------------+-----------+---------------------------------------+
+   | Sprite     | Mean lum  | Reading                               |
+   +============+===========+=======================================+
+   | autosha    | 53.5      | darkest, 0% bright - unselected       |
+   | auto       | 103.3     | mid, 38% bright - selected            |
+   | autofla    | 143.2     | 54% bright, palette full of           |
+   |            |           | (255,246,32) - the hover yellow       |
+   +------------+-----------+---------------------------------------+
+
+   Measuring beat guessing here: the file names alone would allow
+   "sha" to mean shadowed-and-therefore-normal just as easily as
+   shaded-and-therefore-dim, and the two readings invert the page.
+
+   o CHOOSING ONE MOVES THE HIGHLIGHT TO START. The original
+     rebuilds the whole button list and then writes hoverIndex = 2,
+     which is the START button, so the next press lands on the thing
+     you are most likely to want. Ours rebuilds every frame anyway,
+     so only the flag and the hover need setting.
+
+2.7.4.  The bike, and the four constants that make it work
+
+   THE ARTICULATED SKELETON IS THE RIGHT ONE, SLOT 0, and it is
+   drawn UNPOSED. Both halves of that were measured at run time, and
+   both contradict what this section used to say [verified,
+   runtime-capture.txt section 6].
+
+   o racer+0x638 reads 0 in all 23 captures, so the page draws
+     g_meshSkl - corps.skl, not the medium body.
+
+   o WHICH POSE IT USES IS OPEN. A capture appeared to show that no
+     pose is applied - the identity reproduced the original's own
+     g_meshSkl[0] vertices to 0.0001 units while staticPied was out
+     by 42.5 - and that was recorded here as settled. It is
+     RETRACTED: maybe_Racer_Draw poses a slice of that pool per body
+     part by a matrix in the racer record and never writes posed
+     vertices back, so the buffer holds the bind pose whatever the
+     game is doing. See runtime-capture.txt section 6.0.
+
+   THE ARGUMENT THAT WAS WRONG IS WORTH KEEPING. It ran:
+   maybe_Racer_SelectLod (0x0045f160) picks the body by distance to
+   the camera; Enter puts the camera 1500 from the origin; 1500 lands
+   in the "otherwise" band, which is slot 2, g_meshMotoMed. Every
+   step is true and the conclusion is false, because SELECTLOD IS
+   NEVER CALLED ON THIS PAGE - its only caller chain is gameplay - so
+   the slot keeps the 0 Racer_Create leaves. Reading what a function
+   COMPUTES is not the same as establishing that it RUNS.
+
+   THE POSE QUESTION FAILED THE SAME WAY TWICE, one level down.
+   "staticPied" reads as "static feet"; retail footage shows the
+   rider upright with a foot down; the .rot data does extend the left
+   leg. That is suggestive and it is not evidence. The correction
+   that replaced it - "no pose at all" - was worse, because it came
+   with a number attached and the number was measuring the wrong
+   buffer. Both are now withdrawn and the page draws unposed until a
+   capture of the per-part matrices settles it.
+
+   THE SCALE IS 96.0 AND THAT IS VERIFIED TOO.
+   maybe_Game_LoadBikeMeshes (0x00413450) calls Load3dfAndMap seven
+   times, and Load3dfAndMap always scales by the global at
+   0x004d0690, which is 96.0f. Load3df scales by 0x004d0688, a
+   DOUBLE holding 2.8, and only when asked. Two different scale
+   factors for the same file type is exactly the trap that made page
+   14 invisible three times, so the loader was identified before the
+   mesh was loaded rather than after it did not appear.
+
+   THE CAMERA ORBITS; THE BIKE DOES NOT TURN. The tick advances a
+   camera angle, takes its sine and cosine and rebuilds the camera
+   from them every frame. The model sits at the origin. Rotating the
+   model instead would look identical from the front and shade
+   differently, so the reconstruction moves the camera as well.
+
+   AND THE RATE IS EXACT: 0x004d0c58 is 0.0006135923152 radians per
+   millisecond, which is 2*pi / 10240 - ONE REVOLUTION EVERY 10.24
+   SECONDS.
+
+2.7.4.1.  Four constants the decompiler had hidden
+
+   All four read as pointer-shaped garbage in the decompiler, and
+   all four are ordinary doubles. The cause was a wrong VA-to-file
+   mapping: .rdata starts at file offset 0xcea00, not at the
+   .data-derived offset an earlier lookup had reused. Parsing the PE
+   section table instead makes them decode immediately.
+
+   +------------+-------------------+-----------------------------+
+   | Address    | Value             | What it drives              |
+   +============+===================+=============================+
+   | 0x004d0c10 | 3.14159265        | pi, the stat-bar ease       |
+   | 0x004d0c20 | 1.57079633        | pi/2, the same ease         |
+   | 0x004d0c58 | 0.0006135923152   | camera orbit, rad per ms    |
+   | 0x004d0690 | 96.0 (float)      | the Load3dfAndMap scale     |
+   +------------+-------------------+-----------------------------+
+
+   THE FIRST TWO UPGRADE A GUESS TO A READING. The stat-bar tween
+   had been implemented as sin(u*pi - pi/2) on the argument that it
+   was the only pair mapping 0..1 monotonically onto -1..1. It was,
+   and now it is also what the file says.
+
+   o THE LESSON IS ABOUT THE MAPPING, NOT THE CONSTANTS. A hardcoded
+     "image base plus 0x1800" worked for every .data lookup in this
+     project and is simply wrong for .rdata. Read the section table.
+
+2.7.4.2.  Why the bike drew white, and it was not page 10
+
+   The body loaded, transformed, culled and drew - as a WHITE model.
+   Three separate things were wrong and only the third mattered.
+
+   THE FLAGS WERE PAGE 14'S. Game_LoadBikeAndBanks allocates both
+   bike slots with paletted 1 and palBits 8 [verified, the pushes at
+   0x0040a86c]; page 14 passes paletted 0 because its page is
+   truecolour. Copying the title page's arguments told the blend
+   ladder the wrong thing about the source.
+
+   THE SECOND BANK WAS MISSING. Of medium\corps.map's 196 face
+   records, 195 name relative bank 0 and ONE names bank 1, so
+   bnk00_01.raw has to sit in the next slot. One white face out of
+   196 would never have been noticed on its own.
+
+   AND THE REAL CAUSE: THE RENDERER REFUSED INDEXED PAGES.
+   prim_is_textured bailed on bank.isIndexed and bank_texture
+   returned NULL for one, both with a comment saying the path was
+   not wired up because no producer asked for it. Every face of a
+   paletted bank therefore fell through to its flat colour, which
+   for a textured face is 0xffffffff.
+
+   o EVERY MENU BANK BEFORE THIS ONE WAS TRUECOLOUR, which is why a
+     gap that had been sitting in the renderer since the beginning
+     took until the first piece of GAME geometry to show. The
+     comment that named the gap was right, and it was three lines
+     above the return that caused the symptom.
+
+   o THE KEY RULE IS NOT THE SAME FOR THE TWO KINDS.
+     maybe_D3D_LoadRawToTexture drops a truecolour texel whose RGB
+     quantises to zero, and drops INDEX 0 on an indexed page
+     whatever colour it names [verified]. Keying an indexed page on
+     black instead would punch holes wherever the palette holds a
+     dark entry - a different set of texels, and not the artist's.
+
+2.7.4.3.  The liveries are palettes, and that is why the mask is 7
+
+   SPEED.BKF carries BNK00_00.RAW plus BNK00_00.1 through .11. Those
+   are not twelve pages: bank_load's sibling loop reads them as
+   ALTERNATE PALETTES of the one indexed page, up to eight of them,
+   and mode 1 is what enables that loop.
+
+   That explains the tick's selector. It computes
+   (selectedBike + spinOffset) & 7 into three fields - eight
+   palettes, masked to eight. One 256x256 page of indices plus eight
+   palettes is how a 1997 title gives eight bikes eight colour
+   schemes without eight textures.
+
+   bank_set_palette now carries that choice and invalidates the
+   cached texture, so selecting a bike recolours it.
+
+2.7.4.4.  The bike pivoted about its rear wheel
+
+   medium\corps.3df spans x -0.45 to 2.06 before the load scale,
+   so its origin sits by the REAR AXLE and its visual centre is 77
+   units forward and 41 up once scaled by 96. A camera aimed at the
+   origin therefore swings the bike about its back wheel, which is
+   exactly what it looked like.
+
+   THAT WAS ABOUT THE WRONG MESH, AND THE OFFSET IS NOW GONE. The
+   page draws the SKELETON (2.7.4), and skl_load re-centres that on
+   its root joint, which leaves it centred already - the wheels come
+   out symmetric at z +/-84 about the origin.
+
+   THE ORIGINAL OFFSETS NOTHING. Its racer position, its racer matrix
+   at +0xbc and its body instance position are zero and identity in
+   all 23 captures [verified, runtime-capture.txt section 6].
+
+   The reconstruction used to shift the model by minus its own
+   bounding-box centre - a stand-in for a racer record we had not
+   reproduced, and stated as one. That centre is (0.08, 28.80,
+   -9.60), so the stand-in was pushing the bike 28.8 UNITS DOWN and
+   9.6 back. It is the "bike sits too low" the capture was taken to
+   settle, and a good example of a stand-in that fights the real code
+   the moment the real code arrives.
+
+   o A .3df CARRIES NO ORIGIN CONVENTION. The menu title models are
+     centred on theirs and this one is not, so anything that spins a
+     mesh has to measure it rather than assume. mesh_centre exists
+     for that.
+
+2.7.4.5.  Blurry wheels: a missing half texel, and a filter
+
+   The .map stores u and v as TEXEL INDICES over a 256x256 page, and
+   texel i has its centre at (i + 0.5) / 256. Sampling at i / 256
+   lands on the boundary between texels i-1 and i, so a linear filter
+   returns a 50/50 blend of two texels at every corner of every face.
+
+   o AND IT IS WORST WHERE THE ART IS SMALLEST. 62 of the 196 faces
+     of medium\corps.map span ONE TEXEL OR LESS - spokes, brake
+     discs, small detail patches - so for a third of the model the
+     half-texel error is the whole patch. Wheels that should be crisp
+     came out smeared.
+
+   o THE FILTER SHOULD NOT HAVE BEEN ON AT ALL, and the options page
+     is the evidence: the D3D row has THREE states, OFF, ON and
+     FILTERED. Bilinear is a setting the player turns on, so the
+     default a page draws with is UNFILTERED. The reconstruction had
+     linear on for everything because one r_set_filter call served
+     both the 3D geometry and the 2D letterbox blit; they are
+     independent decisions and now each makes its own.
+
+   Neither is a transcription. The original's software rasterizer
+   indexes texels directly and its D3D path fed a different API, so
+   the half-texel rule is a port correction - correct regardless of
+   filtering, and invisible until something sampled a one-texel
+   patch.
+
+2.7.4.5.1.  The bike stood thirty units too high - one wrong builder
+
+   racer+0x1b4 and racer+0x338 ARE DUAL PURPOSE, and that is the
+   whole trap.  They are the POSITION FIELDS of the two wheel model
+   instances at racer+0x1a8 and +0x32c - MR_ModelInstance.position is
+   at +0x0c - so the same eight floats mean two different things:
+
+       at rest     the wheel OFFSET maybe_Racer_PlaceWheels writes,
+                   (0, -96 * rayon, +-48 * axeDistance)
+       in a race   the world GROUND CONTACT the fit writes, which
+                   carries NO RADIUS TERM
+
+   The port's page 10 called the RACE-TIME builder.  With the
+   identity orientation this page uses it returns y = 0 for both
+   wheels, where the rest placement gives -30.72 and -27.84 - so the
+   machine floated about thirty units off the floor.
+
+   MEASURED, both games on the page:
+
+       MOTO   rear (0, -30.720, -84.000)   front (0, -27.840, 83.975)
+       port   rear (0,   0.000, -84.000)   front (0,   0.000, 84.000)
+
+   with the carac reading axeDistance 1.75, rayonAv 0.29, rayonAr
+   0.32 - and -96 * 0.32 = -30.72, -96 * 0.29 = -27.84 exactly.
+
+   THE Z AGREED ALL ALONG, which is why it read as a small vertical
+   error rather than a wrong function: the two builders share the
+   +-48 * axeDistance wheelbase term and differ ONLY in the radius.
+
+   FIXED BY IMPORTING maybe_Racer_PlaceWheels WHOLE, not by lifting
+   the model.  An offset here would have been indistinguishable from
+   the real thing until the next bike with a different radius.
+
+   VERIFIED: all six numbers now agree to 0.000015.
+
+   AND THE FRONT WHEEL'S 0.0247 IS EXPLAINED, which the original's own
+   plate comment had left open as "far too large to be float noise".
+   IT IS NOT PlaceWheels' OUTPUT.  maybe_Racer_Draw rebuilds the front
+   contact at 0x0045f87c from the REAR one plus the NORMALISED
+   rear-to-front direction, scaled by the wheelbase:
+
+       d     = normalise(front - rear)
+       front = rear + d * axeDistance * 96
+
+   The two wheels sit 2.88 units apart VERTICALLY, because their radii
+   differ (0.32 against 0.29), so that direction is TILTED.  Their
+   separation is sqrt(2.88^2 + 168^2) = 168.0247, and stepping 168
+   units along a tilted direction lands 0.0247 short in z:
+
+       d     = (0, 2.88, 168) / 168.0247
+       front = (0, -30.72, -84) + d * 168
+             = (0, -27.8404, 83.9753)        exactly the capture
+
+   So PlaceWheels really does write +-84.0; anything reading
+   racer+0x1b4 AFTER a draw sees the rebuilt value.  The port
+   reproduces it independently, which is what identified it.
+
+2.7.4.6.  The bike change is a camera pan, not a moving bike
+
+   Pressing left or right does not move the model. THE MODEL NEVER
+   MOVES. What slides is the camera's LOOK-AT TARGET, along the
+   camera's own right vector, which sweeps the stationary bike off
+   one side of the screen and back on from the other. Three
+   globals, all page 10's alone [verified]:
+
+   +----------------------+------------+--------------------------+
+   | Global               | Address    | Meaning                  |
+   +======================+============+==========================+
+   | g_nBikeSpinDir       | 0x005420d0 | 0 idle, -1 left, +1 right|
+   | g_nBikeSpinOffset    | 0x005420dc | 0, +1 or -1              |
+   | g_menuBikePanTarget* | 0x0053f540 | the look-at target, vec3 |
+   +----------------------+------------+--------------------------+
+
+   g_nBikeSpinOffset IS THE TRICK, and it is the answer to "surely
+   they reuse one model". Pressing left decrements g_nSelectedBike
+   IMMEDIATELY - the stat bars start tweening to the new bike's
+   numbers that frame - and sets the offset to +1. The livery
+   actually drawn is
+
+       (g_nSelectedBike + g_nBikeSpinOffset) & 7
+
+   computed at 0x0044efa3 and stored every frame by the three MOVs
+   at 0x0044efbb, 0x0044efc0 and 0x0044efc5, into racer+0x2f4,
+   +0x478 and +0x5fc.  So on the way OUT the offset cancels the
+   decrement and the old bike is still on screen.  The
+   snap at 0x0044ef99 clears the offset, and the same model slides
+   back in wearing the new palette.
+
+   o THOSE ARE NOT THE THREE MODEL INSTANCES, and the arithmetic is
+     the proof.  A livery field sits at instance+0x14c, so the three
+     instances Racer_Create initialises - racer+0x24, +0x1a8 and
+     +0x32c, section racers.txt 6 - have theirs at +0x170, +0x2f4
+     and +0x478.  The page writes +0x2f4, +0x478 and +0x5fc: the two
+     WHEELS and a fourth slot at +0x4b0, one stride further on,
+     leaving instance 0's +0x170 alone.
+
+     Reading the offset as +0x2d0 instead makes the three stores
+     land tidily on the three known instances, and it cannot be
+     right - the instance record is 0x184 bytes with its last dword
+     at +0x180, so +0x2d0 is outside it.  See src/racer.h on
+     liveryRider: instance 3 has no mesh, and its livery is what
+     maybe_Racer_Draw dispatches the pose array on at 0x00461a30,
+     which is why it is the one that colours the bike you look at.
+
+   THE CAMERA SPIN IS FROZEN FOR THE DURATION. Only the
+   g_nBikeSpinDir == 0 branch at 0x0044ee2b advances the orbit
+   angle, and it advances the timestamp with it - so the spin
+   resumes where it stopped rather than jumping forward by the
+   length of the pan. Note also that this branch CAPS dt at 1000 ms
+   (MOV EDX,0x3e8 at 0x0044ee43); it does not substitute 100, which
+   is what an earlier reconstruction comment claimed by borrowing
+   page 14's number.
+
+2.7.4.6.1.  The two constants, and why they are scaled by the cosine
+
+   Both are .rdata doubles, both multiplied by cos(camAngle) at
+   0x0044ee09..0x0044ee1f before anything uses them [verified]:
+
+   +------------+---------+---------------------------------------+
+   | Address    | Value   | Role                                  |
+   +============+=========+=======================================+
+   | 0x004d0c48 |   250.0 | how far the target travels, the limit |
+   | 0x004d0c50 |   100.0 | how far per FRAME, the step           |
+   +------------+---------+---------------------------------------+
+
+   THE STORED QUANTITY IS THE TARGET'S WORLD X, not the distance
+   travelled. With the camera at angle a its right vector is
+   (cos a, 0, -sin a), so a pan of t units along it puts the target
+   at x = t*cos a. Pre-multiplying both constants by the cosine is
+   therefore exactly what makes the excursion 250 REGARDLESS of
+   where the camera is in its orbit: SCREEN speed is constant and
+   world speed is not. At a side-on camera the world excursion goes
+   to zero and the screen excursion does not change.
+
+   AND 250 IS EXACTLY THE SCREEN EDGE, which is the check on this
+   whole reading rather than a coincidence. The menu lens is 1911
+   pixels (see projection.txt section 5) and the camera sits 1500
+   from the bike, so a pan of t moves the bike 1911*t/1500 = 1.274*t
+   pixels. 250 gives 318.5 against a half-width of 320.
+
+   THE INVARIANT both branches hold, though neither writes it:
+
+       target.z = -(target.x / cos) * sin
+
+   which is the line through the origin along the right vector. The
+   code accumulates matching increments into x and z instead, and
+   every store - snaps included - satisfies it.
+
+   A ZERO COSINE DOES NOTHING. The branch tests are integer tests on
+   the float's sign bit (TEST EAX,EAX/JG at 0x0044ee8a for positive,
+   CMP EAX,0x80000000/JA at 0x0044eea0 for negative) and BOTH fail
+   on +0.0 and on -0.0, so a camera exactly side-on skips the frame.
+   That is the guard, not an oversight: every branch divides by the
+   cosine.
+
+2.7.4.6.2.  The eight frames, drawn out
+
+   THE VIEW MATRIX LAGS THE TARGET BY ONE FRAME. Camera_LookAt is
+   called at 0x0044edc2 and the slide arithmetic does not start
+   until 0x0044ee23, so every frame is drawn with the PREVIOUS
+   frame's target [verified]. That is load-bearing rather than
+   sloppy, and the way to see it is to walk the frames. Left pressed,
+   cos positive, limit 250 and step 100, in pan units with the pixel
+   position beside them:
+
+       frame   drawn at   pixels   livery
+       -----   --------   ------   ---------------------------
+         1          0          0   old
+         2        100       -127   old
+         3        200       -255   old
+         4        300       -382   NEW  <- swap, off-screen
+         5       -250       +318   new
+         6       -150       +191   new
+         7        -50        +64   new
+         8          0          0   new
+
+   The overshoot to 300 exists because the test is "limit <= x"
+   AFTER the step, so the target passes the edge before it snaps.
+   The lag then puts the livery change on that frame - 382 pixels
+   out, comfortably off a 320 half-width screen - so the swap is
+   invisible. Drop the lag and two things break: the swap becomes
+   visible at the edge, and the pan ends 64 pixels PAST centre
+   before resetting.
+
+   PER FRAME, NOT PER SECOND. There is no dt anywhere in the slide.
+   Eight frames end to end, so the original ran the whole thing in
+   roughly a quarter of a second at its own frame rate and will run
+   it faster on anything quicker. See the open question below.
+
+2.7.4.6.3.  What the reconstruction does
+
+   src/menu.c has it: p10_pan_dir picks the branch, p10_pan_step is
+   the two mirrored arms, and page10_tick holds the snapshot, the
+   per-frame livery write and the termination test.
+
+   o s_p10_targetDrawn REPRODUCES THE LAG. Our draw runs after the
+     tick rather than inside it, so the target is snapshotted at the
+     top of the tick and page10_draw_3d looks at the snapshot.
+
+   o THE CAMERA POSITION NEEDS NO SNAPSHOT, and it is worth saying
+     why rather than leaving it as luck. The orbit angle only
+     advances when g_nBikeSpinDir is 0, and the target is zero on
+     every frame where that is true - the frame the key is pressed
+     and the frame after the reset. So the angle used to build the
+     view is never inconsistent with the angle the target was
+     computed under.
+
+   o WE SET THE PALETTE ONCE, NOT THREE TIMES. The original writes
+     +0x2d0 on the body and both wheels; our three instances share
+     bank P10_BANK, so it is one bank_set_palette, which already
+     no-ops when the index is unchanged.
+
+   NOT REPRODUCED: the frame-rate dependence is transcribed as-is,
+   so the pan is eight of OUR frames and therefore quicker than
+   retail. Nothing was invented to compensate. Whether the original
+   capped its frame rate on this page - the command line has a cap
+   flag - would settle what the intended duration was; until then
+   there is no number to match and inventing one would be a fit.
+
+2.7.4.7.  The camera is lifted twice, by different amounts
+
+   The tick does this, in this order [verified]:
+
+       camPos.y += 200.0        0x0044eda8, const 0x004d0c44
+       Camera_LookAt(target)    0x0044edc2
+       camPos.y += 40.0         0x0044edde, const 0x004d0bac
+       maybe_Racer_Draw(racer, ..., camrec)
+
+   THE VIEW MATRIX IS THEREFORE BUILT FOR A CAMERA AT y=200 AND THE
+   SCENE IS TRANSLATED AS IF IT WERE AT y=240. The two adds straddle
+   the call and the draw subtracts camPos before applying the view,
+   so the 40 is not bookkeeping - it puts the bike lower in frame
+   than a self-consistent camera would.
+
+   THE BASE IS ZERO, AND THAT IS THE INFERRED PART. FUN_0046dab0
+   rebuilds the position every frame as
+
+       camPos = dist * m[0x80..0x88] + m[0x8c..0x94] + racerPos
+
+   where m is the matrix it has itself just written at camrec+0x68
+   from the camera's euler angles - the read at 0x0046dd52 comes
+   AFTER the Matrix34_Copy2 at 0x0046dd4a, which is what makes the
+   two the same matrix. Page 10 turns only the yaw (+0x3c), so that
+   row has no y term; Camera_LookAt writes a zero translation into
+   0x8c..0x94; and the racer sits at the origin here. All three
+   terms vanish, so camPos.y starts at 0 and the absolute values are
+   200 and 240.
+
+   o MEASURED, AND THE CHAIN HOLDS. Two GET_MEMs on camrec+0x98
+     while page 10 was up, a moment apart:
+
+         pEye = ( 1377.54, 240.00, -593.63)   radius 1500.00
+         pEye = (-1488.93, 240.00,  181.90)   radius 1500.00
+
+     y is 240.0 and does not move, and the radius is exactly 1500 -
+     both as predicted above. The orbit really is a yaw-only row
+     times a distance.  [verified]
+
+   THE TWO CAMERA LIFTS, AND WHY THEY WERE WRONGLY LEFT OUT.
+
+   The tick lifts the eye twice, straddling the look-at:
+
+       camPos.y += 200.0     0x0044eda8, const 0x004d0c44
+       Camera_LookAt(target) 0x0044edc2
+       camPos.y += 40.0      0x0044edde, const 0x004d0bac
+
+   For a long time the port applied NEITHER, because applying them
+   dropped the bike 50 px. The reading was never wrong; the other
+   half was missing. THE BIKE IS NOT AT THE ORIGIN - the world
+   matrix maybe_Racer_Draw builds at 0x0045ff99 carries
+   (0, 41.7597885, -0.0123367) on this page.
+
+   +------------------------------+-------+-----------+
+   | camera / bike                | tilt  | bike px   |
+   +==============================+=======+===========+
+   | 200,240 and bike 41.76       | 7.59  |    -2.2   |
+   +------------------------------+-------+-----------+
+   | 200,240 and bike 0           | 7.59  |   +49.9   |
+   +------------------------------+-------+-----------+
+   | no lifts and bike 41.76      | 0.00  |   -53.2   |
+   +------------------------------+-------+-----------+
+   | no lifts and bike 0          | 0.00  |     0.0   |
+   +------------------------------+-------+-----------+
+
+   positive is below centre. Row 2 is what was tried and reverted;
+   row 3 was produced live by zeroing both constants in the running
+   game; row 4 is what the port did. ALL THREE WERE OBSERVED, and
+   the model predicts each.  [verified]
+
+   THE 200 ONLY TILTS - a look-at keeps its target centred, so
+   raising the eye changes the angle and nothing else. THE 40 AND
+   THE 41.76 VERY NEARLY CANCEL, which is why leaving both out also
+   looked right: by cancellation, not by being correct. Applying
+   either alone is visibly wrong in opposite directions.
+
+   THE BODY DOES NOT SUBTRACT A DIFFERENT CAMERA than the wheels -
+   that was the standing suspicion. Every subtraction in
+   maybe_Racer_Draw, the body's at 0x0046164a included, uses
+   camrec+0x98.  [verified]
+
+
+   FREEZING IT, FOR CLOSE INSPECTION. g_nBikeSpinDir at 0x005420d0
+   takes 0 to spin and +-1 while a bike change slides. WRITING 2
+   PAUSES IT: every pan test on the page is an equality against
+   those three values, so 2 falls through to LAB_0044efa3 without
+   advancing the yaw and without starting a slide, and nothing
+   resets it. Restoring 0 resumes from where it stopped, because
+   the timestamp at 0x004e9118 is only refreshed inside the branch
+   that was skipped.  [verified live]
+
+   THE SPIN DOES NOT USE THE GAME CLOCK. It reads timeGetTime()
+   directly at 0x0044ee2b, so mrhook's virtual clock has no effect
+   on it - pausing that would not stop the turntable. The rate is
+   the DOUBLE at 0x004d0c58, 0.000613592 rad per ms, which is 35.16
+   degrees a second and a full turn in 10.2 s.
+
+   tools/mr_menucam.py wraps this: --pause, --resume, --step DEG.
+   It resolves the camera record through the index at 0x004dc0f8
+   rather than assuming 0x005161c0, which is only where it lands on
+   this page.
+
+   AND IT EXPLAINS WHY THE ORBIT IS THE SHAPE THE RECONSTRUCTION
+   USES. A row of a yaw-only rotation times a distance IS
+   (sin, 0, cos) * radius, which is what page10_draw_3d writes by
+   hand. Worth recording because the two look nothing alike in
+   source: the original never names an orbit, it just multiplies a
+   matrix row.
+
+   o Camera_LookAt WRITES TWELVE FLOATS, camrec+0x68 through +0x94
+     [verified, the store run at 0x0046e289..0x0046e2f9], so
+     +0x80..+0x94 are the last two rows of that same matrix and not
+     independent fields. FUN_0046dab0's matrix output is overwritten
+     by Camera_LookAt in the same frame, so on this page only its
+     POSITION output survives.
+
+   THE RECONSTRUCTION DOES NOT APPLY EITHER LIFT, AND THAT IS A
+   DELIBERATE DIVERGENCE. Both were transcribed, straddling
+   camera_look_at exactly as the original straddles its call, and
+   the result put the bike about FIFTY PIXELS LOW on screen. The
+   number follows from the 40 alone: model_draw subtracts camPos
+   before applying the view, so the mismatch shows up directly, and
+   1911 * 39.6 / 1518.5 is 50 pixels.
+
+   o THE READING IS NOT WHAT IS WRONG. The two adds are at
+     0x0044eda8 and 0x0044edde, and section 6.1 of
+     runtime-capture.txt measured camera y at exactly 240.0000 in
+     all 23 blocks. The original's camera IS at 240 when it draws.
+     That is measured, not inferred, and it is not in doubt.
+
+   o WHAT IS IN DOUBT IS WHAT OUR RENDERER DOES WITH IT. Retail
+     does not show a bike fifty pixels low, so something between
+     the measured 240 and our screen disagrees with the original.
+     The two candidates are the pitch sign in camera_look_at - the
+     b[5] = d1 / b[7] = -d1 pair - and the y sign in the
+     projection. BOTH ARE INVISIBLE AT y = 0, which is exactly why
+     this surfaced only when the lift went in: a latent
+     disagreement the lift EXPOSED rather than caused.
+
+   o AND IT IS THE SAME QUESTION 3.1 OF runtime-capture.txt ALREADY
+     HAS OPEN, approached from the other side: "the camera record
+     and g_projZoom -> THE FRAMING - why the bike sits lower than
+     retail". That row is still unanswered.
+
+   HOW TO SETTLE IT: capture camrec+0x68, the twelve floats of the
+     view matrix itself. Every dump so far has taken only the
+     position at +0x98, which is why the framing question has
+     survived three captures. With the matrix in hand the screen
+     position of the origin can be computed directly and compared
+     with a screenshot, and the sign question answers itself.
+
+   Until then y stays 0 - a divergence that looks right, recorded
+   as one, rather than a transcription that looks wrong.
+2.7.5.  What is still not here
+
+   THE PAGE DRAWS THE ARTICULATED MODEL, and it does now.
+
+   maybe_Racer_SelectLod has exactly ONE caller, FUN_00467b30, which
+   is reached only from maybe_Game_Tick and three racer-update
+   functions. All four are gameplay. NO MENU PAGE CALLS IT, so page
+   10 never re-selects a level of detail and racer+0x638 keeps
+   whatever Racer_Create left [verified].
+
+   Racer_Create writes that field twice: 1 at 0x0045c23d, to load
+   FileSklHand, and then EDI at 0x0045c3c2 - where EDI was zeroed by
+   the XOR two instructions earlier. It leaves 0, and slot 0 is
+   g_meshSkl.
+
+   o THE MISTAKE WAS NOT IN THE ARITHMETIC, IT WAS IN THE PREMISE.
+     The distance bands, the constants and the branch order were all
+     read correctly out of maybe_Racer_SelectLod; what went unchecked
+     was whether anything on this path CALLS it. Verifying what a
+     function does is not the same as verifying that it runs.
+
+   o AND THE OTHER GLOBAL IS MOOT BUT WORTH RECORDING. DAT_004ea4e0
+     has ONE reference in the whole binary - the read inside
+     maybe_Racer_SelectLod - and no writer at all. Its initialiser is
+     0, so that branch is always live. It simply never gets the
+     chance here.
+
+   src/skl.c reads the model and src/skl.h has the shape; the two
+   formats are written up in formats/skl-rot.txt with tools/skl.py as
+   the reference decoder. The page loads corps.skl and poses it with
+   staticPied - "static feet", the stance with the rider upright and
+   both feet on the ground.
+
+   THE WHEELS ARE ON, and their placement is read rather than fitted.
+   maybe_Racer_PlaceWheels (0x0045c7c0) builds two offsets from the
+   carac table and three .rdata constants:
+
+       rear  = (0, -96 * RoueRayonAr, -48 * RoueAxeDistance)
+       front = (0, -96 * RoueRayonAv, +48 * RoueAxeDistance)
+
+   -96 is 0x004d0e90 and the two 48s are 0x004d0e94 and 0x004d0e98
+   [verified]. 96 is the Load3dfAndMap scale, so RoueAxeDistance is a
+   wheelbase in mesh units and the halves go either side of the root
+   joint.
+
+   o THE CORROBORATION IS THE GROUND. On SPEED the re-centred body's
+     lowest vertex is y -62.5 and the rear wheel centre lands at
+     y -30.7 with a rolling radius of 30.7, so its contact point is
+     y -61.4. The two agree to about a pixel, which is not something
+     a wrong constant produces.
+
+   o WHAT IS STILL ASSUMED: that the racer's orientation matrix is
+     the identity on this page, so the offsets apply unrotated.
+     Nothing here writes it, and the racer record starts zeroed - but
+     a zeroed matrix is not an identity one, so this is the next
+     thing to check if the wheels sit oddly.
+
+   THE BIKE-CHANGE SLIDE IS DONE - see 2.7.4.6. An earlier version
+   of this paragraph called it "a directed sweep with its own
+   easing, on top of the idle rotation", which was wrong on all
+   three counts: it is a camera pan and not a rotation, it has no
+   easing - it is a fixed step per frame - and it REPLACES the idle
+   rotation rather than adding to it, because the spin is frozen
+   while it runs.
+
+
+   START plays two cues and then WAITS for them. The bike engine
+   sample is (MotoType == 0) + 0x2b, so 0x2c or 0x2b, and then
+   "letsgo" at 0x58; the page change is held until the longer ends.
+   With a silent back end nothing starts and nothing is waited for,
+   which is the same shape page 3 uses for "play solo".
+
+   Solo goes to page 1 and a network game to page 8; neither is
+   built, and both say so.
+
+2.7.6.  The empty panel, and what does NOT fill it
+
+   features.lez has a large blank region in the middle and nothing
+   in the game draws into it. This section exists so the question is
+   not asked a third time.
+
+   THE GEOMETRY, measured from the art rather than guessed:
+
+   +---------------+-----------+-------------------+--------------+
+   | Sprite        | Size      | Placed at         | Panel-local  |
+   +===============+===========+===================+==============+
+   | features.lez  | 473 x 141 | 27, 322           | the panel    |
+   | featacc..bra  |  81 x 9   | 145, 360 step 27  | x 118..199   |
+   | auto/manu     |  95 x 50  | 401, 356 and 407  | x 374..469   |
+   +---------------+-----------+-------------------+--------------+
+
+   which leaves PANEL-LOCAL x 199..374 BY 141 TALL - roughly 175 by
+   105 of usable area, screen x 226..401, y 322..463 - with nothing
+   positioned in it and nothing drawn into it. Decoding the art
+   confirms it is blank: a darker recessed field with faint
+   horizontal striations, between the four stat slots and the
+   A-T / M-T boxes.
+
+   IT IS NOT A MISSING SPRITE. Every Sprite_SetPosition in Enter
+   resolves through the 0x00504880 table to one of the nineteen
+   resources the page already loads - 47, 48, 49, 50..53, 54..59,
+   26..29, 76, 81 - and the tick draws no others. There is no
+   twentieth slot.
+
+   AND IT IS NOT THE POCKET / REVERSE BADGE, which is the obvious
+   guess and is wrong twice over. Modpock.lez (198) and Modrever.lez
+   (199) are 640x480 FULL-SCREEN images, not badges, and neither has
+   a single reference anywhere in the image - they are loaded into
+   the sprite table by Menu_LoadResources and drawn by nobody. The
+   badges that DO exist are smallrev (185) and smallpok (186), and
+   they belong to page 1, at 4,470 and 4,460.
+
+   o SO THE REGION IS EMPTY IN RETAIL TOO, which matches every
+     recording anyone has looked at [observed]. There is nothing
+     here for the reconstruction to implement.
+
+   o WHAT IT WAS FOR IS UNANSWERED. Cut content, or space the
+     layout simply leaves. Nothing in the binary distinguishes
+     those, and the art is one image so it cannot be taken apart
+     to look underneath.
+
+2.8.  Page 2, protocol - graphics and CANCEL
+
+   The connection-method picker, reached from the main menu's LINK
+   button and returning there on CANCEL.  Enter enumerates the
+   DirectPlay service providers; Tick turns each into a text button.
+
+   THE SIX EMPTY ROWS ARE THE ARTWORK, NOT AN UNFINISHED PAGE.
+   tableau.lez paints six row slots; the rows themselves are built
+   from the enumeration, so a machine with no DirectPlay provider
+   gets a frame with nothing in it.  [verified] - with retail paged
+   here, the count at 0x004f1274, the enumerated flag at 0x004f1278,
+   the scroll offset at 0x004f127c and the scroll enable at
+   0x004f1280 all read 0.
+
+   The four sprites, by index into the table at 0x00504880:
+
+   +-----+----------+------------+------------------------------+
+   | Idx | Resource | Position   | Notes                        |
+   +=====+==========+============+==============================+
+   |  1  | paralax2 | scrolling  | (-1, +1) here; page 3 is     |
+   |     |          |            | (1, 1) and page 11 (-1, -1)  |
+   +-----+----------+------------+------------------------------+
+   | 67  | titre    | 0, 0       | the banner                   |
+   +-----+----------+------------+------------------------------+
+   | 68  | stitre   | 83, 152    | the caption                  |
+   +-----+----------+------------+------------------------------+
+   | 69  | tableau  | 83, 197    | the six-row frame            |
+   +-----+----------+------------+------------------------------+
+   | 71  | cancel   | 0, 430     | CENTRED - the third argument |
+   |     |          |            | is 1, where the other three  |
+   |     |          |            | pass 0                       |
+   +-----+----------+------------+------------------------------+
+
+   CANCEL SHATTERS, unlike page 3's own EXIT: the arm at 0x00486e50
+   is Menu_BeginTransition then Menu_GotoPage(3).
+
+   THE PORT IS A SLICE - rule 15's menu exemption.  page2_enter,
+   _tick and _leave draw the four sprites and add CANCEL.  Left
+   out: the enumeration and its 0x110-byte records at 0x005f5ac8,
+   the six text buttons at x 92 / y 202 + 31*row on font 12, the
+   up/down pair (61..66) that Enter only positions at seven
+   providers or more, and FUN_004542c0 which opens the chosen
+   provider and goes to page 7.
+
+   With no networking there is nothing to enumerate, so the slice
+   and the whole behave identically on a modern machine.
+
+
+2.9.  Page 9, results - the screen a quit race lands on
+
+   Enter 0x0044cfd0, Tick 0x0044d540, Leave 0x0044d510.  This is
+   the TOP 5 screen, and it is where retail goes when a race is
+   left - not to the main menu.  Its button set is what tells the
+   three modes apart.
+
+2.9.1.  The sprites
+
+   By index into the pointer table at 0x00504880, as everywhere
+   else - (addr - 0x504880) / 4:
+
+   +-----+----------+------------+--------------------------------+
+   | Idx | Resource | Home       | Notes                          |
+   +=====+==========+============+================================+
+   |   1 | paralax2 | scrolling  | the checkerboard               |
+   +-----+----------+------------+--------------------------------+
+   |  18 | toptitle | 0, 0       | slides there over 1.0 s, from  |
+   |     |          |            | Enter rather than from Tick    |
+   +-----+----------+------------+--------------------------------+
+   |  19 | bestlap  | authored   | drawn, never moved             |
+   +-----+----------+------------+--------------------------------+
+   |  20 | bestRace | 430, 135   | 0x1ae, 0x87                    |
+   +-----+----------+------------+--------------------------------+
+   |  77 | continue | 496, 429   | single and practice            |
+   +-----+----------+------------+--------------------------------+
+   |  78 | Btsave   | 150, 437   | championship                   |
+   +-----+----------+------------+--------------------------------+
+   |  80 | BtAbort  | 296, 437   | championship                   |
+   +-----+----------+------------+--------------------------------+
+   |  82 | BtNextRa | 496, 437   | championship                   |
+   +-----+----------+------------+--------------------------------+
+   | 201 | resetTA  | 296, 429   | practice only                  |
+   +-----+----------+------------+--------------------------------+
+
+   EVERY BUTTON IS PARKED OFF-SCREEN RIGHT BY Enter - x 640 or
+   840 - and slid home by Tick over 0.7 s (0x3f333333), easing 1.
+   Reading Enter alone gives positions that are all off the edge.
+
+2.9.2.  The button set is the mode
+
+   Enter builds the list; the order IS the activated index.
+
+   +----------------+-------+---------------------------------------+
+   | Mode           | Index | Button and condition                  |
+   +================+=======+=======================================+
+   | championship   |   0   | BtNextRa, only while                  |
+   | g_nSelectedMode|       | 0x00509ba8 < 0x005083b4               |
+   | == 2           +-------+---------------------------------------+
+   |                |   1   | BtAbort, VK_ESCAPE                    |
+   |                +-------+---------------------------------------+
+   |                |   2   | Btsave, same condition as BtNextRa    |
+   +----------------+-------+---------------------------------------+
+   | single race    |   0   | continue                              |
+   | and practice   +-------+---------------------------------------+
+   |                |   1   | resetTA, ONLY when mode == 0 and the  |
+   |                |       | track's lap field >= g_nRaceLaps      |
+   +----------------+-------+---------------------------------------+
+
+   So a single race shows one button and practice shows two, from
+   the same branch - the mode test is on resetTA alone.
+
+2.9.3.  Where each button goes
+
+   From the tail of Tick, solo arms only:
+
+   +----------------+---------------------------------------------+
+   | Button         | Destination                                 |
+   +================+=============================================+
+   | continue       | page 6, race select                         |
+   +----------------+---------------------------------------------+
+   | resetTA        | writes a time-attack .bin through           |
+   |                | FUN_004b5190, THEN page 6                   |
+   +----------------+---------------------------------------------+
+   | BtNextRa       | page 5 when 0x004dc07c is 0, else page 6    |
+   +----------------+---------------------------------------------+
+   | BtAbort        | page 3, the main menu                       |
+   +----------------+---------------------------------------------+
+   | Btsave         | page 0x15, the save menu                    |
+   +----------------+---------------------------------------------+
+
+   CONTINUE AND RESET TIME ATTACK BOTH LAND ON PAGE 6 - the
+   difference is the file write, not the destination.  That
+   settles what looks like two paths to the same place.
+
+2.9.4.  The two captions, and their colours
+
+   Neither the track name nor the lap count is art - both are drawn
+   text, and both set their colours before drawing.
+
+   +------------+---------------+-------------+--------------------+
+   | Caption    | Position      | Fore        | Back               |
+   +============+===============+=============+====================+
+   | track name | toptitle +    | 0,0,0       | 255,255,0          |
+   |            | (450, 56)     | black       | yellow             |
+   +------------+---------------+-------------+--------------------+
+   | lap count  | 33, 103       | 255,255,0   | 0,139,89           |
+   +------------+---------------+-------------+--------------------+
+
+   THE NAME IS BLACK AND THAT MATTERS - it sits on the yellow half
+   of the banner, so a font left at its own white is very nearly
+   invisible.  The original sets the pair through the font's vtable
+   slot 0 at 0x0044dafa, passing 0x004f0dd8 and 0x004f0de8; the lap
+   count uses Font_SetForeColour / Font_SetBackColour at 0x0044dc3c.
+
+   THE NAME IS PLACED AGAINST toptitle, not the screen.  Tick reads
+   that sprite back with Sprite_GetPosition at 0x0044da7e and adds
+   the offset, so the caption travels with the banner as it slides.
+
+   Underscores become spaces before it is uppercased, which is why
+   SPEED_BAY reads as SPEED BAY.
+
+2.9.5.  The congratulation, and the INIT placeholder
+
+   Enter scans the rank records - 0xf9 bytes each from 0x005cf509
+   - for a name reading "INIT" (0x494e4954) and builds a bitmask
+   at 0x005401c4 of which rows the player just took.  If any did,
+   it plays 0x5a when row 0 is among them and 0x59 otherwise -
+   cngratim for a new best, cngrecor for a lesser place.
+
+   Those same rows then accept typed initials in Tick: a letter
+   writes into every flagged record, backspace steps back, and
+   RETURN commits through FUN_00464b70.
+
+   Times are formatted %02d:%02d.%02d from a millisecond field at
+   record+0xe8, and the row is drawn only when record+0xec is not
+   0x7f7f7f7f - the empty marker Enter fills the table with.
+
+
+3.  How the pages were identified
+
+3.1.  Method
+
+   Only nine of the 27 live pages reference a string that says anything
+   about their purpose. The menu sprites are far more informative, and
+   every page names its own [verified].
+
+   g_menuObjects at 0x00504880 holds one object pointer per resource id,
+   and the array index IS the resource id - established in menu-
+   resources.txt. A page handler that uses resource n therefore contains
+   a reference to 0x00504880 + n*4. Scanning the 68 handlers for
+   operands in that range yields the exact resource set of each page,
+   and the source table at 0x004e3e20 turns each id back into a file
+   name.
+
+   This is mechanical and needs no decompilation. It identified twenty
+   pages and corrected two earlier readings that had been guessed from
+   strings alone: page 3 is the main menu rather than championship
+   setup, and page 8 is the network lobby rather than a main hub.
+
+3.2.  Defining resources per page
+
+   Shared chrome - paralax1/2/3, Pointeur, Btback, continue, accept,
+   cancel - is omitted below. Pages not listed reference nothing beyond
+   that chrome.
+
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | Page | Ids | Distinctive resources                                                                      |
+   +======+=====+============================================================================================+
+   | 1    | 2   | paralax1, paralax2                                                                         |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 2    | 11  | bouthaut, boutbas, FOCUShau, FOCUSbas, titre, stitre, tableau, cancel                      |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 3    | 17  | maintit, SOLO_D, SOLO_OK, LINK_D, LINK_OK, options, exit, poc_L, poc_D, rev_on/rev_off     |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 5    | 12  | selmode, practice, single, champion, Grdprix, each with a highlight variant                |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 6    | 26  | selrace, laps, moin, plus, left, right, timeatak, attackon, attackof, BtHiscor, maptxt     |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 7    | 20  | newgame, join, session, Btupdate, SSBARRE, SSSCROL, SSFOND, SSCURSE1/2, SSFLECH1-4         |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 8    | 42  | LKCOURSE, LKFEATUR, LKAUTO, LKMANUEL, LKPOCON/OFF, LKREVON/OFF, LKLOCK, LKCOMPU, LKLED1-4  |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 9    | 18  | toptitle, bestlap, bestRace, results, resultsG, Totalpts, Coupe, BtNextRa, Btsave, resetTA |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 10   | 20  | choosemo, choosefo, features, featacc, featspe, featgri, featbra, auto, manu, start        |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 11   | 7   | optitre, accept, BtConfig, btinfo, DATADISK                                                |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 12   | 7   | padcard, clavcard, joycard, choset, setting, accept                                        |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 13   | 8   | proc, video, son, joy, diagnos                                                             |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 14   | 10  | title, title2, title3, title4 and titleGP, title2GP, title3GP, title4GP                    |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 15   | 2   | enternam                                                                                   |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 20   | 11  | CHLOADA, CHLOADB, CHFOND, CHTITRE, CHTITREG, CHBARRE2, CHLIGNE1-3, cancel                  |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 21   | 12  | CHSAVEA, CHSAVEB and the same CH chrome, plus continue                                     |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 23   | 7   | DATTITLE, left, right, accept, cancel                                                      |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 24   | 6   | bestRace, continue, number1, number2, ligne                                                |
+   +------+-----+--------------------------------------------------------------------------------------------+
+   | 26   | 5   | optitre, accept, BtAbort                                                                   |
+   +------+-----+--------------------------------------------------------------------------------------------+
+
+   Several readings fall straight out of this. Page 12 loads padcard,
+   clavcard and joycard, so it configures gamepad, keyboard (clavier)
+   and joystick. Page 13 loads proc, video, son and joy, so it reports
+   processor, video, sound (son) and joystick. Page 10 loads auto and
+   manu with their flash and shadow variants, so the gearbox choice
+   lives on the bike select page.
+
+   The pair 20 and 21 was previously an open question. Page 20 loads
+   CHLOADA and CHLOADB; page 21 loads CHSAVEA and CHSAVEB. Everything
+   else about the two pages is identical, so 20 is load and 21 is save
+   [verified].
+
+3.3.  What the name prefixes mean
+
+   The two-letter prefixes are not a page key. They group by feature,
+   and only two of them happen to belong to a single page [verified]:
+
+   +---------+-------+-----------------+--------------------------+
+   | Prefix  | Count | Used by         | Meaning                  |
+   +=========+=======+=================+==========================+
+   | SS      | 11    | page 7 only     | session list widget set  |
+   +---------+-------+-----------------+--------------------------+
+   | LK      | 30    | page 8 only     | link, ie network play    |
+   +---------+-------+-----------------+--------------------------+
+   | CH      | 11    | pages 6, 20, 21 | championship             |
+   +---------+-------+-----------------+--------------------------+
+   | feat    | 6     | pages 8, 10, 11 | bike statistic bars      |
+   +---------+-------+-----------------+--------------------------+
+   | title   | 8     | page 14 only    | the two title variants   |
+   +---------+-------+-----------------+--------------------------+
+   | paralax | 3     | 16 pages        | shared background layers |
+   +---------+-------+-----------------+--------------------------+
+
+   So the useful rule is narrower than hoped: a prefix that appears on
+   exactly one page names that page, and SS and LK are the only two that
+   do. CH spans the two championship save/load pages and the race select
+   page, which shares its title sprite. Everything else is either a
+   feature family or chrome.
+
+4.  Transitions
+
+   Every edge below is a Menu_GotoPage or Menu_SetPage call with a
+   constant argument, taken from the page's tick handler unless marked
+   otherwise. Repeated destinations are repeated call sites, which is a
+   rough measure of how many menu items lead there [verified].
+
+   +------+-------------------------------+
+   | From | To                            |
+   +======+===============================+
+   | 1    | 0, 3                          |
+   +------+-------------------------------+
+   | 2    | 3, 3, 7                       |
+   +------+-------------------------------+
+   | 3    | 4, 5, 26                      |
+   +------+-------------------------------+
+   | 4    | 0                             |
+   +------+-------------------------------+
+   | 5    | 3, 6, 6, 7                    |
+   +------+-------------------------------+
+   | 6    | 5, 9, 9, 10, 20               |
+   +------+-------------------------------+
+   | 7    | 2 (enter), 2, 2, 2, 22, 26    |
+   +------+-------------------------------+
+   | 8    | 1, 7                          |
+   +------+-------------------------------+
+   | 9    | 3, 5, 6, 6, 6, 7, 7, 8, 8, 21 |
+   +------+-------------------------------+
+   | 10   | 1, 6, 8                       |
+   +------+-------------------------------+
+   | 11   | 23                            |
+   +------+-------------------------------+
+   | 13   | 11                            |
+   +------+-------------------------------+
+   | 14   | 15                            |
+   +------+-------------------------------+
+   | 15   | 3, 15                         |
+   +------+-------------------------------+
+   | 16   | 24                            |
+   +------+-------------------------------+
+   | 17   | 24                            |
+   +------+-------------------------------+
+   | 18   | 24                            |
+   +------+-------------------------------+
+   | 20   | 6, 6                          |
+   +------+-------------------------------+
+   | 21   | 9                             |
+   +------+-------------------------------+
+   | 22   | 7, 7, 7, 7, 8                 |
+   +------+-------------------------------+
+   | 23   | 11, 11                        |
+   +------+-------------------------------+
+   | 24   | 9                             |
+   +------+-------------------------------+
+   | 25   | 14                            |
+   +------+-------------------------------+
+   | 26   | 3, 5, 7, 8                    |
+   +------+-------------------------------+
+
+   Pages 12 and 19 make no constant transition at all, and nothing in
+   the table leads to page 2 except page 7. Page 15 is the only page
+   that transitions to itself.
+
+4.1.  The startup chain
+
+   Only one edge enters the table from outside. Following it and then
+   the table's own edges fixes the opening sequence [verified]:
+
+       FUN_00472c40  -->  25   Delphine Software logo
+                     -->  14   title screen
+                     -->  15   name entry
+                     -->   3   main menu
+
+   Page 25 has exactly one entry site in the whole binary, which is what
+   makes it identifiable as the first page shown. From page 14 the idle
+   timeout diverts to page 1 and then page 0, which is the attract demo.
+
+   The two branches out of the main menu match its own sprites: SOLO
+   leads through 5, mode select, and LINK through 7, the session list,
+   into 8, the lobby.
+
+4.3.  The cinematic intro, scoped
+
+   Page 25 and the transition that ends it. Recorded before any of it
+   is written, because the scoping changed two assumptions.
+
+4.3.1.  The shatter, end to end
+
+   Menu_UpdateTransition (0x0040c500) is only the clock. It runs while
+   transitionActive, computes transitionProgress from the elapsed time
+   against a 1200 ms window (0x4b0), clears the flag when
+   transitionEnd passes, and each frame calls
+   Menu_DrawTransitionEffect (0x00479c10) [verified].
+
+   THE WHOLE EFFECT, in call order:
+
+   +---------------------------+----------------------------------------+
+   | Menu_LoadResources        | Bankw_CreateBank(2) - an EMPTY page,   |
+   | 0x0040aa..0x0040abbf      | no file behind it. Load3df loads       |
+   |                           | data\menu\meshes\vitre.3df into the    |
+   |                           | glass object at 0x00504c70, then       |
+   |                           | MenuGlass_BuildShards rebuilds it.     |
+   +---------------------------+----------------------------------------+
+   | Menu_BeginTransition      | Captures the screen into bank 2 and    |
+   | 0x0040c4a0, 20 callers    | sets g_nTransitionRequested.           |
+   +---------------------------+----------------------------------------+
+   | Menu_Tick 0x00409cfe      | Sees the request, sets transitionActive|
+   |                           | and stamps the 1200 ms window.         |
+   +---------------------------+----------------------------------------+
+   | Menu_UpdateTransition     | progress 0..1, calls the draw.         |
+   +---------------------------+----------------------------------------+
+
+   o THE MESH IS MESHES\VITRE.3DF AFTER ALL. An earlier revision of
+     this section recorded the opposite - that the string references
+     did NOT support the guess, because VITRE.3DF is loaded by
+     Menu_LoadResources and used by MenuPage11_Options_Tick. Both
+     halves of that are true and the conclusion was still wrong:
+     Menu_LoadResources loads it STRAIGHT INTO THE GLASS OBJECT at
+     0x0040abb4, and page 11 is a second user that rebuilds the same
+     object. "Loaded somewhere else" was read as "not this", when the
+     somewhere else WAS this. The guess, made on the name and the
+     640.8 x 480.3 geometry, was right.
+
+   The file: 59 vertices, 99 triangles, flat at z = -0.69, spanning
+   exactly 640.8 x 480.3 - authored in screen pixels. The
+   triangulation is IRREGULAR, areas running 1063 to 6067, which is
+   what makes the break look like glass rather than a grid.
+
+4.3.1.1.  MenuGlass_BuildShards, and how random the shatter is
+
+   0x00479630, run once per load, immediately after Load3df. It
+   replaces the mesh with N = 99 independent shards [verified]:
+
+   1  copy each face's three vertices into their own slot - no vertex
+      is shared between shards any more
+   2  centroid of the three in X and Y (0x004d1828 = 0.3333333); it
+      becomes that shard's translation, with z = 0
+   3  THREE rand() CALLS per shard, one per axis:
+
+          rate = (rand() - 32767.0) * (1/32767.0) * amplitude
+
+      amplitudes 1.8pi, 1.5pi and 1.7pi - 0.90, 0.75 and 0.85 of a
+      turn. (rand() - RAND_MAX)/RAND_MAX lies in [-1, 0], so every
+      shard spins the SAME WAY and only the rate varies.
+   4  UVs from each vertex's own position, before recentring:
+          u = (x + 320) * 256/640          ->   0 .. 256
+          v = (y + 240) * -192/480 + 192   -> 192 .. 0   (flipped)
+   5  subtract the centroid and flatten z, so each shard is centred on
+      its own origin
+   6  TWO primitives per shard, kind 0x10, bank 2, indices (0,1,2) and
+      (0,2,1) - the same triangle wound both ways, so a shard stays
+      visible while it tumbles
+
+   mesh->faceCount stays N while the faces array holds 2N records,
+   which is why the draw loops N times and steps the face pointer by
+   two.
+
+   o THE SHATTER IS ONLY AS RANDOM AS ITS LAST REBUILD, and this is
+     worth knowing before trying to match a recording. The rand()
+     calls run HERE, not per transition. Menu_LoadResources runs once
+     at startup, so EVERY TRANSITION IN A SESSION TUMBLES
+     IDENTICALLY; the values are re-rolled only when
+     MenuPage11_Options_Tick rebuilds the object. And the BREAK
+     PATTERN never varies at all - it is vitre.3df's own
+     triangulation, at its own centroids. What makes each transition
+     look different is the texture, not the motion.
+
+4.3.1.2.  Menu_DrawTransitionEffect, per frame
+
+   Its ECX is NOT the menu - Menu_UpdateTransition loads it from
+   0x00504c70, the glass object. The menu is reached separately
+   through 0x004dc0c4, which is where transitionProgress is read.
+   An earlier signature took MR_Menu and made +0x18, +0x8c and +0x90
+   look like fields of it.
+
+   Per shard:
+
+       A,B,C  = rot[i] * progress            rot = glass+0x90, RATES
+       M      = euler(A, B, C)
+       M.t    = { pos[i].x, pos[i].y,        pos = glass+0x8c
+                  progress * -1850.0 + 1911.0 + pos[i].z }
+       verts  = Screen3D_TransformVertsFlat(M, &v[i*9], 3, 0x1f)
+                Screen3D_CullAndQueueFacesEx(verts, &f[i*2], 2, 1)
+
+   o THE Z RAMP EXPLAINS THE MESH SIZE. 1911.0 is the same 1911 the
+     menu sets as its projection scale, so at progress 0 the pane sits
+     exactly where the projection is 1:1 and its 640.8 x 480.3 covers
+     the screen pixel for pixel. It then flies to camZ 61, through the
+     256 near plane and past the viewer.
+
+   o ONLY Z MOVES. pos[i].x and .y are the shard's own centroid and
+     never change - the spread is perspective as the pane approaches.
+
+4.3.1.3.  What fills bank 2
+
+   Bank 2 has no asset. Menu_LoadResources creates it empty and
+   allocates a texture slot for it; MenuTools_CaptureScreenToBank
+   (0x00479260) fills it with A PICTURE OF THE OUTGOING PAGE
+   [verified].
+
+   Menu_BeginTransition runs it BEFORE the page changes, which is the
+   whole trick - the shards carry away the screen the player is
+   leaving:
+
+       g_nTransitionRequested = 1
+       MenuTools_CaptureScreenToBank(screen, 2)
+       maybe_D3D_ReloadTexture(2, {0,0,256,256}, banks[2].slot[0])
+
+   THE DOWNSAMPLE IS 2-OF-EVERY-5 in both axes - pixels 0 and 2 of
+   each group of five kept, three dropped:
+
+       128 iterations x 2 px   = 256 px   from 128*5 = 640 columns
+        96 iterations x 2 rows = 192 rows from  96*5 = 480 rows
+
+   640x480 -> 256x192 exactly, which is precisely the UV range
+   MenuGlass_BuildShards writes. Two independently read pieces of code
+   agreeing on an odd number is what confirms both readings.
+
+   o IT IS NEAREST-NEIGHBOUR AND UNEVENLY SPACED. A port that
+     resamples "properly" will not match. Matching costs nothing, so
+     r_capture_screen does.
+
+   o THE ARM IS A FRAME LATER THAN THE CAPTURE. Menu_BeginTransition
+     only sets the request; Menu_Tick arms transitionActive on its
+     next pass. Capture and arm are not the same instant.
+
+   o THE PORT CANNOT USE THE SAME SOURCE. The original reads its
+     SOFTWARE framebuffer, where its rasteriser has already put
+     everything. Ours has the 2D there but the 3D goes to D3D, and on
+     a page like 25 the 3D IS the picture - a software-framebuffer
+     grab would capture the backdrop and miss the logo. So
+     r_capture_screen reads the D3D render target instead, via
+     GetRenderTargetData into a SYSTEMMEM surface, and maps game
+     coordinates through the letterbox itself.
+
+     THAT IMPOSES A TIMING RULE THE ORIGINAL DOES NOT HAVE: the swap
+     chain is D3DSWAPEFFECT_DISCARD, so the back buffer holds nothing
+     defined once Present has run. The capture must happen after the
+     scene is drawn and before the present, where the original could
+     read its persistent framebuffer at any moment.
+
+   o THE GUARD IS NOT WHAT MAKES IT BLACK. The copy is skipped only
+     when `g_rendererReady && g_rendererMode == 0 && !bank.pSurface2`,
+     and pSurface2 is set by Bankw_CreateSurfacePage through
+     QueryInterface(IID_IDirectDrawSurface2), so on hardware it is
+     non-null and the copy runs. Resolved; it was left open here.
+
+4.3.1.3.1.  Why OUR shatter looked resampled, and it was two
+            separate things
+
+   Reported from the running port: the effect played correctly but
+   the image on the shards was soft and grainy, "as if something
+   grabbed the image and downsampled it", where recordings of the
+   game keep their resolution [observed].
+
+   THE LOW RESOLUTION ITSELF IS NOT THE BUG. 256x192 is what the
+   original captures, verified in the assembly above, and 2.5x
+   magnification back to 640x480 is inherent to the effect. Blocky
+   is correct. Two things on OUR side turned blocky into blurry,
+   and they are independent.
+
+   ONE: BILINEAR FILTERING. Kind 0x10's feature byte is 0x81, bit 3
+   clear, so the table asks for filtering and drawscene obliged -
+   linear magnification of a 2.5x-upscaled texture, which is
+   precisely the look of a resampled screenshot.
+
+   o BUT THAT BIT IS THE D3D PATH'S ANSWER AND THE D3D PATH NEVER
+     SHOWED THIS EFFECT. Retail's hardware shatter is black - 4.3.1.4
+     - because the capture reads the software framebuffer, which on
+     that path holds only the 2D layer. What players actually saw is
+     the SOFTWARE rasteriser's output, and that is point sampled.
+
+   o WE ALREADY DECLINE TO REPRODUCE THE BLACK BUG, so we show the
+     software path's CONTENT. Showing it with the hardware path's
+     FILTER is a combination that shipped on neither. glass.c now
+     forces point through drawscene_force_point_filter, and says
+     why at the call.
+
+   TWO: THE CAPTURE UNDERSAMPLES A LARGER RENDER TARGET. The
+   original samples a 640x480 software framebuffer, so "pixel 0 of
+   every 5" is a real final screen pixel. r_capture_screen reads a
+   D3D render target that is whatever the window is, and took ONE
+   point sample per game pixel - so at any scale above 1:1 fine
+   detail aliased and the capture came out grainy in a way the
+   original never was.
+
+   o THE FIX IS NOT A DIVERGENCE, it reconstructs the original's
+     SOURCE. Averaging the device block that maps to one game pixel
+     gives what that pixel would have been at 640x480, which is
+     exactly the value the original would then have decimated. The
+     2-of-every-5 pattern is applied to that, unchanged.
+
+   o AND IT IS A NO-OP WHERE IT WAS ALREADY RIGHT. At a 640x480
+     client s_viewScale is exactly 1.0, the block is 1x1, and the
+     result is bit-for-bit what it was.
+
+   THE GENERAL SHAPE IS WORTH KEEPING. Neither cause was a
+   misreading of the original - the capture size, the decimation
+   pattern and the feature bit were all read correctly. Both were
+   the port's DIFFERENT CONTEXT quietly changing what a faithful
+   number does: a filter bit meant for a path that never ran, and a
+   sampling rule written for a framebuffer that is no longer the
+   same size as the screen.
+
+4.3.1.4.  Retail shatters BLACK on the D3D path, and why
+
+   [observed] A 2014 recording of the PC version, frame-stepped, shows
+   the natural page 25 transition shattering ALL BLACK rather than
+   carrying the logo. That is real, it is not a driver quirk, and it
+   is not the 16-bit mode. It is the order of two calls.
+
+   MenuPage25_DsiLogo_Tick rasterises the queue at ONE of two points,
+   chosen by renderer [verified]:
+
+       if (DAT_00504e74 == 0 && (!g_rendererReady ||
+                                 g_rendererMode != 0))
+           Screen3D_DrawScene();          <-- SOFTWARE, before
+       ...
+       Screen3D_EndFrame(0, 0);
+       if (bVar10) Menu_BeginTransition();   <-- THE CAPTURE
+       if (DAT_00504e74 == 0) {
+           if (g_rendererReady && g_rendererMode == 0)
+               Screen3D_DrawScene();      <-- HARDWARE, after
+       } else {
+           Screen3D_ClearBuckets();
+       }
+
+   ModelInstance_Draw only QUEUES; Screen3D_DrawScene rasterises. So
+   on the hardware path the queue is still pending when the capture
+   runs and the capture sees the 2D layer alone - which for page 25 is
+   empty.
+
+   o AND ON THE TRANSITION FRAME IT IS WORSE. Menu_GotoPage sets
+     DAT_00504e74 = 1, so the trailing DrawScene is skipped altogether
+     and Screen3D_ClearBuckets throws the queued logo away. The last
+     frame of the intro draws no logo at all on D3D.
+
+   o SO IT IS A BUG, AND IT IS THE HARDWARE PATH'S. The same capture
+     on the software renderer runs after the geometry and carries the
+     picture the effect was plainly designed to carry. The shape of it
+     - one DrawScene duplicated with opposite guards, the capture
+     sitting between them - is what a hardware path added later to a
+     working software one looks like.
+
+   THE PORT DOES NOT REPRODUCE IT, deliberately. Our capture is taken
+   after the 3D is drawn, so the shards carry the outgoing page on
+   both exits. Copying a cosmetic defect buys nothing, and the project
+   cares about motion and gameplay matching, not about inheriting an
+   ordering mistake. Recorded here so the difference from a recording
+   is not mistaken for a fault later.
+
+   o THE ONE HALF THAT WAS A REAL FAULT was ours: the capture used to
+     run after the page had already changed, so an early skip wore the
+     INCOMING page's background. menu_begin_transition now defers the
+     page change past the capture. That is a fix, not a divergence -
+     the original captures the outgoing page too, it just captures
+     less of it.
+
+4.3.2.  Page 25 needs almost nothing new
+
+   The handlers are Enter 0x004537d0 (1028 bytes), Tick 0x00453c50
+   (1497) and Leave 0x00453bf0 (86). Their callees are, with one
+   exception, machinery page 14 already proved out [verified]:
+
+       Enter  Mesh_LoadPair, Mesh_Scale, ModelInstance_Init,
+              Camera_LookAt, Camera_SetEyeAndTarget,
+              Screen3D_SetProjZoom, Bankw_LoadRawTexture,
+              D3D_AllocTextureSlot, maybe_D3D_RegisterTexture,
+              Sprite_Load, Menu_AddSpriteButton
+       Tick   ModelInstance_Draw, Screen3D_BeginFrame/DrawScene/
+              EndFrame/Present, Sprite_Draw, Menu_Draw,
+              Menu_UpdateTransition, Menu_GotoPage, Color_Pack16
+
+   o IT DOES NOT USE MenuTools_CreateSceneObject. An earlier note
+     listed MR_MenuSceneObject as the next struct to discover and
+     implied the 3D menu pages are built from it. Page 25
+     is not: it uses ModelInstance_Init directly, the same as page 14.
+     So that struct is NOT a prerequisite for the intro, and the two
+     can be sequenced independently.
+
+   Assets: data\pages	itleDsi\ holds D, S, I and DsInt and camera
+   as .3df/.map pairs, plus bnk00_00.raw and bnk00_01.raw. D, S and I
+   are extruded 3D letters (48, 52 and 8 vertices); DsInt and camera
+   have a flat billboard each. CAMERA.3DF is 215 vertices, the only
+   real model in the set.
+
+4.3.3.  Order of work
+
+   1  the skip switch, so the intro can be stepped over while later
+      pages are worked on. DONE - MENU_START_PAGE_DEFAULT in menu.h
+      and [DEBUG] startpage in the ini.
+   2  page 25 enter: meshes, bank, camera, instances. DONE - see
+      section 4.3.4.
+   3  page 25 tick: the letter animation and the text. DONE - see
+      sections 4.3.5 and 4.3.6.
+   4  the transition: what arms transitionActive, and
+      maybe_Menu_DrawTransitionEffect.
+
+4.3.4.  What page 25 enter does, transcribed
+
+   All of the following is read out of MenuPage25_DsiLogo_Enter
+   (0x004537d0) [verified].
+
+   TWO BANKS. bnk00_00.raw into bank 0 and bnk00_01.raw into bank 1,
+   each followed by
+
+       D3D_AllocTextureSlot(bank, small 0, wantKey 1, paletted 0,
+                            palBits 0, rgbBits 16, ...)
+       maybe_D3D_RegisterTexture(path, bank, sub 0, keyBlack 0, src 0)
+
+   so both are colour-keyed 16-bit pages - flags 0x10 | 0x02 - exactly
+   like page 14 bank 3. This note was right and the reconstruction
+   disagreed with it for two sessions; see texture-banks.txt sections
+   5.2.2 and 5.2.3 for how that was settled and what it cost.
+
+   Enter also stores flags 0x180 into each bank
+   before allocating; 0x80 and 0x100 are the pair texture-banks.txt
+   section 5.2 records as "set together by Bankw_CreateBank, meaning
+   not established".
+
+   FIVE MESH PAIRS, loaded in this order, all with Mesh_LoadPair(3df,
+   map, -1, 1):
+
+    +----------+---------+--------------------------------------------+
+    | Mesh     | Verts   | Mesh_Scale                                 |
+    +==========+=========+============================================+
+    | camera   | 215     | 0.055, 0.055, 0.06                         |
+    | D        | 48      | 0.04, 0.04, 0.04                           |
+    | S        | 52      | 0.04, 0.04, 0.04                           |
+    | I        | 8       | 0.04, 0.04, 0.04                           |
+    | DsInt    | 4       | 0.04, 0.04, 0.04                           |
+    +----------+---------+--------------------------------------------+
+
+   camera.3df is the only real model in the set; D, S and I are
+   extruded letters and DsInt is a flat billboard. The mesh records
+   are 0x70 bytes apart from 0x00542150, and the instances 0x184 apart
+   from 0x0053f850 - MR_Mesh and MR_ModelInstance respectively.
+
+   THE INSTANCES:
+
+    +----------+------------------------+---------------------------+
+    | Instance | position               | rotation                  |
+    +==========+========================+===========================+
+    | camera   | (-30, 0, -900)         | (0, -1.701696, 0)         |
+    | D        | (0, 0, 0)              | (0, -pi/2, 0)             |
+    | S        | (0, 0, 0)              | (0, -pi/2, 0)             |
+    | I        | (0, 0, 0)              | (0, +pi/2, 0)             |
+    | DsInt    | (0, 0, 0)              | (0, +pi/2, 0)             |
+    +----------+------------------------+---------------------------+
+
+   o THE LAST TWO ROTATIONS ARE AN OVERWRITE, not a table. One loop
+     initialises all four letters with -pi/2, and the two stores at
+     0x0053fce0 and 0x0053fe64 then put +pi/2 into rotation[1] of the
+     third and fourth immediately afterwards. Reading only the loop
+     gives all four the same pose and loses the fact that half the
+     letters face the other way.
+
+   THE CAMERA is the one page 14 uses: Camera_SetEyeAndTarget with
+   (0,0,0) and (0,0,1500), then the eye written straight into
+   camera+0x98 as (0, 0, 4500), Camera_LookAt at the origin, and
+   Screen3D_SetProjZoom(1.0).
+
+   NO BANK REBASE. Page 14 calls FUN_00422250(3) to shift every face
+   bank index up by three, because its texture goes into bank 3. Page
+   25 loads into banks 0 and 1, which is where its .map records
+   already point, and makes no such call. A reader who adds one "for
+   symmetry" sends every face at a bank nobody loaded.
+
+   THE ESCAPE KEY IS A BUTTON. Enter positions sprite 77
+   (continue.lez) at (-1, -300) - off screen - and registers it with
+   Menu_AddSpriteButton bound to VK_ESCAPE. It can never be hit
+   tested; it is a key binding wearing a button costume, and it is how
+   the player skips the logo. Sprite 178 (logodsi.lez) is loaded
+   separately by Sprite_Load(0xb2).
+
+   EVERY MESH IS RECENTRED FIRST. Enter calls Mesh_CenterOnBounds
+   (0x00420250) on each mesh immediately before Mesh_Scale - once for
+   the camera at 0x004539dc and once per letter at 0x00453a5e. See
+   section 4.3.8; it is not optional and skipping it moves everything.
+
+   NOT REPRODUCED: nothing outstanding.
+
+   o RESOLVED - FUN_00404990(0x0d, 0), carried here as "a sound or
+     music trigger [guess], the same shape as the 0x29 the menu hover
+     plays". It is neither a guess nor a sound effect: the function
+     is CdAudio_PlayTrackCue and it starts RED BOOK CD TRACK 13, once,
+     through mciSendCommandA. The shatter sound is a separate
+     subsystem - sample 0x2a, fired by Menu_Tick when the transition
+     ARMS. Both are cued in the reconstruction against a silent back
+     end. See audio-cues.txt.
+
+   REPRODUCED, and it always was - MenuPage25_DsiLogo_ResetAnim
+   (0x00453610), listed here as missing for several sessions. It sets
+   the six start vectors, the six end vectors and the six durations,
+   and zeroes the six elapsed counters, the finished count at
+   0x0053f788 and instance[5]'s first field. The reconstruction holds
+   the three constant tables as static const arrays and zeroes the
+   counters in its own enter, so every one of the six writes has an
+   equivalent [verified].
+
+   o A RESET EXISTS WHEN SOMETHING ELSE CAN CLOBBER THE STORAGE, so
+     "const tables are equivalent" is a claim that has to be checked,
+     not assumed. It holds: the only reference to 0x00542100 outside
+     page 25 and its static initialiser is MenuPage07_NetSessionList
+     using the address as a LOOP TERMINATOR, because page 7's own
+     array ends exactly where this one begins. Adjacency, not
+     sharing.
+
+   o TITLEDSI ALSO HOLDS CAM.3DF/CAM.MAP, a 78-byte billboard that
+     Enter does NOT load. Something else uses it, or nothing does.
+
+
+4.2.  Sources that are not page handlers
+
+   Five functions drive transitions without being page handlers
+   themselves. They are worth reading next because they decide between
+   pages rather than implementing one:
+
+   +------------+------------------------+--------------------------------------------------------+
+   | Address    | Goes to                | Note                                                   |
+   +============+========================+========================================================+
+   | 0x004587e0 | 5, 5, 14, 24, variable | called from Menu_Tick when g_menuPendingRequest is set |
+   +------------+------------------------+--------------------------------------------------------+
+   | 0x004580f0 | 16, 16, 17, 17, 18, 24 | the only source of pages 16, 17 and 18                 |
+   +------------+------------------------+--------------------------------------------------------+
+   | 0x00412a50 | 24, 24                 | outside menu.cpp entirely                              |
+   +------------+------------------------+--------------------------------------------------------+
+   | 0x00472c40 | 25                     | startup                                                |
+   +------------+------------------------+--------------------------------------------------------+
+   | 0x00449560 | 7, 8                   | a helper between page 7's enter and tick               |
+   +------------+------------------------+--------------------------------------------------------+
+
+4.3.5.  Page 25 tick: the tables, and the three branches
+
+   MenuPage25_DsiLogo_Tick (0x00453c50, 1497 bytes). The animation
+   tables come from MenuPage25_DsiLogo_ResetAnim (0x00453610), its
+   reset [verified].
+
+   THE PER-ENTRY STEP, read at 0x00453ce5 [verified]:
+
+       elapsed[i] += dtMs / (duration[i] * 1000.0f);
+       u = clamp(elapsed[i], 0, 1);
+
+   with the clamp done by testing the FLOAT BITS AS INTEGERS - a
+   signed TEST for <= 0 and a compare against 0x3f800000 for > 1.
+
+   THE EXIT, at the end of the loop [verified]:
+
+       g_nP25AnimFinished = max(g_nP25AnimFinished, finishedThisFrame);
+       if (g_nP25AnimFinished == 6)
+           Menu_GotoPage(g_menu, 0xe);
+
+   So the finished count is a HIGH-WATER MARK and never falls, and
+   reaching six is what ends the intro. Entry 5's twenty seconds is
+   the longest duration and therefore the length of the intro.
+
+   SIX ENTRIES, NOT FIVE. The tick loops six times over instances
+   0x184 apart from 0x0053f850, and guards the draw with
+   "if (i != 5)". Entry 5 is not a model: it writes camera+0x98, so it
+   MOVES THE CAMERA EYE. The instance slot behind it exists and has
+   its rotation[0] zeroed, but nothing ever draws it.
+
+    +---+---------------+-------------------+------------------+------+
+    | i | object        | start             | end              | secs |
+    +===+===============+===================+==================+======+
+    | 0 | camera model  | (50, 80, -1000)   | (50, 0, 7000)    | 15.0 |
+    | 1 | D             | (0, 0, 20000)     | (200, 0, 200)    | 14.5 |
+    | 2 | S             | (0, 0, 20000)     | (-50, 0, 200)    | 14.0 |
+    | 3 | I             | (0, 0, 20000)     | (-250, 0, 200)   | 13.5 |
+    | 4 | DsInt         | (20, 0, 60000)    | (20, -400, -600) | 16.0 |
+    | 5 | camera eye    | (50, 80, -1000)   | (50, 0, 7000)    | 20.0 |
+    +---+---------------+-------------------+------------------+------+
+
+   o THE INTRO RUNS TWENTY SECONDS, the longest duration being entry
+     5's. Worth knowing before wondering whether it has hung, and the
+     reason a skip is worth having.
+
+   o ENTRY 0 WRITES ROTATION ONLY and never touches position, so its
+     start and end rows are set by the reset and then never read. They
+     share entry 5's values, which is a coincidence of authoring, not
+     a link.
+
+   THREE BRANCHES, and the entries do not share one curve:
+
+   1  entry 0, rotation only:
+
+          rotation[0] = 0
+          rotation[1] = (1 - u) * pi/2 - 1.701696
+          rotation[2] = (1 - u*u) * pi/2
+
+      1.701696 (0x004d0d28, a double) is EXACTLY the rotation[1] Enter
+      gives this instance, so the curve ends where Enter started it.
+
+   2  entries 4 and 5, a plain lerp of start to end. Entry 4 writes
+      the instance position; entry 5 writes the camera eye.
+
+   3  entries 1, 2 and 3 - D, S and I - a spiral. See section 4.3.6.
+
+   THE CAMERA IS NOT RE-AIMED. The tick writes camera+0x98 and never
+   calls Camera_LookAt again, so the eye TRANSLATES while the view
+   matrix stays as Enter built it. A port that re-runs the look-at per
+   frame keeps the letters centred and quietly destroys the
+   fly-through.
+
+   THE EXIT. The page leaves for 14 when a button activates - the
+   off-screen ESCAPE button of section 4.3.4 - or when the phase
+   reaches 6, i.e. every object has finished. The phase is the count
+   of finished objects and never decreases, the same shape as page 14.
+
+   Also in the tick and not reproduced: Color_Pack16(0,0,0) into
+   FUN_00499ff0, which looks like a per-frame clear colour, and the
+   Pointeur cursor sprite drawn when the display is a full-screen
+   enumerated device.
+
+
+4.3.6.  The D/S/I spiral, and why it read as impenetrable
+
+   Entries 1, 2 and 3 do not lerp. They ORBIT the Y axis on a
+   shrinking radius while spinning about their own vertical
+   [verified, 0x00453e3f..0x00454070].
+
+       theta  = u * -2pi                      (0x004d0d30)
+       idx    = ftol(theta * 2607.594588)     (0x004d0ca8, 0x4000/2pi)
+       len    = |end|
+       radius = u*u * -2500 + len + 2500      (0x004d0d40, 0x004d0d44)
+       p      = (end / len) * radius
+
+       rotation = (0, (1 - u) * 8pi +/- pi/2, 0)   (0x004d0d38)
+       position = ( p.z*sin + p.x*cos,
+                    p.y,
+                    (p.x*-sin + p.z*cos) - 800 )   (0x004d0d48)
+
+   The sign on pi/2 is + for I and - for D and S, which is the same
+   split Enter makes between the last two letters and the first two.
+   8pi is FOUR self-turns, unwinding to exactly the pose Enter set.
+
+   WHY IT LOOKED WORSE THAN IT IS. The branch is written as a general
+   rotation about an arbitrary axis, and the axis is supplied as an
+   ANGLE which happens to be the literal 0. So two operands that read
+   like variables are constants, and they are constants expressed as
+   TABLE READS:
+
+       [0x005fcb80] = g_cosTable[0]      = cos 0     = 1
+       [0x00608b80] = g_cosTable[0x3000] = cos 3pi/2 = 0
+
+   0x00608b80 is not a separate global; it is g_cosTable + 0x3000*4.
+   Every term multiplied by that second one is zero, and the general
+   axis-angle form collapses to a plain rotation about Y. Reading the
+   two addresses as INDICES rather than as variables is the entire
+   difficulty, and it is the same class of mistake as the bucket at
+   0x0065da34 in renderer.txt turning out to be bucket 7999 rather
+   than a separate list.
+
+   THE READING CHECKS ITSELF. At u = 1 the rotation is a full turn,
+   the radius is |end|, and the -800 shift puts the three letters at
+
+       D (200, 0, -600)   S (-50, 0, -600)   I (-250, 0, -600)
+
+   - their end x values exactly, all on z = -600, which is the plane
+   DsInt independently ends on. Nothing in the transcription put that
+   agreement there; it falls out, and it is what makes the branch
+   trustworthy without running the game.
+
+4.3.7.  The logo sprite is loaded and never drawn
+
+   Enter loads sprite 178, logodsi.lez, with Sprite_Load(0xb2). The
+   tick NEVER DRAWS IT [verified]: the only Sprite_Draw in
+   MenuPage25_DsiLogo_Tick is the Pointeur cursor, and that only on a
+   full-screen enumerated device.
+
+   Something else must draw it - the transition is the obvious
+   candidate, since the logo is what the shatter would reveal - but
+   that has not been read. Recorded because a reconstruction that
+   draws it in the tick puts the finished 2D logo underneath the 3D
+   letters that are still flying in, which looks like the scene
+   containing two copies of itself.
+
+
+4.3.8.  Mesh_CenterOnBounds, and why the letters piled up
+
+   Mesh_CenterOnBounds (0x00420250, was FUN_00420250) [verified]:
+
+       1  min/max over every vertex, seeded at +/- 999999
+       2  centre = (min + max) * 0.5          (0x004d0680 = 0.5f)
+       3  SUBTRACT the centre from every vertex
+       4  recompute every face normal and plane distance
+       5  store half extents at +0x48/+0x4c/+0x50 and a radius at
+          +0x58, all truncated to int
+       6  return the old centre through the out parameter
+
+   Five callers: page 25 enter (twice), MenuTools_CreateSceneObject,
+   maybe_Game_LoadBikeMeshes, FUN_0047b600 and FUN_0040ed10. Page 14
+   is NOT among them, which is correct - its title meshes are meant to
+   keep their offsets, and adding a recentre there would move the
+   title art.
+
+   WHY IT MATTERS HERE. The page 25 meshes carry large authored
+   offsets, because the three letters are modelled as ONE WORD:
+
+    +--------+------------------------------+---------------------+
+    | Mesh   | bounding-box centre          | z extent            |
+    +========+==============================+=====================+
+    | D      | (-7.2,  26.5, -69.5)         | 83.8                |
+    | S      | (-7.2,  26.7,   0.4)         | 61.4                |
+    | I      | (-7.2,  26.9,  52.5)         | 31.0                |
+    | DsInt  | (-0.5, -72.6, -21.6)         | 187.0               |
+    | camera | (-61.5, 29.9, -60.5)         | 249.4               |
+    +--------+------------------------------+---------------------+
+
+   D, S and I tile along +z with no gaps - they ARE the word, laid out
+   in the geometry. So a reader that skips the recentre gives each
+   letter its place in the word PLUS its animation target, and the two
+   offsets fight. With the net mesh scale of 3.84 (96 from the loader
+   times 0.04 from Mesh_Scale) that puts S at world x -51.5 and I at
+   -48.4: THREE UNITS APART, one behind the other. Recentred, they
+   land at 200, -50 and -250 and read left to right as D S I.
+
+   The same offset is why the camera model sat up and to the left -
+   its centre is (-61.5, 29.9, -60.5) - and why the Delphine text sat
+   too low: DsInt's y centre of -72.6 is 279 world units, about 70
+   pixels at this projection.
+
+   o THE GUESS THAT WAS WRONG, recorded because the shape of the error
+     is worth keeping. This function was first dismissed with "it
+     calls Mesh_ComputeFaceNormal, and Mesh_Scale recomputes normals
+     afterwards, so it has no effect this side of the scale". The
+     reasoning was sound about the normals and simply missed that the
+     function does something else entirely first. Judging a function
+     by its most conspicuous callee is how a vertex transform gets
+     mistaken for a normals refresh.
+
+4.3.9.  The depth buffer was fed a constant
+
+   Not the original's problem - a reconstruction one, recorded because
+   the symptom was so misleading. g_drawSceneZFar had never been
+   assigned, so it sat at its 1.0 initialiser and
+
+       sz = clamp(camZ / 1.0, 0, 1)
+
+   made every vertex sz = 1. The depth buffer was enabled and could
+   not discriminate anything, so draw order fell entirely to the
+   queue's bucket sort - whose key is __ftol(camZ) in WORLD UNITS. A
+   215-vertex model only tens of units deep puts nearly all its faces
+   in one bucket and draws them in list order, which on a solid model
+   paints back faces over front ones.
+
+   THAT READS AS A RELIEF CARVED INTO THE SURFACE rather than raised
+   out of it, with the silhouette still correctly oriented - which is
+   not what a winding or handedness fault looks like, and is worth
+   knowing apart from one.
+
+   The reconstruction now sets g_drawSceneZFar to 40000 in
+   menu_set_page, alongside the projection, because that is the value
+   Menu_SetPage writes to [0x006d1f70] - a global Screen3D_Open sets
+   to 16000 and which sits with the projection in both places, so a
+   far distance is the reading [inferred; no reader traced]. Feeding
+   it to the D3D depth range is a PORT DECISION, not a transcription:
+   the original's software path has no depth buffer at all.
+
+
+4.3.10.  The keyed blend switched the depth buffer off
+
+   The sequel to section 4.3.9, and a good example of one fix arming
+   another. Not the original's problem - entirely a port one.
+
+   drawscene.c chose depth writes with
+
+       r_set_depth(1, blend != R_BLEND_NONE ? 0 : 1);
+
+   "write depth unless blending", which is the correct rule for real
+   translucency. But a COLOUR-KEYED TEXTURE IS NOT TRANSLUCENT: the
+   upload writes alpha 0 or 255 and nothing between, so the geometry
+   is opaque geometry with holes in it, and opaque geometry has to
+   write depth.
+
+   So the transparency fix - making the keyed row of the blend ladder
+   reachable at all - turned depth writes OFF for every keyed surface.
+   The menu pages texture almost entirely from keyed banks, so the
+   depth buffer was enabled, cleared every frame, and never stamped.
+
+   WHAT THAT LEAVES is the queue's bucket sort, and this is the part
+   worth remembering because it makes the symptom readable:
+
+   o OBJECT AGAINST OBJECT stays correct. The buckets are keyed on
+     each face's farthest camZ, so two objects at different depths
+     sort properly and one still occludes the other.
+
+   o FACE AGAINST FACE inside one object does not. A model only tens
+     of units deep puts nearly all its faces in a single bucket, where
+     they draw in list order - so a solid model paints its far faces
+     over its near ones.
+
+   THE PART OF THIS THAT WAS WRONG, corrected after the fact and left
+   here because the mistake is instructive. An earlier revision of this
+   section went on to claim that within-object ordering was why page
+   25 read as a relief CARVED INTO its surface rather than raised out
+   of it, and called that combination - correct silhouette, correct
+   motion, inverted-looking surface - diagnostic of a depth fault.
+
+   IT WAS NOT THE DEPTH BUFFER. The camera model looked hollow because
+   the mesh was not mirrored: the reconstruction was missing
+   Mesh_MirrorXAndFlipWinding (0x00422070), so the shell was presented
+   to the viewer open-end first. No depth or winding change could have
+   fixed it, and this section confidently said otherwise for two
+   sessions. See docs/formats/mesh-3df-map.txt section 1.1.
+
+   The lesson is not about depth buffers: A SYMPTOM THAT SURVIVES THE
+   FIX IS EVIDENCE THE DIAGNOSIS WAS WRONG. The relief still looked
+   carved after depth writes were turned on, and that should have
+   retired this explanation immediately instead of being read as the
+   fix not having taken.
+
+   WHAT REMAINS TRUE IS THE RULE ABOUT KEYED GEOMETRY, which stands on
+   its own and is worth keeping:
+
+      THE FIX NEEDS BOTH HALVES. Keyed geometry now writes depth, and an
+   ALPHA TEST is enabled for it - because alpha blending alone does
+   NOT skip the depth write for an alpha-zero fragment, so without the
+   test a billboard would stamp its whole rectangle into the depth
+   buffer and occlude what is behind it.
+
+   o THAT MEANS TURNING ON A RENDER STATE THE ORIGINAL NEVER USES.
+     ALPHATESTENABLE is 0 throughout the binary, and d3d9rt.cpp
+     deliberately kept it at 0 with a note saying the original
+     resolves keying with a real blend instead. That note was right
+     about the original and wrong about us: its software path has no
+     depth buffer, so a blend is all it needs. Ours has one. The
+     divergence is recorded at r_set_alpha_test in render.h rather
+     than quietly made.
+
+
+5.  Naming in the database
+
+   All 68 handlers are named MenuPageNN_Enter, MenuPageNN_Tick or
+   MenuPageNN_Leave, where NN is the table index. The index is a
+   verified fact and always appears; a semantic name is added only where
+   the resource set settles it, giving for example
+   MenuPage08_NetRaceLobby_Tick and MenuPage20_ChampionshipLoad_Enter.
+
+   The seven pages that remain inferred or guessed keep bare indices.
+   Every handler carries a plate comment with its record address, its
+   field offset, the resources it loads and an evidence tag.
+
+6.  Open questions
+
+   o RESOLVED - the page 14 billboards drawing on an opaque black
+     square. Both ends of the transparency path were missing and they
+     met in the middle: drawscene.c passed the blend ladder's keyed16
+     argument as a hardcoded 0, and r_set_bank_colour_key had no
+     caller. Fixed in bank.c/bank.h (bank_alloc_texture_slot),
+     drawscene.c and menu.c.
+
+     The fact that unblocked it: D3D_AllocTextureSlot takes wantKey as
+     an ARGUMENT and page 14 passes 1, with rgbBits 16, so bank 3
+     carries 0x10 | 0x02 and the ladder selects SRCALPHA. An earlier
+     session looked at maybe_D3D_RegisterTexture's keyBlack argument
+     instead - page 14 passes 0 there - and concluded the title bank
+     was unkeyed. Two different switches, both called "the colour
+     key". See texture-banks.txt section 5.2.1.
+
+     The key colour is black, and it is not configurable: the
+     DDCOLORKEY is a literal {0, 0}.
+
+   o RESOLVED - and page 25 is keyed too. The reconstruction had keyed
+     page 14 and NOT page 25, recorded as a deliberate divergence on
+     the grounds that the camera's artwork is mostly black. Both pages
+     pass wantKey 1 and keyBlack 0; there is no difference between
+     them in the binary, and the 60-per-cent figure the divergence
+     rested on had been measured over the whole 256x256 page rather
+     than the rectangles the camera's faces actually sample, which are
+     1.7 per cent black. The divergence is gone; keying is read off
+     bank flag 0x10 when the texture is built.
+
+   o Three pages resist identification. Page 19 has a 67-byte tick, the
+     smallest in the table, and references neither a resource nor a
+     string. Page 22 loads only chrome yet routes to pages 7 and 8. Page
+     26 loads the options title with accept and BtAbort but exits to
+     four different pages.
+
+   o Pages 16, 17 and 18 are identical in shape and in resources -
+     continue and Pointeur only - with one source and one destination
+     each. Reading FUN_004580f0, their only caller, should say what
+     distinguishes them.
+
+   o Page 2 is reached only from page 7 and holds a list widget: up and
+     down buttons, focus sprites, a title, a subtitle and a table. It is
+     probably the network player list, but nothing confirms that yet.
+
+   o ANSWERED. The menu object is MR_Menu, 0xd4c bytes, one instance at
+     g_menu (0x004dc0c4), with 32 inline MR_MenuButton records. The type
+     is applied in the database. See docs/structs/MR_Menu.txt and
+     docs/structs/MR_MenuButton.txt.
+
+   o maybe_Menu_StartAttractDemo is named from one call site and one
+     error string. How it chooses a demo has not been read.
+
+   o WHAT FRAME RATE WAS PAGE 10'S BIKE PAN WRITTEN FOR? It steps a
+     fixed 100 units a frame with no dt (2.7.4.6.2), so its duration
+     is whatever the frame rate is - eight frames, full stop. The
+     reconstruction transcribes that and therefore runs it quicker
+     than retail. The command line has a frame-rate cap flag; if the
+     menu is capped, the cap is the intended duration. Until that is
+     read there is no number to match, and picking one that looks
+     right would be a fit rather than a finding.
+
+   o Resource ids reached indirectly, through a helper rather than by a
+     direct reference in the handler, would not appear in the section
+     3.2 scan. The counts there are lower bounds.
+
+
+7.  Which pages need the renderer
+
+   Measured by walking the transitive callees of each page's enter and
+   tick handlers and looking for the geometry path - Screen3D_DrawScene,
+   the cull and transform functions, Load3df, Load3dfAndMap, Mesh_Scale
+   and Bankw_LoadRawTexture [verified].
+
+   THE ANSWER IS ESSENTIALLY ALL OF THEM. Of the 26 live pages, 25
+   reach geometry. The exception is page 19, and page 19 draws nothing
+   at all.
+
+   +------+---------------+----------------------------------------+
+   | Page | geometry hits | note                                   |
+   +======+===============+========================================+
+   | 0,27 | -             | empty records, not pages               |
+   +------+---------------+----------------------------------------+
+   | 19   | 0             | a developer benchmark; see below       |
+   +------+---------------+----------------------------------------+
+   | 1, 4 | 1             | Load3df only, and NOT from the drawing |
+   |      |               | half - see X.1                         |
+   +------+---------------+----------------------------------------+
+   | rest | 5 to 9        | DrawScene, cull, transform, meshes     |
+   +------+---------------+----------------------------------------+
+
+   PAGE 25 IS NOT AN EXCEPTION, and an earlier assumption that it was
+   is corrected here. Its enter handler loads two raw textures into
+   banks 0 and 1 and five 3df meshes from data\pages\titleDsi\ -
+   camera, D, S, I and DsInt - scales them, initialises model
+   instances, sets a camera and a projection zoom; its tick animates
+   six instances and calls Screen3D_DrawScene. The Delphine Software
+   logo is a 3D scene in which the letters are meshes. The one sprite
+   it holds is the mouse pointer.
+
+   The plate comment on the handler said as much - "loads
+   data\pages\titleDsi\ (camera, D, S ... meshes)" - so the
+   information was there to be read.
+
+   PAGE 19 IS A BENCHMARK, not a screen. Its enter allocates 96000
+   bytes as 8000 records of three floats, fills them with constants,
+   and its tick brackets a single call in Profile_Start and
+   Profile_Stop and stores the result. No sprites, no Menu_Draw, no
+   resources, no strings. That is what the note above meant by
+   "unidentified - smallest handler"; it is identified now.
+
+7.1.  Page 1 is the one whose DRAWING is sprite-only
+
+   Page 1, the loading screen, shows Load3df in its closure, but not
+   from the part that draws. Its tick does two unrelated jobs in
+   sequence: it paints the loading screen, and then it loads the level
+   and hands over to the game. The geometry hit belongs to the second
+   half.
+
+   The drawing half is small and self-contained [verified]:
+
+       sprintf(path, "%sload.lez", trackDirectory)
+       background = Sprite_LoadFromFile(path)
+       lodanim    = Sprite_Load(175)   placed at 498,381
+       loadtxt    = Sprite_Load(176)   placed at   0,408
+       smallpok   = Sprite_Load(186)   placed at   4,460  if unlocked
+       smallrev   = Sprite_Load(185)   placed at   4,470  if unlocked
+
+       Screen3D_BeginFrame
+         draw background, loadtxt, smallrev, smallpok   all mode 5
+       Screen3D_EndFrame
+       Screen3D_Present
+
+   Mode 5 is the sentinel meaning "use the sprite's own kind", so the
+   manifest's kind field is what decides opaque against colour-keyed:
+   the background is kind 0 and everything else kind 1.
+
+   o LODANIM IS LOADED AND PLACED BUT NOT DRAWN HERE, and the thing
+     that draws it now has an address. Menu_DrawLoadingScreen
+     (0x004470d0) repaints this whole screen, and the LOADER calls
+     it once per step through maybe_Loader_ReportStep (0x004421d0)
+     - the same function that carries the step caption, "Init WAV
+     samples ..." and its neighbours. Page 1 paints the screen once
+     and then blocks in the load; that is what keeps it alive.
+
+     LODANIM BLINKS. It is drawn under
+
+         if (lodanim && g_nLoadAnimPhase && ...) draw;
+         ...
+         g_nLoadAnimPhase ^= 1;
+
+     so it appears on alternate loading steps [verified]. It is NOT
+     a progress bar, it does not fill in, and there is no third
+     state. g_nLoadAnimPhase (0x004e90fc) is read at 0x0044719b and
+     XORed at 0x0044723a and those are its only two references in
+     the image; it initialises to 1, so the first reported step
+     draws it.
+
+     THIS IS WHERE THE "GREY LOGO THAT TURNS COLOUR" COMES FROM.
+     The MotoRacer logo bottom right is painted into the track's own
+     load.lez in grey and lodanim is the coloured one placed over it
+     at 498,381, so alternating steps read as the logo colouring in
+     [inferred - from the placement and the blink; the two images
+     have not been compared pixel for pixel, which is the way to
+     settle it].
+
+     AND ZERO STEPS MEANS GREY. Before any step is reported the
+     screen has been painted by page 1's tick and lodanim has never
+     been drawn. That is exactly where the reconstruction sits, so
+     NOT drawing it is the faithful thing rather than a gap - see
+     7.1.1.
+
+   o THE BACKGROUND IS NOT A MANIFEST RESOURCE. It is built from the
+     format string "%sload.lez" at 0x004dbd88 against the selected
+     track's directory, so each track ships its own. There is a
+     load.lez at manifest id 177 as well, but that is the generic one
+     Menu_LoadResources takes at boot.
+
+7.1.1.  What the reconstruction has, and the two things it does not
+
+   Reimplemented in src/menu.c - page01_enter, page01_tick,
+   page01_leave - not in page_loading.c, which no longer exists.
+
+   o THE BACKGROUND IS THE SELECTED TRACK'S. It is built with
+     track_asset_name against track_at(g_selectedTrack), matching
+     the sprintf at 0x0040b41e, and falls back to the [PATHS] ini
+     directory only if the track list did not load. It used to be
+     built from the ini setting alone, which is ONE directory for
+     the whole run - so every island would have shown ile01's
+     loading art. Each island ships its own load.lez and that is
+     what the format string is for.
+
+   o LODANIM IS LOADED AND LOGGED AND NOT DRAWN, for the reason
+     above: with no loading steps the correct picture is the grey
+     logo in the background art. An earlier version drew it
+     unconditionally to prove the sprite resolved, which showed a
+     COLOURED logo on a screen that has loaded nothing.
+
+   o THE BADGES ARE BOTH SHOWN. The original gates smallrev and
+     smallpok on unlock flags out of a save file. There is no save
+     file, so s_p1_show_badges forces both on - a divergence, and a
+     visible one.
+
+   NOT REPRODUCED, and both are the same missing piece:
+
+   o THE LEVEL LOAD. The second half of the original's tick parses
+     "%sLevel.Spt" (0x00427e80) and hands over to the game.  The port
+     loads in Enter instead, through race_load, and the tick holds
+     the page while the race is up.
+
+   o A FAILED LOAD TAKES THE ORIGINAL'S FAILURE PATH.  When the parse
+     or Game_Load fails, page 1 calls Menu_SetPage(g_menu, 3) - back
+     to the main menu [verified, the call at 0x0040bb40 with PUSH 3
+     immediately before it].
+
+   o NEITHER EXIT SHATTERS, and this page must not.  Both are plain
+     Menu_SetPage calls - page 0 on success at 0x0040b7f0, page 3 on
+     failure at 0x0040bb40 - and neither arms the glass, which is why
+     retail never shatters the loading screen on the way into a race.
+     Using a transition here would be wrong twice over: the wrong
+     exit AND an effect the original does not play.
+
+   REACHED FROM PAGE 10. Start on bike select goes to page 1 when
+   g_soloMode is set and page 8 otherwise [verified, 0x0044f900];
+   the solo arm is wired and the network lobby still logs that it
+   is not built.
+
+   AND THE SOLO ARM DOES NOT SHATTER. Page 10's case 2 calls
+   Menu_GotoPage(g_menu, 1) and does NOT set the local that drives
+   Menu_BeginTransition at the end of the tick. Only the NETWORK
+   arm (page 8) and BACK (case 3, page 6) set it. So entering a
+   race cuts; leaving the page sideways shatters.
+
+   THIS MISTAKE HAS NOW BEEN MADE TWICE, which is why it is written
+   down rather than just fixed. Both times the reconstruction
+   reached for menu_begin_transition because that is the usual way
+   a page changes - once for page 1's own exit and once for page
+   10's entry into it - and both times retail plainly does not
+   shatter there.
+
+   THE RULE, worth applying before writing any page change:
+   Menu_SetPage and Menu_GotoPage CUT. Only an explicit
+   Menu_BeginTransition arms the glass, and in the page handlers
+   that is a separate flag tested at the END of the tick, well
+   away from the Goto call it belongs to. Reading the Goto alone
+   tells you nothing about whether it shatters.

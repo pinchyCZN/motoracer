@@ -1,0 +1,902 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                    GHIDRA FUNCTION BOUNDARY REPAIRS
+
+
+Abstract
+
+   Ghidra had split 71 game functions into a short stub plus an orphaned
+   body. All 71 are now repaired [verified]. This note records the
+   defect, the detection rule, and what the repair uncovered, because
+   the same shape will recur in any fresh import of this binary.
+
+   The practical stake: an orphaned body decompiles with phantom inputs
+   - in_ZF, in_AL, in_EAX, in_stack_00000010 - because the values it
+   depends on were set in the stub. Anything read from such a function
+   is unreliable, and at least one real finding was missed because of
+   it.
+
+Table of Contents
+
+   1. The defect
+      1.1. Flag scheduling, gaps of 7 to 17 bytes
+      1.2. SEH prologue, gaps of 31 to 41 bytes
+   2. Detection needs no heuristic
+   3. The sweep
+      3.1. Effect on the function counts
+   4. What the repair uncovered
+      4.1. A colour conversion site the catalogue missed
+      4.2. A name on the wrong address
+   5. Audit of the existing documents
+      5.1. Verified unchanged
+      5.2. Corrected
+      5.3. New findings the repair exposed
+   6. A second defect: code in no function at all
+      6.1. What the sweep found
+      6.2. Defining them
+      6.3. Result, and the cost
+      6.4. What the sweep did and did not change for analysis
+      6.5. One thing the sweep did surface
+   7. A third defect: code never disassembled
+      7.1. How it was found
+      7.2. Detection: follow every pointer in data
+         7.2.1. .rdata is compiler noise
+         7.2.2. .data is where the real code was hiding
+         7.2.3. Defining them makes work for the other two tools
+   8. Tool
+   9. Open questions
+   10. A fourth defect: switch cases promoted to functions
+      10.1. Detection: a function nothing calls
+      10.2. The sweep
+      10.3. One case regenerates, and is left open
+   11. Typing the hidden this of a __thiscall function
+      11.1. Why this went unnoticed for so long
+      11.2. A note on run_script_inline output
+      11.3. The sweep: 42 bare, 9 fixed
+   12. A fifth defect: unaff_ registers at COM call sites
+
+
+1.  The defect
+
+   Two prologue shapes produce it, and both end in a NOP that Ghidra
+   treats as a boundary.
+
+1.1.  Flag scheduling, gaps of 7 to 17 bytes
+
+   MSVC hoists a flag-setting instruction above the callee-saved
+   register pushes and leaves the branch below them, because pushes do
+   not disturb the flags:
+
+   004a1770  SUB ESP,0x8
+   004a1773  MOV EAX,[0x0062e444]
+   004a1778  TEST EAX,EAX            <- sets flags
+   004a177a  NOP
+   004a177b  PUSH EBX/ESI/EDI/EBP    <- pushes do not touch flags
+   004a177f  JZ  0x004a1949          <- consumes flags from 004a1778
+
+   Ghidra's function-start analyser pattern-matches the PUSH sequence as
+   a prologue, creates a function at 004a177b, and truncates the real
+   one to eleven bytes.
+
+1.2.  SEH prologue, gaps of 31 to 41 bytes
+
+   The shape already described in subsystems/dd-primary-surface.txt: a
+   textbook MSVC structured-exception-handling prologue, again split at
+   its trailing NOP. That note found two by hand. The sweep shows they
+   were two of many.
+
+2.  Detection needs no heuristic
+
+   A function whose last instruction falls through into the entry point
+   of another function is always wrong. Real functions do not fall out
+   of their own body. That rule is exact, needs no size threshold, and
+   catches both shapes:
+
+   last = instruction at function.body.maxAddress
+   if last.fallThrough is the entry point of another function
+       -> split
+
+   Every one of the 71 orphans had zero incoming references, which
+   corroborates the reading but is not needed to detect it.
+
+3.  The sweep
+
+   +---------------------------------------+--------+
+   | Splits found in game code              | 68    |
+   | Repaired by script                     | 67    |
+   | Repaired by hand                       | 1     |
+   | Repaired in earlier sessions           | 3     |
+   | Failed                                 | 0     |
+   | Remaining in game code                 | 0     |
+   +---------------------------------------+--------+
+
+   The three earlier repairs are Cdd_CreatePrimarySurface,
+   Cdd_CreateMainSurface and the span clipper at 0x004a1770, all found
+   individually before the pattern was recognised.
+
+   Two splits remain above 0x004b0000, in MFC or CRT code. They are out
+   of scope: library code is fenced off and is not analysed here.
+
+3.1.  Effect on the function counts
+
+   +----------------------+--------+-------+
+   | Region               | Before | After |
+   +----------------------+--------+-------+
+   | .text total          | 2542   | 2471  |
+   | Game, below 0x4b0000 | 1594   | 1523  |
+   | Library, at/above    | 948    | 948   |
+   +----------------------+--------+-------+
+
+   The difference is exactly 71 in both columns, and the library count
+   is unchanged, which is the expected signature of a merge that touched
+   only game code.
+
+   The working set is therefore 1523 functions, not 1594. Documents
+   quoting the old figures have been updated.
+
+4.  What the repair uncovered
+
+4.1.  A colour conversion site the catalogue missed
+
+   FUN_00485e50 was split, and its body held a hardcoded colour
+   conversion that subsystems/pixel-format.txt did not record. The
+   instruction search that built that catalogue did find AND EBP,0xf800
+   at 0x0048608f, but it was inside the orphan, decompiled to noise, and
+   was triaged as unrelated.
+
+   Whole, it reads:
+
+   c = ((((alpha & 0x3f | 0xffffff80) << 0x10 | rgb & 0xf800) << 3
+         | rgb & 0x7c0) << 2 | rgb & 0x1f) << 3
+
+   The masks 0xf800, 0x7c0 and 0x1f are the engine's framebuffer layout.
+   Tracing the shifts, the three channels land at bits 19-23, 11-15 and
+   3-7, which is one 5-bit value left-aligned in each byte, with alpha
+   in the top byte. It converts the engine's 5-5-5 colour to ARGB8888
+   for Direct3D vertex colours [verified].
+
+   This is the lesson worth keeping: a static search for constants finds
+   the instructions, but a split function makes them impossible to
+   interpret. Repair boundaries before cataloguing, not after.
+
+   The related constant 0x3e000 appears as a default vertex colour at
+   0x00485542, 0x004865bf and 0x0049b270. As an ARGB8888 value that is
+   r=0x03, g=0xe0, b=0x00. Not yet explained.
+
+4.2.  A name on the wrong address
+
+   Input_InitJoysticks was attached to the orphan at 0x004189cb rather
+   than the real entry at 0x004189c0, which has six incoming calls. The
+   name now sits on the entry point.
+
+   This is the failure mode to watch for when repairing: the script
+   skips any orphan carrying a non-default name rather than silently
+   discarding it, and reports it for manual handling.
+
+5.  Audit of the existing documents
+
+   Every .txt in docs/ was grepped for all 71 stub and orphan addresses,
+   and each document that cited one was re-read against the repaired
+   function.
+
+   The outcome is better than expected. The earlier notes were
+   substantially correct, because they had been written by decompiling
+   the orphaned body and attributing it to the right entry point. The
+   reader got the right answer despite the defect. What suffered was the
+   citations, and anything that happened to fall inside the stub.
+
+5.1.  Verified unchanged
+
+   formats/mesh-3df-map.txt, against Load3dfAndMap at 0x00420a50. The
+   0x200 header, the byte 1 bit 0x80 version test, the 128-byte records,
+   the n < 3 exemption, and the rule that n must equal 3 or 4 according
+   to whether face+0x34 is -1, all match the whole function exactly. One
+   addition was made; see 5.3.
+
+   subsystems/dd-chain.txt, against
+   Cdd_SetCooperativeLevelAndDisplayMode at 0x004752d0. Correct
+   throughout, including the borderless-window special case where a
+   640x480 request whose work area matches is masked with 0x7f30ffff.
+   That function kept its name through the merge, which confirms the
+   repair script preserves a stub's name.
+
+   subsystems/dd-init.txt makes no detailed claims about the split
+   functions it lists, so nothing there needed changing.
+
+5.2.  Corrected
+
+   subsystems/input-bindings.txt gave Input_InitJoysticks as 0x004189cb.
+   That was the orphan. The real entry, with six incoming calls, is
+   0x004189c0.
+
+   subsystems/pixel-format.txt cited three orphan addresses: 0x0049a5ab,
+   0x0049c59e and 0x004a177b, now corrected to 0x0049a5a0, 0x0049c590
+   and 0x004a1770.
+
+5.3.  New findings the repair exposed
+
+   Beyond the D3D vertex colour path in section 4.1, two more.
+
+   The flat-colour face path in Load3dfAndMap resolves a single colour
+   for a face whose UVs are all equal, and calls
+   Color_Convert555ToSurface to search a bank palette. It also pins the
+   texture bank record at 824 bytes with three known fields. Written up
+   in formats/mesh-3df-map.txt section 6.
+
+   The rectangle fade at 0x0049a5a0 reads g_bitsR as a pixel distance
+   rather than a bit count. That was invisible before, because the
+   function decompiled with phantom in_ZF and in_AL inputs.
+
+   Followed up and resolved: 0x004ee9ac is one dword with one writer,
+   and the fade is reading the wrong global. It is a real bug in the
+   game, with no visible symptom because g_bitsR is 5 on every mode the
+   game supports. See subsystems/pixel-format.txt section 1.1.1.
+
+   This is the clearest illustration of what the split functions were
+   costing. The bug sat in a function that had been broken in the
+   database since import, and no amount of reading the decompiler output
+   would have surfaced it.
+
+
+6.  A second defect: code in no function at all
+
+   The split functions above were a defined stub plus a defined orphan.
+   A separate defect leaves instructions belonging to NO function. Such
+   code is invisible to the decompiler, to call graphs, and to every
+   function-scoped search, and the fall-through detector in section 2
+   cannot see it because it compares two defined functions.
+
+   It was found by accident: the code that fills the D3D texture format
+   descriptor writes a global at 0x0041ed15, and that address was inside
+   no function. A sweep followed.
+
+6.1.  What the sweep found
+
+   Walking every instruction in game code and grouping maximal runs
+   whose containing function is null gave 315 runs and 70524 bytes
+   [verified]. They separate cleanly into two populations:
+
+   +-----------------------+------+-------+--------------------------------------------------------------------+
+   | Population            | Runs | Bytes | What                                                               |
+   +=======================+======+=======+====================================================================+
+   | SEH unwind thunks     | 160  | 1600  | ten bytes, MOV EAX,<handler table> then a jump; compiler generated |
+   +-----------------------+------+-------+--------------------------------------------------------------------+
+   | Under 32 bytes, other | 30   | -     | fragments                                                          |
+   +-----------------------+------+-------+--------------------------------------------------------------------+
+   | Substantial           | 125  | 68420 | real game code                                                     |
+   +-----------------------+------+-------+--------------------------------------------------------------------+
+
+   The substantial runs included the D3D device and format
+   initialisation at 0x0041e8f0 (3128 bytes), four rasterizer span
+   setups around 0x0049e510 to 0x004a2630 of about 2000 bytes each, and
+   single runs of 7079 and 6288 bytes.
+
+6.2.  Defining them
+
+   createFunction at each run start, iterated to a fixpoint. Ghidra
+   bounds each body by following flow, so a run that begins with a thunk
+   yields a small function and the remainder reappears as a new run on
+   the next pass. Nine passes defined 508 functions with no failures.
+
+   One caveat found the hard way, and now written into the tool:
+   defining a function at an SEH prologue whose body was also orphaned
+   RECREATES the split-function defect. Three appeared and were merged
+   with the section 7 tool. One of the three had its name,
+   Cd3d_CreateDD, sitting on the body rather than the entry, exactly
+   like Input_InitJoysticks in section 4.2, and was repaired by hand.
+
+6.3.  Result, and the cost
+
+   +---------------------+--------+-------+
+   | Measure             | Before | After |
+   +=====================+========+=======+
+   | Orphan code runs    | 315    | 1     |
+   +---------------------+--------+-------+
+   | Orphan bytes        | 70524  | 107   |
+   +---------------------+--------+-------+
+   | Fall-through splits | 0      | 0     |
+   +---------------------+--------+-------+
+   | .text functions     | 2471   | 3019  |
+   +---------------------+--------+-------+
+   | Game functions      | 1523   | 2070  |
+   +---------------------+--------+-------+
+
+   The one remaining run is 0x00444937 to 0x004449a1, 107 bytes. Ghidra
+   will not bound it by flow, so it is probably reachable only through a
+   computed jump. Left alone.
+
+   The cost is that the game function count rose by 547, and 742 of the
+   2070 are sixteen bytes or fewer. Those are the SEH thunks and small
+   fragments, and they inflate any raw count.
+
+   The honest working-set figure is therefore functions LARGER than
+   sixteen bytes, which is 1328. Use that number, not 2070, when judging
+   how much is left to understand:
+
+   +-------------------+----------------+
+   | Size              | Game functions |
+   +===================+================+
+   | 16 bytes or fewer | 742            |
+   +-------------------+----------------+
+   | 17 to 64          | 324            |
+   +-------------------+----------------+
+   | 65 to 256         | 414            |
+   +-------------------+----------------+
+   | 257 to 1024       | 390            |
+   +-------------------+----------------+
+   | over 1024         | 179            |
+   +-------------------+----------------+
+
+   Nothing was lost by this. The 68 KB was always in the binary; it
+   simply had no name and could not be decompiled. The count went up
+   because the database became more honest, not because the job got
+   bigger.
+
+
+6.4.  What the sweep did and did not change for analysis
+
+   A concern was raised that the colour-constant catalogue in
+   subsystems/pixel-format.txt might be incomplete, because 68 KB of
+   code had been excluded from every function-scoped search. The
+   searches were re-run afterwards. THE CONCERN WAS UNFOUNDED
+   [verified].
+
+   +----------------------+--------+--------+
+   | Search               | Before | After  |
+   +======================+========+========+
+   | operand 0xf800       | 7      | 7      |
+   +----------------------+--------+--------+
+   | operand 0x7c00       | 4      | 4      |
+   +----------------------+--------+--------+
+   | operand 0x7c0        | 22     | 22     |
+   +----------------------+--------+--------+
+   | SHR reg,0xb          | 19     | 19     |
+   +----------------------+--------+--------+
+   | xrefs to g_maskR     | 43     | 43     |
+   +----------------------+--------+--------+
+   | instructions scanned | 235420 | 235420 |
+   +----------------------+--------+--------+
+
+   Identical in every case, including the instruction count. The reason
+   is worth writing down: Ghidra's instruction search walks the LISTING,
+   not the function set, so it finds instructions belonging to no
+   function. Orphaned code was always discoverable.
+
+   What orphaning broke was INTERPRETATION. An instruction inside an
+   orphaned body still turns up in a search, but the function around it
+   decompiles to noise, so the hit cannot be understood and gets triaged
+   away. That is exactly what happened at 0x0048608f, described in
+   section 4.1.
+
+   The rule to carry forward: an instruction-level search is complete
+   regardless of function boundaries, but any conclusion drawn from
+   reading the surrounding function is only as good as that function's
+   bounds. Repair boundaries before interpreting, not before searching.
+
+6.5.  One thing the sweep did surface
+
+   Four functions of roughly 2000 bytes each at 0x0049e510, 0x0049fa10,
+   0x004a0f90 and 0x004a2630 were defined for the first time. All four
+   are entries in the second dispatch table at 0x004f1ee4, the one
+   Screen3D_DispatchPrimitive loads into DAT_006d20bc [verified].
+
+   That makes them the edge-walking layer between primitive dispatch and
+   the span loops in subsystems/pixel-format.txt section 1.3.2.1. They
+   reference neither the pixel-format globals nor the span patch flag,
+   consistent with edge walkers that call through DAT_00655d08 rather
+   than touching pixels. None had been read before, because none existed
+   as functions.
+
+
+7.  A third defect: code never disassembled
+
+   Sections 1 and 6 covered functions split in two, and code
+   disassembled but belonging to no function. There is a third case, and
+   it is invisible to both of those sweeps: bytes that are real code but
+   were never DISASSEMBLED at all.
+
+   Neither tool can see it. The split-function detector compares two
+   defined functions. The orphan-code scanner walks the instruction
+   listing, and unlisted bytes are not in it.
+
+7.1.  How it was found
+
+   By accident, while reading the rasterizer. The walker table names
+   0x004a0260 as an edge walker, but no function existed there. A
+   function existed eleven bytes later, at 0x004a026b.
+
+   Eleven bytes is the flag-scheduling signature from section 1.1, and
+   the raw bytes confirmed it:
+
+       83 ec 08        SUB ESP,0x8
+       a1 44 e4 62 00  MOV EAX,[0x0062e444]
+       85 c0           TEST EAX,EAX
+       90              NOP
+       53 56 57 55     PUSH EBX/ESI/EDI/EBP
+       0f ..           JZ near
+
+   A split, but with the stub never disassembled, so the sweep in
+   section 6 had nothing to find. Deleting the body function and
+   recreating at the true entry merged it: 623 bytes against 612 plus
+   11.
+
+7.2.  Detection: follow every pointer in data
+
+   The general rule is that a function pointer stored in data should
+   land on a function entry. Sweeping every aligned dword in .rdata and
+   .data for values inside the code range, and classifying the target,
+   separates the problem cleanly [verified]:
+
+   +---------+-------+--------------+----------------+
+   | Section | Entry | Mid-function | Undisassembled |
+   +=========+=======+==============+================+
+   | .rdata  | 623   | 4            | 470            |
+   +---------+-------+--------------+----------------+
+   | .data   | 178   | 49           | 13             |
+   +---------+-------+--------------+----------------+
+
+   The two sections mean completely different things, and the split
+   matters more than the totals.
+
+7.2.1.  .rdata is compiler noise
+
+   The 470 in .rdata cluster between 0x004d5200 and 0x004d7d00 with
+   targets a uniform thirteen bytes apart. They are MSVC C++ exception-
+   handling tables pointing at unwind funclets, the cleanup code the 160
+   SEH thunks of section 6.1 belong to.
+
+   These are deliberately left undefined. They are compiler-generated
+   cleanup, not game logic, and defining them would add hundreds of tiny
+   functions that inflate every count for no analytical gain. Recorded
+   here so nobody rediscovers them and assumes they matter.
+
+7.2.2.  .data is where the real code was hiding
+
+   Only thirteen, and they form two tables:
+
+   +-------------------+---------+---------------------------------------------------------------------------------+
+   | Table             | Targets | What                                                                            |
+   +===================+=========+=================================================================================+
+   | around 0x004dbb5c | 11      | menu page handlers; 16-byte records holding three function pointers each, into  |
+   |                   |         | menu.cpp, pageMainMenu.cpp and pageProtocol.cpp                                 |
+   +-------------------+---------+---------------------------------------------------------------------------------+
+   | 0x004f1fa4        | 2       | two more span functions, immediately past the rasterizer walker table           |
+   +-------------------+---------+---------------------------------------------------------------------------------+
+
+   Both are unambiguously code. 0x0040b3f0 opens with MOV EAX, FS:[0],
+   the MSVC SEH prologue; 0x004a2ed0 opens by reading DAT_006d1f7c and
+   DAT_006d20b4, the span x bounds, exactly as the other span functions
+   do.
+
+   One of the eleven menu entries, 0x00443200, turned out to be 4884
+   bytes. A function of that size had been completely absent from the
+   database.
+
+   The menu table has since been mapped in full: 28 records, 27 live
+   pages, 68 handlers, and the transition graph between them. See
+   docs/subsystems/menu-pages.txt.
+
+7.2.3.  Defining them makes work for the other two tools
+
+   Defining the thirteen created four new fall-through splits and
+   exposed six orphan runs, because some targets sit in front of bodies
+   that were already defined and disassembling fresh code reveals more.
+   A repair cycle alternating the orphan and split tools settled it in
+   one pass.
+
+   It also cleared the last stubborn orphan run at 0x00444937, which had
+   resisted createFunction until the surrounding code was defined.
+
+   Final state: no undisassembled pointer target in .data, no fall-
+   through splits, and no orphan code runs anywhere in game code.
+
+
+8.  Tool
+
+   Two scripts, both run through the ghidra MCP, both DRY_RUN by
+   default.
+
+   tools/ghidra_fix_split_functions.java merges a stub with its orphaned
+   body.
+
+   A FOURTH script belongs in this sequence, added later:
+   tools/ghidra_restore_original_bytes.java. The shipped MOTO.EXE is
+   modified at seven sites and a reimport brings those modifications
+   back; the script writes the original bytes into the database so the
+   decompiler stops showing patched logic. Run it after the other three,
+   since it disassembles code and adjusts a function body. See binary-
+   modifications.txt [verified].
+
+   tools/ghidra_define_orphan_code.java defines code that belongs to no
+   function.
+
+   tools/ghidra_check_pointer_tables.java finds code reachable only
+   through a pointer in data, which neither of the others can see.
+
+   Order matters: run the pointer sweep first, then the orphan tool,
+   then the merge tool, and repeat until all three report nothing. Each
+   can create work for the others.
+
+   DRY_RUN = true    report only, change nothing
+   DRY_RUN = false   apply
+   FIX_BELOW         address ceiling, default 0x004b0000
+
+   It iterates to a fixpoint, because merging can expose a further fall-
+   through, and it preserves a stub's name if it has one. Run it after
+   any reimport or reanalysis.
+
+9.  Open questions
+
+   o One orphan run survives, 0x00444937 to 0x004449a1, 107 bytes with
+     one incoming reference. createFunction refuses it, so it is
+     probably reached only by a computed jump. Worth a look, since
+     unreachable-by-flow code is where jump tables hide.
+   o Two fall-through splits remain in library code at 0x004b0be0 and
+     0x004b9c53, deliberately out of scope.
+
+   o Two splits remain in library code, at 0x004b0be0 and 0x004b9c53.
+     The second has two incoming references to the orphan, so it is not
+     the same shape and needs looking at before being merged.
+   o ANSWERED. Every document was cross-referenced against the 71 split
+     pairs and the affected ones re-read against the repaired functions.
+     Results in section 5.
+   o Ghidra's analyser will recreate these on a fresh import. Whether
+     the function-start pattern can be disabled or narrowed, rather than
+     repaired afterwards, has not been investigated.
+
+
+A FOURTH DEFECT CLASS: LATE FUNCTION BOUNDARIES
+
+   Found while reading the window procedure. It is distinct from the
+   three above and the existing repair scripts do NOT catch it
+   [verified].
+
+   A function reached ONLY through a pointer - a window procedure, a
+   virtual method in a vtable, a dispatch-table entry - has no CALL
+   reference. Ghidra never disassembles its prologue. If some other pass
+   then defines the tail as a function, the result is a function that
+   starts several bytes inside itself. The decompiler loses the calling
+   convention and invents phantom inputs.
+
+   It does not look like orphaned code, because the tail IS a well-
+   formed function. That is why ghidra_define_orphan_code and
+   ghidra_fix_split_functions both miss it.
+
+   +------------+-----------------+---------+-------------------------+
+   | Real entry | Was recorded as | Late by | What it is              |
+   +============+=================+=========+=========================+
+   | 0x00432980 | 0x004329a5      | 0x25    | the window procedure    |
+   +------------+-----------------+---------+-------------------------+
+   | 0x00414080 | 0x004140a2      | 0x22    | CWinApp::InitInstance   |
+   +------------+-----------------+---------+-------------------------+
+   | 0x004a31d0 | 0x004a31db      | 11      | a screen3d span routine |
+   +------------+-----------------+---------+-------------------------+
+
+   All three are repaired. Detector:
+
+
+
+       tools/ghidra_find_late_boundaries.java
+
+
+
+   It looks for a DATA reference into .text whose target is not inside
+   any function, is not disassembled, and whose bytes look like an x86
+   prologue. The prologue test is what makes it usable: without it the
+   output is dominated by MSVC switch jump tables, which have the same
+   reference shape.
+
+   Two weaker heuristics were tried first and both FAILED to find the
+   window procedure, which is worth recording so they are not tried
+   again:
+
+   o "entry preceded by undisassembled non-padding bytes" - missed it,
+     because the byte before the recorded entry was an alignment 0x90,
+     which the filter discarded as padding.
+
+   o "function with zero references to its entry" - produced 35 hits in
+     game code, all of them legitimate pointer-dispatch families (menu
+     page Enter/Tick tables, rasterizer span functions) with correct
+     boundaries. No signal.
+
+   Run it after the other three scripts on any reimport. Repair is
+   manual: remove the late function, disassemble at the real entry,
+   recreate it, then restore the name, calling convention and comment.
+
+
+10.  A fourth defect: switch cases promoted to functions
+
+   Found while auditing named functions for the signature pass. 32
+   entries in the game range carried Ghidra's automatic caseD_NN
+   labels and had been made FUNCTIONS. They are not functions. They
+   are the case bodies of four switch statements, and promoting them
+   amputated those bodies from the functions that own them
+   [verified].
+
+   The damage is the same shape as section 1's - a function whose body
+   stops early decompiles wrongly - but the cause is different, so the
+   section 2 detection rule does not catch it.
+
+10.1.  Detection: a function nothing calls
+
+   The signature is unambiguous and needs no heuristic:
+
+   o the name starts with caseD_, Ghidra's own label for a computed
+     jump target;
+
+   o every reference to it is either a COMPUTED_JUMP or the DATA
+     reference from the jump table - there is not one CALL;
+
+   o the source of that COMPUTED_JUMP lies inside another function,
+     which is the function the block belongs to.
+
+   Anything matching all three is a case body, not a function.
+
+10.2.  The sweep
+
+   All 32 belonged to just four parents, and three of the four are on
+   the menu path [verified]:
+
+   +----------------------------------+--------+---------------------+
+   | Parent                           | Cases  | Body, before->after |
+   +==================================+========+=====================+
+   | MenuPage11_Options_Tick          |   20   |  4991 -> 6280       |
+   | 0x00443200                       |        |                     |
+   +----------------------------------+--------+---------------------+
+   | MenuPage12_ControllerConfig_Tick |    7   |   468 -> 2230       |
+   | 0x00444f30                       |        |                     |
+   +----------------------------------+--------+---------------------+
+   | FUN_00440540                     |    4   |   785 -> 1426       |
+   +----------------------------------+--------+---------------------+
+   | maybe_Event_WndProc  0x00432980  |    1   |  3500 -> 3792       |
+   +----------------------------------+--------+---------------------+
+
+   The repair is to delete the case functions and set the parent's
+   body to the union of its own body and theirs. All four then
+   decompile cleanly.
+
+   Note the scale of the Options and ControllerConfig damage.
+   MenuPage12_ControllerConfig_Tick was showing 468 bytes of a
+   2230-byte function - four fifths of the controller configuration
+   page was invisible, and the page had been read and recorded in that
+   state.
+
+   o IT ALSO INFLATED THE COVERAGE NUMBERS. 32 of a then-current
+     count of 457 named game functions were these labels, so the
+     honest named count was 425.
+
+10.3.  One case regenerates, and is left open
+
+   caseD_200 at 0x00433637, the maybe_Event_WndProc case, comes BACK
+   as a function after being deleted. Its parent's body is then clipped
+   again, to less than it had before the repair.
+
+   It has a DATA reference at 0x00433894 as well as the COMPUTED_JUMP,
+   and the likeliest reading is that an analyzer treats that data word
+   as a function pointer and re-creates the function from it
+   [guess - the mechanism was not confirmed].
+
+   Rebuilding the parent with CreateFunctionCmd in recreate mode gives
+   the right 3792-byte body and preserves the name and plate comment,
+   but it does not survive. maybe_Event_WndProc still decompiles - 576
+   lines, and the signature pass resolved it to a genuine
+   LRESULT __stdcall(HWND, uint, uint, int) - so it is legible, just
+   not whole.
+
+   Left open deliberately. It is one case block in event.cpp, not on
+   the menu path, and chasing the analyzer that regenerates it was not
+   worth the session. The other 31 are fixed and stay fixed.
+
+
+11.  Typing the hidden `this` of a __thiscall function
+
+   SYMPTOM. A __thiscall function has had its prototype set and its
+   stack parameters are correctly typed and named, but field accesses
+   through the object still decompile as raw arithmetic:
+
+       *(int *)((int)this + 4)          instead of
+       this->segmentCount
+
+   and the signature line shows void *this.
+
+   WHAT DOES NOT WORK. Neither set_function_prototype nor
+   set_parameter_type will touch it. The latter is explicit:
+
+       Cannot set type for register-based variable 'this' at storage
+       location: ECX:4 (auto)
+       Ghidra limitation: Cannot modify auto-parameter: this
+
+   THE CAUSE IS IN THAT MESSAGE. Under __thiscall, `this` is an
+   AUTO-PARAMETER: Ghidra synthesises it from the calling convention
+   instead of storing it as a variable. There is nothing to retype,
+   so no API call can succeed, and this is not a defect in the MCP
+   layer.
+
+   THE FIX. An auto-`this` takes its type from the function's CLASS
+   NAMESPACE. Put the function in a GhidraClass whose name matches an
+   existing structure, and Ghidra types `this` as a pointer to that
+   structure.
+
+   In the GUI:
+
+       Symbol Tree -> Classes -> right-click -> New -> Class
+       name it exactly as the struct, then drag the function onto it
+       (or Edit Function... and set the namespace there)
+
+   Scripted: tools/ghidra_set_thiscall_class.java, run through the
+   MCP run_script_inline or the Script Manager. Edit CLASS_NAME and
+   ADDRS at the top.
+
+   THE CLASS NAME MUST MATCH AN EXISTING STRUCT. If no structure of
+   that name is in the data type manager, `this` stays void* and the
+   script reports success anyway.
+
+11.1.  Why this went unnoticed for so long
+
+   The racer functions always decompiled correctly - as
+   MR_Racer::maybe_Racer_UpdateCrash(MR_Racer *this) - because an
+   earlier session had already put them in an MR_Racer class. The Trk
+   functions did not, and the difference was invisible from the
+   prototype API, which reports success either way.
+
+   SO THE TELL IS THE DOUBLE-COLON. A decompiled signature with a
+   Class:: prefix has a typed `this`; one without does not. That is
+   worth checking on any __thiscall function before concluding its
+   object layout is unknown - the layout may be perfectly well known
+   and simply not wired up.
+
+11.2.  A note on run_script_inline output
+
+   Its result is prefixed by about a hundred lines of compile errors
+   naming nine McpInline_*.java files, then an
+   "Unexpected error activating bundle" stack trace. NONE OF THAT IS
+   FROM THE SCRIPT JUST SUBMITTED. Read past it to the
+   --- SCRIPT OUTPUT --- section; a run ending in
+   "SCRIPT COMPLETED SUCCESSFULLY" worked regardless.
+
+   THE FILES DO NOT EXIST. An earlier version of this note said to
+   delete them and that was wrong - checked, and
+   C:/Users/<user>/ghidra_scripts holds no McpInline_*.java at all.
+   The MCP server writes each inline script, runs it, and removes it.
+   The compiled-bundle directory on disk is clean too, holding only
+   the most recent script's .class plus a generated activator.
+
+   IT IS IN-MEMORY STATE. Ghidra's GhidraSourceBundle keeps a map of
+   source file to build errors and does not purge entries whose file
+   has since been deleted. The tell is in the message itself:
+
+       C:\Users\...\ghidra_scripts hasn't changed, with 9 files
+       failing in previous build(s)
+
+   It decides nothing has changed, skips the rebuild, and replays the
+   stored failures. The stack trace underneath is Ghidra tripping over
+   exactly that - "Source file for script does not exist!" for the
+   first of the nine.
+
+   TOUCHING THE DIRECTORY DOES NOT HELP. Tried: bumping the mtime on
+   ghidra_scripts leaves the message identical, so the staleness check
+   is not a directory timestamp.
+
+   WHAT DOES CLEAR IT, in increasing order of disruption:
+
+   o Script Manager -> Refresh (the two-arrows icon), which forces a
+     full rescan and rebuild;
+   o Bundle Manager (the plug icon in Script Manager) -> untick and
+     re-tick the ghidra_scripts bundle;
+   o restart Ghidra.
+
+   All three are GUI actions on a live Ghidra. Do not delete
+   osgi/compiled-bundles/<id>/ underneath a running instance to force
+   it - the MCP connection depends on that instance, and the noise is
+   cosmetic.
+
+11.3.  The sweep: 42 bare, 9 fixed
+
+   Enumerating every __thiscall function and checking whether its
+   parent namespace is a GhidraClass:
+
+       __thiscall total   353
+       already in a class 311
+       BARE (this void*)   42
+
+   So the defect was the exception rather than the rule - most of the
+   image was already wired up by earlier sessions, which is exactly
+   why it went unnoticed.
+
+   FIXED THIS PASS:
+
+   +---------------------------------+------------------+------------+
+   | Function                        | Class            | Evidence   |
+   +=================================+==================+============+
+   | Trk_FindSegmentForPoint         | MR_Trk           | verified   |
+   | maybe_Trk_ClipMoveAgainstWalls  | MR_Trk           | verified   |
+   | maybe_Racer_Draw                | MR_Racer         | verified   |
+   | Racer_Create                    | MR_Racer         | verified   |
+   | ModelInstance_Init              | MR_ModelInstance | inferred   |
+   | Mesh_FreeUnshared               | MR_Mesh          | inferred   |
+   | Mesh_ComputeFaceNormal          | MR_Mesh          | inferred   |
+   | Mesh_Scale                      | MR_Mesh          | inferred   |
+   | Mesh_RebaseBankIndices          | MR_Mesh          | inferred   |
+   +---------------------------------+------------------+------------+
+
+   THE TWO RACER ONES WERE CHECKED BY OFFSET, not by name.
+   maybe_Racer_Draw reads [ECX+0x78] (bikeIndex), [EBX+0x2e55] (the
+   bike root matrix) and [EBX+0xbc] (matOrientation); Racer_Create
+   writes [ECX+0x8] (humanPlayer), [ECX+0x4] (soloMode) and reads
+   [ECX+0x78]. Those are MR_Racer offsets and nothing else's.
+
+   maybe_Racer_Draw IS 10247 BYTES and was decompiling entirely
+   through void*, which makes it the largest single beneficiary in
+   the image.
+
+   THE FOUR Mesh ONES AND ModelInstance_Init ARE [inferred] - the
+   name plus a struct of the right shape (MR_Mesh 121 bytes,
+   MR_ModelInstance 388 = 0x184, which matches the racer's embedded
+   instance). A wrong class assignment only affects rendering and is
+   reversible, but it is still an assertion; if any of these five
+   starts producing nonsense field names, this is the place to look.
+
+11.3.1.  What was deliberately NOT fixed
+
+   o maybe_Snd_TickRacer (0x00406290). ITS ECX IS THE AUDIO RECORD,
+     NOT THE RACER, despite the name - see audio-cues.txt. This is a
+     documented trap that has already cost one wrong reading, and a
+     name-based sweep would walk straight into it. Left bare.
+
+   o maybe_Game_CollideRacers, maybe_Game_RenderFrame,
+     maybe_Game_ApplyModeRequest and the seven Cdd_/Dd* functions.
+     MR_Game and MR_Cdd DO NOT EXIST as structures, so there is
+     nothing to attach and the class would type this as void*
+     anyway.
+
+   o Trk_ReadMesh, Trk_ReadFace, Trk_ReadVec3, Trk_ReadMatrix. The
+     Trk_ prefix is misleading here - these look like methods on a
+     FILE READER object rather than on MR_Trk, and one is 47 bytes.
+     Reading them properly comes before naming them.
+
+   o The remaining 22 - Bankw_, Math_, Main_, Load3df, Script_,
+     Settings_, Carac_, Csample_, Net_, Anim_, MenuTools_,
+     Screen3D_. No struct exists for any of their objects yet.
+
+   THE RULE THAT FALLS OUT: fix a bare `this` when a struct of the
+   right shape already exists AND the offsets confirm it. Creating a
+   struct just to satisfy the sweep would be inventing a layout,
+   which is the opposite of the point.
+
+12.  A fifth defect: unaff_ registers at COM call sites
+
+   A phantom input named unaff_EBX, unaff_ESI or similar in a
+   function that calls a COM interface is USUALLY NOT A PHANTOM
+   INPUT AT ALL. It is a stack argument the decompiler has
+   mislaid, and the cause is the indirect call above it.
+
+   A vtable call - CALL dword ptr [EAX + 0x34] - has no prototype,
+   so the decompiler cannot know the callee is stdcall and assumes
+   the pushed arguments are still on the stack when it returns.
+   Every later stack reference in the function is then wrong by the
+   size of those arguments, and a reference that should name a
+   parameter instead lands on a register the prologue saved.
+
+   Csample_Play (0x00440ec0) is the worked example. It ends RET 0x4
+   and reads its one argument with MOV EAX,[ESP+0xc], but the
+   decompiler shows unaff_EBX: the two arguments pushed for
+   SetCurrentPosition leave ESP eight low, and [ESP+0xc] then lands
+   exactly on the slot PUSH EBX saved in the prologue.
+
+   RETYPING THE FUNCTION DOES NOT FIX IT. Setting the prototype to
+   __thiscall(void *, unsigned int) and forcing a redecompile both
+   leave unaff_EBX in place, because the defect is in the CALLEE's
+   missing signature, not the caller's. That is what separates this
+   from section 11 and from the six prototype fixes in
+   whole-function-import.txt, where retyping was the whole cure.
+
+   The fix is to type the DirectDraw, Direct3D and DirectSound
+   vtables as structures of function pointers, which would settle
+   it at every COM call site at once. Not done - it is a large
+   piece of work and the replace-list functions are the ones that
+   would benefit most, so it belongs with that effort.
+
+   UNTIL THEN, READ THE ASM. A stack argument is unambiguous in the
+   disassembly: count the prologue pushes, add four for the return
+   address, and check the RET immediate.

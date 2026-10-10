@@ -1,0 +1,217 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>15.0</VCProjectVersion>
+    <ProjectGuid>{8A5F3C21-9B4E-4D7A-A1C6-2E9D3F5B7A84}</ProjectGuid>
+    <RootNamespace>mracer</RootNamespace>
+    <ProjectName>mracer</ProjectName>
+    <WindowsTargetPlatformVersion>10.0.17134.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v141</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v141</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v141</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v141</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)..\build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)..\build\obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <TreatSpecificWarningsAsErrors Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">4013</TreatSpecificWarningsAsErrors>
+      <CreateHotpatchableImage Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</CreateHotpatchableImage>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateMapFile Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</GenerateMapFile>
+      <CreateHotPatchableImage Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">X86Image</CreateHotPatchableImage>
+      <RandomizedBaseAddress Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">false</RandomizedBaseAddress>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <TreatSpecificWarningsAsErrors Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">4013</TreatSpecificWarningsAsErrors>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateMapFile Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">false</GenerateMapFile>
+      <RandomizedBaseAddress Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">false</RandomizedBaseAddress>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="agent.c" />
+    <ClCompile Include="netplay.c" />
+    <ClCompile Include="racerdraw.c" />
+    <ClCompile Include="config.c" />
+    <ClCompile Include="bkf.c" />
+    <ClCompile Include="assets.c" />
+    <ClCompile Include="font.c" />
+    <ClCompile Include="framebuffer.c" />
+    <ClCompile Include="lez.c" />
+    <ClCompile Include="level.c" />
+    <ClCompile Include="fx.c" />
+    <ClCompile Include="trk.c" />
+    <ClCompile Include="grid.c" />
+    <ClCompile Include="hud.c" />
+    <ClCompile Include="horizon.c" />
+    <ClCompile Include="autopilot.c" />
+    <ClCompile Include="race.c" />
+    <ClCompile Include="physics.c" />
+    <ClCompile Include="racer.c" />
+    <ClCompile Include="log.c" />
+    <ClCompile Include="menures.c" />
+    <ClCompile Include="model.c" />
+    <ClCompile Include="mesh.c" />
+    <ClCompile Include="transform.c" />
+    <ClCompile Include="rawtex.c" />
+    <ClCompile Include="bank.c" />
+    <ClCompile Include="prim.c" />
+    <ClCompile Include="shade.c" />
+    <ClCompile Include="detail.c" />
+    <ClCompile Include="queue.c" />
+    <ClCompile Include="cull.c" />
+    <ClCompile Include="clip.c" />
+    <ClCompile Include="drawscene.c" />
+    <ClCompile Include="glass.c" />
+    <ClCompile Include="d3d9rt.cpp" />
+    <ClCompile Include="xa2.cpp" />
+    <ClCompile Include="menu.c" />
+    <ClCompile Include="music.c" />
+    <ClCompile Include="scene.c" />
+    <ClCompile Include="sprite.c" />
+    <ClCompile Include="tga.c" />
+    <ClCompile Include="wave.c" />
+    <ClCompile Include="timing.c" />
+    <ClCompile Include="rand.c" />
+    <ClCompile Include="fontdef.c" />
+    <ClCompile Include="audio.c" />
+    <ClCompile Include="objsnd.c" />
+    <ClCompile Include="options.c" />
+    <ClCompile Include="bpt.c" />
+    <ClCompile Include="tracks.c" />
+    <ClCompile Include="bikes.c" />
+    <ClCompile Include="skl.c" />
+    <ClCompile Include="trig.c" />
+    <ClCompile Include="main.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="agent.h" />
+    <ClInclude Include="netplay.h" />
+    <ClInclude Include="config.h" />
+    <ClInclude Include="font.h" />
+    <ClInclude Include="hud.h" />
+    <ClInclude Include="framebuffer.h" />
+    <ClInclude Include="camera.h" />
+    <ClInclude Include="horizon.h" />
+    <ClInclude Include="lez.h" />
+    <ClInclude Include="log.h" />
+    <ClInclude Include="menures.h" />
+    <ClInclude Include="model.h" />
+    <ClInclude Include="mesh.h" />
+    <ClInclude Include="transform.h" />
+    <ClInclude Include="rawtex.h" />
+    <ClInclude Include="bank.h" />
+    <ClInclude Include="prim.h" />
+    <ClInclude Include="bkf.h" />
+    <ClInclude Include="assets.h" />
+    <ClInclude Include="shade.h" />
+    <ClInclude Include="detail.h" />
+    <ClInclude Include="queue.h" />
+    <ClInclude Include="autopilot.h" />
+    <ClInclude Include="race.h" />
+    <ClInclude Include="cull.h" />
+    <ClInclude Include="clip.h" />
+    <ClInclude Include="drawscene.h" />
+    <ClInclude Include="render.h" />
+    <ClInclude Include="menu.h" />
+    <ClInclude Include="scene.h" />
+    <ClInclude Include="sprite.h" />
+    <ClInclude Include="tga.h" />
+    <ClInclude Include="wave.h" />
+    <ClInclude Include="timing.h" />
+    <ClInclude Include="rand.h" />
+    <ClInclude Include="fontdef.h" />
+    <ClInclude Include="audio.h" />
+    <ClInclude Include="objsnd.h" />
+    <ClInclude Include="xa2.h" />
+    <ClInclude Include="options.h" />
+    <ClInclude Include="bpt.h" />
+    <ClInclude Include="tracks.h" />
+    <ClInclude Include="bikes.h" />
+    <ClInclude Include="skl.h" />
+    <ClInclude Include="trig.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

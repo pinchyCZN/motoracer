@@ -1,0 +1,315 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          THE RMNR SOUND FILES
+
+
+Abstract
+
+   The 250 files in SFX.BKF are named .WAV but begin with the magic
+   "rmnr" instead of "RIFF". They are ordinary uncompressed PCM RIFF
+   WAVE files with a positional cipher applied [verified]. There is no
+   compression and no custom container: once unmasked, every one of them
+   is a standard wave file that Windows, or Python's stdlib wave module,
+   reads directly.
+
+   This was the last unexamined format in the data.
+
+   +--------------+------------+-----------------------------------------------------------+
+   | Function     | Address    | Role                                                      |
+   +==============+============+===========================================================+
+   | Csample_Load | 0x00440af0 | reads the file, creates the DirectSound buffer, uploads   |
+   +--------------+------------+-----------------------------------------------------------+
+   | Wave_Read    | 0x00440d30 | opens, unmasks, validates, returns PCM and a WAVEFORMATEX |
+   +--------------+------------+-----------------------------------------------------------+
+   | Wave_Unmask  | 0x00440d00 | the cipher                                                |
+   +--------------+------------+-----------------------------------------------------------+
+
+Table of Contents
+
+   1. The cipher
+      1.1. The trigger is one letter
+      1.2. Three regions, each restarting the counter
+   2. What the loader builds
+   3. Verification
+      3.1. Cross-validation against the other bit depth
+      3.2. The masker missed the trailing chunks
+   4. Inventory
+   5. Reference reader
+   6. Modernization note
+      6.1. The port's reader, and how it is checked
+   7. Open questions
+
+
+1.  The cipher
+
+   Wave_Unmask is four lines:
+
+   for (i = 0; i < len; i++)
+       buf[i] = buf[i] + (-8 - i) * 4;
+
+   so
+
+   plain[i] = (cipher[i] - 0x20 - 4*i) & 0xff
+
+   It is stateless and positional. The counter restarts at zero on every
+   call, and because 4*i wraps at 256 the key repeats every 64 bytes.
+
+   Note this is a different mechanism from the .bpt obfuscation in
+   formats/bpt.txt, which uses a Park-Miller generator. The two
+   subsystems were protected independently.
+
+   Wave_Read calls FUN_0042ee60 on entry, which clears DAT_004e85d4.
+   That global is read and written only by File_Open [verified], so it
+   is file-layer state and has nothing to do with the cipher. There is
+   no seed to track.
+
+1.1.  The trigger is one letter
+
+   Wave_Read reads the first 0x24 bytes and then tests
+
+   masked = ((char)hdr[0] == 'r')
+
+   "RIFF" begins with 'R', 0x52. Masked, byte 0 becomes 0x52 + 0x20 =
+   0x72, which is 'r'. So the lowercase letter is itself the flag: the
+   game distinguishes the two forms by case alone and reads plain RIFF
+   files unchanged [verified]. Nothing else is checked before unmasking,
+   and there is no "rmnr" constant anywhere in the binary.
+
+   The rest of the magic falls out of the same arithmetic. "IFF" at i =
+   1, 2, 3 becomes 0x6d, 0x6e, 0x72, spelling "mnr".
+
+1.2.  Three regions, each restarting the counter
+
+   The loader never unmasks the file in one pass. It unmasks three
+   separate buffers, and i restarts at 0 for each:
+
+   +--------+---------------------------+-------------------------------------+
+   | Region | What                      | Length                              |
+   +========+===========================+=====================================+
+   | 1      | RIFF, WAVE and fmt header | 0x24 bytes                          |
+   +--------+---------------------------+-------------------------------------+
+   | 2      | data chunk header         | 8 bytes, after seeking fmtSize - 16 |
+   +--------+---------------------------+-------------------------------------+
+   | 3      | payload                   | the data chunk size                 |
+   +--------+---------------------------+-------------------------------------+
+
+   Between regions 1 and 2 the loader seeks forward by fmtSize - 16.
+   Every shipped file has an 18-byte fmt chunk, so that skips the two
+   cbSize bytes, which are therefore never unmasked. A decoder has to
+   reproduce this exactly: treating the file as one continuous stream
+   produces garbage from byte 0x24 onward.
+
+   After unmasking, Wave_Read validates all four tags: RIFF, WAVE, fmt
+   and data. It is a real format check, just one performed on plaintext.
+
+2.  What the loader builds
+
+   Wave_Read fills an 18-byte WAVEFORMATEX from the fmt chunk, and
+   Csample_Load hands it to IDirectSound CreateSoundBuffer. The format
+   tag is hardcoded to 1, WAVE_FORMAT_PCM, rather than copied from the
+   file, and the derived fields are recomputed rather than trusted:
+
+   nBlockAlign     = (wBitsPerSample / 8) * nChannels
+   nAvgBytesPerSec = nBlockAlign * nSamplesPerSec
+   cbSize          = 0
+
+   So the game ignores those three fields in the file. Only the channel
+   count, sample rate and bit depth are read.
+
+3.  Verification
+
+   Hand-decoding 16_BITS/KTM/CHOC1.WAV, 15394 bytes, gives every field
+   consistently [verified]:
+
+   i=0    "RIFF"
+   i=4    0x00003c1a = 15386, which is the file length minus 8
+   i=8    "WAVE"
+   i=12   "fmt "
+   i=16   18
+   i=20   tag 1, 1 channel
+   i=24   16000 Hz
+   i=28   32000 bytes/sec, which is 16000 x 2
+   i=32   blockAlign 2, 16 bits
+   then   "data", 15348 bytes
+
+   and 38 + 8 + 15348 is exactly 15394.
+
+   All 250 files decode and pass a consistency check on the RIFF size,
+   the format tag, blockAlign, avgBytesPerSec and the trailing byte
+   count.
+
+3.1.  Cross-validation against the other bit depth
+
+   The bank ships two parallel trees, 8_BITS and 16_BITS, with 125 files
+   each and identical relative paths. If the decode is right they must
+   hold the same sounds at two depths, which is a check the decoder
+   cannot fake.
+
+   Converting each 16-bit file to 8 bits and correlating against its
+   twin:
+
+   +------------------------+------------+
+   | Measure                | Result     |
+   +========================+============+
+   | Pairs                  | 125 of 125 |
+   +------------------------+------------+
+   | Same sample rate       | 125        |
+   +------------------------+------------+
+   | Same sample count      | 124        |
+   +------------------------+------------+
+   | Mean correlation       | 0.998      |
+   +------------------------+------------+
+   | Correlation above 0.99 | 124        |
+   +------------------------+------------+
+
+   The single outlier is MENU/CONTINUE.WAV, where the 8-bit file is 2959
+   samples and the 16-bit file is 2960. A one-sample length difference
+   is an authoring artifact, not a decode error; the waveforms still
+   correlate at 0.80.
+
+   This is the same technique that validated the .bkf reader against the
+   pre-extracted tree and the .trk geometry against MAP.LEZ. Two files
+   that were never compared during decoding agreeing on their contents
+   is much stronger evidence than either file parsing cleanly on its
+   own.
+
+3.2.  The masker missed the trailing chunks
+
+   Three files carry a RIFF LIST/INFO chunk after the data chunk, and it
+   is not masked [verified]. The loader stops at the end of the data
+   chunk and never reads that far, so the masking tool never covered it.
+
+   Read as plaintext it gives the provenance of the samples:
+
+   16_BITS/DIVERS/BIRD3.WAV   ICRD  1997-04-02
+   16_BITS/DIVERS/FETE.WAV    ICRD  1997-03-17
+                              ISFT  Cool Edit v.95 by Syntrillium
+                                    Software Corporation
+   8_BITS/DIVERS/FETE.WAV     same as the 16-bit twin
+
+   Cool Edit is the editor that later became Adobe Audition. The dates
+   fit a 1997 release.
+
+   Sixty-nine other files have a single trailing byte, which is the
+   ordinary RIFF word-alignment pad after an odd-sized data chunk.
+
+4.  Inventory
+
+   125 sounds, each shipped at both depths. 4.4 MB of 16-bit and 2.2 MB
+   of 8-bit.
+
+   +--------+-------+-------------------------------------------+
+   | Folder | Count | Contents                                  |
+   +========+=======+===========================================+
+   | DIVERS | 46    | general effects: crashes, ambience, crowd |
+   +--------+-------+-------------------------------------------+
+   | VOICES | 43    | spoken lines and countdown                |
+   +--------+-------+-------------------------------------------+
+   | KTM    | 16    | the KTM bike                              |
+   +--------+-------+-------------------------------------------+
+   | NINJA  | 11    | the Ninja bike                            |
+   +--------+-------+-------------------------------------------+
+   | MENU   | 9     | interface                                 |
+   +--------+-------+-------------------------------------------+
+
+   Every file is mono. Sample rates:
+
+   +-------+-------+
+   | Rate  | Files |
+   +=======+=======+
+   | 5000  | 9     |
+   +-------+-------+
+   | 8000  | 19    |
+   +-------+-------+
+   | 11025 | 51    |
+   +-------+-------+
+   | 14000 | 2     |
+   +-------+-------+
+   | 16000 | 36    |
+   +-------+-------+
+   | 19000 | 1     |
+   +-------+-------+
+   | 22050 | 7     |
+   +-------+-------+
+
+   The 8-bit tree exists because the game offers a sample depth setting;
+   the strings "Sample depth :", "8 bits" and "16 bits" sit next to the
+   audio menu, and Wave16Bits is a stored setting. See
+   subsystems/settings.txt.
+
+   The magic appears in SFX and nowhere else. A scan of all 23 extracted
+   banks finds exactly the 250 SFX files and no others [verified].
+
+5.  Reference reader
+
+   tools/rmnr.py.
+
+   python tools/rmnr.py --check PATH [PATH ...]
+   python tools/rmnr.py --info  PATH
+   python tools/rmnr.py --wav OUT.wav PATH
+
+   The --wav option writes a standard 16-byte-fmt PCM RIFF file, rebuilt
+   from the WAVEFORMATEX the game itself constructs rather than copied
+   from the input, so the output matches what DirectSound is actually
+   given. The result opens in Python's stdlib wave module and in any
+   player.
+
+6.  Modernization note
+
+   Nothing here needs replacing. The samples are plain PCM, so the audio
+   path can feed any modern API directly once the cipher is undone. The
+   only real decision is whether to keep reading the masked files or to
+   unmask the bank once at build time, which is a project choice rather
+   than a technical constraint.
+
+6.1.  The port's reader, and how it is checked
+
+   src/wave.c, transcribed whole from Wave_Read and Wave_Unmask.
+   wave_load takes a LOGICAL name and goes through asset_load, so it
+   reads the member out of SFX.BKF the way the game does - rule 10 -
+   rather than out of the extracted tree.
+
+   ONE DIVERGENCE, AND IT IS NOT ARITHMETIC. The original streams
+   through File_Open and seeks between regions; ours takes the whole
+   member from asset_load and walks it in memory, because that is
+   what the archive reader hands back.  The region boundaries and the
+   cipher are identical, including the seek over cbSize.
+
+   THE KNOWN-ANSWER TEST.  [DEBUG] wavecheck=1 decodes the nine
+   16-bit menu samples and logs one line per header.  rmnr.py prints
+   the same line from the oracle, reading the same archive:
+
+       python tools/rmnr.py --table decomp\DATA\SFX.BKF
+                            --match "16_BITS\\MENU"
+
+   The two formats are deliberately identical, so verifying the C is
+   a literal diff rather than a reading of two differently-shaped
+   tables.  The oracle's answer, which is what a correct decoder
+   prints:
+
+       CONTINUE   5000 Hz    5920 bytes
+       DEPLETT   16000 Hz   21468 bytes
+       GOKTM     16000 Hz   26858 bytes
+       GONINJA   16000 Hz   22308 bytes
+       PODIUM1   22050 Hz  156648 bytes
+       PODIUM2   22050 Hz  198558 bytes
+       SELECT    22050 Hz   19216 bytes
+       TITLE     22050 Hz   74784 bytes
+       VALIDE    16000 Hz   44116 bytes
+
+   all 16-bit mono.  THE RATES ARE NOT UNIFORM - three different ones
+   inside one directory - so a back end that assumes a single rate
+   for the bank will play a third of the menu at the wrong pitch.
+
+7.  Open questions
+
+   o What writes these files? The masking tool is not in the shipped
+     binary, since only the read path exists. Whether it was a build
+     step or a save path in an internal tool is unknown.
+   o Csample_Load takes a flags argument that is OR'd with 0xe0 to build
+     the DSBUFFERDESC. The three bits forced on are not yet identified,
+     nor is what the caller passes.
+   o The 24 files nested one level deeper than the rest are grouped by
+     something not yet determined; the top-level split is category, not
+     bike.

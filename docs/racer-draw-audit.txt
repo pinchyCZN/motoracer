@@ -1,0 +1,3399 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                  THE RACER DRAW PARITY AUDIT
+
+
+Abstract
+
+   Every function behind "racer draw + shadow + LOD + segment list",
+   what it was imported from, and whether it can be VERIFIED rather
+   than argued about.
+
+   THE CALL GRAPH MATCHES RETAIL AND THE GEOMETRY DOES NOT. Those are
+   different claims and this project has conflated them: the wheels
+   and the rider are visibly mispositioned while every function sits
+   where the original puts it. Structure was the last job; values are
+   this one.
+
+   WHAT MAKES THIS DIFFERENT FROM EVERY EARLIER ATTEMPT is that a
+   function can now be answered instead of eyeballed. MR_Racer carries
+   the original layout for its whole 0x3209 prefix, and HOOK_FUNC runs
+   our C inside MOTO in place of theirs, so the question is "given
+   these bytes in, do we produce the same bytes out" - settled by a
+   diff. See whole-function-import.txt 6.1.
+
+Table of Contents
+
+   1. The split that decides the method
+   2. Directly verifiable - a standalone original exists
+   3. Blocks inside maybe_Racer_Draw - no entry point of their own
+   4. Ours, with no original at all
+   5. The gap that explains the symptom
+   6. Order of work
+   7. First measurement - the pose array, MOTO against ours
+   8. The rider angles are not a pose bug
+   9. The speed divergence - a launch hold we do not have
+      9.1. And racer+0x00ec was never written
+   10. The speed divergence was the harness, not the physics
+      10.1. Four harness faults that produced false readings
+   11. The geometry divergence is suspensionAngle
+      11.1. On the 2pi angles, which are NOT the cause
+   12. suspensionAngle was a startup transient, and what it was hiding
+      12.1. The composition rule is not the same at every level
+      12.2. Why depth 1 could not see it
+      12.3. The tree, read live from the part pointers
+   13. The walk is fixed; what is left is one table index
+      13.1. The residual is a 2pi that costs one table index
+   14. The swingarm was one cross product, taken backwards
+      14.1. How it was isolated, and what that cleared
+      14.2. The swingarm group, two of four settled
+      14.3. The swingarm group is settled
+   15. The shadow was never built - two tick paths, one dead
+      15.1. The shadow is verified
+      15.2. Both sides park on a different 2pi, and that is the whole
+   16. What leaves MOTO headingSmoothed at 0: Racer_Reset
+      16.1. The shadow is a rectangle and that is correct
+   17. What turns MOTO bike while it stands still: the cosine table
+      17.1. Do NOT sweep cos and sin blindly
+   18. The fork group is verified
+      18.1. Section 3 after all of this
+   19. The rider group: two of three verified
+      19.1. Where MOTO part view matrix lives
+      19.2. racerdraw_part_matrix adds nothing of its own
+   20. VOID (see 31) - viewPart3 read at the wrong slot
+      20.1. racerdraw_view_matrix is exact, so the camera is not at
+            fault
+      20.2. Member 3 is built in the rear-wheel block, and the slice
+   21. maybe_Racer_Draw is 10246 bytes held as 31 slices
+      21.1. What the rear-wheel block actually computes
+      21.2. Why this is not a one-sitting import
+   22. Coverage map, and the merge plan
+      22.1. What merging actually means here
+      22.2. The order to do it in
+   23. The 464-byte gap, 0x0045fa30..0x0045fc00
+      23.1. MEMBER 3 DEFAULTS TO AN IDENTITY, and that resolves 20.2
+      23.2. The first computation in the gap
+   24. The gap feeds rear_frame, which also drops it
+      24.1. Bytes of original per line of C, as a defect detector
+   25. What the gap actually contains, and why it is not all missing
+      25.1. What IS missing from it
+   26. The slot trace resolves one level and opens another
+      26.1. Piecemeal tracing has reached its limit
+   27. rear_frame span read whole, with the frame map
+      27.1. The rear frame position is not drawPos
+      27.2. But the world rear frame is already right
+   28. VOID (see 31) - the 0x004603f2 block, read at the wrong slot
+      28.1. So the difference is in the camera-relative rear frame
+   29. VOID (see 31) - operands of member 3 compared at the wrong slot
+   30. VOID (see 31) - why three readings of member 3 all failed
+   31. RETRACTION - viewPart3 was never wrong
+      31.1. The hook was reading the wrong slot
+      31.2. What survives
+   32. Step 4 - SelectLod partly verified, the cull not testable
+      32.1. The cull cannot be diffed with this harness
+   33. Step 4 verified across the field
+   34. Step 2 - maybe_Inst_DrawWithMatrix read whole
+      34.1. Three things are missing
+   35. far_lod - the rig works, the comparison needs our side mirrored
+      35.1. arg1 is NOT the camera struct, and 21.1 overstated it
+      35.2. What to do instead
+   36. far_lod is blocked by the dead tick path, not by the harness
+   37. The two tick paths are merged
+      37.1. IT DOES NOT UNBLOCK far_lod, AND SECTION 36 OVERSTATED THAT
+   38. The ORIGIN gaps are closed - 99.3 per cent by slice
+      38.1. One thing WAS missing, and it is menu-only
+   39. VOID (see 47) - the 2 pi wrap is NOT harmless
+      39.1. What the residual actually is
+   40. The shade flag is segment +0xe0, and it arrives late
+      40.1. Verified against the shipped tracks
+      40.2. What it unblocks, and the one thing it does not
+   41. Two shading mechanisms, and the tunnel is the other one
+      41.1. maybe_Racer_ShadeParts, imported whole
+      41.2. g_flLightDir is a constant, not data
+   42. The tunnel is verified, and what is left after it
+      42.1. Status of the three gaps this left open
+      42.2. maybe_Mesh_SetPrimVariant, read
+   43. maybe_Mesh_SetPrimVariant, done - and inert on measured data
+      43.1. It swaps nothing on the bike we can measure
+   44. Racer_BuildVertexNormals - shade_parts has its input
+      44.1. What had to be wired first
+      44.2. Where this leaves the shading chain
+   45. The per-vertex pass must not run in a race
+      45.1. So when does it run
+      45.2. The pose did not regress
+   46. VOID (see 52) - the wheels DO spin
+      46.1. Where the rotation that DOES exist is applied
+   47. The rider residual IS the 2 pi wrap, and section 39 was wrong
+      47.1. Everything else about the rider is already identical
+      47.2. Where the wrap comes from, and what is left to find
+      47.3. What the number means, and why it is invisible
+   48. Found: race_ang_cos called libm where the original reads the
+       table
+      48.1. The chain, because it is worth seeing whole
+   49. The table fix was real but was NOT the cause
+      49.1. VOID (see 50) - the rebuild IS the original's
+   50. Found: the quantise ran after the ground fit instead of before
+      50.1. The rebuild is verified, and 49.1 was wrong about it
+      50.2. Three wrong diagnoses, and what they have in common
+   51. Closed - the rider residual is gone
+      51.1. What the whole thing turned out to be
+   52. The wheels DO spin - Racer_SpinWheels, and 46 was wrong
+      52.1. The state, and the function that advances it
+      52.2. Everything downstream was already built
+   53. The spin belongs to the wheel MESH only
+      53.1. Why the verification passed anyway
+   54. The wheels are verified on all four counts
+   55. The front wheel translated when steering - the steer was applied
+      55.1. Where the second rotation came from
+      55.2. The first measurement of this was worthless
+   56. The fork fix is confirmed, with a small asymmetric residual left
+      56.1. Two false leads, both killed by measurement
+   57. The asymmetry was the tool, and the rest is inherited
+      57.1. VOID (see 58) - the contact is not the cause
+   58. There is no contact settling difference, and no residual worth
+      58.1. The real number, from clean isolated runs
+   59. The shadow is TEXTURED, and ours was drawing an untextured quad
+      59.1. Two details that had to be measured, not assumed
+      59.2. Verified - the shadow matches MOTO exactly
+   60. The shadow's bank is bike-relative and was not rebased
+      60.1. Why 59.2's "byte-identical" was true and not enough
+   61. The shadow textured, and the wheelie question answered
+      61.1. VOID (see 62) - MOTO's shadow does NOT shorten
+   62. MOTO's shadow does NOT shorten - it is built before the lean
+      62.1. Two ways this was got wrong first
+   63. Why the shadow ordering was missed - the order was written down
+      63.1. Three reasons it survived, and only one is about the shadow
+      63.2. What this implies beyond the shadow
+
+1.  The split that decides the method
+
+   A function can be hooked only if the original has its own ENTRY
+   POINT. Most of racerdraw.c does not: it is maybe_Racer_Draw cut on
+   its own seams, and a seam has no address to jump to.
+
+   +----------------------------+-------+---------------------------+
+   | kind                       | count | how it gets verified      |
+   +============================+=======+===========================+
+   | standalone original        |     9 | HOOK_FUNC, byte-diff      |
+   +----------------------------+-------+---------------------------+
+   | block inside another       |    22 | trace hook on the block,  |
+   | function                   |       | feed ours the same inputs |
+   +----------------------------+-------+---------------------------+
+   | ours, no original          |     3 | by the callers only       |
+   +----------------------------+-------+---------------------------+
+
+2.  Directly verifiable - a standalone original exists
+
+   These can be hooked TODAY and diffed byte for byte.
+
+   +---------------------------+------------+------------------------+
+   | ours                      | original   | what to diff           |
+   +===========================+============+========================+
+   | racerdraw_racer           | 0x0045f290 | everything below it    |
+   +---------------------------+------------+------------------------+
+   | racerdraw_select_lod      | 0x0045f1c0 | racer+0x634, +0x638    |
+   +---------------------------+------------+------------------------+
+   | racerdraw_visible         | 0x0046e8b0 | the return, 0 or 1     |
+   +---------------------------+------------+------------------------+
+   | racerdraw_build_shadow    | 0x00461aa0 | racer+0x2ea9, 6 verts  |
+   +---------------------------+------------+------------------------+
+   | racerdraw_shadow          | 0x00461f70 | queued faces           |
+   +---------------------------+------------+------------------------+
+   | rd_draw_instance          | 0x0048c6d0 | THE WHEELS             |
+   +---------------------------+------------+------------------------+
+   | racerdraw_shade_level     | 0x00465d60 | STUB - returns 0x1f    |
+   +---------------------------+------------+------------------------+
+   | racerdraw_shade_parts     | 0x00462a40 | STUB - does nothing    |
+   +---------------------------+------------+------------------------+
+   | racerdraw_cockpit         | 0x00462110 | STUB - never called    |
+   +---------------------------+------------+------------------------+
+
+   And one outside racerdraw.c, same property:
+
+   +---------------------------+------------+------------------------+
+   | trk_list_visible_segments | 0x0040ce60 | the emitted index list |
+   +---------------------------+------------+------------------------+
+
+3.  Blocks inside maybe_Racer_Draw - no entry point of their own
+
+   Twenty-two functions, every one tagged "@ 0x0045f290, at ...". They
+   cannot be hooked because the address in the tag is a SEAM, not a
+   call target. They are verified by hooking the enclosing function
+   and comparing what it produces, or by a trace hook on the block
+   that captures the stack slots either side of it.
+
+   Grouped by what they position, because that is how the symptom
+   presents:
+
+   THE BIKE BODY   build_matrices, rebuild_contacts, offsets,
+                   draw_position, view_matrix
+   THE FORK        fork_solve, fork_scale, fork_tip,
+                   fork_part_matrix, front_wheel_offset, steer_pose
+   THE SWINGARM    rear_frame, arm_angle, arm_matrix,
+                   rear_wheel_offset
+   THE RIDER       place_rider, part_is_rider, part_matrix
+   THE FAR LOD     far_lod, far_shade
+   THE QUEUE       queue_parts (uncalled), shading_enabled (uncalled)
+
+4.  Ours, with no original at all
+
+   racerdraw_bind_skeleton   the MR_Skeleton to MR_RacerPart bridge.
+                             The original needs none: it keeps the
+                             pose in the racer and fills it in the
+                             tick.
+   racerdraw_init_shadow     from Racer_Create 0x0045c010, which is a
+                             constructor rather than a draw function.
+   racerdraw_part_walks      SEE SECTION 5. This one is the problem.
+
+5.  The gap that explains the symptom
+
+   Skl_BuildPartMatrices (0x00463d90) WAS NEVER IMPORTED.
+
+   It is a standalone function - 261 instructions, five basic blocks,
+   thirteen parameters because the 3x4 matrix goes BY VALUE, calling
+   Matrix34_Copy, maybe_Mat34_FromEuler, Vec3_Set,
+   Vec3_TransformByMatrix34, Matrix34_Identity and FUN_00464190. It is
+   what walks the part tree and writes every part matrix.
+
+   WE WROTE rd_walk INSTEAD. Its ORIGIN tag names
+   "maybe_Racer_Draw @ 0x0045f290, at 0x00460f00..0x00460f70", which
+   is the CALL SITE - the two lines that invoke the walk, not the walk.
+   racerdraw_part_walks, the function that drives it, carries NO ORIGIN
+   TAG AT ALL. The composition rule came from skl.c, chosen because it
+   reproduced the game stored matrices to 0.0004 in a capture.
+
+   THE FILE ALREADY NAMES THE DOUBT, in racerdraw.c above rd_walk:
+
+       "The decompilation of Skl_BuildPartMatrices appears to INVERT
+        the incoming matrix before composing - the transpose and
+        -R^T t are both visible ... IF A CAPTURE EVER DISAGREES, the
+        inverse is the first thing to try."  [open]
+
+   THAT OPEN QUESTION POSITIONS THE RIDER AND EVERY BIKE PART, and the
+   rider and the wheels are exactly what is mispositioned. It is not
+   proof, but it is the first place to look and it is now answerable
+   rather than arguable.
+
+6.  Order of work
+
+   STATUS, and section 12.1 is the evidence: step 1 is DONE and
+   verified - parts 0..3 and 15 are exact. Steps 2..4 are IMPORTED
+   but NOT YET DIFFED against MOTO. Step 5 has a floor that has
+   stopped moving for the frame, fork and swingarm, so it can start.
+
+   1  IMPORT Skl_BuildPartMatrices WHOLE, hook it at 0x00463d90 and
+      diff the twenty part matrices at racer+0x63c+(slot*20+part)*100
+      +0x18, forty-eight bytes each. It is standalone, it writes into
+      the byte-exact pose array, and it decides the thing that looks
+      wrong. Everything else in section 3 reads what it produces, so
+      auditing them first would be measuring against a moving floor.
+
+   2  maybe_Inst_DrawWithMatrix (0x0048c6d0) - the wheels, and the
+      other half of the visible symptom.
+
+   3  maybe_Racer_BuildShadow (0x00461aa0) - six vertices into the
+      racer, the cleanest byte-diff of the set.
+
+   4  maybe_Racer_SelectLod, then the cull - both small, both write
+      one or two fields.
+
+   5  Only then the blocks in section 3, top down, each against a
+      floor that has stopped moving.
+
+   DO NOT AUDIT IN FILE ORDER. The blocks consume each other: offsets
+   feeds draw_position feeds view_matrix feeds the part loop. Verify
+   producers before consumers or every reading is contaminated by the
+   one above it - which is the mistake that made the piecemeal import
+   unfalsifiable in the first place.
+
+7.  First measurement - the pose array, MOTO against ours
+
+   Both games placed at (-128, 0, 2058) yaw 0 with mr_place --to both,
+   stepped two frames, then all seventeen 100-byte part records read
+   from each and compared field by field. THE POINT IS TO SEPARATE
+   INPUTS FROM OUTPUTS: comparing a matrix means nothing if the angles
+   feeding it already differ.
+
+   +--------------------------+------------------------------------+
+   | field                    | result                             |
+   +==========================+====================================+
+   | tree: next/parent/child  | IDENTICAL, all 17, including part  |
+   |                          | 3 severed as its own root          |
+   +--------------------------+------------------------------------+
+   | pivot, firstVertex,      | IDENTICAL, all 17                  |
+   | vertexCount              |                                    |
+   +--------------------------+------------------------------------+
+   | angle, BIKE parts        | IDENTICAL - 0, 1, 2, 15, 16        |
+   +--------------------------+------------------------------------+
+   | angle, RIDER parts       | DIFFER - 4..14, by up to 1.5 rad   |
+   +--------------------------+------------------------------------+
+
+   So racerdraw_bind_skeleton is CORRECT: the tree it builds, the
+   pivots it copies and the severing of part 3 all match the original
+   exactly.
+
+   MAX ABSOLUTE MATRIX ELEMENT DIFFERENCE, by part:
+
+       0, 1, 2      0.010 .. 0.018      the walk, inputs identical
+       15           0.896               the fork override
+       16           10.58               the rear wheel
+       4 .. 14      21 .. 77            rider, fed wrong angles
+
+   THE INVERSE FIX WORKED. Parts 0, 1 and 2 are pure output of
+   skl_build_part_matrices with identical inputs and an identical
+   tree, and they now agree to about 0.018 on elements of order 5.
+   That residue is most likely the cosine table index: a turn is
+   0x4000 entries, so one step is 3.8e-4 rad, and against a pivot of
+   27 units that is about 0.01 - the magnitude observed. [inferred]
+
+   THE RIDER IS NOT A WALK PROBLEM. Twelve of seventeen parts are fed
+   angles that differ before the walk runs, so their matrices cannot
+   agree whatever the composition rule is. That is racer_build_pose
+   and the .ROT blend, upstream of everything audited here.
+
+   NEXT, in producer-before-consumer order:
+
+     1  the rider pose angles - 12 of 17 parts, and the largest
+        single source of wrong geometry
+     2  part 16, the rear wheel - 10.58 with correct inputs
+     3  part 15, the fork override - 0.896
+     4  the cosine table residue, once the rest is exact
+
+8.  The rider angles are not a pose bug
+
+   THE BLENDER IS CORRECT. anim_blend_angle_frames matches
+   Anim_BlendAngleFrames (0x0045b4e0) in every respect: the
+   shortest-arc wrap, the [0, 2pi] normalisation, min(count), and both
+   self-copy guards. The only difference is that ours works in double
+   where the original works in float. [verified]
+
+   ITS INPUTS DIFFER INSTEAD. Same placement, same input, two frames:
+
+       speed        MOTO 0.989   ours 1.898
+       engineSpeed  MOTO 0.3     ours 0.0
+       suspAngle    MOTO -0.0112 ours 0.0423
+       lean         both -0.0000
+
+   AND SPEED PICKS THE POSE WEIGHT DIRECTLY. Below the 20/3.6 gate the
+   base stance blends staticPied to staticHaut with w = speed * 0.18:
+
+       w(MOTO 0.989) = 0.178
+       w(ours 1.898) = 0.342
+
+   Nearly double, on a blend between feet-down and feet-up - a large
+   postural change that moves every rider joint. So the rider is
+   posed correctly from the wrong number.
+
+   THE WORK IS IN THE DRIVETRAIN, NOT THE DRAW. Auditing the pose
+   sequence now would measure it against a moving floor, which is the
+   mistake section 6 exists to prevent.
+
+   NOT ESTABLISHED: whether speed accounts for ALL of the angle
+   difference. The 1.5 rad deltas in section 7 were measured at a
+   different spot from these numbers, so the two are not directly
+   comparable. Re-measure the pose once speed agrees. [open]
+
+9.  The speed divergence - a launch hold we do not have
+
+   tools/check_physics.py passes with 0 failures, so the individual
+   formulas are right. The divergence is in SEQUENCING.
+
+   Placed identically, stepped one frame at a time:
+
+   +-------+---------------------+---------------------+
+   | frame | MOTO speed / engine | ours speed / engine |
+   +=======+=====================+=====================+
+   | 0     | 0.000  /  0.3       | 0.000  /  0.0       |
+   +-------+---------------------+---------------------+
+   | 1     | 0.000  /  0.6       | 0.990  /  0.0       |
+   +-------+---------------------+---------------------+
+   | 2     | 0.000  /  0.9       | 1.898  /  0.0       |
+   +-------+---------------------+---------------------+
+   | 3     | 0.000  /  1.2       | 2.392  /  0.0       |
+   +-------+---------------------+---------------------+
+   | 4     | 0.000  /  0.0       | 2.909  /  0.0       |
+   +-------+---------------------+---------------------+
+   | 5     | 1.898  /  0.7       | 3.453  /  0.0       |
+   +-------+---------------------+---------------------+
+
+   THAT FOUR-FRAME HOLD DID NOT REPRODUCE and the reading above is
+   retracted. A second run from a fresh reset had MOTO moving on frame
+   1 like ours. The hold was leftover state from the experiment before
+   it - MOTO had been left mid-shift - not a systematic difference.
+
+   THE LESSON IS THE MEASUREMENT, NOT THE ENGINE. A single run off an
+   unknown starting state is an anecdote. Reset both sides and repeat
+   before recording anything as a property of the game; this section
+   nearly sent the next session after a launch limiter that was never
+   missing.
+
+   THE REAL DIVERGENCE, from the repeated run, is the ENGINE:
+
+   +-------+---------------------+---------------------+
+   | frame | MOTO speed / engine | ours speed / engine |
+   +=======+=====================+=====================+
+   | 0     | 0.000  /  0.7       | 0.000  /  0.0       |
+   +-------+---------------------+---------------------+
+   | 1     | 1.898  /  0.7       | 0.990  /  0.4       |
+   +-------+---------------------+---------------------+
+   | 3     | 4.022  /  1.5       | 2.391  /  0.9       |
+   +-------+---------------------+---------------------+
+   | 5     | 6.591  /  2.5       | 3.452  /  1.3       |
+   +-------+---------------------+---------------------+
+
+   MOTO SITS AT 0.7 FROM FRAME 0 AND WE START AT ZERO. 0.7 is exactly
+   the idle floor 9.32.1 documents - moteurVitesseMax / regimeMax *
+   1200 for the road bike - so the original has the engine idling
+   before the throttle does anything, and we do not.
+
+   OUR ENGINE THEN STAYS ABOUT HALF THEIRS all the way out, and road
+   speed follows it: our per-frame gain settles near 0.5 where theirs
+   climbs 1.0 to 1.35. Torque is a function of engine speed, so one
+   explains the other.
+
+   THE FLOOR IS INSIDE physics_tick_drivetrain, which race.c calls
+   ONLY on the throttle branch (dm.num > 0). Whatever keeps MOTO at
+   0.7 with the bike stationary is therefore somewhere we do not run.
+   That is the next thing to read. [open]
+
+9.1.  And racer+0x00ec was never written
+
+   engineSpeed lived only in s_race_drive; the racer field stayed 0
+   for the entire race. FIXED - race.c now mirrors it beside r->speed.
+
+   THE BYTE-EXACT STRUCT IS ONLY WORTH ANYTHING IF IT IS CURRENT. A
+   field kept in a static instead reads 0 to every comparison and to
+   every imported function that expects it at its offset. Here it
+   looked like a dead engine next to MOTO 0.7 idle - a false lead
+   manufactured by the very struct meant to prevent them. Check for
+   others before trusting a zero.
+
+10.  The speed divergence was the harness, not the physics
+
+   Measured from a genuine standing start, both bikes aligned down the
+   track, reading the port real state rather than its mirrors:
+
+   +-------+---------------------+---------------------+
+   | frame | MOTO speed / engine | ours speed / engine |
+   +=======+=====================+=====================+
+   | 1     | 1.8976 / 0.73       | 0.9897 / 0.38       |
+   +-------+---------------------+---------------------+
+   | 2     | 2.9092 / 1.11       | 1.8977 / 0.73       |
+   +-------+---------------------+---------------------+
+   | 3     | 4.0218 / 1.54       | 2.3915 / 0.91       |
+   +-------+---------------------+---------------------+
+   | 4     | 5.2454 / 2.01       | 2.9094 / 1.11       |
+   +-------+---------------------+---------------------+
+   | 6     | 8.0695 / 3.09       | 4.0221 / 1.54       |
+   +-------+---------------------+---------------------+
+
+   OURS AT FRAME 2N IS MOTO AT FRAME N, to about 1e-4, on speed AND
+   engine. The gains sum too: MOTO frame-2 gain 1.0116 against our
+   frames 3 and 4, 0.4938 + 0.5179 = 1.0117.
+
+   SO THE DRIVETRAIN IS RIGHT. One SEND_INPUT frame is not the same
+   quantity of simulation on the two sides - mr_ab.py header says so
+   outright - and every "half acceleration" reading in this
+   investigation was that, not physics.
+
+10.1.  Four harness faults that produced false readings
+
+   Each of these produced a confident, wrong conclusion first.
+
+   o mr_ab DEFAULT SPOT POINTS BOTH BIKES ACROSS THE TRACK. It is
+     built on mr_place, which is documented as "place the bike for a
+     repeatable impact test". Every speed number taken through it is a
+     wall-scrape measurement.
+
+   o mr_place --to both DOES NOT RELIABLY PLACE THE PORT. Observed 675
+     units out in one run and 97 in another, while reporting success.
+     Direct SET_MEM works; verify the two positions before believing
+     any comparison.
+
+   o PLACING STRAIGHT AFTER mr_reset IS CLOBBERED. The restart
+     re-places racers on a later tick.
+
+   o THE PORT DRIVETRAIN STATE IS NOT IN THE RACER. speed,
+     gearboxRoadSpeed and engineSpeed live in the static s_race_drive
+     (0x00643270); the racer fields are mirrors written at the END of
+     the tick. READS are a frame stale at worst; WRITES ARE SILENTLY
+     DISCARDED. Zeroing racer+0x124 to get a standing start does
+     nothing - the port kept 18 m/s and looked like it was jumping to
+     the gear top in one frame.
+
+   THE BYTE-EXACT STRUCT IS ONLY AS GOOD AS WHAT ACTUALLY LIVES IN IT.
+   Three of the fields an A/B most wants to set are copies. Fixing that
+   - making s_race_drive the mirror and the racer the state - would
+   remove a whole class of false reading. [open]
+
+11.  The geometry divergence is suspensionAngle
+
+   Measured with both games at a VERIFIED identical standing start -
+   same position, same orientation, same speed, confirmed before
+   reading anything.
+
+   CLEARED, all with identical values:
+
+       racerdraw_bind_skeleton    tree, pivots, severing
+       anim_blend_angle_frames    matches 0x0045b4e0 in every respect
+       racer_build_pose           angles agree, modulo 2pi
+       mat34_from_euler           reproduces the original truncation
+       racerdraw_build_matrices   every input matches
+
+   THE ONE INPUT THAT DIFFERS:
+
+       suspensionAngle   racer+0x2e8d   MOTO 0.0000   ours -0.0809
+
+   AND 0.0809 IS THE WHOLE GEOMETRY ERROR. bodyMat is matBikeRoot with
+   the suspension pitch folded in; the walk takes bodyMat as its root;
+   every part inherits it. Parts 0 to 4 are out by 0.08 - the pitch -
+   and the rider chain amplifies that to 20..79 five levels down.
+
+   MOTO READS EXACTLY ZERO with the bike stationary on flat ground,
+   which is what a suspension at rest should be. Ours does not.
+
+   NEXT: whatever writes racer+0x2e8d. It is upstream of the draw
+   entirely, so nothing in section 3 can be judged until it agrees.
+   [open]
+
+11.1.  On the 2pi angles, which are NOT the cause
+
+   Our pose angles land on 2pi where MOTO lands on 0. Tested directly:
+
+       0     -> raw 0.0        -> index 0
+       2pi   -> raw 16383.9999 -> index 16383
+       pi/2  -> raw  4095.9999 -> index 4095
+
+   So 2pi is NOT equivalent to 0 - it is one table step short. But
+   MOTO truncates identically with its own constant at 0x004d0ed0, so
+   this is faithful, and one step is 0.000383 rad - three orders below
+   the observed error. Ruled out, and written down so it is not
+   re-investigated.
+
+12.  suspensionAngle was a startup transient, and what it was hiding
+
+   THE CHAIN, traced end to end: geometry error <- bodyMat <-
+   suspensionAngle -0.0809 <- headingSmoothed 6.2023 where MOTO has 0.
+
+   6.2023 IS 2pi - 0.0809, so ours is genuinely 0.0809 behind the
+   target while MOTO has settled on it. suspensionAngle is
+   headingSmoothed - rawTarget, which wraps to exactly -0.0809.
+
+   IT CONVERGES. headingSmoothed moves by delta/RetardCadre with
+   RetardCadre 16, and measured over 120 frames:
+
+       +0    -0.08089
+       +30   -0.00612
+       +120  -0.00013
+
+   SO THE SUSPENSION MODEL IS CORRECT and the wrap matches the
+   original, sign-bit test included. What differs is the STARTING
+   value: MOTO begins settled, ours begins 0.0809 off and converges.
+   That is an initialisation difference, not a physics one. [open -
+   what leaves MOTO headingSmoothed at exactly 0 on a fresh race]
+
+   MEASURE AFTER SETTLING, NOT ONE FRAME AFTER A RESET. Every pose
+   reading in sections 7 and 11 was taken inside this transient and
+   is superseded by the table below.
+
+12.1.  The composition rule is not the same at every level
+
+   THE ROOT INVERTS ITS PARENT AND THE RECURSION DOES NOT.
+
+       Skl_BuildPartMatrices     0x00463d90  RET 0x30  inv(P) * L
+       Skl_BuildPartMatricesRec  0x00464190  RET       P * L
+
+   They are separate functions with different signatures - the root
+   takes the parent matrix by value, the recursive half takes nothing
+   but ECX. Transcribing the walk as ONE function and inverting at
+   every level is what misplaced the rider.
+
+   MEASURED against MOTO read directly, both games settled, part
+   records at racer+0x63c:
+
+   +------+--------+------------+------------+------------+
+   | part | parent |      P * L | inv(P) * L |      L * P |
+   +======+========+============+============+============+
+   |   16 |      2 |   0.000000 |  10.594376 |   0.000000 |
+   +------+--------+------------+------------+------------+
+   |    9 |      4 |   0.000001 |  22.540773 |   8.633676 |
+   +------+--------+------------+------------+------------+
+   |   11 |     10 |   0.000002 |  51.906054 |   3.610270 |
+   +------+--------+------------+------------+------------+
+   |   13 |      9 |   0.019757 |  83.069825 |  18.061458 |
+   +------+--------+------------+------------+------------+
+   |    6 |      5 |   0.012018 |  76.047066 |  69.587178 |
+   +------+--------+------------+------------+------------+
+
+   The 0.01 to 0.03 residuals are the CHECKER, not the port: the
+   comparison script builds its reference euler from libm while the
+   game reads a 0x4000-entry cosine table with no interpolation. A
+   1.9e-4 sine error against a pivot tens of units long lands exactly
+   there.
+
+12.2.  Why depth 1 could not see it
+
+   BOTH WALK ROOTS STORE AN IDENTITY ROTATION - parts 0 and 3 read
+   1,0,0 / 0,1,0 / 0,0,1 live. With parent = identity, inv(parent) =
+   identity and every candidate rule collapses to L, so parts 1, 2 and
+   4 agree under all four and only depth 2 and below discriminate.
+
+   That is the whole of the "correct to depth 1, wrong from depth 2"
+   signature, and it is why an earlier agreement to 0.0004 was not
+   evidence: that capture had an identity root too.
+
+   DO NOT VALIDATE A SKELETON RULE ON A ONE-LEVEL TREE. It is the
+   trap this subsystem sets, and it has now been walked into twice.
+
+12.3.  The tree, read live from the part pointers
+
+   No hook is needed - +0x00 next, +0x04 parent, +0x08 child are in
+   the records. All seventeen, slot 0 [verified]:
+
+       0 -> 2 -> 16
+         -> 1 -> 15
+       3 -> 4 -> 9 -> 13 -> 14
+                   -> 12
+                   -> 10 -> 11
+              -> 7 -> 8
+              -> 5 -> 6
+
+   Children are pushed front, so a child chain descends in part index
+   and +0x08 gives the highest.
+
+   PARTS 15 AND 16 ARE IN THE TREE. Part 16 carries no geometry
+   (vertexCount 0) so it never draws, which is why it can be wrong
+   without being visible - and that also makes it the CLEANEST test
+   in the set: zero angles, an exact parent, and a leaf.
+
+   THE SIBLING TAKES THE SHARED PARENT, not the previous sibling.
+   The original recurses on ->next by CALL and descends to ->child by
+   looping back into its own frame, which leaves the sibling case
+   ambiguous in the disassembly. Parts 7 and 5 are siblings of 9 and
+   both resolve against part 4, so it is settled.
+
+13.  The walk is fixed; what is left is one table index
+
+   MEASURED after the split, both games settled:
+
+   +--------+-----------+----------+
+   | part   |    before |    after |
+   +========+===========+==========+
+   | 0..3   |   0.00000 |  0.00000 |
+   +--------+-----------+----------+
+   | 4      |   0.01454 |  0.01454 |
+   +--------+-----------+----------+
+   | 5..14  |   19 - 80 |  0.010 - |
+   |        |           |    0.055 |
+   +--------+-----------+----------+
+   | 15     |   0.00001 |  0.00001 |
+   +--------+-----------+----------+
+   | 16     |  10.59438 |  0.00000 |
+   +--------+-----------+----------+
+
+13.1.  The residual is a 2pi that costs one table index
+
+   OUR ANGLES ARE MOTO PLUS EXACTLY 2PI on parts 2, 3, 4, 6, 7, 8, 9,
+   11, 12 and 13 - the angle column reads 6.28319, not a fraction of
+   it. That is normally harmless, because
+
+       index = (int)(a * 2607.5945876) & 0x3fff
+
+   shifts by exactly 0x4000 and masks back. IT IS NOT HARMLESS FOR A
+   NEGATIVE ANGLE. (int) truncates toward zero, so a*K rounds UP while
+   (a + 2pi)*K rounds DOWN, and the two land one index apart:
+
+   +------+-----------+--------+------------+----------+
+   | part |  MOTO deg | idx(a) | idx(a+2pi) |   d cos  |
+   +======+===========+========+============+==========+
+   |    4 |    -19.16 |  15513 |      15512 | 1.26e-04 |
+   +------+-----------+--------+------------+----------+
+   |    9 |    -41.04 |  14517 |      14516 | 2.52e-04 |
+   +------+-----------+--------+------------+----------+
+   |    6 |    -83.94 |  12564 |      12563 | 3.81e-04 |
+   +------+-----------+--------+------------+----------+
+   |   10 |     22.41 |   1019 |       1019 | 0.00e+00 |
+   +------+-----------+--------+------------+----------+
+
+   Every negative angle shifts; every non-negative one does not. A
+   2e-4 cosine error against a pivot tens of units long is the 0.01 to
+   0.05 seen, and it accumulates with depth - part 14, four levels
+   down, is the worst at 0.055.
+
+   THE BLEND IS NOT THE CULPRIT. Anim_BlendAngleFrames 0x0045b4e0
+   really does normalise into [0, 2pi] - the lower bound at
+   0x004d0e54 reads 0.0 - and src/skl.c transcribes that faithfully.
+   So the original produces non-negative angles there too, and the
+   negatives in MOTO pose records come from somewhere else: part 2 is
+   the fixed rake, near-constant at -11 degrees whatever the rider
+   does. [open - which writer leaves a pose angle negative]
+
+   THIS IS NOT THE SAME 2pi AS 15.2. That one is headingSmoothed, a
+   racer field; this one is in the POSE angles. Fixing headingSmoothed
+   left this table completely unchanged, so they are unrelated and the
+   cause of this one is still open.
+
+14.  The swingarm was one cross product, taken backwards
+
+   racerdraw_arm_angle computed the numerator as dot(u, d x w) where
+   the original takes dot(u, w x d). Swapping the operands negates
+   the numerator and so negates the angle:
+
+       MOTO   +0.413850 rad     ours   -0.413850 rad
+
+   THE MAGNITUDE STAYS EXACTLY RIGHT, which is why this reads on
+   screen as a swingarm at the wrong angle rather than as a broken
+   one, and why it survived a comparison that only checked pose
+   matrices. Added to the -0.55 rad rest angle it puts the arm at
+   -55 degrees against the original -7.8.
+
+   THE POSE ARRAY CANNOT SEE THIS. Parts 2 and 16 measure 0.00000
+   against MOTO throughout, because the drawn swingarm and rear
+   wheel do not come from the walk - they come from rearMat ->
+   rear_frame -> arm_angle -> arm_matrix, and only the last two feed
+   geometry.
+
+14.1.  How it was isolated, and what that cleared
+
+   +---------------------------+------------------------------------+
+   | stage                     | verdict                            |
+   +===========================+====================================+
+   | the four inputs           | byte-identical - frontWheelContact |
+   |                           | rearWheelContact, position,        |
+   |                           | matBikeRoot all 0.00000            |
+   +---------------------------+------------------------------------+
+   | swingarmRest, carac 27    | -0.55 on both, from 0x005092e4     |
+   +---------------------------+------------------------------------+
+   | racerdraw_rear_frame      | a to_euler/from_euler round trip,  |
+   |                           | identity on the rotation to 1.1e-14|
+   |                           | over 4000 random rotations         |
+   +---------------------------+------------------------------------+
+   | racerdraw_arm_angle       | THE SIGN                           |
+   +---------------------------+------------------------------------+
+
+   THE ORIGINAL STASHES THE SOLVED ANGLE AT 0x00580a70 and the port
+   was not writing it. Transcribing that one store is what made the
+   stage directly comparable; nothing reads it back on either side.
+
+   RD_PART_ARM_PIVOT IS 3, and that is confirmed rather than assumed:
+   recomputing the angle from every one of the seventeen part pivots,
+   under both cross orders, gives exactly one value matching MOTO -
+   part 3 with w x d, to six decimals. Repeated with the bike rotated
+   40 degrees so the answer does not depend on an identity frame.
+
+14.2.  The swingarm group, two of four settled
+
+   arm_angle is in section 3, THE SWINGARM, which section 6 puts at
+   step 5 - after the wheels, the shadow and the LOD. It was reached
+   early because it is visible, not because the order was worked
+   through.
+
+   +----------------------------+-----------------------------------+
+   | block                      | state                             |
+   +============================+===================================+
+   | racerdraw_rear_frame       | VERIFIED - euler round trip is an |
+   |                            | identity, and its output feeds a  |
+   |                            | reproduction of MOTO angle        |
+   +----------------------------+-----------------------------------+
+   | racerdraw_arm_angle        | VERIFIED against 0x00580a70 at    |
+   |                            | two headings                      |
+   +----------------------------+-----------------------------------+
+   | racerdraw_arm_matrix       | NOT VERIFIED. Its inputs are now  |
+   |                            | both right, so the output follows |
+   |                            | IF the composition is - and the   |
+   |                            | operand order is exactly what was |
+   |                            | wrong in the skeleton walk        |
+   +----------------------------+-----------------------------------+
+   | racerdraw_rear_wheel_offset| NOT VERIFIED                      |
+   +----------------------------+-----------------------------------+
+
+   NEITHER OF THE TWO REMAINING HAS A STASH to compare against, so
+   they need a hook on maybe_Racer_Draw or a mirror of what they
+   feed - the rear instance position, which IS readable at
+   racer+0x32c.
+
+14.3.  The swingarm group is settled
+
+   arm_matrix and rear_wheel_offset were checked together, by hooking
+   the rear-wheel draw call in MOTO at 0x00460d3e and capturing the
+   three offset floats the six pushes leave at ESP+0x0c. That one
+   measurement covers both, because the offset is the wheel pivot
+   taken through armW.
+
+   +-------+--------------------------+--------------------------+
+   | yaw   | MOTO                     | dmax against ours        |
+   +=======+==========================+==========================+
+   | 0     | 0.086  28.896  17.544    | 0.00059                  |
+   +-------+--------------------------+--------------------------+
+   | 40    | 11.326 28.896  13.399    | 0.01561  -> see below    |
+   +-------+--------------------------+--------------------------+
+
+   THE 40-DEGREE RESIDUAL WAS OURS AND IT IS FIXED. arm_matrix built
+   its rotation with libm cos and sin where the original indexes
+   g_cosTable like every other rotation in the draw. One table index
+   is 3.8e-4 rad, which over a 70-unit swingarm is about 0.013 units
+   of wheel position - the size of the gap. It cancels at yaw 0,
+   which is why the head-on figure looked clean.
+
+   WATCH FOR THIS ELSEWHERE. Any transcribed rotation that calls
+   cos/sin instead of trig_cos/trig_sin is quantised differently from
+   the original, and the error only shows up off-axis.
+
+   The four swingarm blocks are now verified. What is left in section
+   3 is the bike body, the fork, the rider placement and the far LOD.
+
+15.  The shadow was never built - two tick paths, one dead
+
+   racer+0x2ea9 read six zero vertices against MOTO hexagon:
+
+       MOTO   -168.000  4.000  2182.000   ... six of these
+       ours      0.000  0.000     0.000
+
+   racerdraw_build_shadow itself is fine. The call to it sits in
+   race_tick_all, WHICH NOTHING INVOKES - grep finds the definition,
+   the header and one comment, and no caller. The live per-racer tick
+   is race_tick_physics on racer 1 only, and it had no shadow call.
+
+   THE PORT HAS TWO TICK PATHS AND ONLY ONE RUNS. race_tick_all plus
+   racer_tick_dispatch are transcribed against Race_TickAllRacers
+   0x0047df40 and are dead; race_tick_physics is what executes. Any
+   work added to the faithful path is invisible until they are
+   merged. [open]
+
+   THE SHADOW IS A TICK PRODUCT, NOT A DRAW PRODUCT - the original
+   calls maybe_Racer_BuildShadow from both physics ticks, FUN_0045e940
+   and FUN_0046bf80, and never from maybe_Racer_Draw. It must run
+   after the tick because the hexagon is built on the two wheel
+   contacts.
+
+   A ZERO ON OUR SIDE AND A NUMBER ON THEIRS IS THE SIGNATURE OF A
+   MISSING CALL, not of wrong arithmetic. Check the call graph before
+   reading the function.
+
+15.1.  The shadow is verified
+
+   Head-on the six vertices are BYTE-EXACT, 0.00000 on all three
+   axes. Rotated 40 degrees the worst is 0.14871, and none of it is
+   the shadow arithmetic:
+
+   +---------------------+-----------+
+   | input               |      dmax |
+   +=====================+===========+
+   | frontWheelContact   |  0.074028 |
+   | rearWheelContact    |  0.074051 |
+   | matOrientation      |  0.000882 |
+   +---------------------+-----------+
+
+   The function propagates those and adds nothing. It does not
+   converge with more settling either - 150, 450 and 750 frames all
+   give 0.14871 - so it is a steady-state difference, not a
+   transient.
+
+15.2.  Both sides park on a different 2pi, and that is the whole
+       remaining error
+
+       headingSmoothed    MOTO 0.0000000   ours 6.2831821
+       suspensionAngle    MOTO 0.0000000   ours -0.0000033
+
+   6.2831821 is 2pi - 3.3e-6. The two are the SAME ANGLE; ours parks
+   just below one full turn and MOTO parks just above zero. Both are
+   legal outputs of the wrap.
+
+   THE WRAP IS NOT THE BUG - it is transcribed correctly. Read out of
+   0x00466bbc: the negative test is the float-sign trick, the add
+   loop runs while the value is below 0.0 at 0x004d0e54, and the
+   subtract branch tests C0|C3 - less-or-equal - so the original ALSO
+   leaves exactly 2pi alone. Do not "fix" it to >= .
+
+   IT COSTS A TABLE INDEX, AND THE TABLE IS WHERE IT BITES. The yaw
+   the orientation is rebuilt from lands on index -1817 in MOTO and
+   -1820 in ours, and both matrices are then EXACTLY the cosine of
+   their own index - MOTO m[8] 0.766893 against cos(-1817) 0.766893,
+   ours 0.766154 against cos(-1820) 0.766154. Neither is wrong
+   arithmetic; they are two different entries of the same table.
+
+   FIXED - see 16. And it closed NOTHING ELSE. With headingSmoothed
+   reading 0 on both sides at every stage, the 40-degree shadow is
+   still 0.14871, the contacts still 0.074, and the pose angle table
+   in 13 is unchanged to the digit. The prediction that these shared
+   a root cause was wrong; they are three separate residuals.
+
+   WHAT THE 40-DEGREE ORIENTATION GAP ACTUALLY IS, as far as it is
+   measured: MOTO settles to cosine-table index -1817 and we settle
+   to exactly -1820. Both games were PLACED at exactly 40 degrees,
+   which is index 1820.4444, so ours has not moved and MOTO has
+   drifted 0.076 degrees during the 150 settling frames. Something
+   turns their stationary bike very slightly and ours does not.
+   [open]
+
+16.  What leaves MOTO headingSmoothed at 0: Racer_Reset
+
+   Racer_Reset 0x0045bb30 - FUN_0045bb30 until now - XORs EBP and
+   then stores it about thirty times. A memset reproduces all of
+   those and NONE of the four that are not zero:
+
+   +------------+------------------+----------------------------+
+   | at         | field            | value                      |
+   +============+==================+============================+
+   | 0x0045bb92 | placeWheels2     | a copy of position         |
+   | 0x0045bc2a | onGroundPrev     | 1                          |
+   | 0x0045bc30 | onGround         | 1                          |
+   | 0x0045bc48 | racer+0x20       | 1.0f                       |
+   | 0x0045bc4f | poseStaticPied   | 0x0051d678, pilot rot 4    |
+   +------------+------------------+----------------------------+
+
+   NONE OF THOSE FOUR WAS THE headingSmoothed CAUSE - they were
+   worth fixing but the 2pi survived all of them. Measured per frame,
+   with both games reset and placed identically:
+
+       after mr_reset      MOTO 0.0000000   ours  0.0000000
+       after the F1 frame  MOTO 0.0000000   ours -0.0981748
+       one frame later     MOTO 0.0000000   ours  6.1968994
+
+   -0.0981748 IS EXACTLY pi/2 OVER 16, and 16 is RetardCadre. So the
+   suspension chased a target of -pi/2 for exactly one frame, and
+   -pi/2 is what racer_chassis_attitude returns from its degenerate
+   branch at 0x0045ca5c when scale is zero.
+
+   THE MATRIX IS ZERO ON THAT FRAME, because our memset zeroes
+   matBikeRoot and the suspension ticks before Racer_ComposeOrientation
+   0x0045cb00 fills it. An all-zero 3x4 is not a state the original
+   ever presents to that function.
+
+   AND ONE FRAME IS PERMANENT. headingSmoothed wraps into [0, 2pi],
+   so -0.098 becomes 2pi - 0.098, and the return step is delta/16.
+   By the time it has crept back to within a few microradians of the
+   turn, that step is smaller than one float ULP at 6.28 and it
+   stops. It parks there for the rest of the race.
+
+   THE FIX IS TO SEED matBikeRoot TO IDENTITY at reset. Not a guard
+   on the degenerate branch - the original has that branch and needs
+   it; what the original does not have is a zero matrix.
+
+   THE GATED TAIL IS NOT TRANSCRIBED. Everything from 0x0045bc59 is
+   skipped when the second parameter is zero, and seeds
+   trackTotalProgress from 0x0052c10c halved and signed by
+   0x004dc144. [open]
+
+   TWO FIELDS OF THIS FUNCTION HAVE NOW BEEN FOUND ONE AT A TIME, by
+   chasing a symptom back to a zero that should not have been zero.
+   The rest of the reset is the obvious place to look the next time a
+   value starts wrong and converges.
+
+16.1.  The shadow is a rectangle and that is correct
+
+   Six vertices, two quads - (0,1,2,5) and (5,2,3,4) - and the two
+   middle vertices sit at the MIDPOINTS of the long sides, so seen
+   from above the pair is a rectangle, not a hexagon. Verified:
+   vertices 2 and 5 share the corner x values, -88 and -168, at yaw
+   zero.
+
+   THE SIXTH AND THIRD VERTEX EXIST TO LET IT FOLD. They are lifted 8
+   units against the corners 4, so the shadow tents along its
+   centreline and follows a crest instead of cutting through it.
+
+17.  What turns MOTO bike while it stands still: the cosine table
+
+   Placed at exactly 40 degrees and left alone, the two disagree by
+   frame 2 and then both freeze [verified]:
+
+   +-------+-------------+-------------+
+   | frame | MOTO yaw    | ours yaw    |
+   +=======+=============+=============+
+   | 0     |  -40.00000  |  -40.00000  |
+   | 1     |  -39.96825  |  -39.99023  |
+   | 2     |  -39.92434  |  -39.99023  |
+   | 3..12 |  -39.92434  |  -39.99023  |
+   +-------+-------------+-------------+
+
+   NOTHING IS TURNING IT - steering, lean and flLeanTarget all read
+   0.0 on MOTO for every one of those frames [verified]. Both sides
+   are quantising to the cosine table and stopping at different
+   entries: -39.99023 is index -1820 and -39.92434 is -1817. Exact 40
+   degrees is 1820.4444, so ours truncates once and MOTO walks three.
+
+   racer_compose_yaw USED libm AND NOW USES THE TABLE, which is right
+   - the original builds the increment with Vec3_Set(0, yaw, 0) and
+   maybe_Mat34_FromEuler - BUT IT DID NOT CLOSE THIS. With the yaw
+   increment at zero the function is a no-op either way, so the fix
+   cannot affect a bike standing still. MOTO gets its walk from
+   somewhere else and the source is not identified. [open]
+
+   WHERE IT STANDS, measured after the fix:
+
+   +--------+-----------+------------+--------------+
+   | yaw    | shadow    | contacts   | settled yaw  |
+   +========+===========+============+==============+
+   | 0      |   0.00000 |   0.000000 | exact        |
+   | -75    |   0.00012 |   0.000019 | 4e-5 apart   |
+   | 40     |   0.14871 |   0.074028 | 0.066 apart  |
+   +--------+-----------+------------+--------------+
+
+   SO IT IS NOT A GENERAL OFF-AXIS DEFECT. Two of three headings are
+   effectively exact and 40 degrees is not. Whatever walks MOTO three
+   indices there does not fire at -75.
+
+17.1.  Do NOT sweep cos and sin blindly
+
+   The original uses BOTH. maybe_Mat34_FromEuler and the inline
+   rotation builds index g_cosTable; other sites emit x87 FSIN and
+   FCOS, which is what libm gives. Converting those to the table
+   would be as wrong as leaving the first kind alone.
+
+   The test is what the ORIGINAL does at that address, not what
+   looks consistent:
+
+   +--------------------------------+---------------------------+
+   | site                           | original                  |
+   +================================+===========================+
+   | racer_compose_yaw              | TABLE - fixed             |
+   | racerdraw_arm_matrix           | TABLE - fixed             |
+   | racer_pose_stunt_step          | FSIN - correct as libm    |
+   | racer_pose_glance              | FSIN - correct as libm    |
+   +--------------------------------+---------------------------+
+
+   Still unchecked, each needs its own look: the spring bounce in
+   racer.c, racer_wheelie_swing_contact, and the two pairs in
+   race.c around the camera. [open]
+
+18.  The fork group is verified
+
+   Hooked at the front-wheel draw call 0x0045fd0d, the same six-push
+   shape as the rear at 0x00460d3e, capturing the three offset floats
+   at ESP+0x0c. One number covers fork_solve, fork_scale, fork_tip
+   and front_wheel_offset, because the offset is the fork tip taken
+   through the solved chain.
+
+   +-------+-------+-------------------------------+----------+
+   | yaw   | wheel | MOTO                          |     dmax |
+   +=======+=======+===============================+==========+
+   | 0     | front |   3.0438  30.5756   -2.5771   |  0.00002 |
+   | 0     | rear  |   0.0864  28.8962   17.5442   |  0.00000 |
+   | -75   | front |   3.2785  30.5756    2.2715   |  0.00002 |
+   | -75   | rear  | -16.9217  28.8962    4.6328   |  0.00002 |
+   | 40    | front |   0.6802  30.5756   -3.9299   |  0.00449 |
+   | 40    | rear  |  11.3257  28.8962   13.3990   |  0.01537 |
+   +-------+-------+-------------------------------+----------+
+
+   EXACT AT TWO OF THREE HEADINGS. The 40-degree column is the
+   0.066-degree heading difference from section 17 arriving here; it
+   is upstream of both groups and neither of them creates it.
+
+   NOT COVERED: racerdraw_steer_pose. Every one of these runs has
+   zero steering input, so the fork yaw it writes is zero on both
+   sides and the comparison does not exercise it. It needs a run with
+   the bars turned. [open]
+
+18.1.  Section 3 after all of this
+
+   +---------------+------------------------------------------+
+   | group         | state                                    |
+   +===============+==========================================+
+   | THE SWINGARM  | VERIFIED - all four                      |
+   | THE FORK      | VERIFIED except steer_pose               |
+   | THE BIKE BODY | build_matrices verified; the other four  |
+   |               | not - rebuild_contacts, offsets,         |
+   |               | draw_position, view_matrix               |
+   | THE RIDER     | not verified - place_rider,              |
+   |               | part_is_rider, part_matrix               |
+   | THE FAR LOD   | not verified                             |
+   | THE QUEUE     | uncalled on both sides                   |
+   +---------------+------------------------------------------+
+
+   And of the numbered order in section 6: step 1 done, steps 3 and
+   5 substantially done, steps 2 and 4 still never diffed.
+
+19.  The rider group: two of three verified
+
+   racerdraw_place_rider WRITES TWO RACER FIELDS, so it needs no
+   hook at all - matRiderRoot at +0x3085 and riderPosition at
+   +0x30b5 are both directly readable:
+
+   +-------+----------------+-----------+
+   | yaw   | field          |      dmax |
+   +=======+================+===========+
+   | 0     | matRiderRoot   |   0.00000 |
+   | 0     | riderPosition  |   0.00000 |
+   | -75   | matRiderRoot   |   0.00000 |
+   | -75   | riderPosition  |   0.00000 |
+   | 40    | matRiderRoot   |   0.00088 |
+   | 40    | riderPosition  |   0.00002 |
+   +-------+----------------+-----------+
+
+   The 0.00088 is the section 17 heading gap arriving unchanged -
+   matOrientation differs by the same 0.000882, and matRiderRoot
+   copies its 3x3.
+
+   THE TRANSLATION ROWS ARE ZERO ON BOTH, confirmed at all three
+   headings. That is deliberate in the original and the reconstruction
+   already matched it.
+
+   racerdraw_part_is_rider IS VERIFIED STRUCTURALLY. It answers
+   3 <= part <= 14, and the live part-pointer tree in 12.3 has the
+   rider subtree as exactly 3 -> 4 -> 5..14 with the bike as 0, 1, 2,
+   15, 16. The range and the tree agree; there is no flag to compare.
+
+   racerdraw_part_matrix IS NOT VERIFIED. Its output is a stack local
+   on both sides, so it needs a mirror on ours and a hook on theirs.
+
+19.1.  Where MOTO part view matrix lives
+
+   In the part loop the transform is CALL 0x0049b2c0 at 0x00461981,
+   and the matrix is pushed as its second argument:
+
+       0046196e  LEA EDX,[ESP+0x134]     after PUSH EAX, PUSH EBP
+       00461979  PUSH EDX
+       00461981  CALL 0x0049b2c0
+
+   With four pushes between, the matrix sits at ESP+0x13c at
+   0x0046197a - a 7-byte MOV, so hook THAT rather than the CALL. Two
+   captures of 24 bytes cover the 48. EDI is the loop counter and EBX
+   the racer, both in the register dump, so hits can be attributed.
+
+   Ours is mirrored into g_rdPartView, indexed by part.
+
+19.2.  racerdraw_part_matrix adds nothing of its own
+
+   Hooked at 0x0046197a, matrix at ESP+0x13c, member index in EDI,
+   mapped to a part through the live remap
+
+       remap = 0 1 15 2 16 3 4 5 6 7 8 9 10 11 12 13 14
+
+   so member 2 is the front wheel and member 3 the swingarm - the
+   two bike parts that sit out of index order. Yaw 0, settled:
+
+   +----+------+-----------+---------------------------+
+   |  i | part |      dmax | note                      |
+   +====+======+===========+===========================+
+   |  2 |   15 |   0.00003 | bike                      |
+   |  6 |    4 |   0.01276 | rider                     |
+   |  7 |    5 |   0.02139 | rider                     |
+   |  8 |    6 |   0.05810 | rider                     |
+   |  9 |    7 |   0.02322 | rider                     |
+   | 10 |    8 |   0.03935 | rider                     |
+   | 11 |    9 |   0.00732 | rider                     |
+   +----+------+-----------+---------------------------+
+
+   EVERY RIDER FIGURE MATCHES THE POSE-MATRIX RESIDUAL FOR THE SAME
+   PART in section 13 - part 6 is 0.05810 here against 0.01997 there
+   scaled through the view, part 9 the smallest in both. The function
+   propagates what it is given and adds nothing measurable; part 15,
+   whose pose matrix is exact, comes out at 0.00003.
+
+   MEMBER 3 IS NOT COMPARABLE YET. Members 0 and 3 skip
+   part_matrix entirely and use the prebuilt viewPart0 and viewPart3,
+   so the mirror never held anything for part 2 and the 500 it
+   reported was against zeroes. Both are now mirrored separately.
+
+   THE SPECIAL CASE IS REAL - CMP EDI,0x3 / JNZ at 0x004614cf, with
+   i == 0 tested separately at 0x00461460. So the structure in the
+   port is right. The comment claiming member 3 gets an IDENTITY is
+   wrong and is now corrected in the source; MOTO passes a near-90
+   degree Y rotation. See section 20.
+
+20.  VOID (see 31) - viewPart3 read at the wrong slot
+
+   The reading was taken at the wrong slot; section 31 retracts
+   it. 20.1 below was measured correctly and stands; 31 lists 20.2
+   as void with the rest.
+
+20.1.  racerdraw_view_matrix is exact, so the camera is not at fault
+
+       MOTO member 0  -0.0000 -0.0000 1.0000  -0.0000 1.0000 0.0000
+                      -1.0000 -0.0000 -0.0000  0.0000 -78.9600 250.0000
+       ours viewPart0  identical, dmax 0.00000
+
+   Member 0 has its own transform call at 0x004614be with the matrix
+   at ESP+0x3cc. Hooking it gives a byte-exact match, which verifies
+   racerdraw_view_matrix AND establishes that camEye and camView
+   agree - a view matrix cannot match if its camera does not. Worth
+   knowing because a debug side-view camera on our side does NOT
+   perturb these readings.
+
+20.2.  VOID (see 31) - member 3 is built in the rear-wheel block
+       and the slice dropped it
+
+   The slice WAS narrow, but member 3 was never wrong - 23.1 has
+   why, and 22 keeps the lesson that coverage is not correctness.
+
+21.  maybe_Racer_Draw is 10246 bytes held as 31 slices
+
+   0x0045f290..0x00461a96 is 0x2806 = 10246 bytes, and src/ carries
+   31 ORIGIN tags pointing
+   into it - 28 in racerdraw.c, 2 in model.c, 1 in racer.c. It is
+   section 3 of this document plus everything added since.
+
+   EVERY DEFECT THIS SESSION THAT WAS NOT IN THE SKELETON WALK CAME
+   OUT OF THIS FUNCTION: the arm-angle cross product (14), the libm
+   arm matrix (14.3), and the member-3 matrix (20.2). That is the
+   argument for importing it whole rather than continuing to audit
+   slices of it.
+
+21.1.  What the rear-wheel block actually computes
+
+   0x004604c0..0x00460da0 is not one output but at least two, and the
+   second is a 3x4 BY 3x4 MATRIX MULTIPLY written out inline - eight
+   FLD/FMUL/FADDP groups of the same shape, one per output element:
+
+       004605b6  FLD [ESI+0x6c] / FMUL [ESP+0x58]
+       004605bd  FLD [ESI+0x84] / FMUL [ESP+0x60]
+       004605c7  FLD [ESI+0x78] / FMUL [ESP+0x5c]
+       004605d4  FSTP [ESP+0x2c]
+
+   so  [ESP+0x10 .. 0x3c]  =  [ESP+0x58]  x  [ESI+0x68]
+
+   with the translation rows added separately - FADD [ESI+0x8c] at
+   0x00460618 and FADD [ESI+0x94] at 0x00460668.
+
+   ESI IS THE CAMERA AND IT IS A PARAMETER. MOV ESI,[ESP+0x42c] at
+   0x0045f9cb, held across the whole block. The struct carries a 3x4
+   at +0x68 with its translation at +0x8c..+0x94, so the original
+   passes ONE camera object where the port passes camEye and camView
+   separately.
+
+   The result is copied ESP+0x10 -> ESP+0xac -> ESP+0x238, and
+   ESP+0x238 is what member 3 reads. See 20.2.
+
+21.2.  Why this is not a one-sitting import
+
+   The block is 2272 bytes of x87 with no calls to lean on - the
+   matrix products are inlined rather than going through
+   Matrix34_Multiply, so there is no call graph to read the structure
+   off. It needs the stack slots tracked by hand, and the second
+   operand at [ESP+0x58] is set further back still.
+
+   THE CHECK IS ALREADY BUILT, which is the reason to do it properly
+   rather than approximately: hook 0x0046197a for member 3 and
+   0x004614b7 for member 0, and the target is member3 = A x member0
+   with A a 1.914-degree Y rotation and translation (-4.0791,
+   -6.1705, 2.7412). Any transcription can be scored against that
+   before it is believed.
+
+22.  Coverage map, and the merge plan
+
+   The 31 tags collapse to 8 disjoint spans. Against the 10246 bytes
+   of the original, 1358 - THIRTEEN PER CENT - is claimed by no slice
+   at all:
+
+   +---------------------------+--------+---------------------------+
+   | range                     |  bytes | note                      |
+   +===========================+========+===========================+
+   | 0045f290..0045f2d0        |     64 | prologue                  |
+   | 0045f5a0..0045f6a0        |    256 |                           |
+   | 0045fa30..0045fc00        |    464 | largest                   |
+   | 004603f2..004604c0        |    206 | right before the block in |
+   |                           |        | 21.1                      |
+   | 00460db7..00460ea6        |    239 | place_rider tags two      |
+   |                           |        | POINTS here, not a range  |
+   | 00460ea6..00460f00        |     90 |                           |
+   +---------------------------+--------+---------------------------+
+
+   COVERAGE IS NOT THE SAME AS CORRECTNESS, and 20.2 is the proof:
+   the member-3 matrix is built inside 0x004604c0..0x00460da0, which
+   IS claimed - by racerdraw_rear_wheel_offset, which reproduces only
+   one of the two things that region computes. A claimed span can
+   still be a third of the code.
+
+   So the gap table is a floor on what is missing, not a measure of
+   it.
+
+22.1.  What merging actually means here
+
+   racerdraw.c IS ALREADY THE DEDICATED FILE - its header says the
+   function was "brought over whole", which is not true and should be
+   corrected. 28 of the 31 tags are already in it. The other three
+   are helpers with a defensible home:
+
+     mat34_invert_rigid   model.c   general 3x4 maths, also used by
+                                    the skeleton walk
+     the vertex/face loop model.c   shared with other draws
+     the contact rebuild  racer.c   writes racer fields
+
+   So the file merge is nearly a no-op. THE REAL WORK IS THE 28
+   FUNCTIONS BECOMING ONE, in the original order, with the six gaps
+   filled from the disassembly.
+
+22.2.  The order to do it in
+
+   1  Fill the six gaps first, as marked stubs inside the existing
+      slices. They are the only part where behaviour is definitely
+      absent, and they are small - four of the six are under 250
+      bytes.
+
+   2  Re-derive the span table after each gap lands. A gap that
+      shrinks means the transcription is real; one that does not
+      means the address range was mis-attributed.
+
+   3  Only then inline the 28 into one function, bottom up, keeping
+      the leaf formulas as named statics the way racer_update_pose
+      did. That import is the model: control flow whole, formulas
+      named, ORIGIN on each.
+
+   4  Score every step against the hooks that already exist -
+      0x004614b7 for member 0, 0x0046197a for member 3 and the part
+      loop, 0x0045fd0d and 0x00460d3e for the two wheel offsets. Four
+      attachment points cover most of what the function produces.
+
+23.  The 464-byte gap, 0x0045fa30..0x0045fc00
+
+   It sits between racerdraw_view_matrix, which ends at 0x0045fa30,
+   and racerdraw_fork_solve, which starts at 0x0045fc00. It is not
+   x87 soup - it is a chain of named helpers, which makes it the
+   cheapest of the six gaps to transcribe:
+
+       0x004039c0  Matrix34_Copy
+       0x00403710  Matrix34_Identity
+       0x0040fc90  Vec3_Set
+       0x00410010  Vec3_TransformByMatrix34
+       0x0040ffc0  Vec3_Add
+
+23.1.  MEMBER 3 DEFAULTS TO AN IDENTITY, and that resolves 20.2
+
+       0045fa3d  LEA ECX,[ESP+0x3f4] / CALL Matrix34_Identity
+       0045fa49  LEA ECX,[ESP+0x238] / CALL Matrix34_Identity
+
+   ESP+0x238 IS THE MEMBER-3 SLOT - the same one written at 0x00460707
+   and read at 0x00461525. So it is identity-initialised here and
+   only later overwritten by the rear-wheel block.
+
+   THAT IS WHERE THE "MEMBER 3 GETS AN IDENTITY" NOTE CAME FROM. The
+   claim was not invented; it was read off this instruction and then
+   stated as though it were the whole story. It is the DEFAULT, not
+   the value - if the block at 0x004604c0 runs, it is replaced.
+
+23.2.  The first computation in the gap
+
+       C   = g_bikeCarac[bikeIndex] float at 0x005092b8, which is
+             carac 16 - two past RoueAxeDistance at 0x005092b0, so
+             the REAR wheel radius
+
+       lift = C * 48 + C * 12 * springBounce        racer+0x2e91
+       Vec3_Set(v, 0, lift, 0)
+
+   with 48 at 0x004d0e98, 96 at 0x004d102c and 0.125 at 0x004d1050 -
+   the 12 is 0.125 * 96. A purely vertical offset driven by the
+   spring, then taken through a matrix by Vec3_TransformByMatrix34
+   and accumulated with Vec3_Add.
+
+   The same shape repeats for a second value read from [ESP+0x160],
+   so the gap builds TWO offsets and adds them - front and rear.
+
+   IT IS NOT racerdraw_offsets. That is transcribed from
+   0x0045f7a0..0x0045f830, a different range. This is a second,
+   later offset pass that the port does not have at all. [open -
+   what consumes its result]
+
+24.  The gap feeds rear_frame, which also drops it
+
+   [ESP+0x1bc..0x1c4] is the vector the gap builds. It has exactly
+   one reader, at 0x0045feea:
+
+       0045fee5  CALL Vec3_TransformByMatrix34   -> EAX
+       0045feea  FLD [EAX]   / FADD [ESP+0x1bc] / FSTP [ESP+0x1cc]
+       0045fefa  FLD [EAX+4] / FADD [ESP+0x1c0] / FSTP [ESP+0x1d0]
+       0045ff19  FLD [EAX+8] / FADD [ESP+0x1c4]
+
+   so the suspension offset is ADDED to a transformed point inside
+   0x0045fe10..0x0046019a - the span racerdraw_rear_frame claims.
+   Our rear_frame is a euler round trip and a translation copy; it
+   does not do this addition at all.
+
+   SECOND DEFECT OF THE SAME SHAPE AS 20.2: a claimed span whose
+   transcription covers a fraction of what the range computes.
+
+24.1.  Bytes of original per line of C, as a defect detector
+
+   Ranking every slice by (claimed bytes) / (lines of our C) separates
+   the verified from the suspect almost perfectly:
+
+   +------------------------------+--------+------+---------+
+   | our function                 | orig B | C ln | B/line  |
+   +==============================+========+======+=========+
+   | racerdraw_rear_wheel_offset  |   2272 |   14 |   162.3 |
+   | racerdraw_part_is_rider      |   1328 |    4 |   332.0 |
+   | racerdraw_part_matrix        |   1232 |   17 |    72.5 |
+   | racerdraw_rear_frame         |    906 |   19 |    47.7 |
+   | racerdraw_fork_part_matrix   |   1312 |   36 |    36.4 |
+   | racerdraw_far_lod            |    720 |   41 |    17.6 |
+   +------------------------------+--------+------+---------+
+   | racerdraw_offsets            |    304 |   26 |    11.7 |
+   | racerdraw_arm_matrix         |    229 |   29 |     7.9 |
+   | racerdraw_arm_angle          |    371 |   48 |     7.7 |
+   | racerdraw_build_matrices     |    384 |   56 |     6.9 |
+   | racerdraw_fork_solve         |    352 |   65 |     5.4 |
+   | racerdraw_front_wheel_offset |     64 |   12 |     5.3 |
+   | racerdraw_view_matrix        |     96 |   23 |     4.2 |
+   +------------------------------+--------+------+---------+
+
+   EVERY FUNCTION VERIFIED AGAINST MOTO SITS AT 4 TO 12. Both defects
+   found the hard way - rear_wheel_offset in 20.2 and rear_frame here
+   - are at the top of the list. The metric would have pointed at
+   both before either was measured.
+
+   IT DOES NOT DISTINGUISH A DEFECT FROM A SLOPPY TAG. part_is_rider
+   is a four-line range test carrying the whole part loop range, and
+   fork_part_matrix is VERIFIED exact at 36 bytes per line. A high
+   ratio means "this span contains more than this function does",
+   which is worth reading either way - but the fix is sometimes just
+   narrowing the ORIGIN.
+
+   USE IT TO ORDER THE MERGE. rear_frame and far_lod are the two
+   unexamined entries above 15 with honest-looking tags.
+
+25.  What the gap actually contains, and why it is not all missing
+
+   Reading the second half of 0x0045fa30..0x0045fc00 changes the
+   picture from section 23:
+
+       0045fb3e  EAX = racer + slot*2000 + 0x6e8
+                 0x6e8 - 0x63c is 0xac = one part record plus 0x48,
+                 so this is &pose[slot][1].pivot - THE FORK PIVOT
+       0045fb49  Vec3_TransformByMatrix34 of it
+       0045fb5b  EDI = [skeleton + 8] - the front wheel part index,
+                 the same +8 the fork override reads
+       0045fb6d  FLD [racer+0x110]      steering
+       0045fb73  FMUL [ESP+0x168]       double
+       0045fb80  FMUL [0x004d1048]      double
+       0045fb8d  FSTP [ESP+0x88]
+
+   THE STEERING ANGLE AND THE FORK PIVOT TRANSFORM ARE THINGS THE
+   PORT ALREADY HAS - racerdraw_steer_pose computes
+   steering * factor * constant and racerdraw_fork_solve transforms
+   part 1 pivot. They are tagged to other addresses, so the coverage
+   map counted this range as missing when most of it is not.
+
+   SO THE GAP TABLE IN 22 OVERSTATES. It measures untagged bytes, and
+   untagged is not the same as unimplemented - a mis-tagged ORIGIN
+   inflates it exactly as much as a real hole. Both need fixing, but
+   they are different jobs.
+
+25.1.  What IS missing from it
+
+   The addition at 0x0045feea is real and our rear_frame does not do
+   it. But CALLING +0x1bc "THE SUSPENSION OFFSET" WAS AN OVER-READING
+   and 23.1 and 24 are corrected by racer-draw-frame.txt 3: it is a
+   vec3 SCRATCH, built at 0x0045f828 as a normalised direction,
+   scaled by RoueAxeDistance twice, added to three different things,
+   and rewritten again inside the gap. What it holds at 0x0045feec is
+   whatever the gap last left there.
+
+   A SLOT IS NOT A VARIABLE. +0x12c has 50 references, +0x010 has 46,
+   +0x0ac has 37. Naming a slot after one of its uses is how a
+   transcription ends up with the right shape and the wrong value.
+
+26.  The slot trace resolves one level and opens another
+
+   The calling convention settles the first slot. Vec3_Set is
+   __thiscall with three stack args, so the PUSH EDX at 0x0045fa84 is
+   NOT its argument - it survives the purge and belongs to the call
+   after it:
+
+       0045fa84  PUSH EDX             &[ESP+0x298]
+       0045fa9f  CALL Vec3_Set        this=&[ESP+0x84], (0, lift, 0)
+       0045faab  PUSH EAX             the vector Vec3_Set returned
+       0045faac  PUSH ECX             &[ESP+0xe0]
+       0045faad  CALL Vec3_TransformByMatrix34
+
+   giving  [ESP+0xe0] = (0, lift, 0) through the matrix [ESP+0x298].
+
+   AND [ESP+0x298] IS BUILT IN ANOTHER GAP. Its five references are
+   0x0045f5b9, 0x0045f8ea, 0x0045fa65, 0x0045fb06 and 0x0045ff2e, and
+   the first is inside 0x0045f5a0..0x0045f6a0 - the 256-byte gap.
+
+26.1.  Piecemeal tracing has reached its limit
+
+   Three slots traced, three levels deep, and each landed in another
+   untagged region: [ESP+0x58] -> [ESP+0x40] -> [ESP+0x12c];
+   [ESP+0x1c0] -> rear_frame span; [ESP+0xe0] -> [ESP+0x298] ->
+   the 0x0045f5a0 gap.
+
+   THAT IS NOT BAD LUCK, IT IS THE SHAPE OF THE PROBLEM. The function
+   keeps about forty live matrices and vectors in one stack frame and
+   threads them through 200-odd calls. A slot only means anything in
+   the context of the frame, so tracing one at a time re-derives the
+   same frame repeatedly and gets slower the deeper it goes.
+
+   READ IT FRONT TO BACK IN ADDRESS ORDER INSTEAD, building the frame
+   map once - offset, what lives there, where it is written, where it
+   is read. Every slot then costs a lookup rather than a search, and
+   the transcription falls out in the original order, which is what
+   the merge wants anyway.
+
+   The four hooks already in place score it as it goes: 0x004614b7,
+   0x0046197a, 0x0045fd0d, 0x00460d3e.
+
+27.  rear_frame span read whole, with the frame map
+
+   0x0045fe10..0x0046019a, 906 bytes, with every call resolved to a
+   name and every stack operand to a body offset. It is SIX things,
+   not one:
+
+   +--------------------------+-------------------------------------+
+   | at                       | what                                |
+   +==========================+=====================================+
+   | 0045fe28..0045fe63       | the steer angle, written into       |
+   |                          | pose[slot][1].angle at racer+0x6ac  |
+   |                          | via Vec3_Copy3 - THIS IS            |
+   |                          | racerdraw_steer_pose                |
+   +--------------------------+-------------------------------------+
+   | 0045fe91..0045fed7       | +0x110 = rayonAr*48 +               |
+   |                          | rayonAr*12*springBounce - THE SAME  |
+   |                          | LIFT the gap computes               |
+   +--------------------------+-------------------------------------+
+   | 0045fee5..0045ff23       | transform, then + the +0x1bc vec3   |
+   +--------------------------+-------------------------------------+
+   | 0045ff4f..0045ff99       | THE REAR FRAME ITSELF               |
+   +--------------------------+-------------------------------------+
+   | 0045ffc8..004600ee       | three point transforms and their    |
+   |                          | differences                         |
+   +--------------------------+-------------------------------------+
+   | 004600f5..0046019a       | d = rearWheelContact - P, then the  |
+   |                          | CROSS PRODUCT - this is             |
+   |                          | racerdraw_arm_angle numerator       |
+   +--------------------------+-------------------------------------+
+
+   SO THE 47.7 BYTES-PER-LINE WAS PARTLY AN ARTEFACT. The span holds
+   rear_frame AND steer_pose AND the front half of arm_angle, and
+   arm_angle is verified exact. Our version recomputes the P, X and Z
+   transforms inside arm_angle instead of reading them from here,
+   which is a divergence in structure but not in result.
+
+27.1.  The rear frame position is not drawPos
+
+       0045ff62  Vec3_Add     +0x070 = +0x0dc + (transformed)
+       0045ff73  Mat34_ToEuler       +0x010 <- +0x298
+       0045ff80  Vec3_Copy3          +0x0ac
+       0045ff99  Mat34_FromEulerPos  +0x180 = (euler +0x0ac, pos +0x070)
+
+   OURS PASSES drawPos WHERE THE ORIGINAL PASSES +0x070, and +0x070
+   is a sum, not the draw position. racerdraw_rear_frame takes
+   (rearMat, drawPos, out) and sets out[9..11] = drawPos; the
+   original sets it from Vec3_Add(+0x0dc, a transformed vector).
+
+   THAT IS THE MISSING TERM, and it matches the measurement in 20:
+   member 3 came out at (0.0000, -78.9600, 250.0000) against MOTO
+   (-4.0791, -85.1305, 252.7412). A small additive difference in all
+   three components is exactly what a missing summand looks like.
+
+   +0x298 IS OUR rearMat [verified]. Hooked at 0x0045ff2e and
+   compared against g_rdRearMat:
+
+       yaw -75   0.2593 .. 0.9658    dmax 0.000000
+       yaw  40   0.7669 .. -0.6418   dmax 0.000881
+
+   and -75 is a real rotation, not the identity case that hid the
+   P*L bug in 12.2. The 0.000881 at 40 is the section 17 heading
+   residual arriving, nothing new. So the euler source agrees and
+   only the POSITION argument differs.
+
+27.2.  But the world rear frame is already right
+
+   The position at 0x0045ff99 is built inline:
+
+       0045ff4f  +0x010 = transform(+0x10c, rearMat)
+       0045ff62  +0x070 = +0x0dc + +0x010
+       0045ff99  frame  = FromEulerPos(euler(rearMat), +0x070)
+
+   with +0x0dc holding the sum copied out at 0x0045ff2c..0x0045ff3f,
+   and +0x10c being the vec3 whose Y is the lift written at
+   0x0045fed7.
+
+   THAT IS NOT THE MEMBER-3 DEFECT, and the evidence is already on
+   record: racerdraw_rear_wheel_offset matches MOTO to 0.00002 at yaw
+   0 and -75 (section 18). That offset is pivot-through-armMat minus
+   the contact, and armMat inherits the rear frame TRANSLATION - so a
+   wrong translation would show up in it one for one. It does not,
+   which means our drawPos already equals +0x070.
+
+   SO THE MEMBER-3 TRANSLATION ERROR IS IN THE CAMERA-RELATIVE REAR
+   FRAME, not the world one. racerdraw_racer calls rear_frame twice -
+   once with drawPos and once with camRel - and only the second feeds
+   viewPart3. The block read here is the first. [open]
+
+28.  VOID (see 31) - the 0x004603f2 block, read at the wrong slot
+
+   Same wrong slot as 20; 31 retracts it. 28.1 stands.
+
+28.1.  So the difference is in the camera-relative rear frame
+
+       004603b4  Mat34_FromEulerPos(+0x12c, euler=+0x0ac, pos=+0x0dc)
+       004604ba  +0x040 = armEuler x +0x12c
+       004604c8  +0x010 = +0x040 x camera        -> member 3
+
+   +0x12c here is the CAMERA-RELATIVE REAR FRAME, and the shape
+   matches ours exactly: we compose armC with rearFrameC inside
+   arm_matrix, then with camView. Same three operands, same order.
+
+   With the arm angle, the arm rotation and the camera all verified,
+   THE ONLY REMAINING OPERAND IS +0x12c. Its euler comes from +0x0ac,
+   a copy of the vec3 at +0x07c made at 0x00460393..0x004603aa, and
+   its position from +0x0dc - where ours passes to_euler(rearMat) and
+   camRel. That pair is the next thing to read. [open]
+
+29.  VOID (see 31) - operands of member 3 compared at the wrong
+     slot
+
+   Same wrong slot as 20; 31 retracts it.
+
+30.  VOID (see 31) - why three readings of member 3 all failed
+
+   The premise was the wrong slot, so the question was not real.
+   31 has what was actually happening.
+
+31.  RETRACTION - viewPart3 was never wrong
+
+   Captured at its REAL slot, member 3 matches:
+
+       yaw   0   dmax 0.00003
+       yaw -75   dmax 0.00026
+
+   SECTIONS 20, 20.2, 28, 29 AND 30 ARE VOID. There is no missing
+   rotation, no missing summand, no wrong composition and no
+   spurious 7.8-degree tilt. racerdraw_arm_matrix, racerdraw_rear_
+   frame and the viewPart3 chain are correct.
+
+31.1.  The hook was reading the wrong slot
+
+   The part-loop transform at 0x0046197a takes its matrix as a
+   PUSHED POINTER, and the two paths push different ones:
+
+       general path   00461979  PUSH EDX   EDX = &+0x12c
+       i == 3 path    00461531  PUSH ECX   ECX = &+0x238
+
+   Both arrive at 0x0046197a with four pushes pending, so
+   ESP+0x13c is the matrix FOR THE GENERAL PATH ONLY. Every
+   "member 3" capture in this document was reading +0x12c.
+
+   IT LOOKED CREDIBLE BECAUSE IT WAS SELF-CONSISTENT. +0x12c held a
+   stable value across headings, so the readings repeated exactly and
+   the 6.17 difference reproduced every time. A stable wrong number
+   is not evidence of anything.
+
+   THE LESSON IS ABOUT THE CAPTURE, NOT THE ANALYSIS. Six sections of
+   reasoning were built on it and every one of them was wrong,
+   including three that were retracted for other reasons along the
+   way. When a hook captures a stack slot at a MERGE POINT, the slot
+   only means one thing per incoming path - resolve which path the
+   hit came from before believing the bytes.
+
+   EDI DISTINGUISHES THEM and was in the register dump the whole
+   time: it is the member index, 3 on the branch in question. The
+   information needed to catch this was captured and not used.
+
+31.2.  What survives
+
+   Everything measured at a slot with ONE writer and one reader is
+   unaffected - the pose walk, the shadow, the wheel offsets, the arm
+   angle, view_matrix, place_rider, the frame map itself. Those were
+   read from racer fields or from unambiguous single-path sites.
+
+   THE SWINGARM WAS ALREADY FIXED IN SECTION 14 - the w x d cross
+   product - and that fix was verified against 0x00580a70, a global
+   with a single writer. It is not affected by this.
+
+32.  Step 4 - SelectLod partly verified, the cull not testable
+
+   racerdraw_select_lod writes racer+0x634 and +0x638, so it needs no
+   hook. Local racer, teleported to vary the distance and sampled one
+   frame later:
+
+   +--------+-------------+------+-------------+------+
+   | dz     | MOTO dist   | slot | ours dist   | slot |
+   +========+=============+======+=============+======+
+   | 0      |     543.115 |    0 |     543.115 |    0 |
+   | 1200   |     528.132 |    0 |     528.132 |    0 |
+   | 2600   |     525.423 |    0 |     525.094 |    0 |
+   | 4000   |     524.496 |    0 |     523.962 |    0 |
+   +--------+-------------+------+-------------+------+
+
+   The distance formula agrees - two of four exact, the others within
+   0.53, which is the camera converging on a slightly different
+   heading (section 17).
+
+   ONLY BAND 0 IS EXERCISED. The chase camera holds the racer at
+   about 525 units whatever is done to its position, and it catches
+   up inside one frame, so dist never approaches the 1000, 2500 or
+   3000 thresholds. The three far bands are untested. [open]
+
+32.1.  The cull cannot be diffed with this harness
+
+   racerdraw_visible needs racers at varying distances, and the two
+   games do not have the same field:
+
+       active racers    MOTO 12+      ours 2
+       position dmax    up to 47000 units on the AI racers
+
+   mr_place and the settle procedure place ONE racer. Everything
+   else - the grid, the AI, the count - diverges immediately, so any
+   comparison that depends on the FIELD rather than on racer 1 is
+   measuring two different races.
+
+   THAT ALSO BOUNDS THREE OTHER THINGS: the LOD of non-local racers,
+   the cull, and the glance rival search in racer_update_pose all
+   read the field and none of them can be A/B tested as things stand.
+
+   FIXED - mr_place --grid copies MOTO whole field onto the port:
+   position, orientation, travel direction and the active flag for
+   every racer, and the count. See tools/mr_place.py grid_copy.
+
+   IT ALSO EXPLAINS AN EARLIER OBSERVATION. The port computes
+   cameraDist only for racers it draws, because select_lod is called
+   from the draw loop; MOTO computes it for all of them from the
+   tick. That divergence is documented at the call site in race.c and
+   is confirmed here - our racers 3 and up read 0.0.
+
+33.  Step 4 verified across the field
+
+   With mr_place --grid the two games hold the same thirteen racers,
+   and one frame later:
+
+   +--------------+---------------+---------------+
+   | racers       | MOTO          | ours          |
+   +==============+===============+===============+
+   | 1            | slot 0 drawn 1| slot 0 drawn 1|
+   | 2 .. 12      | slot 4 drawn 0| slot 4 drawn 0|
+   +--------------+---------------+---------------+
+
+   TWELVE OF TWELVE AGREE on both outputs, which is what
+   maybe_Racer_SelectLod and the cull actually produce.
+
+   THE DISTANCES DIFFER BY 200 TO 600 UNITS AND THAT IS NOT THE
+   FUNCTIONS. Every difference is smaller than the position drift of
+   the same racer - racer 2 is 312 of distance against 616 of
+   position - which is one frame of each side steering its own AI
+   after the copy. The grid is placed alike for one frame, not kept
+   in step.
+
+   AND BAND 4 IS NOW EXERCISED, which the local racer could not do:
+   the far racers sit at 36000 to 53000 units and both sides select
+   slot 4. Bands 2 and 3 - between 1000 and 3000 - still have no
+   racer in them. [open]
+
+   THE SAME COPY UNBLOCKS the glance rival search in
+   racer_update_pose, which reads the field the same way.
+
+34.  Step 2 - maybe_Inst_DrawWithMatrix read whole
+
+   0x0048c6d0 is a standalone function and decompiles cleanly, so it
+   needed no hook at all.
+
+       void __thiscall maybe_Inst_DrawWithMatrix(
+               MR_ModelInstance *inst, void *shadeArg, MR_Camera *cam,
+               float *orient, float dx, float dy, float dz)
+
+   WHAT MATCHES rd_draw_instance:
+
+       trans   = inst->position + offset - cam->eye     cam+0x98
+       3x3     = orient x cam->view                     cam+0x68
+       trans  += cam->view translation                  cam+0x8c
+       verts   = Screen3D_TransformVertsFlat(m, mesh verts, n, 0x1f)
+
+   The composition, the eye subtraction and the 0x1f shade are all
+   ours. Its INPUTS were already verified in section 18 - the two
+   wheel offsets match MOTO to 0.00002 at yaw 0 and -75.
+
+34.1.  Three things are missing
+
+   o maybe_Mesh_ShadeVertices IS NOT CALLED. The original runs it
+     between the transform and the cull, with three globals at
+     0x0052c228, 0x0052c22c and 0x0052c230. The port has no such
+     function - the name appears only in comments.
+
+   o THE CULL IS TWO BRANCHES, NOT ONE:
+
+         if (inst->detailLevel < 0)
+             CullAndQueueFacesEx(verts, prims + split, count - split, 1)
+         else
+             CullAndQueueFaces(verts, prims, count, inst->detailLevel)
+
+     rd_draw_instance always takes the second, and
+     cull_and_queue_faces does not take the detail level at all.
+     cull_and_queue_facesEx exists but is a STUB.
+
+   o THE SPLIT INDEX IS mesh+0x68, and our MESH is port-shaped with
+     no equivalent. Prims are addressed as prims + split*0x40, which
+     the 0x40-byte MR_Primitive assertion confirms.
+
+   detailLevel IS ALREADY ON MR_ModelInstance at +0x14c, so only the
+   mesh field and the shade pass are actually absent. The branch
+   cannot be transcribed until mesh+0x68 is identified and something
+   fills it. [open]
+
+35.  far_lod - the rig works, the comparison needs our side mirrored
+
+   THE FAR PATH CAN NOW BE EXERCISED, which it could not be before
+   --grid. Parking a copied racer 2700 units ahead of the local one:
+
+       racer 2   dist 3514.3   slot 4   drawn 1
+
+   so MOTO takes the far branch for it, and the matrix is capturable
+   at 0x0045f43a - body +0x0ac, two hits per frame.
+
+35.1.  arg1 is NOT the camera struct, and 21.1 overstated it
+
+   Reconstructing MOTO camera operand to check our formula offline
+   failed: ESI at 0x0045f43a is 0x00516228, and scanning 200 bytes
+   from there finds exactly ONE valid rotation - at +0x00, not +0x68:
+
+       +0x00  det 1.00000   1.0000 0.0000 0.0000  0.0000 0.9959
+                            -0.0906  0.0000 0.0906 0.9959
+
+   The +0x68 read that worked at 0x0045ff2e does not work here. So
+   "arg1 is THE CAMERA, a 3x4 at +0x68" in racer-draw-frame.txt 1 is
+   true at one site and not established generally - the struct holds
+   more than one matrix and which one is live depends on where you
+   are in the function. [open]
+
+   THAT IS WHY THE OFFLINE CHECK WAS ABANDONED rather than pursued:
+   a formula test whose operand is itself in doubt proves nothing.
+
+35.2.  What to do instead
+
+   Mirror our own far matrix and compare directly - no camera
+   reconstruction needed. g_rdFarLod and g_rdFarLodPos are now
+   written in racerdraw_racer beside the far_lod call, keyed by the
+   racer position because that function has no racer index.
+
+   Then: mr_place --grid, park a racer between 2500 and 3000 units,
+   hook 0x0045f43a, match the hit by ebx and ours by position.
+
+36.  far_lod is blocked by the dead tick path, not by the harness
+
+   --grid now copies segmentStart as well, which was the missing
+   piece for the DRAW: without it a copied racer sits in a segment
+   the visible-segment list does not carry and is silently never
+   drawn. With it, our far_lod runs for the right racer -
+   g_rdFarLodPos matches racer 2 exactly.
+
+   THE MATRICES STILL DIFFER, AND THE INPUTS SAY WHY:
+
+   +--------------------+------------------------+-------------+
+   | field              | MOTO / ours            | copied      |
+   +====================+========================+=============+
+   | matBikeRoot        | agrees                 | yes         |
+   | lean               | -0.247 / 0.000         | NO          |
+   | rearWheelContact   | -48.7,0,8201 / 0,0,0   | NO          |
+   +--------------------+------------------------+-------------+
+
+   OUR RACER 2 HAS NO DERIVED STATE AT ALL. rearWheelContact is
+   exactly zero, which is what puts -5534 in the z of our far matrix.
+
+   THAT IS SECTION 15 AGAIN. race_tick_all is dead; the live path is
+   race_tick_physics on racer 1 only, so racers 2 and up are never
+   ticked and nothing computes their contacts, lean or suspension.
+   Copying more fields in --grid would paper over it - the values
+   would be MOTO derived state pasted onto a racer our own tick never
+   touches, which measures nothing.
+
+   SO THE ORDER OF WORK IS FIXED BY THIS: merging the two tick paths
+   comes BEFORE any further audit of a non-local racer. far_lod, the
+   glance rival search and the far-band LOD all need racers our own
+   game actually simulates. [open]
+
+   WHAT far_lod DID GET: the far branch is reachable and hookable at
+   0x0045f43a, our side is mirrored in g_rdFarLod, and the two are
+   keyed to the same racer. The comparison is set up and waiting on
+   the tick merge.
+
+37.  The two tick paths are merged
+
+   racer_tick_dispatch WAS AN EMPTY SHELL, which is the real reason
+   race_tick_all was dead. Its human branch fell through to
+   (void)buttons and a comment saying maybe_Racer_Tick was not
+   transcribed - but race_tick_physics IS maybe_Racer_Tick, written
+   under another name and called straight from the frame loop.
+
+   So there were not two implementations to reconcile. There was one
+   implementation and one faithful skeleton that never reached it.
+
+   +----------------------+--------------------------------------+
+   | before               | after                                |
+   +======================+======================================+
+   | frame loop ->        | frame loop -> race_tick_all ->       |
+   | race_tick_physics    | racer_tick_dispatch ->               |
+   | (racer 1 only)       | race_tick_physics                    |
+   +----------------------+--------------------------------------+
+   | build_shadow patched | build_shadow only in race_tick_all,  |
+   | into the frame loop  | its faithful home                    |
+   +----------------------+--------------------------------------+
+
+   race_tick_physics now takes dtScaled rather than seconds, which is
+   what Racer_TickDispatch passes; the frame loop scales once at the
+   call. The buttons are still not passed down as arguments because
+   race_tick_physics reads them off the racer through
+   race_poll_input - the original hands them down, the port keeps
+   them on MR_Racer, so they arrive by a different road rather than
+   not at all.
+
+37.1.  IT DOES NOT UNBLOCK far_lod, AND SECTION 36 OVERSTATED THAT
+
+   racer_tick_dispatch returns early for a non-human racer because
+   maybe_Racer_TickAI is not transcribed. Racers 2 and up now reach
+   the dispatch and get their shadow built, and nothing else - no
+   contacts, no lean, no suspension.
+
+   SO THE BLOCKER FOR far_lod, THE GLANCE AND THE FAR BANDS IS THE AI
+   TICK, not the path merge. The merge was worth doing on its own -
+   one path, the shadow in its right place, and a shell that now does
+   what its name says - but it does not produce a simulated non-local
+   racer. [open - maybe_Racer_TickAI]
+
+38.  The ORIGIN gaps are closed - 99.3 per cent by slice
+
+   Four ranges of maybe_Racer_Draw were carried by no slice tag.  All
+   four were mis-tagging, not missing code: every one of them is a
+   function the port already has, tagged too narrowly.
+
+   +------------------------+-------+------------------------------+
+   | Range                  | Bytes | Resolution                   |
+   +========================+=======+==============================+
+   | 0045f290..0045f2d0     |    64 | the prologue - it belongs to |
+   |                        |       | racerdraw_racer, which is    |
+   |                        |       | tagged with the whole-       |
+   |                        |       | function form and so was     |
+   |                        |       | never counted                |
+   +------------------------+-------+------------------------------+
+   | 0045f5a0..0045f6b0     |   272 | racerdraw_build_matrices.    |
+   |                        |       | Its tag began after the roll |
+   |                        |       | chain that IS its first half |
+   +------------------------+-------+------------------------------+
+   | 0045fa30..0045fc00     |   464 | racerdraw_fork_solve's setup |
+   |                        |       | - slot inits, spring offsets |
+   |                        |       | and the pivot transform      |
+   +------------------------+-------+------------------------------+
+   | 00460da0..00460f00     |   352 | racerdraw_place_rider. Its   |
+   |                        |       | tag named the two stores as  |
+   |                        |       | points and left the branch   |
+   |                        |       | between them unattributed    |
+   +------------------------+-------+------------------------------+
+
+   Also corrected: racerdraw_arm_matrix ended at 0x004603f2 and
+   actually runs to 0x004604b0, and racerdraw_view_matrix starts at
+   0x004604b0 rather than 0x004604c0 because 0x004604ba builds the
+   matrix it consumes.
+
+   Slice coverage is now 10173 of 10246 bytes.  The 73 bytes left are
+   the prologue and a nine-byte call tail, both inside
+   racerdraw_racer's own body.
+
+   THE POINT IS NOT THE PERCENTAGE.  A wrong range hides real code:
+   the arm_matrix tag alone was concealing 206 bytes, and a reader
+   auditing coverage would have gone looking for a function that was
+   already there.  Re-measure after any retag.
+
+38.1.  One thing WAS missing, and it is menu-only
+
+   Each wheel is drawn through one of TWO helpers, chosen on
+   g_nRacerDrawFx at 0x004dc130 - maybe_Inst_DrawWithMatrix at
+   0x0048c6d0 when set, maybe_Inst_DrawWithMatrixNoFx at 0x0048c400
+   when clear.  The port implements only the first.
+
+   THAT IS CORRECT FOR A RACE.  The flag reads 1 in the running game
+   at page 0, and it is cleared only by MenuPage10_BikeSelect and
+   MenuPage24_Podium - the turntable and the podium draw a bike with
+   no shadow and no wheel effects.  The same flag gates the shadow
+   block at 0x0045f40f, which is why those two pages show none.
+
+   Both branches compute the same offset before their call, so the
+   two helpers differ in effects and not in placement.  That is why
+   the wheel positions verify against MOTO with only one of them
+   written.
+
+   STILL ABSENT ON THE Fx PATH: maybe_Mesh_SetPrimVariant(racer+0x360,
+   shade != 0x1f), called just before the draw.  With
+   racerdraw_shade_level stubbed to RD_SHADE_FULL the argument is
+   always 0, so it cannot matter until that stub is real.  [open -
+   with the shade flag]
+
+39.  VOID (see 47) - the 2 pi wrap is NOT harmless
+
+   This section argued the wrap could be ignored. Section 47
+   measured it as the whole of the rider residual. 39.1 stands.
+
+39.1.  What the residual actually is
+
+   The parts that still differ are the RIDER chain, and the wrap does
+   not line up with them:
+
+   +-------+-------------+-------------+---------------------------+
+   | part  | angle dmax  | matrix dmax | note                      |
+   +=======+=============+=============+===========================+
+   | 0, 1  |     0.00000 |     0.00000 | roots, exact              |
+   +-------+-------------+-------------+---------------------------+
+   | 2, 3  |     6.28319 |     0.00000 | wrap only, no error       |
+   +-------+-------------+-------------+---------------------------+
+   | 5, 10 |     0.00000 |     0.01349 | error WITHOUT a wrap      |
+   | 14    |     0.00000 |     0.05467 | the largest, and no wrap  |
+   +-------+-------------+-------------+---------------------------+
+   | 15    |     0.00000 |     0.00001 | front bodywork/fork       |
+   | 16    |     0.00000 |     0.00000 | rear wheel                |
+   +-------+-------------+-------------+---------------------------+
+
+   THE TWO SETS DO NOT OVERLAP.  Parts carrying a wrap can have zero
+   matrix error and parts with no wrap carry the largest, so the wrap
+   and the residual are unrelated and section 39 retires only the
+   first.
+
+   The bike is done: 15 and 16 are the parts the swingarm and rear-
+   wheel work targeted and they are exact.  What is left is the rider,
+   between 0.010 and 0.055, and it comes from racer_update_pose rather
+   than from maybe_Racer_Draw - a different function and not part of
+   this merge.  [open - the rider chain]
+
+40.  The shade flag is segment +0xe0, and it arrives late
+
+   racerdraw_shade_level was a stub because the per-segment shade flag
+   was not parsed.  It is now found and implemented.
+
+   maybe_Racer_ShadeLevel (0x00465d60) is two lines:
+
+       if (g_nTrkSegmentCount == 0) return 0x1f;
+       return (-(seg[racer->segmentStart].nShaded == 0) & 0xf) + 0x10;
+
+   so 0x10 on a shaded segment and 0x1f otherwise.  It indexes by
+   racer+0x31c1, segmentStart - the segment the race assigned, NOT a
+   per-frame current segment.  That is the original's choice and it is
+   transcribed rather than corrected.
+
+   THE FLAG IS NOT IN THE SEGMENT RECORD, which is why it stayed lost.
+   The 132-byte record has no room for it and the in-memory segment is
+   252.  It is written by a SECOND per-segment pass, the section
+   formats/trk.txt calls the link table: Trk_Load's loop at 0x0040df49
+   indexes g_pTrkSegments by the segment stride i*0xfc and stores three
+   u16 into +0xd8, +0xda, +0xde and then, for version > 3, four dwords
+   into +0xec, +0xe8, +0xe4, +0xe0.
+
+   THE FOUR DWORDS ARE READ IN DESCENDING OFFSET ORDER.  Reading them
+   in the order they appear in the struct swaps the shade flag with the
+   two surface ids.
+
+   OUR LOADER WAS PUTTING THEM IN A LINK ARRAY NOTHING READ.  src/trk.c
+   parsed the section into MR_TrkLink, which was allocated, filled and
+   freed with no consumer anywhere in the port - so the bytes were
+   consumed, the file stayed aligned, and the data went nowhere.  That
+   is why the omission never showed up as a parse failure.  The fields
+   now land on MR_TrkSegment and MR_TrkLink is gone.
+
+40.1.  Verified against the shipped tracks
+
+   Link count equals segment count in all ten, and +0xe0 is strictly
+   0 or 1 in every one - never any other value.  [verified] - read out
+   of the .trk files with tools/trk.py's reader.
+
+   +-------------+----------+--------+
+   | Track       | Segments | Shaded |
+   +=============+==========+========+
+   | ile01       |      788 |     32 |
+   | ile02       |      648 |    154 |
+   | Track03     |      622 |     20 |
+   | ile04       |      782 |    155 |
+   | ile05       |      668 |     40 |
+   | Track06     |      435 |     18 |
+   | ile08       |      919 |    263 |
+   | bercy       |      716 |      3 |
+   | ile10       |     1048 |      8 |
+   | ile11       |      848 |     15 |
+   +-------------+----------+--------+
+
+   bercy is an indoor stadium and has three shaded segments; ile08 has
+   263 of 919.  The spread is what a bridge-and-tunnel flag should look
+   like, which is the sanity check that this is the right field.
+
+40.2.  What it unblocks, and the one thing it does not
+
+   racerdraw_racer now takes the MR_Trk so it can reach the segment.
+   The bike-select page passes NULL and is correct to: the original
+   clears g_nRacerDrawFx on entry, so the shading pass never runs
+   there.
+
+   maybe_Mesh_SetPrimVariant(racer+0x360, shade != 0x1f) IS NOW LIVE
+   AND STILL MISSING.  It was inert while the shade level was pinned
+   at 0x1f, because its argument was always 0.  With a real shade
+   level, a shaded segment makes the original switch a prim variant
+   that we do not.  [open - maybe_Mesh_SetPrimVariant @ 0x004221d0]
+
+   racerdraw_shade_parts (0x00462a40) is also still a stub, so nothing
+   yet consumes the level per vertex.  The level is correct at its
+   source; what it feeds is not written.  [open]
+
+41.  Two shading mechanisms, and the tunnel is the other one
+
+   Section 40 ended by naming maybe_Racer_ShadeParts as what stood
+   between the shade flag and a visible tunnel.  THAT WAS WRONG, and
+   the correction matters because the two are unrelated.
+
+   +----------------------+------------------------------------------+
+   | The shade LEVEL      | maybe_Racer_ShadeLevel returns 0x10 or   |
+   |                      | 0x1f from the segment flag.  The         |
+   |                      | original keeps it in one frame slot      |
+   |                      | (+0x128) and PUSHES IT INTO EVERY        |
+   |                      | PART'S TRANSFORM at 0x0046147c.  This    |
+   |                      | is the tunnel darkening.                 |
+   +----------------------+------------------------------------------+
+   | maybe_Racer_ShadeParts| per-vertex lighting by NORMAL against a |
+   |                      | world light direction.  Never sees the   |
+   |                      | segment flag at all.                     |
+   +----------------------+------------------------------------------+
+
+   The port was passing RD_SHADE_FULL as that transform argument -
+   hardcoded, in the one place the original passes the level.  So the
+   flag was parsed correctly, the level was computed correctly, and
+   the value was then thrown away one call short of the renderer.
+
+   THE STUB'S SIGNATURE IS WHAT CAUSED THE CONFUSION.  It took a
+   shadeLevel argument the original does not have, which made it look
+   like the level's consumer.  A stub that invents a parameter asserts
+   a data flow, and this one asserted a wrong one.
+
+41.1.  maybe_Racer_ShadeParts, imported whole
+
+   482 bytes, 142 instructions, __ftol its only callee.  The
+   decompiler renders the whole body as one bare __ftol() because the
+   arithmetic is FPU-only, so it was read from the disassembly.
+
+   THE SIGNATURE IS 18 STACK DWORDS AND IT USES FOUR.  The caller at
+   0x004619e8 pushes one dword, the light direction, the camera 3x4 BY
+   VALUE (48 bytes copied onto the stack at 0x004619c5), the constant
+   1.0f, and the destination vertex array.  The body reads only
+   [ESP+0x30], [ESP+0x34], [ESP+0x38] and [ESP+0x70] - the light and
+   the destination.  THE MATRIX AND THE 1.0f ARE PASSED AND IGNORED.
+   The port takes the three that matter.
+
+   What it computes, per part, per vertex:
+
+       L      = normalise(light), only if |light| != 0.0
+       a,b,c  = M^T * L          the light in the part's local frame
+       d      = dot(normal, -(a,b,c))
+       v      = (int)(20.0 - d * 32/3)
+       if (v >= 0x20) v = 0x1f
+       vertex.shade = v << 13
+
+   o 20.0 is 0x004d0f98 and 32/3 is 0x004d109c.  The length is
+     compared against 0x004d0e54, which is 0.0f.
+   o THERE IS NO LOWER CLAMP.  Only the top is clamped; a negative
+     intensity is shifted left 13 as a negative int.  Transcribed as
+     it stands.
+   o MR_Vertex is already 0x1c with shade at +0x0c, so the store
+     needed no layout work.
+
+   ITS INPUT DOES NOT EXIST YET.  The normals come from
+   racer+0x2d60[slot], a per-LOD array allocated and computed by
+   FUN_00462580 (1187 bytes).  The port has no equivalent, so
+   racerdraw_slot_normals returns NULL and the function returns
+   without writing.  The function is whole and correct; what feeds it
+   is missing.  [open - FUN_00462580]
+
+41.2.  g_flLightDir is a constant, not data
+
+   0x0052c228 reads all zeroes in .data and -0.5, -1.0, 0.0 in the
+   running game, which looked like loaded content.  It is not:
+   FUN_00410120 writes the immediates 0xbf000000 and 0xbf800000 at
+   0x0041014e and 0x00410158, and EBX - zero at that point - to the
+   third.  So it is a compile-time constant and transcribing it is
+   reading the binary, not hardcoding what looks right.
+
+   It is passed UNNORMALISED; maybe_Racer_ShadeParts normalises its
+   own copy.  MenuPage10_BikeSelect and MenuPage24_Podium overwrite
+   it, so the turntable and the podium light from somewhere else.
+
+42.  The tunnel is verified, and what is left after it
+
+   ile01 confirmed visually - the bike goes light and dark past each
+   tunnel light - and numerically: a 41-segment window either side of
+   the bike reads IDENTICAL between MOTO and the port, and both derive
+   the same level from it.  The two games report different values only
+   because they sit at different segments.
+
+       segments 141..181
+         MOTO 00000110101010101010101010101010101010101
+         ours 00000110101010101010101010101010101010101
+
+   The tunnel begins around segment 147 and alternates from there,
+   which is the flicker rather than a steady darkening.
+
+42.1.  Status of the three gaps this left open
+
+   +--------------------------+--------------------------------------+
+   | racerdraw_shade_level    | DONE.  Not a stub; the tunnel is its |
+   |                          | proof.                               |
+   +--------------------------+--------------------------------------+
+   | racerdraw_shade_parts    | IMPORTED WHOLE, writes nothing.      |
+   |                          | Blocked on the per-slot normals from |
+   |                          | FUN_00462580, 1187 bytes, which the  |
+   |                          | port has no equivalent of.           |
+   +--------------------------+--------------------------------------+
+   | maybe_Mesh_SetPrimVariant| LIVE AND MISSING.  Was inert while   |
+   |                          | the level was pinned at 0x1f.        |
+   +--------------------------+--------------------------------------+
+   | the rider residual       | UNCHANGED, and not part of this.     |
+   +--------------------------+--------------------------------------+
+
+   THE OLD NOTE "both need a per-segment shade flag we do not parse"
+   IS NO LONGER TRUE OF EITHER.  shade_level needed the flag and has
+   it; shade_parts never needed it at all - it lights by normal and
+   never reads the segment.  The flag was only ever half the story.
+
+42.2.  maybe_Mesh_SetPrimVariant, read
+
+   121 bytes, and the whole of it is a kind swap:
+
+       for (i = 0; i < this->primCount; i++)     count at this+0x2c
+           k = *(short *)(*this + i * 0x40);     array at *this
+           shaded ? (0x10 -> 0x15, 0x26 -> 0x27)
+                  : (0x15 -> 0x10, 0x27 -> 0x26)
+
+   So 0x10/0x15 and 0x26/0x27 are lit/unlit variant PAIRS of the same
+   primitive and this toggles a whole mesh between them.  No vertices,
+   no colours, only the kind field.
+
+   ITS SIGNATURE IN THE DB WAS WRONG - (this, mesh, enable), three
+   parameters, where the call site at 0x00460ce6 pushes exactly one
+   dword.  Corrected to (this, shaded).  The argument is SETNZ on
+   (shadeLevel != 0x1f).
+
+   It is called on the Fx wheel path only, once per wheel, on the
+   object at racer+0x360, under g_nRacerDrawFx.  Implementing it needs
+   that object mapped to our MR_RacerDrawSet prims first.  [open]
+
+43.  maybe_Mesh_SetPrimVariant, done - and inert on measured data
+
+   Imported whole.  121 bytes, and the entire body is a kind swap over
+   a prim array:
+
+       shaded ? (0x10 -> 0x15, 0x26 -> 0x27)
+              : (0x15 -> 0x10, 0x27 -> 0x26)
+
+   for i < primCount, stride 0x40.  MR_Primitive is already 0x40 with
+   kind at +0x00, so the walk is the same one.
+
+   TWO CALL SITES, ONE PER WHEEL, AND THEY TAKE DIFFERENT MESHES.
+   Front is racer+0x1dc at 0x0045fcd6, rear is racer+0x360 at
+   0x00460ce6.  Both are assigned together at 0x0045f544 when
+   skeletonSlot <= 1, from two per-slot global arrays of stride 0x70:
+
+       racer+0x1dc = 0x0051ac58 + slot * 0x70      front
+       racer+0x360 = 0x0052c240 + slot * 0x70      rear
+
+   Both arguments are SETNZ on (shadeLevel != 0x1f), so the parameter
+   is simply "on a shaded segment".
+
+   THE MESHES ARE PER-SLOT GLOBALS, so this is SHARED state: every
+   racer in a LOD slot points at one prim array, and the last writer
+   before the draw wins.  That is the original's design, not an
+   oversight to correct.
+
+43.1.  It swaps nothing on the bike we can measure
+
+   Read live from both games, same bike, same track:
+
+   +-------------+-------+------------------+-------------+
+   | Mesh        | Prims | Kinds            | Swappable   |
+   +=============+=======+==================+=============+
+   | front wheel |    48 | 1 x36, 2 x12     | 0           |
+   | rear wheel  |    48 | 1 x36, 2 x12     | 0           |
+   | bike body   |   340 | 1                | 0           |
+   +-------------+-------+------------------+-------------+
+
+   MOTO and the port agree exactly, which is itself worth having - the
+   wheel prim arrays are the same size and carry the same kinds on
+   both sides.  But none of 0x10, 0x15, 0x26 or 0x27 appears, so the
+   loop runs and swaps zero primitives.
+
+   THE FUNCTION IS RIGHT AND THE EFFECT IS ABSENT.  Those are separate
+   facts and conflating them is how a correct import gets reverted by
+   somebody who sees no change.  The call sits where the original's
+   sits and will fire the first time a wheel mesh carries a blended
+   kind.  Which bike, track or texture setting produces one is not
+   established.  [open]
+
+   So the shade level remains the whole of the visible tunnel effect;
+   this is a second mechanism that is present in the code and dormant
+   in the data.
+
+44.  Racer_BuildVertexNormals - shade_parts has its input
+
+   FUN_00462580, now Racer_BuildVertexNormals, imported whole.  It
+   builds smooth per-vertex normals for one LOD slot, and Racer_Create
+   runs it twice - once per articulated slot, ONCE PER RACER.  It
+   depends only on the bind pose, which is why the port calls it at
+   race setup rather than next to racerdraw_bind_skeleton, which runs
+   every frame.
+
+   Accumulate a normalised face normal onto each of its three
+   vertices, count the contributions, then divide and renormalise.
+   Standard smooth-normal construction, with three things that are
+   not standard:
+
+   o THE CROSS PRODUCT IS REVERSED.  Read literally it is
+     cross(e2,e1), the negation of the usual order.
+     maybe_Racer_ShadeParts negates again before dotting, so the two
+     agree; flipping either alone inverts the lighting.
+
+   o 0x004d0ec8 IS A DOUBLE 1.0, not a float.  Its bytes are
+     00 00 00 00 00 00 f0 3f, so reading four bytes there returns
+     zero and makes the whole function look like it zeroes its own
+     output.  That reading is wrong and it is an easy one to make.
+
+   o DIVISION BY THE COUNT IS UNGUARDED.  A vertex in no face has
+     count 0 and produces inf or nan, which the following length test
+     does not rescue.  OURS SKIPS THOSE VERTICES - a deliberate
+     divergence, because the alternative is nan reaching the
+     rasterizer through the shade.
+
+44.1.  What had to be wired first
+
+   The builder walks each part's face list at +0x698/+0x69c.  Those
+   are written by Skl_Load (0x0046327d, 0x004637e6), not by
+   Racer_Create - the skeleton loader partitions the mesh's faces per
+   member.
+
+   The port's skeleton had the vertex range per member but not the
+   face range, even though skl_load already appends faces in member
+   order, so the slice existed implicitly.  MR_SklMember now records
+   firstFace and faceCount as the loader goes.
+
+   THE FACES ARE NOT COPIED ONTO MR_RacerPart, and that is deliberate.
+   part->faces is MR_Primitive * - the 0x40-stride render form with
+   u16 indices - while the skeleton's own faces are MESH_FACE, the
+   loader form with int indices.  They are different arrays, and
+   assigning one to the other would type-confuse
+   racerdraw_queue_parts, which reads part->faces.  The builder reads
+   the skeleton's slice directly instead.
+
+   So racerdraw_queue_parts is still unfed: it needs the
+   MR_Primitive-form per-part slice, which is a mapping from member to
+   a range of s_race_bikePrims rather than of mesh.faces.  [open]
+
+44.2.  Where this leaves the shading chain
+
+   +----------------------------+----------------------------------+
+   | segment +0xe0 flag         | parsed, verified against MOTO    |
+   | racerdraw_shade_level      | done - the visible tunnel        |
+   | part transform gets it     | done                             |
+   | maybe_Mesh_SetPrimVariant  | done, matches no kind in stock   |
+   |                            | data - see 43.1                  |
+   | Racer_BuildVertexNormals   | done                             |
+   | maybe_Racer_ShadeParts     | done, and now actually writes    |
+   +----------------------------+----------------------------------+
+
+   The per-vertex pass is no longer a no-op.  Whether it LOOKS right
+   is untested: the sign convention, the reversed cross product and
+   the 20.0 / 32-thirds mapping have all been read rather than
+   observed, and nothing has compared a vertex shade against MOTO.
+   That is the next measurement, not a claim.  [open]
+
+45.  The per-vertex pass must not run in a race
+
+   The darkening that appeared on the bike and rider after
+   Racer_BuildVertexNormals landed is OURS, not the original's.
+
+   maybe_Racer_Draw gates the whole maybe_Racer_ShadeParts call on
+   g_nShadeParts at 0x004ea4d0, testing it at 0x0046199a and jumping
+   past the call when it is zero.  READ LIVE MID-RACE ON ile01: ZERO.
+   A hook armed on the call site took no hits in three frames, which
+   is the same fact from the other direction.
+
+   Its only writers are MenuPage10_BikeSelect_Enter (0x0044e4f9) and
+   _Leave (0x0044ed11), and MenuPage10_BikeSelect_Tick reads it, so it
+   belongs to the bike-select page.  Enter writes it from the same
+   register it uses for g_nRacerDrawFx, so the two move together.
+
+   The port called shade_parts under racerdraw_shading_enabled(1) - a
+   hardcoded 1 where the original reads a flag.  Now mirrored as
+   g_rdShadeParts, defaulting OFF.
+
+   NOTHING WAS WRONG WITH THE PASS OR ITS INPUT.  The normals are
+   bit-identical to MOTO (0 of 48 vertices differ, worst 0.000000) and
+   the arithmetic was transcribed from the disassembly.  The defect
+   was running correct code in a place the original does not.
+
+   THE LESSON IS THE HARDCODED 1.  racerdraw_shading_enabled took the
+   flag as a parameter precisely so a real one could be passed, and
+   the call site passed a literal instead - which reads as "enabled"
+   rather than as "unresolved".  A stub gate that defaults to ON is
+   indistinguishable from a working one until something downstream
+   starts drawing.
+
+45.1.  So when does it run
+
+   Not established.  Enter writes the same register that clears
+   g_nRacerDrawFx, which would make it 0 on the turntable too, and
+   Leave writes a value not yet read.  Every state measured so far has
+   it at zero.  FUN_00462c30 is the remaining reader and has not been
+   looked at.  [open - what turns g_nShadeParts on]
+
+   Until that is answered the port keeps it off, which matches every
+   measurement taken.
+
+45.2.  The pose did not regress
+
+   Setting perSlotArrays[slot] to the member count - needed because
+   maybe_Racer_ShadeParts loops i < partCount[slot] and the port held
+   zero - also feeds racer_pose_slot_count and the pose write-back,
+   which had therefore been a no-op.  Re-running the pose A/B after
+   the change gives numbers identical to before, digit for digit,
+   parts 15 and 16 still at 0.00001 and 0.00000.
+
+46.  VOID (see 52) - the wheels DO spin
+
+   This section concluded they did not. Racer_SpinWheels exists
+   and section 52 has it. 46.1 stands.
+
+46.1.  Where the rotation that DOES exist is applied
+
+   Every joint angle becomes a matrix in one place: the pose loop at
+   0x00460f70, which is inside the audited range and is ours as
+   skl_part_local via racerdraw_part_walks.  It reads the three angles
+   at record +0x0c and runs each through the 14-bit table -
+   FMUL 0x004d0ed0, __ftol, then g_cosTable[i & 0x3fff] for cos and
+   [(i - 0x1000) & 0x3fff] for sin.
+
+   So a wheel is just a joint.  Had the original spun them, this loop
+   is where it would have shown up, and it is already transcribed.
+
+47.  The rider residual IS the 2 pi wrap, and section 39 was wrong
+
+   Section 39 concluded the wrap was free because parts 2 and 3 carry
+   it with a matrix dmax of 0.00000.  That generalised from two
+   samples and is false.
+
+   THE WRAP COSTS ONE TRIG INDEX, because the index cast truncates
+   TOWARD ZERO and the two representatives straddle the wrap:
+
+       MOTO  angle = -0.3344078   ->  (int)(-871.9956)  = -871
+                                      -871 & 0x3fff     = 15513
+       ours  angle = +5.9487777   ->  (int)(15512.0044) = 15512
+
+   One index apart, so cos comes out 0.94473 against 0.94460 and sin
+   0.32785 against 0.32821.  Parts 2 and 3 happened to truncate the
+   same way; nothing about them was general.
+
+47.1.  Everything else about the rider is already identical
+
+   Ruled out by measurement, in this order:
+
+   +--------------------------+---------------------------------+
+   | joint angles mod 2 pi    | identical to 6 decimals, all 17 |
+   | pivots                   | identical, all 17               |
+   | matRiderRoot             | identical                       |
+   | matBikeRoot              | identical                       |
+   | matOrientation           | identical                       |
+   | the part tree            | identical - every parent, next  |
+   |                          | and child pointer decoded and   |
+   |                          | compared on both sides          |
+   +--------------------------+---------------------------------+
+
+   So the inputs, the roots and the topology all agree.  Only the
+   angle REPRESENTATIVE differs, and only where the angle is negative.
+
+   +------+-------------+------------+
+   | part | MOTO        | ours       |
+   +======+=============+============+
+   | 2    | -0.19175    | +6.09144   |
+   | 4    | -0.33441    | +5.94878   |
+   | 6    | -1.46495    | +4.81823   |
+   | 8    | -0.11351    | +6.16967   |
+   | 9    | -0.71637    | +5.56682   |
+   | 5,10 | all positive| identical  |
+   | 14   | all positive| identical  |
+   +------+-------------+------------+
+
+   EVERY NEGATIVE ANGLE IS WRAPPED IN OURS AND NONE IN MOTO, and ours
+   is MOTO plus exactly 2 pi - so the lerp changed nothing and only
+   the wrap fired.
+
+47.2.  Where the wrap comes from, and what is left to find
+
+   anim_blend_angle_frames wraps into [0, 2pi] on its BLEND path only.
+   Both copy paths - t <= 0 and t >= 1 - return without wrapping, and
+   the t <= 0 path skips even the copy when out == a.
+
+   The original has the identical wrap; this was read off the
+   disassembly at 0x0045b4e0 rather than assumed.  So MOTO keeping a
+   negative angle means EVERY ONE of its fifteen blend call sites in
+   maybe_Racer_UpdatePose took a copy path in this state, while at
+   least one of ours blended.
+
+   Confirmed from the other end with a hardware watchpoint on part 4's
+   angle: the only writer is 0x0045e355, the write-back loop at the
+   end of maybe_Racer_UpdatePose, storing EAX = 0xbeab3780 - the
+   negative value - straight from its stack frame.
+
+   WHAT IS NOT YET KNOWN is which of our passes blends where MOTO
+   copies.  A pass with a == b still wraps, so it need not be one that
+   changes anything.  [open - instrument the t of each pass]
+
+   One divergence was found and fixed on the way: our blender computed
+   in DOUBLE where the original keeps the whole lerp in one FPU float
+   slot and compares against float 0.0 at 0x004d0e54.  Widening the
+   intermediate moves the sign test and so moves the wrap.
+
+   IT CUT THE RESIDUAL BY MORE THAN HALF - worst matrix dmax 0.05467
+   to 0.01926, part 13 0.04825 to 0.01911, part 8 0.03308 to 0.01670.
+   Parts 4, 5, 9, 10 and 12 did not move.  This was predicted NOT to
+   help; the prediction was wrong and the double was doing real damage
+   on the parts whose blends actually changed a value.
+
+47.3.  What the number means, and why it is invisible
+
+   matrix dmax is the largest difference in ANY of the 12 elements,
+   and it is dominated by the TRANSLATION, not the rotation.  Part 4
+   is the clean example:
+
+       rotation   MOTO 0.94473 / -0.32785   ours 0.94460 / -0.32821
+       translation MOTO (0.000, 12.547, 1.396)
+                   ours (0.000, 12.561, 1.395)
+
+   The rotation elements differ by 0.0004, which is exactly one trig
+   index - 2 pi / 16384 = 0.000383 rad.  The translation differs by
+   0.014, fifty times more, because the pivot arm is long: part 4's
+   pivot is (0.278, 10.413, -36.514), about 38 units, and
+   0.0004 x 38 = 0.015.
+
+   SO THE WHOLE RESIDUAL IS ONE TRIG INDEX ACTING ON A 38-UNIT ARM.
+   0.015 units on a bike roughly 100 units across is under two
+   hundredths of a per cent.  IT IS NOT VISIBLE AND IT IS NOT MEANT TO
+   BE LOOKED FOR - this is a numeric check, not a visual one.  Any
+   visible rider difference is a different bug and should be chased
+   separately rather than attributed here.
+
+48.  Found: race_ang_cos called libm where the original reads the table
+
+   The pass that blends where MOTO copies is the PITCH, and the reason
+   is four levels upstream of the pose.
+
+   Traced by hooking our own anim_blend_angle_frames.  Exactly two
+   call sites run per frame at rest:
+
+       racer_update_pose+0x5FA   t = 0                  copies
+       racer_update_pose+0x718   t = 1.46958e-15        BLENDS
+
+   The second is the pitch.  Hooking racer_pose_pitch gave its inputs:
+
+       front[1] = +1.54305e-14      rear[1] = -1.54305e-14
+
+   so the ground contacts are equal and opposite instead of zero, and
+   poseBlend converges to 1.47e-15 rather than decaying to it.  Those
+   come from racer_wheel_ground, which is m[6+i] * along + m[9+i] +
+   position[i]; with along = +-84 that needs m[7] = 1.8369e-16.
+
+   IT DOES.  Read bit for bit:
+
+   +--------+---------------------+----------------------+
+   | slot   | MOTO                | ours                 |
+   +========+=====================+======================+
+   | m[1]   | 0        00000000   | -1.83697e-16 a553c9ca|
+   | m[2]   | -0       80000000   | +1.83697e-16 2553c9ca|
+   | m[3]   | 0        00000000   | +1.83697e-16 2553c9ca|
+   | m[5]   | 0        00000000   | -1.83697e-16 a553c9ca|
+   | m[6]   | 0        00000000   | -1.83697e-16 a553c9ca|
+   | m[7]   | -0       80000000   | +1.83697e-16 2553c9ca|
+   +--------+---------------------+----------------------+
+
+   matBikeRoot is exact on both sides; only matOrientation carries it.
+
+   1.83697e-16 IS cos(3pi/2) IN DOUBLE.  race_ang_cos was
+
+       return (float)cos((double)(a & 0x3fff) * RACE_RAD_PER_ANG);
+
+   with the comment immediately below it stating that the original
+   rebuilds the 3x3 from g_cosTable[i & 0x3fff].  The code and the
+   note describing it disagreed, and the note was right.
+
+   THE TABLE IS BIT-IDENTICAL BETWEEN THE TWO GAMES - checked at all
+   four quadrant entries, including g_cosTable[0x3000] =
+   -1.190342746e-12 - so switching to it is exact, not merely closer.
+
+48.1.  The chain, because it is worth seeing whole
+
+       race_ang_cos uses libm            cos(3pi/2) = -1.83697e-16
+         -> matOrientation off-diagonals +-1.83697e-16, not 0
+         -> wheel ground contacts        +-1.54305e-14, not 0
+         -> pitch weight                 1.46958e-15, not 0
+         -> the pitch pose pass BLENDS   where the original COPIES
+         -> anim_blend_angle_frames wraps every negative angle by 2pi
+         -> the trig index truncates one step differently
+         -> every rider joint is one index out
+
+   A 1e-16 error in a cosine became a visible-in-the-numbers pose
+   difference eleven orders of magnitude larger, because a boolean -
+   blend or copy - sat in the middle of it.  THAT is why the residual
+   did not shrink when the inputs looked identical to six decimals:
+   the comparison that mattered was against exact zero.
+
+   THIS IS THE THIRD libm-FOR-TABLE DEFECT, after racer_compose_yaw
+   and racerdraw_arm_matrix.  Any remaining cos/sin call on a path
+   that feeds a matrix should be treated as suspect until checked.
+
+49.  The table fix was real but was NOT the cause
+
+   Section 48 predicted that using g_cosTable in race_ang_cos would
+   close the rider residual.  IT DID NOT.  The pose comparison after
+   the change is identical digit for digit - worst matrix dmax still
+   0.01926, angle deltas still 6.28319.
+
+   The change did take effect and is worth keeping: matOrientation's
+   off-diagonals went from 2553c9ca (cos(3pi/2) in double,
+   1.83697e-16) to 2ba7869e (the table's -1.190342746e-12).  It is now
+   doing what the original's comment describes.  BUT NEITHER VALUE IS
+   ZERO, and MOTO's are exact zero, so the residue survived at a
+   different magnitude.
+
+   TWO PREDICTIONS IN A ROW WERE WRONG HERE.  The first said the 2 pi
+   wrap was harmless; the second said the table fix would close it.
+   Both were reasoned from a mechanism that was real but not the
+   binding constraint.  The lesson is the same one twice: verify the
+   OUTPUT against MOTO, not the mechanism against a story.
+
+49.1.  VOID (see 50) - the rebuild IS the original's
+
+   The reading was right and the conclusion drawn from it was
+   not; 50 and 50.1 have what was actually wrong.
+
+50.  Found: the quantise ran after the ground fit instead of before
+
+   A hardware watchpoint on MOTO's matOrientation[6] settles it.
+   Three writes per frame, in this order:
+
+   +-----------+------------------------------+---------------+
+   | eip       | what                         | value written |
+   +===========+==============================+===============+
+   | 0045cb58  | the Matrix34_Multiply copy   | -1.19e-12     |
+   | 0045cca6  | the quantise rebuild store   | -1.19e-12     |
+   | 00469738  | inside UpdateGroundContact,  | 0.0           |
+   |           | the terrain re-fit           |               |
+   +-----------+------------------------------+---------------+
+
+   SO MOTO PRODUCES THE SAME RESIDUE WE DO AND THEN THROWS IT AWAY.
+   The rebuild is not a cleaner formula; it is the same formula, and
+   the exact zeros come from the ground fit that runs after it.
+
+   The port called race_orient_quantise at the END of the tick, after
+   racer_update_ground_contact, so the rebuild had the last word and
+   the residue survived.  The original quantises inside
+   maybe_Racer_ApplySteering (0x0046664a), BEFORE the ground fit.
+   Moved to match.
+
+   THIS IS THE SAME MISTAKE THE COMMENT AT THAT SITE ALREADY WARNS
+   ABOUT, in a subtler form.  It says what used to be there "overwrote
+   matOrientation with the SEGMENT matrix ... so the terrain fit
+   racer_update_ground_contact had just built was thrown away every
+   single frame".  The segment matrix went; the overwrite stayed, now
+   carrying only 1e-12 instead of a whole wrong attitude, and that was
+   small enough to look like nothing.
+
+50.1.  The rebuild is verified, and 49.1 was wrong about it
+
+   Traced instruction by instruction through the x87 stack,
+   0x0045cc36 to 0x0045ccd2.  All nine elements match ours exactly:
+
+       m[0] = cB*cC              m[1] = sC*cA + sB*cC*sA
+       m[2] = sC*sA - sB*cC*cA   m[3] = -(sC*cB)
+       m[4] = cC*cA - sC*sB*sA   m[5] = cC*sA + sC*sB*cA
+       m[6] = sB                 m[7] = -(cB*sA)
+       m[8] = cB*cA
+
+   A is roll, B pitch, C yaw; the sines and cosines come from
+   g_cosTable at i & 0x3fff and (i - 0x1000) & 0x3fff, and the
+   translation row is zeroed at +0xe0 and +0xe4.
+
+   Section 49.1 claimed m[6] came from an FSUBP of two products.  IT
+   DOES NOT - it is a bare sB.  The FSUBP two instructions earlier
+   produces m[4], and an FXCH ST2 moves sB to the top before the
+   store; reading the store without following the exchange gives the
+   wrong operand.  x87 traces have to be followed through the
+   exchanges or not attempted.
+
+50.2.  Three wrong diagnoses, and what they have in common
+
+   +---+------------------------------+---------------------------+
+   | 1 | the 2 pi wrap is harmless    | true for the two parts    |
+   |   |                              | sampled, false in general |
+   +---+------------------------------+---------------------------+
+   | 2 | race_ang_cos's libm call is  | a real defect, fixed, and |
+   |   | the cause                    | not the cause             |
+   +---+------------------------------+---------------------------+
+   | 3 | our rebuild formula is wrong | it is identical           |
+   +---+------------------------------+---------------------------+
+
+   Each was a mechanism that existed, reasoned forward to a
+   conclusion, and stated before the output was checked.  The thing
+   that actually answered it was the watchpoint - asking WHO WROTE
+   THIS rather than what should have.  On a divergence this small,
+   go to the watchpoint first.
+
+51.  Closed - the rider residual is gone
+
+   After moving the quantise to the original's position:
+
+   +--------------+---------+---------+---------+
+   | measure      | before  | float   | after   |
+   |              |         | fix     | move    |
+   +==============+=========+=========+=========+
+   | worst matrix |  0.05467|  0.01926|  0.00001|
+   | angle dmax   |  6.28319|  6.28319|  0.00000|
+   | pivot dmax   |  0.00000|  0.00000|  0.00000|
+   +--------------+---------+---------+---------+
+
+   ALL SEVENTEEN PARTS now report angle 0.00000, pivot 0.00000 and
+   matrix at or below 0.00001, which is float noise.  Every 2 pi wrap
+   is gone, so every joint holds the same representative MOTO does and
+   the trig index is the same one.
+
+   Confirmed at the source as well:
+
+       matOrientation   12/12 slots bit-identical
+       poseBlend        00000000 on both
+
+   The pitch weight is exactly zero, so the pitch pass copies rather
+   than blends, which is what the original does and what the whole
+   chain in 48.1 hung on.
+
+51.1.  What the whole thing turned out to be
+
+   One line in the wrong place.  race_orient_quantise ran after
+   racer_update_ground_contact instead of before it, so a rebuild
+   carrying the angle table's -1.19e-12 at the quarter turns
+   overwrote a terrain fit that was exactly zero.
+
+   Nothing else was wrong.  The rebuild formula was right, the trig
+   table was right, the blender was right, the pose passes were right,
+   the normals were right, the tree was right.  A 1e-12 in one matrix
+   slot became a 2 pi wrap on every rider joint because a boolean -
+   blend or copy - sat between them.
+
+   TWO REAL DEFECTS WERE FIXED ON THE WAY and neither was the cause:
+   race_ang_cos called libm where the original reads the table (48),
+   and anim_blend_angle_frames computed in double where the original
+   keeps floats (47.2).  Both are worth keeping; the second more than
+   halved the residual before the actual fix removed it.
+
+52.  The wheels DO spin - Racer_SpinWheels, and 46 was wrong
+
+   Section 46 concluded there was no wheel rotation to implement.  It
+   is visibly wrong in retail, and the reason the probes missed it is
+   worth stating: they looked for spin STATE in the wheel instances
+   and for a cycling PART matrix, and the spin is neither.  It is a
+   plain accumulating angle in the racer that only the draw consumes.
+
+   Found by hooking maybe_Inst_DrawWithMatrix at 0x0048c70e and
+   capturing the matrix it is handed (EBX) with EBP naming the
+   instance.  Both wheels get a PURE X-AXIS ROTATION that changes
+   every frame:
+
+   +------+--------+-------------------+-----------+
+   | hit  | wheel  | m[4] / m[5]       | angle rad |
+   +======+========+===================+===========+
+   | 1    | front  | 0.97329 / -0.22957|   0.2318  |
+   | 3    | front  | 0.99685 / -0.07930|   0.0794  |
+   | 2    | rear   | 0.68926 / -0.72451|   0.8112  |
+   | 4    | rear   | 0.78145 / -0.62396|   0.6743  |
+   +------+--------+-------------------+-----------+
+
+   The angles are EXACT TABLE INDICES - -181.0 and 1404.0 - which is
+   what said the matrix is built from g_cosTable and the angle is
+   stored, not computed from a matrix.
+
+52.1.  The state, and the function that advances it
+
+   racer+0x2e3d and racer+0x2e49, the two euler triples the frame doc
+   already called "unnamed next to forkDive".  Only X is ever set, and
+   both accumulate with distance - measured creeping on MOTO:
+
+       speed    rear (+0x2e3d)   front (+0x2e49)
+        8.52          7.89087          8.70716
+       10.19          8.70443          9.60489
+       12.02          9.66738         10.66745
+       13.98         10.79187         11.90827
+       15.94         12.07923         13.32880
+
+   The front runs faster because its radius is smaller.
+
+   A watchpoint on +0x2e3d names the single writer: 0x00466a42, in
+   FUN_00466940, now Racer_SpinWheels.  It is called once per racer
+   per tick from all three tick variants and is short enough to quote:
+
+       if (humanPlayer ? (inputWord & 2) : (tickInputWord & 2)) return;
+       axis   = matOrientation row3 + row2
+       rear  += dot(rearContact  - rearContactPrev,  axis)
+                / (rayonAr * g_frameDelta * 96)
+       front += dot(frontContact - frontContactPrev, axis)
+                / (rayonAv * g_frameDelta * 96)
+
+   o 96.0 is 0x004d102c.
+   o BRAKING LOCKS THE WHEELS.  Bit 1 returns early, so a braking bike
+     slides with its wheels stopped.
+   o THE AXIS IS ROW3 PLUS ROW2, which is not obviously a direction.
+     Transcribed as it stands.
+   o It never wraps.  The angle grows without bound and only ever
+     reaches mat34_from_euler, which masks the index.
+
+52.2.  Everything downstream was already built
+
+   racerdraw_build_matrices has read rearWheelSpin and
+   frontWheelSpin since it was written - racerdraw.c calls
+   mat34_from_euler on both, the rear
+   chain at one and the front at the other.  MR_Racer has carried the
+   fields all along.  The ONLY missing piece was the accumulator, so
+   the wheels were being drawn with a spin of exactly zero every
+   frame.
+
+   THAT IS WHY "ALL THE MATRICES MATCH" WAS TRUE AND USELESS.  The
+   pose A/B compares pose[] parts; the wheels are drawn as INSTANCES
+   with a matrix built outside that array, so a comparison that reads
+   zero on both sides passes while both are wrong in the same way -
+   ours because nothing writes the angle, MOTO's only when the bike
+   happens to be stopped.  A comparison taken at rest cannot see a
+   term that is zero at rest.
+
+53.  The spin belongs to the wheel MESH only
+
+   With Racer_SpinWheels landed the wheels turned, and so did the
+   swingarm, the rear frame and the fork pivot - both wheels orbiting
+   a point that was not their axle.
+
+   THE SPIN WAS IN A MATRIX FOUR THINGS SHARE.  Our rearMat was
+   FromEuler(rearWheelSpin) x roll x root and fed all of:
+
+       racerdraw_rear_frame  -> rearFrameW, the world rear frame
+       racerdraw_arm_angle   -> the swingarm angle
+       racerdraw_rear_frame  -> rearFrameC -> armC -> viewPart3
+       the rear wheel draw
+
+   Only the last of those wants it.  MOTO keeps the two apart:
+
+       +0x298   roll x root                    the general rear matrix
+       +0x268   FromEuler(rearWheelSpin) x +0x298     the wheel's attitude
+       +0x334   a copy of +0x268, and the ONLY thing that reaches
+                maybe_Inst_DrawWithMatrix
+
+   The front is the same shape: the bars on the body place the fork
+   and build the front frame, and frontWheelSpin goes on top for the mesh
+   alone.  Ours folded it into frontMat, which
+   racerdraw_fork_solve transforms the pivot through - so the fork
+   pivot orbited and carried the wheel with it.
+
+   Fixed by giving build_matrices a fifth output.  rollOut and
+   frontOut are spin-free and feed the frames, the pivot, the arm and
+   the swingarm; rearOut and frontWheelOut carry the spin and go only
+   to the two wheel draws.
+
+53.1.  Why the verification passed anyway
+
+   "+0x298 == rearMat" was checked and held.  It held because rearWheelSpin
+   was ALWAYS ZERO, which makes +0x298 and +0x268 the same matrix.
+   The test could not distinguish them and neither could any run
+   taken at rest.
+
+   THIS IS THE SECOND TIME THE SAME BLIND SPOT HAS BITTEN in two
+   sections - 52.2 says it about the wheel matrix itself.  A term that
+   is zero in the state you measure is a term you have not measured,
+   and the pose A/B deliberately settles the bike to a standstill
+   before comparing, so it is structurally blind to every motion-only
+   term.
+
+   WHAT CAUGHT IT: tools/mr_wheel_ab.py, written for this and now in
+   the harness.  It does not try to DRIVE both sides to the same
+   spin - the timebase makes that diverge - it WRITES the same angle
+   into racer+0x2e3d and +0x2e49 on both, then diffs the matrix each
+   wheel is actually drawn with.
+
+   VERIFIED with the spin forced to 0.7 rad rear and 1.3 front:
+
+       wheel   MOTO angle   ours angle   rotation dmax
+       rear      -0.69988     -0.69988        0.000000
+
+   and rearFrameW sits at identity to 0.000000, which is the
+   regression guard: the moment the spin leaks back into the frame
+   the swingarm is built from, that number moves.
+
+54.  The wheels are verified on all four counts
+
+   tools/mr_wheel_ab.py, run against the fixed build:
+
+   +----------------+--------------------------------------+--------+
+   | check          | result                               | verdict|
+   +================+======================================+========+
+   | draw matrix    | rear and front rotation dmax         | exact  |
+   |                | 0.000000 with the spin forced to     |        |
+   |                | 0.7 and 1.3 rad                      |        |
+   +----------------+--------------------------------------+--------+
+   | rate           | rear 0.00986427 against 0.00986059   | 0.04%  |
+   |                | rad per unit, front 0.01088471       |        |
+   |                | against 0.01088065                   |        |
+   +----------------+--------------------------------------+--------+
+   | brake gate     | 0.00000 advance on BOTH sides while  | exact  |
+   |                | the bike is still sliding to a stop  |        |
+   +----------------+--------------------------------------+--------+
+   | no leak        | rearFrameW at identity to 0.000000   | exact  |
+   |                | while both wheels are spun           |        |
+   +----------------+--------------------------------------+--------+
+
+   The rate residual is measurement, not formula: distance is a CHORD
+   between two positions while the spin integrates the per-frame path.
+   The ratio between the two wheels is identical on both sides to five
+   figures - 1.1034 - which is the radii agreeing exactly.
+
+   The pose comparison at rest is unchanged at 0.00001, so none of
+   this regressed the rider.
+
+55.  The front wheel translated when steering - the steer was applied
+     twice
+
+   Reported visually: steering left swung the front wheel out beside
+   the fork instead of turning it in place.
+
+   MEASURED with the steering FORCED equal on both sides, fork dive
+   and suspension zeroed, so only the placement maths differs:
+
+   +----------+------------------------+------------------------+------+
+   | steering | MOTO offset            | ours offset            | dmax |
+   +==========+========================+========================+======+
+   |      0.0 |  3.044  30.576  -2.577 |  3.044  30.576  -2.577 | 0.00 |
+   |   -600.0 | -12.978 30.576  -5.439 | -27.589 28.692  -7.938 |14.61 |
+   |    600.0 |  19.192 30.576  -6.283 |  33.820 28.815  -8.608 |14.63 |
+   +----------+------------------------+------------------------+------+
+
+   Two things in that table name the bug between them:
+
+   o EXACT AT ZERO STEER, so the chain is right and only the steering
+     term is wrong.
+   o THE X SWING IS 1.91x TOO BIG - MOTO moves 16.15, ours 30.78 -
+     which is the signature of ONE ROTATION APPLIED TWICE.
+   o MOTO'S Y NEVER MOVES.  30.576 at every angle, because the steer
+     is a rotation about the bike's own Y axis.  Ours drifts, which
+     can only happen if something angle-dependent scales the fork
+     axis.
+
+55.1.  Where the second rotation came from
+
+   maybe_Racer_Draw builds the fork frame at 0x0045fb0f from body
+   +0x298 - roll x root, NO STEER - and transforms the fork pivot
+   through it at 0x0045fb49.  So in the original the pivot stays put
+   when the bars turn and only the fork AXIS rotates, through the
+   steer matrix built separately at 0x0045fb6d.
+
+   The port passed frontFrame, built from frontMat, and frontMat is
+   steer x body.  So the pivot turned as well as the axis: two
+   rotations, hence 1.91x.  The Y drift follows from the same cause -
+   a pivot that swings changes reach, and reach scales an axis that
+   points down the fork.
+
+   Fixed by building the fork frame from rollMat.
+
+   ONE THING THIS RULED OUT ALONG THE WAY: MOTO reads the fork tip's
+   part index from a per-slot table at racer+0x2d74 rather than
+   hardcoding it - EDI = [ptr+8] at 0x0045fb5b.  Read live it is 15,
+   which is what the port hardcodes, so it is not a divergence.  The
+   table itself is worth knowing: it reads 0, 1, 15, 2, 16, 3, 4, 5.
+   [open - what that ordering is]
+
+55.2.  The first measurement of this was worthless
+
+   Driving both sides with the same keys and comparing gave errors up
+   to 18 units that were almost entirely STATE DIVERGENCE - different
+   speed, different steering angle - not placement error.  Forcing
+   the steering angle equal is what made the table above mean
+   anything.
+
+   That is the third time this session a comparison had to be made
+   state-matched before it said anything true.  tools/mr_steer_ab.py
+   now does it properly.
+
+56.  The fork fix is confirmed, with a small asymmetric residual left
+
+   tools/mr_steer_ab.py against the fixed build:
+
+   +----------+------------------------+------------------------+------+
+   | steering | MOTO offset            | ours offset            | dmax |
+   +==========+========================+========================+======+
+   |      0.0 |  3.044  30.576  -2.577 |  3.044  30.576  -2.577 | 0.00 |
+   |   -300.0 | -3.551  30.575  -2.648 | -3.535  30.576  -2.646 | 0.02 |
+   |   -600.0 |-12.978  30.576  -5.439 |-13.011  30.576  -5.323 | 0.12 |
+   |    300.0 |  9.925  30.576  -2.705 |  9.775  30.576  -3.152 | 0.45 |
+   |    600.0 | 19.192  30.576  -6.283 | 18.927  30.575  -6.964 | 0.68 |
+   +----------+------------------------+------------------------+------+
+
+   Against 14.61 and 14.63 before the fix, and Y IS NOW PINNED at
+   30.576 on both sides at every angle - which was the specific
+   signature of the pivot turning, and it is gone.
+
+   WHAT IS LEFT is 0.68 at full right lock out of a 16-unit swing,
+   about 4 per cent, and it is ASYMMETRIC: left is five times better
+   than right.  Mostly in Z.  A direction-dependent error points at a
+   sign somewhere - RD_STEER_FORK is the negation of RD_STEER_WHEEL
+   and the two are used in different places.  [open]
+
+56.1.  Two false leads, both killed by measurement
+
+   o "OUR STEERING DECAY IS HALF MOTO'S" - 99 per frame against 198,
+     which looked like a clean physics divergence.  IT IS THE HARNESS.
+     MOTO runs a MINIMUM OF TWO frames for a one-frame request, so it
+     ticked twice while the port ticked once.  Asking for two or more
+     gives exact accounting on both.  The per-tick rate is 99 on both
+     sides and there is no divergence.
+
+     This also means the hook fires on MOTO's FIRST draw, after one
+     tick, so both sides draw at the same angle and the comparison in
+     56 is valid.  The steer column in the tool's output is read AFTER
+     the run and is not the drawn angle; it is labelled as such now.
+
+   o "OUR MR_BikeCarac IS PERMUTED" - 32 of 40 fields differed against
+     g_bikeCarac at 0x00509278.  MEANINGLESS: MR_BikeCarac is OUR
+     layout, filled by our own .bpt parser, and is not required to
+     match the original's field order.  Diffing two different structs
+     byte for byte compares nothing.  Check a NAMED field or nothing.
+
+   PRE-COMPENSATING THE DECAY, tried in the tool, made it worse - the
+   decay is a constant subtraction, not a ratio, so scaling the input
+   moved both sides further apart.  Reverted.
+
+57.  The asymmetry was the tool, and the rest is inherited
+
+   Section 56 left "0.68 at full right lock, five times worse than
+   left" and guessed at a sign error.  IT WAS THE TOOL.
+
+   mr_steer_ab ticked both games once per row and never re-placed
+   them, so the bike and its wheel contacts drifted as the sweep ran.
+   The rows measured later read worse, and the original angle order -
+   0, -300, -600, +300, +600 - put both right-hand rows last.  That is
+   the whole of the "asymmetry".
+
+   Caught by sweeping a finer range: the row at steering ZERO, which
+   had been exactly 0.0000 when it ran first, reported 0.2319 when it
+   ran fifth.  A row that is exact in one order and not in another is
+   measuring the harness.
+
+   With the state re-established before every row:
+
+   +----------+--------+
+   | steering |  dmax  |
+   +==========+========+
+   |   -600   | 0.0147 |
+   |   -300   | 0.1254 |
+   |      0   | 0.0281 |
+   |   +300   | 0.0161 |
+   |   +600   | 0.1702 |
+   +----------+--------+
+
+   Max 0.17 and no left/right bias at all.
+
+57.1.  VOID (see 58) - the contact is not the cause
+
+   Section 58 found no contact settling difference at all, so
+   this line of enquiry had nothing in it.
+
+58.  There is no contact settling difference, and no residual worth
+     the name
+
+   Placed identically and settled, the wheel contacts are EXACTLY
+   EQUAL - not close, equal:
+
+       after 10, 20, 40 and 80 frames
+       frontWheelContact  MOTO -128.000 0.000 2142.000  ours identical
+       rearWheelContact   MOTO -128.000 0.000 1974.000  ours identical
+       dmax 0.0000 at every sample
+
+   So 57.1 was wrong.  The contact dmax of 0.77 to 3.09 it reported
+   was read AFTER the measured frame, by which point MOTO had ticked
+   twice and the port once - the same two-frame floor that produced
+   the phantom steering-decay divergence in 56.1.  At the moment of
+   the draw the contacts agree.
+
+58.1.  The real number, from clean isolated runs
+
+   One angle per invocation, each from a freshly placed and settled
+   bike:
+
+   +----------+--------+
+   | steering |  dmax  |
+   +==========+========+
+   |   -600   | 0.0147 |
+   |   -300   | 0.0165 |
+   |      0   | 0.0000 |
+   |   +300   | 0.0161 |
+   |   +600   | 0.0147 |
+   +----------+--------+
+
+   SYMMETRIC TO FOUR DECIMALS at the lock stops - -600 and +600 both
+   read 0.0147 - and exactly zero at centre, repeatably.  0.015 on a
+   16-unit swing is under a tenth of a per cent, which is one frame of
+   state and float rounding.
+
+   THE FORK PLACEMENT IS DONE.  Every claim of a residual in 56 and 57
+   was the measurement:
+
+   +---------------------------+------------------------------------+
+   | "0.68, five times worse   | cross-row drift; the sweep never   |
+   | on the right"             | re-placed the bike                 |
+   +---------------------------+------------------------------------+
+   | "inherited from the       | contacts read after the run, not   |
+   | contact"                  | at the draw; they are equal        |
+   +---------------------------+------------------------------------+
+   | "the contacts settle      | they do not differ at all          |
+   | differently"              |                                    |
+   +---------------------------+------------------------------------+
+
+   A MULTI-ANGLE SWEEP IS STILL NOT TRUSTWORTHY, even with a per-row
+   re-place: MOTO's two-frame floor means a row occasionally draws at
+   the forced angle rather than the decayed one and reads several
+   units out.  The tool now says to run one angle per invocation, and
+   how to spot a bad row - its two post-run steer values will not be
+   99 apart.
+
+59.  The shadow is TEXTURED, and ours was drawing an untextured quad
+
+   Reported visually: our shadow is a plain grey rectangle where
+   retail draws a bike silhouette.
+
+   THE TWO QUADS SAMPLE A TEXTURE.  Read out of the running game,
+   racer+0x2ea9+0x48, the two MR_Primitives differ from ours in every
+   field that matters:
+
+   +--------------+---------------------------+------------------+
+   | field        | MOTO                      | ours             |
+   +==============+===========================+==================+
+   | kind         | 0x2c                      | 0x2c             |
+   | bankIndex    | 1                         | 0                |
+   | flatColor    | 0xff000000                | 0x00000000       |
+   | uv[0..7]     | an atlas rectangle        | all zero         |
+   +--------------+---------------------------+------------------+
+
+   So the geometry was right all along - section 12 checked the six
+   vertices byte for byte and they still agree - and the shadow was
+   being drawn with no texture, no bank and a zero alpha byte.
+
+   THE PIXEL RECTANGLES, one row of an atlas split in two:
+
+       prim0   u 113 -> 58    v 2 -> 34     tail 114.0
+       prim1   u  56 ->  2    v 2 -> 34     tail  57.0
+
+   with the corners ordered (u0,v0) (u0,v1) (u1,v1) (u1,v0).
+
+59.1.  Two details that had to be measured, not assumed
+
+   o THE UV SCALE IS A FLOAT RECIPROCAL.  pixel * (1.0f/255.0f)
+     reproduces the original's bits at every corner; a correctly
+     rounded pixel/255.0 comes out ONE ULP HIGH at 56, 58 and 113 and
+     exact at 2 and 34.  Seven candidate formulas were tried against
+     the five observed bit patterns and only the reciprocal matches
+     all five.
+
+   o +0x3f IS THE ALPHA BYTE and ours was zero.  The prim constructor
+     at 0x00422de0 derives flatColor from colorIndex by the 5-6-5
+     expansion, which for colour 0 gives 0 - so the 0xff in the top
+     byte is set somewhere else and is not a consequence of the
+     colour.  A zero there is what a fully transparent primitive
+     looks like.
+
+   THE TAIL SLOT IS NOT A WRAP UV.  The constructor copies the first
+   (u,v) into slot 4 for ordinary faces; the shadow instead holds
+   114.0 and 57.0, each one past its own quad's u0.  114.0 appears as
+   the immediate 0x42e40000 at 0x0045bfce, so it is authored, not
+   derived.  [open - what reads it]
+
+59.2.  Verified - the shadow matches MOTO exactly
+
+   With both bikes placed together and settled:
+
+       shadow vertices    worst dmax 0.00000 across all six
+       primitives         BYTE-IDENTICAL on both quads
+
+   Every field agrees - kind, colourIndex, bankIndex, flags,
+   effectiveKind, flatColor and all ten uv slots including the two
+   tail values the constructor does not write.
+
+   So the shadow is now the original's, geometry and material both.
+   Whether the SILHOUETTE appears depends on bank 1 holding the same
+   page ours does, which is a texture-loading question and not a
+   property of these primitives.
+
+60.  The shadow's bank is bike-relative and was not rebased
+
+   With the primitives byte-identical to MOTO (59.2) the shadow still
+   drew as a rectangle.  The material was right; the PAGE it names was
+   not loaded.
+
+   MOTO's bank numbering and ours are different, and the shadow is the
+   one primitive that carries the original's index literally:
+
+   +----------------------------+----------+----------+
+   | file                       | MOTO     | ours     |
+   +============================+==========+==========+
+   | data\speed\bnk00_00.raw    | bank  0  | bank 28  |
+   | data\speed\bnk00_01.raw    | bank  1  | bank 29  |
+   | data\ile01\...\bnk00_02    | bank  2  | bank  9  |
+   +----------------------------+----------+----------+
+
+   MOTO runs the two bike pages first and the track from 2; the port
+   puts the track at 8 and the bike at RACE_BIKE_BANK.  So the shadow's
+   bankIndex of 1 means "the bike's second page" and resolves to 29
+   here, not 1.
+
+   BANK 1 IS EMPTY IN THE PORT - read live, s_banks[0] and s_banks[1]
+   are entirely zero - so prim_is_textured returned 0 and both quads
+   fell through to their flatColor.  That is 0xff000000: a solid black
+   rectangle, which is exactly what was on screen.
+
+   Fixed by rebasing the shadow prims with prim_rebase_banks and
+   RACE_BIKE_BANK, the same call the bike's own prims already get.
+
+60.1.  Why 59.2's "byte-identical" was true and not enough
+
+   The primitives ARE identical to MOTO's, field for field, and that
+   was verified honestly.  It just does not settle the question,
+   because a bankIndex is only meaningful against a bank TABLE, and
+   the two programs number their tables differently.  Copying the
+   original's index verbatim is correct for every field except this
+   one, where it is the one field that must NOT be copied verbatim.
+
+   The tell was available and was not read: prim.h already says a face
+   pointing at a bank nobody loaded "draws as its flatColor", and the
+   flatColor here is opaque black.  A black rectangle was the
+   documented symptom of exactly this.
+
+61.  The shadow textured, and the wheelie question answered
+
+   The silhouette draws correctly once the UVs are in TEXELS.  Two
+   fields had to diverge from the original's stored values, both for
+   the same reason:
+
+   +------------+---------------------------+------------------------+
+   | field      | MOTO holds                | ours must hold         |
+   +============+===========================+========================+
+   | bankIndex  | 1, its own bank numbering | 29, RACE_BIKE_BANK + 1 |
+   | uv[0..7]   | normalised, pixel/255     | PIXELS, 0..255         |
+   +------------+---------------------------+------------------------+
+
+   Both were verified byte-identical to MOTO first and both were
+   wrong.  A field whose meaning depends on the engine around it -
+   a table index, a coordinate convention - cannot be checked by
+   comparing it to the original's value.  The bike's own prims were
+   the available evidence for the UV convention all along: they carry
+   225, 233, 249 and they render.
+
+   THE SYMPTOMS WERE DIAGNOSTIC ONCE PAIRED.  bankIndex 1 pointed at
+   an unloaded bank, so prim_is_textured returned 0 and the quad drew
+   its flatColor - an opaque black rectangle.  Fixing that alone made
+   it INVISIBLE, because the normalised UVs then sampled texel (0,0),
+   which is the colour key.  Rectangle and invisible were two
+   different bugs and the second was hidden behind the first.
+
+61.1.  VOID (see 62) - MOTO's shadow does NOT shorten
+
+   Measured the other way in 62: the shadow is built before the
+   lean, so it cannot shorten with it.
+
+62.  MOTO's shadow does NOT shorten - it is built before the lean
+
+   A real wheelie, driven with the STUNT BUTTON on both sides:
+
+   +----------+---------+--------+--------+
+   | side     | front.y | horiz  | shadow |
+   +==========+=========+========+========+
+   | MOTO     |  118.79 |  118.8 |  248.0 |
+   | ours     |  118.79 |  118.8 |  198.8 |
+   +----------+---------+--------+--------+
+
+   THE CONTACTS ARE IDENTICAL and the shadows are not.  So the
+   difference is not the geometry, which 61.1 checked and found the
+   same in both, but WHEN the shadow is built.
+
+   maybe_Racer_Tick calls, in order:
+
+       0045d79c  maybe_Racer_UpdateGroundContact
+       0045d7b4  Racer_SpinWheels
+       0045d7c2  maybe_Racer_BuildShadow
+       0045d7c9  maybe_Racer_UpdateLean
+
+   and a watchpoint on the front contact's y shows five writes a
+   frame, the LIFT coming from UpdateLean at 0x0046a11f, 0x0046a177
+   and 0x0046a4f8 - all after BuildShadow.  UpdateGroundContact puts
+   the contact back on the road at 0x00469b35 every frame, the shadow
+   is built from that, and only then does the lean raise it again.
+
+   SO THE ORIGINAL'S SHADOW NEVER SEES A RAISED FRONT WHEEL.  It is
+   not that the shortening is suppressed; the shadow is simply built
+   one step too early to know about it.
+
+   The port called racerdraw_build_shadow after racer_tick_dispatch -
+   after everything, lean included - and so handed it the swung
+   contact.  Moved to sit between racer_spin_wheels and the lean.
+
+62.1.  Two ways this was got wrong first
+
+   o READING THE CODE WAS NOT ENOUGH.  Both implementations read
+     frontWheelContact and rearWheelContact and project to the
+     ground; comparing the two functions says they must agree, and
+     they do not, because the ORDER around them differs.  A function
+     can be transcribed perfectly and still be wrong at the point it
+     is called.
+
+   o THE FIRST WHEELIE TEST NEVER WHEELIED.  Holding accelerate never
+     raises the nose, and forcing wheelieAngle moves neither game's
+     contacts - both sat at front.y 0.00 and a 248-unit shadow at
+     every forced angle, which reads exactly like agreement.  THE
+     STUNT BUTTON IS BIT 6 AND IS NOT PART OF THE INPUT WORD:
+     mrhook routes 0x40 to stuntHeld and stuntPressed directly, and
+     the port takes keys=c.  A test that cannot produce the state it
+     is testing will report that everything matches.
+
+63.  Why the shadow ordering was missed - the order was written down
+     and not followed
+
+   Verified after the move: our shadow holds 248.0 through a wheelie
+   with the front contact at y 118.79, against MOTO's 251.4 at the
+   same lift.  MOTO's few units of variation are terrain, since each
+   vertex is dropped onto the ground independently; ours is on flat
+   road.  The divergence is closed.
+
+   THE ORDER WAS ALREADY IN THE TREE.  racer.c carries s_tickOrder,
+   tagged "ORIGIN maybe_Racer_Tick @ 0x0045d580, its call list - DATA,
+   not code", and it lists in sequence:
+
+       maybe_Racer_BuildShadow       0x00461aa0
+       maybe_Racer_UpdateLean        0x00469c60
+
+   BuildShadow before UpdateLean, correctly recorded.  Nothing reads
+   that table.  racer_tick_order() has exactly one reference in the
+   whole tree - its own declaration in racer.h - so the sequence was
+   transcribed as documentation and the scaffolding in race.c then
+   called things in a different order with nothing to object.
+
+63.1.  Three reasons it survived, and only one is about the shadow
+
+   o IT WAS NEVER IN THE maybe_Racer_Draw AUDIT.  BuildShadow is
+     called from the TICK by all three tick variants and never from
+     the draw, so the whole audit that verified racerdraw.c function
+     by function could not have covered where it is called from.
+
+   o THE FUNCTION WAS VERIFIED, THE CALL SITE WAS NOT.
+     racerdraw_build_shadow is byte-exact - section 12 checked all six
+     vertices and they still agree.  A function can be transcribed
+     perfectly and be wrong at the point it is invoked, and nothing in
+     the harness looks at invocation order.
+
+   o maybe_Racer_Tick WAS NEVER IMPORTED WHOLE.  It exists here as
+     slices - racer.c carries five separate "at 0x0045d..." tags - plus
+     the s_tickOrder table.  CLAUDE.md 15 says a slice "silently drops
+     every branch nobody knew to look for"; what it dropped here was
+     not a branch but the ORDER, which is the one thing a call list is.
+
+   AND THE VERIFICATION COULD NOT HAVE CAUGHT IT.  The shadow was
+   compared at rest, where the front contact is flat and both orders
+   give the same six vertices.  That is the third time this session a
+   term that is zero in the measured state hid a real divergence - the
+   wheel spin and the fork steer were the others.
+
+63.2.  What this implies beyond the shadow
+
+   Sixteen other steps sit in s_tickOrder and none of them is checked
+   against what race.c actually does.  Any one of them could be in the
+   wrong place for the same reason, and the symptom would again only
+   appear in a state the comparison does not visit.
+
+   THE TABLE IS THE FIX THAT IS ALREADY HALF-WRITTEN.  It names the
+   function, the address and the guard for every step; comparing it
+   against the real call sequence is a mechanical check nobody has
+   run.  [open - audit race.c's tick against s_tickOrder]

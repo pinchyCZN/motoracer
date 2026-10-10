@@ -1,0 +1,606 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                               MR_VERTEX
+
+
+Abstract
+
+   Size: 0x1c = 28 bytes [verified] - the stride every setup function
+   uses to index the vertex array, verts + i * 0x1c.
+
+   Ghidra type applied: created, not force-applied to signatures. The
+   record is passed as a bare int in most decompiled prototypes and
+   retyping fifteen call sites was judged more churn than benefit.
+
+   The vertex record of the software rasterizer. Every field was
+   established from use rather than from a loader, and the last two only
+   fell when maybe_Screen3D_ClipEdgeNear was read - it is the one
+   function that writes all seven.
+
+Table of Contents
+
+   1. Fields
+   2. How each field was established
+   3. The projection
+   4. What is NOT in the record
+   5. Open questions
+   6. The shade word is packed
+      6.1. Bit 31 - the low 24 bits are a literal colour
+      6.2. Bit 30 - full bright
+      6.3. The intensity window, and why two readers disagree
+      6.4. The ramp itself, decoded
+      6.5. There are TWO colour routes, selected by texture presence
+         6.5.1. Three things that follow
+         6.5.2. The hardware path IS Gouraud shaded, and a correction
+         6.5.3. How the previous version of this section got it backwards
+   7. Where the array is built
+
+1.  Fields
+
+   +--------+------+-------+---------+------------+-------------------------------+
+   | Offset | Size | Type  | Name    | Confidence | Notes                         |
+   +========+======+=======+=========+============+===============================+
+   | +0x00  | 4    | float | camX    | verified   | camera space                  |
+   +--------+------+-------+---------+------------+-------------------------------+
+   | +0x04  | 4    | float | camY    | verified   | camera space                  |
+   +--------+------+-------+---------+------------+-------------------------------+
+   | +0x08  | 4    | float | camZ    | verified   | tested against the near plane |
+   +--------+------+-------+---------+------------+-------------------------------+
+   | +0x0c  | 4    | int   | shade   | verified   | PACKED - intensity plus two   |
+   |        |      |       |         |            | flag bits, see section 6      |
+   +--------+------+-------+---------+------------+-------------------------------+
+   | +0x10  | 4    | int   | screenX | verified   | projected                     |
+   +--------+------+-------+---------+------------+-------------------------------+
+   | +0x14  | 4    | int   | screenY | verified   | projected, Y flipped          |
+   +--------+------+-------+---------+------------+-------------------------------+
+   | +0x18  | 4    | float | invZ    | verified   | 1/z; UVs premultiplied by it  |
+   +--------+------+-------+---------+------------+-------------------------------+
+
+2.  How each field was established
+
+   +-----------+------------------------------------------------------------+
+   | Field     | Evidence                                                   |
+   +===========+============================================================+
+   | camZ      | compared against maybe_g_nearPlaneZ by all 5 setups        |
+   +-----------+------------------------------------------------------------+
+   | shade     | averaged by flat setups, passed per vertex by Gouraud ones |
+   +-----------+------------------------------------------------------------+
+   | screenX/Y | passed as the six coordinates every emitter sorts by Y     |
+   +-----------+------------------------------------------------------------+
+   | invZ      | UVs multiplied by it, and divided by it to recover true UV |
+   +-----------+------------------------------------------------------------+
+   | camX/camY | linearly interpolated to the near plane by ClipEdgeNear    |
+   +-----------+------------------------------------------------------------+
+
+   The shade identification took three attempts and is written up in
+   subsystems/rasterizer-pipeline.txt sections 18 and 22. It was twice
+   called a depth on the strength of being averaged into a per-primitive
+   value, and only settled when a Gouraud setup was seen forwarding it
+   per vertex and a Gouraud emitter seen interpolating it per scanline.
+
+   camX and camY were the last two. maybe_Screen3D_ClipEdgeNear computes
+   them as the linear interpolation of the two input vertices toward the
+   near plane, which both identifies them and confirms the guess
+   recorded in section 13.2 that +0x00, +0x04 and +0x08 form a float x,
+   y, z triple [verified].
+
+3.  The projection
+
+   maybe_Screen3D_ClipEdgeNear is the only place the whole record is
+   built from scratch, so it is also the clearest statement of how a
+   vertex is projected [verified]:
+
+       t       = (nearZ - a->camZ) / (b->camZ - a->camZ);
+       out->camX = a->camX + t * (b->camX - a->camX);
+       out->camY = a->camY + t * (b->camY - a->camY);
+       out->camZ = nearZ;
+       out->invZ = 1.0f / nearZ;
+       out->screenX = g_viewCentreX + (int)project(camX);
+       out->screenY = g_viewCentreY - (int)project(camY);
+
+   Two details worth keeping. The clipped vertex lands exactly on the
+   near plane, so camZ and invZ are both exact rather than interpolated.
+   And screen Y is viewCentreY MINUS the projected value, so camera Y
+   grows upward while screen Y grows downward.
+
+   The 1.0 numerator is maybe_g_minDenom, the same constant the emitters
+   use as a minimum triangle area. That is the compiler sharing one
+   float, not a connection between the two uses.
+
+4.  What is NOT in the record
+
+   o NO texture coordinates. UVs are per FACE, four u,v pairs at face
+     +0x04, +0x0c, +0x14 and +0x1c, which is why a quad carries four of
+     them and a triangle ignores the last. See rasterizer-pipeline.txt
+     section 19.2.
+
+   o NO colour. Flat primitives take a packed 555 colour from face
+     +0x02; Gouraud primitives interpolate the per-vertex shade at +0x0c
+     instead. Whether that shade is a scalar intensity or a packed
+     colour is not settled - see section 18.2.
+
+   o NO normal. Lighting is resolved before rasterization; the vertex
+     carries only its result.
+
+   So the record is purely post-transform: everything in it is the
+   output of the geometry stage, and the rasterizer never sees object
+   space.
+
+5.  Open questions
+
+   o CLOSED - it is BOTH, selected by a flag bit. See section 6. The
+     question had been posed as either/or three times; the answer is
+     that bit 31 switches the meaning of the low 24 bits.
+
+   o CLOSED - see section 7. The array is the pool at 0x006d20d8 and
+     the two functions that fill it are Screen3D_TransformVertsFlat
+     and Screen3D_TransformVertsShaded.
+
+   o Whether screenX and screenY are plain integers or fixed point.
+     CLOSED - plain integers [verified]. Screen3D_TriK9 multiplies the x
+     arguments by 0x2000 and uses the y arguments raw as subscripts into
+     g_scanlineOffset and g_spanScanlineHead, which a value carrying
+     fraction could not do. The scaling exists to give the edge DDA sub-
+     pixel precision the vertex does not carry. See
+     subsystems/rasterizer-pipeline.txt section 42.4.
+
+
+6.  The shade word is packed
+
+   +0x0c is not a plain intensity. D3D_WriteVertex (0x004af420) reads it
+   once and branches on two high bits, which settles a question this
+   note carried open through three attempts [verified]:
+
+       uVar3 = *(uint *)(vertex + 0x0c);
+       if (uVar3 & 0x80000000)                    /* section 6.1 */
+           diffuse  = uVar3 & 0xffffff;
+           specular = 0xffffffff;
+       else if (uVar3 & 0x40000000)               /* section 6.2 */
+           diffuse  = 0x00ffffff;                 /* or 0xffffffff */
+       else {                                     /* section 6.3 */
+           g = (uVar3 & 0x3fc00) >> 10;
+           if (DAT_0053bb38) g /= 2;
+           diffuse  = g << 16 | g << 8 | g;
+           specular = diffuse | 0xff000000;
+       }
+
+   Layout, high to low:
+
+   +---------+------------------------------------------------------+
+   | Bits    | Meaning                                              |
+   +=========+======================================================+
+   | 31      | the low 24 bits are a literal RGB colour             |
+   +---------+------------------------------------------------------+
+   | 30      | full bright - draw unshaded white                    |
+   +---------+------------------------------------------------------+
+   | 18..29  | not read by anything found                           |
+   +---------+------------------------------------------------------+
+   | 10..17  | the intensity, 8 bits                                |
+   +---------+------------------------------------------------------+
+   | 0..9    | low fraction, not read                               |
+   +---------+------------------------------------------------------+
+
+6.1.  Bit 31 - the low 24 bits are a literal colour
+
+   With bit 31 set the field stops being an intensity: the diffuse
+   colour is taken as shade & 0xffffff directly and the specular is
+   forced to opaque white. So a vertex can carry either a light level or
+   an explicit colour, and the flag says which.
+
+   That is the honest answer to section 5's old question. It was posed
+   as "intensity or packed colour"; it is intensity by default and a
+   packed colour when bit 31 says so.
+
+6.2.  Bit 30 - full bright
+
+   With bit 30 set the diffuse becomes 0x00ffffff, or 0xffffffff when
+   -Alpha (DAT_004dc1c0) or DAT_004dc1bc is on - white, with the alpha
+   byte chosen by the texture-format configuration. No shade lookup
+   happens at all.
+
+   D3D_DrawScene reads the same bit for a second purpose: it passes
+   (shade & 0x40000000) != 0 to D3D_SetDither as a suppression flag and
+   forwards it in the high byte of the first argument to
+   D3D_EmitTriangle and D3D_EmitLine. That is consistent - an unshaded
+   white vertex has no gradient to dither.
+
+   o This closes the open question in subsystems/d3d-render-state.txt
+     section 6, which recorded the 0x40000000 vertex bit as suppressing
+     dithering without knowing what it MEANT. It means full bright.
+
+   o Nothing in the image sets either flag with an OR. The only writer
+     found is a store of the whole word - FUN_00485e50 writes
+     0x40000000 exactly, which is bit 30 with an intensity of zero, an
+     unshaded vertex. So the flags are composed when the word is built,
+     not toggled afterwards.
+
+6.3.  The intensity window, and why two readers disagree
+
+   The two back ends read different windows of the same field, and both
+   end at bit 17 [verified]:
+
+   +------------------+-----------------+-------+----------------------+
+   | Reader           | Mask and shift  | Range | Use                  |
+   +==================+=================+=======+======================+
+   | D3D_WriteVertex  | & 0x3fc00 >> 10 | 0..255| grey diffuse, the    |
+   |                  |                 |       | same value in R, G, B|
+   +------------------+-----------------+-------+----------------------+
+   | D3D_DrawScene    | & 0x3e000 >> 5  | 0..31 | row index into the   |
+   |                  |                 | x 256 | 8 KB shade ramp at   |
+   |                  |                 |       | DAT_005d43b0         |
+   +------------------+-----------------+-------+----------------------+
+
+   Bits 13..17 are the top five of bits 10..17, so D3D_DrawScene simply
+   takes a coarser five-bit version of the same intensity. Read as the
+   19.13 fixed point this note already recorded, bits 13..17 are integer
+   bits 0..4 - the range 0 to 31 - and bits 10..12 are the top three
+   fractional bits. The two windows are the same number at two
+   precisions, not a contradiction.
+
+   o REPLICATION IS THE PROOF. D3D_WriteVertex expands the eight bits
+     into R, G and B with the identical value, and D3D_DrawScene uses
+     its five bits as ONE row selector applied to all three channel
+     bytes in turn. Neither is something a packed colour could survive.
+     That is what finally settles the intensity reading, and it is two
+     independent sightings rather than one.
+
+   o The 0..31 range is corroborated a third way.
+     Screen3D_DispatchPrimitive picks the Full or Half variant of kinds
+     1 and 2 on 0x3dfff < shade, and 0x3dfff is 31.0 minus one unit in
+     19.13. So subsystems/rasterizer-pipeline.txt section 27.2's "full
+     texel above 31.0, halved below" is literally this comparison.
+
+   DAT_0053bb38 halves the intensity when set. D3D_DrawScene sets it for
+   primitive kinds 0x15, 0x27 and 0x20 and clears it otherwise, so those
+   three kinds draw at half brightness - the hardware counterpart of the
+   Full and Half split above.
+
+6.4.  The ramp itself, decoded
+
+   The 8 KB table at 0x005d43b0 - now labelled g_d3dShadeRamp - is
+   EMPTY IN THE IMAGE and built at run time. Its only writer is a nine
+   instruction loop at the end of Cdd_ctor2 (0x00473950), reached from
+   Cd3d_Ctor, and the whole table is [verified]:
+
+       table[level][channel] = channel * level / 32
+
+   32 levels by 256 channel values. The loop does it by repeated
+   addition rather than multiplication - an accumulator advanced by the
+   level each column - which is why it took reading the assembly to see
+   what it was. A plain linear ramp with no gamma of any kind; in 1997
+   this bought a table lookup instead of a multiply and a shift per
+   channel per vertex.
+
+   o FULL BRIGHTNESS IS 247, NOT 255. The largest entry is
+     255 * 31 / 32 = 247, so a lit surface never quite reaches the
+     primitive's own flat colour - it tops out about 3 per cent short.
+     A port that scales by level/31 instead of level/32 will be
+     slightly brighter than the original everywhere.
+
+   D3D_DrawScene applies it at 0x004af8eb, computing the row offset in
+   one step rather than forming the level first:
+
+       row = (vertex->shade & 0x3e000) >> 5;      /* level * 256 */
+       r = table[row + ((flatColor >> 16) & 0xff)];
+       g = table[row + ((flatColor >>  8) & 0xff)];
+       b = table[row + ( flatColor        & 0xff)];
+       vertex->specular = rgb | 0xff000000;
+       vertex->color    = (flatColor & 0xff000000) | rgb;
+
+   Two things fall out of those last two lines:
+
+   o THE PRIMITIVE'S ALPHA BYTE SURVIVES into the diffuse. That is what
+     carries the 0x80 the half blend of d3d-render-state.txt section
+     3.1 depends on - if the shading returned an opaque colour the
+     blend would stop being 50 per cent.
+
+   o THE SPECULAR STORE IS INERT. The same RGB goes into the specular
+     with alpha forced to 0xff, and SPECULARENABLE is emitted from
+     DAT_0053bb34, which Cd3d_Ctor zeroes in a run of stores right
+     after XOR EAX,EAX. The only two references to that address in the
+     image are that write and the read in D3D_EmitRenderStates, so the
+     specular component is computed for every vertex and never used
+     [verified]. Worth knowing rather than merely skipping: a port that
+     wrote it faithfully on a device where specular IS enabled would
+     add the colour to itself and roughly double every lit surface.
+
+   NOT the same table as g_shadeLut (0x004f62f0), which is 32 x 32
+   dwords, belongs to the software rasterizer, and still has no writer -
+   subsystems/rasterizer-pipeline.txt section 31.2. The names are
+   similar and the tables are not.
+
+6.5.  There are TWO colour routes, and the selector is texture presence
+
+   D3D_WriteVertex (0x004af420) has exactly one caller, and it is
+   D3D_DrawScene. So that function carries both the inline shade-ramp
+   computation of section 6.4 AND a call to the routine of section 6,
+   which branches on bits 31 and 30 instead.
+
+   WHICH ROUTE SERVES WHICH PRIMITIVE IS NOW ESTABLISHED. It is one
+   boolean computed per primitive at the top of the body [verified]:
+
+       untextured = kind == 0x0c || kind == 5 || kind == 0
+                 || bankIndex > 0x2d
+                 || bank[bankIndex].pTexSlot[slot] == -1
+
+       UNTEXTURED  ->  the inline shade-ramp loop
+       TEXTURED    ->  D3D_WriteVertex
+
+   where slot is the queue node's texture slot, or 0 when that is -1.
+
+   The sense reads backwards for a moment and then makes sense. An
+   untextured face has no texel to take its colour from, so its flat
+   colour goes through the intensity ramp. A textured face wants a GREY
+   modulator, so that the MODULATE texture stage yields texel times
+   light - and a grey is exactly what section 6 builds. Two different
+   jobs, two routines.
+
+6.5.1.  Three things that follow
+
+   o THE HALF-BRIGHTNESS KINDS ARE TEXTURED-ROUTE ONLY. DAT_0053bb38 is
+     set for kinds 0x15, 0x27 and 0x20 and cleared otherwise, and
+     D3D_WriteVertex is its only reader. The ramp route never halves,
+     so an untextured face of one of those kinds draws at full
+     intensity.
+
+   o THE BIT-31 AND BIT-30 CASES ARE TEXTURED-ROUTE ONLY as well. The
+     ramp route reads bits 13..17 and nothing else, so a vertex
+     carrying a literal colour or the full-bright flag is shaded as an
+     intensity if its primitive happens to be untextured.
+
+   o THE STATE MASK'S BIT 0 IS A DIFFERENT TEST. D3D_DrawScene builds
+     that from the KIND alone - set for anything not 0, 5 or 0x0c -
+     without asking whether a texture is bound. So a primitive can
+     carry mask bit 0 and still take the untextured colour route, when
+     its bank has no slot. The two tests overlap and are not the same,
+     and subsystems/d3d-render-state.txt section 3's "textured" is the
+     mask one.
+
+6.5.2.  The hardware path IS Gouraud shaded, and a correction
+
+   D3D_WriteVertex takes the corner index as its third argument and
+   computes a colour only when that is 0, or when g_cfgGouraud
+   (DAT_004dc1d8) is 1. D3D_EmitRenderStates reads the same global for
+   SHADEMODE:
+
+       SHADEMODE = (g_cfgGouraud == 0) ? 1                  /* FLAT */
+                                       : 2 - (DAT_0053bdfc == 0);
+
+   g_cfgGouraud IS INITIALISED TO 1 IN .data, and Cd3d_Ctor sets
+   DAT_0053bdfc to 1, so the default resolves to SHADEMODE 2,
+   D3DSHADE_GOURAUD, and every corner gets its own colour [verified].
+
+   The single write to g_cfgGouraud anywhere in the image stores ZERO,
+   at 0x004146c1 - and that is the HANDLER for the string "-NoGouraud"
+   at 0x004dc558, which the flag block at 0x004dc664 documents as
+   "Disable gouraud shading". It is a DISABLE switch.
+
+   The address appears nowhere in .data or .rdata, so no table-driven
+   parser reaches it indirectly either. Three instruction operands are
+   the complete set of references [verified].
+
+6.5.3.  How the previous version of this section got it backwards
+
+   An earlier reading concluded the opposite - that the shipped
+   hardware path never Gouraud shaded - and the reasoning is worth
+   keeping because the shape of the mistake will recur.
+
+   It searched for WRITERS of the global, found exactly one, saw that
+   it stored 0, and took that for the initialisation. It even flagged
+   the right residual risk, that a table-driven parser might write the
+   flag indirectly, and checked for it.
+
+   THE DEFAULT WAS NEVER A WRITE AT ALL. It was the initialised value
+   in .data, which an instruction search cannot see by construction.
+
+   Two things would each have caught it:
+
+   o READ THE GLOBAL'S INITIAL VALUE before concluding anything about
+     its default. For a .data global that value IS the default, and the
+     writers are the exceptions to it.
+
+   o TAKE THE FLAG'S NAME SERIOUSLY. A switch named as a negation -
+     -NoGouraud, -NoD3D, -NoDither, -NoPal256, and this binary has many
+     - implies the positive is the default. A "disable" handler storing
+     0 is the exception path, not the initialisation.
+
+   The generalisation for this project: "the only writer sets X" is a
+   claim about the writers, not about the value. For anything in .data,
+   pair it with the initialised value before drawing a conclusion.
+
+7.  Where the array is built
+
+   The pool is a bump-allocated array of MR_Vertex at 0x006d20d8, with
+   the cursor in g_vertexPoolCount (0x0068b014), and two functions fill
+   it [verified]:
+
+   +-----------------------------+------------+----------------------+
+   | Function                    | Address    | Shade source         |
+   +=============================+============+======================+
+   | Screen3D_TransformVertsFlat | 0x0049b2c0 | ONE intensity        |
+   |                             |            | argument, reused for |
+   |                             |            | every vertex         |
+   +-----------------------------+------------+----------------------+
+   | Screen3D_TransformVertsShaded| 0x0049b490| an int ARRAY,        |
+   |                             |            | advanced per vertex, |
+   |                             |            | and OPTIONAL - see   |
+   |                             |            | section 7.2          |
+   +-----------------------------+------------+----------------------+
+
+   Both return the base of the slice they just filled, and the caller
+   hands that straight to Screen3D_CullAndQueueFaces. The flat one is
+   the whole transform in about forty lines:
+
+       camX  = (x*m0 + y*m3 + z*m6 + m9 ) * g_xScale
+       camY  = (x*m1 + y*m4 + z*m7 + m10) * g_yScale
+       camZ  =  x*m2 + y*m5 + z*m8 + m11
+       shade = intensity << 13
+       invZ  = 1.0f / camZ
+       if (camZ >= nearPlaneZ) {
+           screenX = round(g_viewCentreX + invZ * camX)
+           screenY = round(g_viewCentreY - invZ * camY)
+       }
+
+   The matrix is 3x4, twelve floats, column major. The viewport x and y
+   scales are folded into the matrix rows once per call rather than
+   applied per vertex.
+
+7.2.  The shaded transform's interface, which is not what it looks like
+
+   Read from the disassembly of 0x0049b490 [verified]. Three things
+   about it matter to anything that calls or ports it.
+
+   THE Y COORDINATE COMES FROM A SEPARATE ARRAY. The position source is
+   stride 12 and only elements [0] and [2] are ever read; y comes from
+   a second pointer of stride 4:
+
+       FLD [ESI]     x       ESI advances by 0xc
+       FLD [ESI+8]   z
+       FLD [EAX]     y       EAX advances by 4
+
+   That y pointer is also what the entry test rejects on. Pass NULL and
+   the function returns the pool base having done nothing - and WITHOUT
+   advancing g_vertexPoolCount, because the advance happens after the
+   test.
+
+   A heightfield-shaped interface: a base mesh supplying x and z, a
+   parallel stream supplying y. animDecor.cpp is the neighbourhood, so
+   deforming decorative geometry with per-vertex lighting is the
+   obvious reading [inferred].
+
+   THE INTENSITY ARRAY IS OPTIONAL, AND WHEN NULL THE SHADE FIELD IS
+   NOT WRITTEN AT ALL. The slot keeps whatever the previous user of it
+   left there - the same stale-slot hazard section 7.2's neighbour
+   records for screenX and screenY, one field over. A consumer cannot
+   tell the difference between an intensity and a leftover.
+
+   THERE IS A SECOND MATRIX AND AN OVERRIDE LIST. The function builds
+   two matrices: the argument one with the projection scales folded in
+   exactly as the flat transform folds them, and a second from
+   FUN_00403a80 combining two globals with the object's matrix at +0x68
+   and its negated translation at +0x98..+0xa0.
+
+   The override list is an array of TWELVE-BYTE records
+
+       { float x; int vertexIndex; float z; }
+
+   and the match is an INTEGER compare against the loop counter, not
+   the float compare the decompiler shows. A matching vertex is
+   transformed by the SECOND matrix from the record's own x and z, and
+   the base stream still advances either way. What drives it has not
+   been read.
+
+   THE CONTROL WORD BRACKET IS IDENTICAL to the flat transform, so
+   FISTP rounds here too. Two functions agreeing on that is worth more
+   than either alone.
+
+7.1.  It states the 19.13 format outright
+
+   shade = intensity << 13 is the producer saying what section 6.3 had
+   to infer from two readers [verified]. Bits 0..12 are therefore always
+   zero in a transformed vertex, which is why the eight bits
+   D3D_WriteVertex takes at 10..17 come out as the intensity times
+   eight, and the five D3D_DrawScene takes at 13..17 come out as the
+   intensity itself. Same number, two precisions, now explained from
+   both ends.
+
+   It also locates the flags. Bit 30 of the shade word is bit 17 of the
+   intensity argument and bit 31 is bit 18, so a caller sets full
+   bright or literal-colour by passing a large intensity rather than by
+   OR-ing anything afterwards. That is consistent with section 6.2's
+   finding that nothing in the image ORs those bits in.
+
+7.2.  Two consequences worth carrying into a port
+
+   o SCREEN COORDINATES ARE CONDITIONAL. screenX and screenY are
+     written only when camZ passes the near plane. A vertex behind the
+     camera keeps whatever the previous user of that pool slot left
+     there. Every consumer must test camZ before reading a screen
+     coordinate, and Screen3D_CullAndQueueFaces does exactly that.
+     A port that always projects, or that zeroes the pool, will not
+     reproduce the original's behaviour on near-plane-crossing faces -
+     though it will be tidier, and the difference is only visible
+     through the clipper.
+
+   o THE POOL HAS NO BOUND CHECK in either transform. The cursor is
+     bumped by the vertex count and the write proceeds.
+
+     THE RESET IS Screen3D_BeginFrame [verified]. It zeroes
+     g_vertexPoolCount once per frame, in the same guarded block that
+     seeds the span free list, alongside the queue-node count and the
+     split-primitive pool index. So the only thing bounding the pool is
+     how much geometry one frame submits, and nothing checks it - the
+     queue node count is capped at 0x1d4b by its consumer, but the
+     vertex pool is not capped anywhere.
+
+     The reset is SKIPPED when BeginFrame's first argument is non-zero,
+     which is the resume path used around a mid-frame error dialog. A
+     port must keep that conditional: resuming an interrupted frame and
+     resetting the pool underneath it would strand every queued
+     primitive's vertex pointers. See
+     subsystems/rasterizer-pipeline.txt section 38.0.
+
+   The flat and Gouraud split here is the same axis as the software
+   pipeline's slots 4/6 versus 5/7 - see
+   subsystems/rasterizer-pipeline.txt section 5 - so the decision is
+   made once, at transform time, and the primitive kind carries it
+   downstream.
+
+
+7.3.  The loop runs under a modified x87 control word
+
+   Neither of the two things that matter most about this function is
+   visible in the decompiled C. Both are in three instructions before
+   the loop [verified from the disassembly]:
+
+       FSTCW  [ESP+0x10]        save the control word
+       AND    EAX, 0xfcff       clear bits 8,9
+       OR     EAX, 0x000c       set bits 2,3
+       FLDCW  [ESP+0x12]
+       ... the whole vertex loop ...
+       FLDCW  [ESP+0x10]        restore
+
+   Bits 8 and 9 are PRECISION CONTROL. Clearing them selects 00, single
+   precision, 24-bit mantissa. Bits 2 and 3 are the ZM and OM exception
+   masks - zero divide and overflow.
+
+   THE TRANSFORM IS COMPUTED AT SINGLE PRECISION ON PURPOSE. No 80-bit
+   intermediate survives inside the loop; every partial product is
+   rounded to float32 as it goes. A port that computes in double will
+   produce slightly different screen coordinates, and the difference
+   will land on rounding boundaries.
+
+   MASKING THE ZERO DIVIDE IS WHAT MAKES 1.0f / camZ SAFE. A vertex
+   exactly on the camera plane yields infinity rather than raising, and
+   the near-plane test afterwards discards it.
+
+7.3.1.  It rounds. It does not truncate.
+
+   ROUNDING CONTROL IS BITS 10 AND 11, AND THEY ARE NOT TOUCHED. They
+   stay at 00, round-to-nearest-even, so the two FISTP instructions
+   that write screenX and screenY ROUND.
+
+   This is worth stating loudly because the usual MSVC truncation
+   idiom looks almost identical and does the opposite:
+
+       truncate (__ftol)   OR 0x0c00     bits 10,11  RC = toward zero
+       this function       OR 0x000c     bits 2,3    exception masks
+
+   0x0c00 against 0x000c. Same digits, different shift. Reading one for
+   the other gives a transform that is wrong by up to a pixel
+   everywhere and by a consistent whole pixel on negative coordinates,
+   which is exactly the kind of error that looks like a viewport
+   offset rather than a rounding bug.
+
+   In C the equivalent is lrintf, which honours the current rounding
+   mode. A cast is not: a cast truncates toward zero.
+
+7.3.2.  A note on where this came from
+
+   docs/subsystems/rasterizer-pipeline.txt section 50.3 wrote the
+   projection as round(...) from Screen3D_ProjectVertex, and was right,
+   but the reason was not established there - it was taken from
+   Ghidra's ROUND() rendering. This is the confirmation, and it also
+   explains why the C decompilation of the two functions shows bare
+   __ftol calls with no hint of either property.

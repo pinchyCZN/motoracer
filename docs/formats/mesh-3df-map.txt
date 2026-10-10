@@ -1,0 +1,772 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                 THE .3DF MESH AND .MAP TEXTURE FORMATS
+
+
+Abstract
+
+   A .3df holds geometry. Its paired .map holds one texture record per
+   face. The game loads them together and refuses to proceed if they
+   disagree.
+
+   Verified: all 128 .3df files and all 124 paired .map files parse with
+   every byte accounted for and zero failures [verified]. Reference
+   reader at tools/mesh3df.py.
+
+   +----------------------+------------+-------------------------------------+
+   | Function             | Address    | Role                                |
+   +======================+============+=====================================+
+   | Load3df              | 0x00420590 | mesh only                           |
+   +----------------------+------------+-------------------------------------+
+   | Load3dfAndMap        | 0x00420a50 | mesh plus paired texture map        |
+   +----------------------+------------+-------------------------------------+
+   | Menu_LoadFinalMeshes | 0x0047b600 | builds the %s\%s.3df and .map paths |
+   +----------------------+------------+-------------------------------------+
+
+Table of Contents
+
+   1. .3df layout
+      1.1. Winding, and the mirror that goes with it
+         1.1.1. How a partial reading went wrong twice
+   2. .map layout
+      2.1. The n < 3 records
+   3. Trailing block
+   4. The link to texture banks
+   5. Higher bit flags
+      5.1. Prim_SetKind and Prim_SetColorIndex
+      5.2. The flags to kind decode
+      5.3. A record with n < 3 takes a different path
+      5.4. What the game actually produces
+   6. Flat-colour faces and the bank record
+      6.1. The bank record
+   7. Reference reader
+   8. Open questions
+
+
+1.  .3df layout
+
+   u16   version         always 1; the loader rejects anything else
+   u16   vertexCount
+   vertex[vertexCount]   3 x float32: x, y, z
+   face records, repeating:
+       u16 n             vertices in this face; 0 ends the list
+       u16 flags         material or texture selector
+       u16 index[n]      indices into the vertex array
+
+   Confirmed byte-exactly on the smallest file. LAUREAT.3DF is 102
+   bytes: a 4-byte header, six vertices at 72 bytes, two quad records at
+   12 bytes each, and a 2-byte terminator.
+
+   The loader allocates 12 bytes per vertex and 0x40 per face, and
+   branches on n == 3 versus anything else, so triangles and polygons
+   take separate construction paths. Both 3 and 4 occur in the shipped
+   data; nothing larger was seen.
+
+   Load3dfAndMap scales every vertex by a global at 0x004d0690 as it
+   reads. Load3df scales by a different global at 0x004d0688, and only
+   when its third argument is non-zero. Two different scale factors for
+   the same file type is worth remembering before treating coordinates
+   as absolute.
+
+   BOTH VALUES ARE NOW READ [verified]: 0x004d0690 is 96.0 as a
+   FLOAT and 0x004d0688 is 2.8 as a DOUBLE. Not only different
+   numbers but different widths, which is why a careless dump of
+   either address as the wrong type returns nonsense.
+
+   WHICH LOADER A GIVEN MODEL USES IS WORTH ESTABLISHING BEFORE
+   LOADING IT, not after it fails to appear. The bike meshes go
+   through maybe_Game_LoadBikeMeshes (0x00413450), which calls
+   Load3dfAndMap seven times - so a bike loads at 96.0, the same as
+   the menu title models. Page 14 was invisible three times running
+   over exactly this class of mistake.
+
+   Afterwards the loader computes a plane distance per face from the
+   face normal and one of its vertices, so faces carry a plane equation
+   downstream, not just indices.
+
+1.1.  Winding, and the mirror that goes with it
+
+   THE SINGLE MOST IMPORTANT DETAIL IN THIS FILE for anyone building
+   primitives from it, and it took three attempts to get right. Two
+   earlier revisions of this section were wrong in opposite
+   directions; section 1.1.1 records why, because the failure shape
+   recurs.
+
+   A PAIRED LOAD TOUCHES THE FACE ORDER FOUR TIMES [verified]:
+
+   +---+------------------------------+-------------------------------+
+   | # | What                         | Order after                   |
+   +===+==============================+===============================+
+   | 1 | Face_InitQuad 0x00422c80     | idx3, idx2, idx1, idx0        |
+   |   | Face_InitTriangle 0x00422be0 | REVERSED                      |
+   +---+------------------------------+-------------------------------+
+   | 2 | Face_ReverseWinding 0x423170 | file order                    |
+   |   | from the .3df loop           |                               |
+   +---+------------------------------+-------------------------------+
+   | 3 | the .map rebuild, via        | unchanged - FUN_00422d20      |
+   |   | FUN_00422d20 / FUN_00422ed0  | stores its arguments in order |
+   +---+------------------------------+-------------------------------+
+   | 4 | Mesh_MirrorXAndFlipWinding   | REVERSED, and every vertex    |
+   |   | 0x00422070, at the very end  | has x negated                 |
+   +---+------------------------------+-------------------------------+
+
+   NET, FOR A MESH LOADED WITH A .map: faces are REVERSED from the
+   order the .3df holds, and the geometry is MIRRORED IN X.
+
+   NET, FOR Load3df - the mesh-only loader: steps 1 and 2 only, so
+   file order and no mirror. The two loaders genuinely differ, and
+   step 4 is what separates them: Load3dfAndMap calls it at
+   0x004215c4 and Mesh_LoadPair at 0x00421aba; Load3df does not call
+   it at all.
+
+   Step 1, read off the CALLEE stack rather than a decompiled argument
+   list - Ghidra models these call sites with one parameter too few,
+   which is the tell. Three registers are saved on entry, so the
+   arguments begin at [ESP+0x10], and the constructor does
+
+       [ESP+0x18] -> [ESI+0x2c]   index[0]
+       [ESP+0x1c] -> [ESI+0x2e]   index[1]
+       [ESP+0x20] -> [ESI+0x30]   index[2]
+       [ESP+0x24] -> [ESI+0x32]   index[3]
+       [ESI+0x34] = [ESP+0x18]    the wrap slot, repeating the first
+
+   while the call sites push idx0 first, so idx3 lands in [ESP+0x18].
+
+   Steps 2 and 4 share one routine:
+
+       n = (index[4] != -1) + 3          4 for a quad, 3 for a triangle
+       for (i = 0; i < n / 2; i++) {
+           swap index[i] <-> index[n-1-i]
+           swap uv[i]    <-> uv[n-1-i]
+       }
+       index[n] = index[0];  uv[n] = uv[0]
+
+   The arity comes from the wrap slot: +0x34 is a repeat of index[0]
+   for a quad and 0xffff for a triangle, so it reads the vertex count
+   back out of the record rather than being told it. The UVs travel
+   with the indices, so the vertex-to-texel pairing never breaks.
+
+   o STEP 4 IS DISGUISED AS A MATRIX. Its vertex loop looks like a
+     general 3x3 transform assembled from g_cosTable at 0, 0x1000,
+     0x2000 and 0x3000. Those are cos 0, cos pi/2, cos pi and
+     cos 3pi/2 - 1, 0, -1, 0 - so every product collapses and the
+     three stores reduce to
+
+         x = -x        y = -(-y) = y        z = z
+
+     Substitute the table values before reading it as a rotation.
+
+   o THE TWO HALVES OF STEP 4 BELONG TOGETHER. A mirror flips winding
+     by itself, so the reversal afterwards restores correct winding
+     for the mirrored geometry. Implementing ONE half is worse than
+     implementing neither.
+
+1.1.1.  How a partial reading went wrong twice
+
+   Recorded because the failure was expensive - three sessions - and
+   the shape of it recurs.
+
+   FIRST WRONG READING: step 1 only. That says the loader reverses,
+   which is half true and was adopted. It fixed page 14, whose title
+   logos read mirrored, so it looked confirmed.
+
+   SECOND WRONG READING: steps 1 and 2. That says the reversals cancel
+   and file order is correct, so the reversal was removed. Page 14
+   went back to reading OTOM and RECAR.
+
+   BOTH SURVIVED BECAUSE THE TEST OBJECT COULD NOT TELL THEM APART. A
+   page-14 title logo is a DOUBLE-SIDED BILLBOARD: MOTO.3DF is four
+   vertices and two faces, [0,3,2,1] and [0,1,2,3], the same quad
+   wound both ways, and its two .map records carry mirrored U spans
+   (0,0,255,255 against 255,0,0,255). So exactly one face survives the
+   cull and the winding alone decides which - i.e. whether the logo
+   reads MOTO or OTOM. AND A BILLBOARD IS PLANAR IN X, so the mirror
+   in step 4 moves it by its own thickness and changes nothing
+   visible.
+
+   That is the trap in one sentence: ON A BILLBOARD, STEP 4 IS
+   INDISTINGUISHABLE FROM A BARE WINDING REVERSAL. Supplying the
+   winding half by hand made page 14 correct while leaving every solid
+   mesh mirrored the wrong way round, and page 25 - which draws closed
+   letters and an open camera shell - could not be fixed by any
+   winding choice at all. Its camera model read as a hollow pan with
+   the reversal and as a cookie cutter without it, because both are
+   views of the SAME wrongly-mirrored shell from its open side.
+
+   THE GENERAL LESSON: a symmetric test object cannot validate an
+   asymmetric property, and when one page is fixed by a change that
+   leaves another page broken in a way the change cannot explain, the
+   change is a mask and not a fix.
+
+   CHECKS THAT SETTLE IT WITHOUT READING THE LOADER:
+
+   o THE CAP TEST, for an extruded cutout. TITLEDSI\CAMERA.3DF has
+     exactly two x planes, 59 cap faces on one and none on the other -
+     an open shell. As shipped its cap sits at the LOW x end facing
+     -X, and page 25 rotates local +X toward the viewer, so without
+     the mirror the viewer faces the OPEN end. With it, the cap faces
+     the viewer and the count of faces passing the cull rises from 42
+     to 101 of 166.
+
+   o SIGNED VOLUME plus a known-outward cube. D.3DF and S.3DF are
+     closed and consistently wound; the signed volume of D over its
+     file-order faces is +137921, so file order is outward AS THE FILE
+     HOLDS IT - which is why the mirror is needed to make the reversed
+     order correct rather than the file order.
+
+
+2.  .map layout
+
+   0x000  512-byte header
+   0x200  one 128-byte record per face, in mesh face order
+
+   The header is read in a single 0x200 call and only one byte is
+   tested: byte 1 must have bit 0x80 set, otherwise the game reports
+   that the file version is too old. Observed files begin 01 80.
+
+   Record fields, from the loader's stack frame:
+
+   +0x00  u16    n, vertices this record describes
+   +0x22  i32    u[0]
+   +0x26  i32    u[1]
+   +0x2a  i32    u[2]
+   +0x2e  i32    u[3]
+   +0x32  i32    v[0]
+   +0x36  i32    v[1]
+   +0x3a  i32    v[2]
+   +0x3e  i32    v[3]
+   +0x48  u32    flags; the low 16 bits are a texture bank index
+   +0x4e  u32    texture id within that bank
+
+   U and V are stored as two separate arrays of four, not interleaved
+   pairs, and are converted to float on load.
+
+   THEY ARE TEXEL INDICES OVER A 256x256 PAGE, and a renderer that
+   samples with them has to move each one to the CENTRE of its texel:
+   texel i covers [i/256, (i+1)/256) and its centre is (i+0.5)/256.
+   Sampling at i/256 lands on the boundary between two texels, which
+   a linear filter then blends.
+
+   THAT MATTERS MORE THAN IT SOUNDS because a lot of faces sample a
+   single texel. Of the 196 face records in SPEED\MEDIUM\CORPS.MAP,
+   62 span ONE TEXEL OR LESS in both u and v - wheel spokes, brake
+   discs and small detail patches are flat colours taken from one
+   point of the page. For those faces the half-texel error is the
+   whole patch. Most of each 128-byte
+   record is padding: about 24 bytes carry data.
+
+2.1.  The n < 3 records
+
+   A record whose n is less than 3 takes a completely separate path. The
+   loader sets flags from the record and never reads UVs, and -
+   importantly
+
+   o never checks it against the mesh.
+
+   Only records with n >= 3 are validated, against the rule that n must
+   equal 3, or 4 when the mesh face has a fourth index. Failing that
+   gives "Erreur: Le map %s ne correspond pas" and the load is
+   abandoned.
+
+   This matters when writing a checker. Comparing every record's n
+   against its face's vertex count reports false failures: in the
+   shipped data 2ND has four records with n = 0 against quad faces, and
+   3RD has one. Applying the game's own rule instead, all 124 pairs
+   validate.
+
+3.  Trailing block
+
+   The loader reads exactly 512 + faces * 128 bytes and ignores the
+   rest. Of the 124 paired maps, 123 carry one extra unread 128-byte
+   block and one does not:
+
+   123 files    size = 512 + faces * 128 + 128
+     1 file     size = 512 + faces * 128        (ORC.MAP)
+
+   So the padding is conventional rather than structural. A reader must
+   not require it, and a writer need not emit it.
+
+4.  The link to texture banks
+
+   The low 16 bits of a record's flags field index the runtime texture
+   bank array that bankw.Cpp manages at 0x004f9628. That is the same
+   bank system whose pages are 256 x 256, and whose on-disk form is the
+   .RAW files catalogued in asset-inventory.txt.
+
+   Across the shipped meshes the referenced bank indices are mostly 0,
+   with a scattering of 1, 2, 3, 4, 5, 6, 7, 11, 13 and 19. Counted
+   properly by tools/map_kinds.py over 10,330 real face records:
+
+   +------+-------+------+-------+------+-------+
+   | Bank | Faces | Bank | Faces | Bank | Faces |
+   +======+=======+======+=======+======+=======+
+   | 0    |  6228 | 4    |     2 | 11   |   256 |
+   +------+-------+------+-------+------+-------+
+   | 1    |   624 | 5    |   516 | 13   |   256 |
+   +------+-------+------+-------+------+-------+
+   | 2    |   232 | 6    |     8 | 19   |   291 |
+   +------+-------+------+-------+------+-------+
+   | 3    |  1025 | 7    |   892 |      |       |
+   +------+-------+------+-------+------+-------+
+
+   An earlier draft of this paragraph listed only 1, 3, 5, 7 and 19 and
+   missed 2, 4, 6, 11 and 13.
+
+   THOSE ARE RELATIVE INDICES. Mesh_RebaseBankIndices (0x0045c700)
+   walks every face after load and adds the caller's base bank index
+   into the field at +0x36, so the absolute bank is base + relative
+   [verified]. That is why the values are small and clustered. For a
+   bike, base and base+1 are the two banks Game_LoadBikeAndBanks
+   loads, so relative 0 is bnk00_00.raw and relative 1 is
+   bnk00_01.raw. See subsystems/texture-banks.txt section 4.2.4.
+
+   That closes the loop for static geometry: a .3df supplies positions
+   and face indices, its .map supplies per-face UVs plus a bank and
+   texture id, and the bank resolves to a .RAW page. Everything needed
+   to draw a textured object is now identified, even though the .RAW
+   header itself is still unread.
+
+5.  Higher bit flags
+
+   The flags dword carries more than the bank index. The loader tests
+   bits 0x10000, 0x20000, 0x40000, 0x80000, 0x100000, 0x200000 and
+   0x400000, each selecting a different draw mode constant or setting a
+   bit in the face's byte at +0x38. Bit 0x20000 additionally sets a
+   whole-object flag, and the object is later re-sorted so that faces
+   carrying it are grouped - transparency or a two-pass draw [inferred].
+
+   The specific constants written are 1, 2, 8, 0xc, 0xd, 0x10, 0x15,
+   0x26 and 0x27 depending on the bit combination and on whether a
+   fourth argument is set. DECODED - see section 5.2.
+
+   THE THREE BITS THAT SET FACE FLAGS RATHER THAN A KIND are now
+   decoded, from the readers of MR_Primitive.flags [verified]:
+
+   +------------+---------------+------------------------------------+
+   | .map bit   | flags bit     | Effect                             |
+   +============+===============+====================================+
+   | 0x020000   | 0             | joins the grouped second pass; the |
+   |            |               | loader partitions those faces to   |
+   |            |               | the front and sets objectFlags 0   |
+   +------------+---------------+------------------------------------+
+   | 0x100000   | 3             | opts the face out of detail        |
+   |            |               | reduction at detail level 2        |
+   +------------+---------------+------------------------------------+
+   | 0x400000   | 1             | DEPTH BIAS - the face sorts as if  |
+   |            |               | 1024 units farther away, so it     |
+   |            |               | renders behind its true position   |
+   +------------+---------------+------------------------------------+
+
+   The loader also sets flags bit 2 on every face unconditionally, and
+   nothing anywhere reads it. See structs/MR_Primitive.txt section 7.
+
+5.1.  Prim_SetKind and Prim_SetColorIndex
+
+   Two small setters in frame3d.cpp, named while decoding this, and
+   both worth their own note [verified]:
+
+   Prim_SetKind (0x00423150) writes BOTH kind fields at once, and is
+   BOUNDS-CHECKED against 0x46 - exactly the size of the primitive-kind
+   feature table Screen3D_Open builds:
+
+       if (kind < 0x46) { prim->kind = kind; prim->effectiveKind = kind; }
+
+   An out-of-range kind is SILENTLY IGNORED and the previous value
+   survives. It is not clamped and there is no error.
+
+   Not every kind assignment goes through it. The flag decode below
+   stores directly to +0x00 and leaves +0x3a alone; Prim_SetKind is
+   called only to zero both fields on the short path of section 5.3.
+
+   Prim_SetColorIndex (0x00423110) sets +0x02 and derives +0x3c from
+   it, and it is the 5-5-5 to 8-8-8 expansion of MR_Primitive.txt
+   section 6.1 seen from the PRODUCING side - which independently
+   confirms that note.
+
+5.2.  The flags to kind decode
+
+   IT IS NOT A TABLE. It is a base kind plus three feature bits, and
+   the nine constants are simply what those combinations are numbered
+   [verified from the post-constructor block of Load3dfAndMap]:
+
+   +------------------------------+-----------+---------------+
+   | Condition                    | Kind      | Feature bits  |
+   +==============================+===========+===============+
+   | base                         | 1         | 0x01          |
+   +------------------------------+-----------+---------------+
+   | + map 0x010000               | 2         | 0x09          |
+   +------------------------------+-----------+---------------+
+   | + tier2 selector             | 0x10      | 0x81          |
+   +------------------------------+-----------+---------------+
+   | + both                       | 0x26      | 0x89          |
+   +------------------------------+-----------+---------------+
+   | + map 0x200000               | 0x15      | 0x85          |
+   +------------------------------+-----------+---------------+
+   | + map 0x200000 and 0x010000  | 0x27      | 0x8d          |
+   +------------------------------+-----------+---------------+
+
+   THE FEATURE-BIT COLUMN IS THE CONFIRMATION. Those values come from
+   subsystems/detail-levels.txt section 6, which was reconstructed from
+   an entirely different function - Screen3D_Open's construction loop -
+   and every column agrees:
+
+   o map bit 0x010000 adds exactly bit 3, "do NOT filter this kind",
+     in all three pairs 1->2, 0x10->0x26 and 0x15->0x27.
+
+   o the tier2 selector adds exactly bit 7, quality tier 2.
+
+   o map bit 0x200000 yields the full quality ladder, bits 0, 7 and 2.
+
+   Two independent decodes from two functions agreeing bit for bit is
+   the strongest confirmation either of them has.
+
+   Note that 0x200000 DISCARDS the tier2 selector rather than composing
+   with it: the result is 0x15 either way, so a face carrying the
+   tier-3 bit is at maximum quality whatever the caller asked for.
+
+   Two more bits then REPLACE the kind outright. Both are unconditional
+   stores, so the ORDER in the function decides the winner:
+
+       map 0x040000  ->  kind 0x0d   exempt from detail reduction
+       map 0x080000  ->  kind 8      translucent - written LAST
+
+   So translucent beats 0x0d when both are set, and five shipped
+   records do set both.
+
+   THE TIER2 SELECTOR is Load3dfAndMap's fourth argument AND a non-zero
+   face bank index, so it upgrades faces on the SECOND texture page and
+   leaves the first alone. Who passes what, read off the call sites:
+
+   +-----------------------------+---------------------------------+
+   | Caller                      | faceKindSelect                  |
+   +=============================+=================================+
+   | MenuTools_CreateSceneObject | 0                               |
+   +-----------------------------+---------------------------------+
+   | FUN_0047b600                | 1                               |
+   +-----------------------------+---------------------------------+
+   | maybe_Game_LoadBikeMeshes   | 0 at five sites; a runtime SETZ |
+   |                             | on (DAT_00509398 == EBP) at two |
+   +-----------------------------+---------------------------------+
+
+   So menu geometry never sees the upgrade and bike geometry sees it
+   conditionally. What that runtime test compares is an open question.
+
+5.3.  A record with n < 3 takes a different path
+
+   A .map record whose vertex count is below three does not describe a
+   polygon, and the loader handles it in a few lines instead: it calls
+   Prim_SetKind(0) - so both kind fields are cleared - and then
+   consults only three bits, with no tier variants at all [verified]:
+
+       map 0x010000  ->  kind 2
+       map 0x040000  ->  kind 0x0d
+       map 0x080000  ->  kind 0x0c
+
+   Note 0x080000 gives 0x0c here and 8 on the normal path. Its colour
+   also comes from record +0x02 rather than +0x4e.
+
+   THE +0x02 COLOUR IS 5-6-5, not 5-5-5, and the sentence above was
+   read as saying otherwise. The 5-5-5 in section 6 is about the
+   TEXTURE ID being converted through Color_Convert555ToSurface on a
+   different branch; it does not describe this field, which carries a
+   surface-format pixel like a bank page does.
+
+   THE DATA SETTLES IT WITHOUT READING MORE CODE. Across the 26
+   letter .map files of the 3D menu font there are 18 distinct +0x02
+   values:
+
+   +----------+-------+------------------+----------------------+
+   | Value    | Count | as 5-6-5         | as 5-5-5             |
+   +==========+=======+==================+======================+
+   | 0x829f   |  306  | (132,165,255)    | (  0,165,255) cyan   |
+   | 0x935f   |   73  | (148,210,255)    | ( 33,214,255) cyan   |
+   | 0x48d8   |   56  | ( 74, 24,198)    | (148, 49,198)        |
+   | 0xbc1f   |   44  | (189,130,255)    | (123,  0,255) magenta|
+   | 0xe55f   |   39  | (231,170,255)    | (206, 82,255)        |
+   | 0x2149   |   26  | ( 33, 41, 74)    | ( 66, 82, 74)        |
+   +----------+-------+------------------+----------------------+
+
+   Read as 5-6-5 all eighteen are one hue - blue-purple - differing
+   only in brightness, which is what a per-face lit palette looks
+   like. Read as 5-5-5 they scatter across cyan, magenta and blue
+   with no relationship. One reading is a palette and the other is
+   noise.
+
+   o SO THE LIGHTING IS AUTHORED, NOT COMPUTED. These faces carry a
+     pre-shaded colour each; there is no light source in the engine
+     to find and no normal-based term to reproduce. A port that
+     hunts for one is chasing something that is not there.
+
+   o AND THE WRONG READING FAILS LOUDLY HERE, which is lucky. On a
+     texture-mapped mesh a 555/565 mix-up shifts hues slightly; on
+     18 flat colours it turns a blue alphabet into a rainbow, and
+     the error names itself.
+
+   EXACTLY ONE RECORD in the shipped game takes this path, and it has
+   no flag bits set, so it comes out kind 0. That makes KIND 0x0C THE
+   ONE CONSTANT OF THE NINE WITH NO PRODUCER IN SHIPPED DATA.
+
+5.4.  What the game actually produces
+
+   tools/map_kinds.py applies the decode above to every shipped .map:
+
+       python tools/map_kinds.py
+
+   Over 10,330 real face records in 124 paired files:
+
+   +---------+--------------+--------------+
+   | Kind    | select = 0   | select = 1   |
+   +=========+==============+==============+
+   | 0x00    |            1 |            1 |
+   +---------+--------------+--------------+
+   | 0x01    |         9739 |         5910 |
+   +---------+--------------+--------------+
+   | 0x02    |          259 |          151 |
+   +---------+--------------+--------------+
+   | 0x08    |           16 |           16 |
+   +---------+--------------+--------------+
+   | 0x0d    |          119 |          119 |
+   +---------+--------------+--------------+
+   | 0x10    |            - |         3829 |
+   +---------+--------------+--------------+
+   | 0x15    |          188 |          188 |
+   +---------+--------------+--------------+
+   | 0x26    |            - |          108 |
+   +---------+--------------+--------------+
+   | 0x27    |            8 |            8 |
+   +---------+--------------+--------------+
+
+   And the flag bits themselves:
+
+   +------------+-------+---------------------------------------+
+   | Map bit    | Faces | Effect                                |
+   +============+=======+=======================================+
+   | 0x010000   |   271 | do not filter                         |
+   +------------+-------+---------------------------------------+
+   | 0x020000   |     5 | face flags bit 0, the second pass     |
+   +------------+-------+---------------------------------------+
+   | 0x040000   |   124 | kind 0x0d                             |
+   +------------+-------+---------------------------------------+
+   | 0x080000   |    16 | translucent                           |
+   +------------+-------+---------------------------------------+
+   | 0x100000   |  2624 | face flags bit 3, no detail reduction |
+   +------------+-------+---------------------------------------+
+   | 0x200000   |   196 | quality tier 3                        |
+   +------------+-------+---------------------------------------+
+   | 0x400000   |     0 | face flags bit 1, the depth bias      |
+   +------------+-------+---------------------------------------+
+
+   THE ZERO IS THE INTERESTING ROW. Map bit 0x400000 is never set in
+   any shipped mesh, so MR_Primitive flags bit 1 - the +1024.0 depth
+   bias whose only reader in the whole image is
+   Screen3D_CullAndQueueFacesEx - has NO PRODUCER in mesh data. The
+   mechanism is real and fully documented at both ends and no shipped
+   geometry uses it.
+
+   o A METHODOLOGY NOTE THAT CHANGED THESE NUMBERS. 123 of the 124
+     paired .map files carry one extra 128-byte block past the last
+     face record, and Load3dfAndMap reads exactly 512 + faces * 128 and
+     ignores it. Counting that block as a face adds about 600 phantom
+     records: kind 0x0d first came out as 179 rather than 119, and the
+     no-filter bit as 312 rather than 271. Section 3 says the padding
+     is conventional rather than structural; an analysis script has to
+     bound itself by the paired .3df's face count, not by the file
+     size.
+
+6.  Flat-colour faces and the bank record
+
+   Added after a function boundary repair. Load3dfAndMap had been split
+   by Ghidra, and this path sits in the part that was orphaned. The rest
+   of this note was written from the orphan and checked out unchanged;
+   only this was missed.
+
+   When a face's four UV pairs are all equal the face is flat coloured,
+   and the loader resolves a single colour for it rather than a texture
+   [verified]. Which way depends on a per-bank flag:
+
+       if (bank.isIndexed == 0)
+           colour = page16[ftol(v) * 0x100 + ftol(u)]
+       else
+           colour = page8 [ftol(v) * 0x100 + ftol(u)]
+       face[+0x02] = colour
+       Prim_SetKind(face, 0)
+       Prim_SetColorIndex(face, face[+0x02])
+
+   *** AND THE KIND IS FORCED TO ZERO *** [verified, 0x004212b4]
+
+   Both arms converge on a literal PUSH 0 into Prim_SetKind, AFTER
+   +0x02 has been written. So the flags-to-kind decode of section 5.2
+   applies ONLY to a face with a real UV span: a face whose UVs are all
+   equal is untextured flat-shaded geometry however its flags read, and
+   section 5.2's table cannot be applied without this test first.
+
+     o IT IS v * 0x100 + u. V IS THE ROW. Both arms scale the second
+       uv float, and the two saved pointers are what settle which
+       that is:
+
+           004211ea  LEA ECX,[EBX + 0x4]    &u0 -> [EBP-0x1c]
+           00421211  LEA EAX,[EBX + 0x8]    &v0 -> [EBP-0x14]
+           ...
+           00421251  MOV EAX,[EBP-0x14]     v0
+           0042125b  SHL EAX,0x8            <- V is the one scaled
+           0042125e  MOV ECX,[EBP-0x1c]     u0
+           0042126a  MOV AL,[EDI + EAX]     <- plus U
+
+       uv[] is (u0,v0,u1,v1,...), so face+0x4 is u0 and face+0x8 is
+       v0. The four equality tests just above confirm it from the
+       other side: they pair +0x4/+0xc/+0x14 against each other and
+       +0x8/+0x10/+0x18 against each other, which only holds if the
+       first of each pair of floats is u.
+
+       A TRANSPOSED READ LANDS ON A REAL TEXEL rather than out of
+       bounds, so it returns a plausible wrong colour and nothing
+       looks broken. The tell is that the wrong texels cluster in
+       the page's grey ramp, which every livery palette holds in
+       common - so the bike's flat faces come out grey AND STOP
+       CHANGING WITH THE RIDER. Checked against the art: read
+       v * 0x100 + u, KTMCROSS's helmet vent samples slot 111, which
+       is yellow-green, red, salmon and orange across the eight
+       palettes; read the other way it samples slot 172, which is
+       0x9b9b9b in all eight.
+
+     o THE COST OF MISSING THE KIND ZERO IS NOT COSMETIC. GUIDON.MAP's
+       232 records are n = 3 and 4 with flags 0x00000007 and 0x00200007,
+       whose low 16 bits name bank 7; the table gives them kind 1 and
+       0x15, textured. MOTO reads kind 0 with colorIndex 0xc8c8 live.
+       A port that applies the table alone draws the whole
+       first-person cockpit as untextured white or not at all - which
+       is exactly what happened.
+
+     o AND THE INDEXED ARM KEEPS ONLY THE LOW BYTE, AND 0xffff00ff, so
+       what lands in +0x02 is a PALETTE INDEX rather than a colour. A
+       port that resolves it at load time bakes the active palette in
+       and loses the livery.
+
+       DOWNSTREAM IS Screen3D_CullAndQueueFaces, which at 0x0049c516
+       indexes bank[face->bankIndex] + 8 - the palette COUNT - and
+       sends the primitive to Screen3D_QueuePrimitivePaletted rather
+       than Screen3D_QueuePrimitive when it is set. That function
+       stores bank[i].palette[k] into the queue node at 0x0049cdf7,
+       k being a queue-time argument, and the rasterizer indexes it.
+       So the palette is chosen PER DRAW, which is what makes a
+       livery change recolour a flat face.
+
+       Note what this implies about +0x3c: Prim_SetColorIndex derives
+       flatColor by expanding +0x02 as 5-5-5, and on an indexed bank
+       +0x02 is a slot 0..255, so flatColor is meaningless there. It
+       is not a bug in the original - nothing on that path reads it.
+
+   If instead the UVs differ but the bank is indexed, the loader
+   converts the texture id as a 555 colour through
+   Color_Convert555ToSurface (0x00402020) and linearly searches the
+   bank's 256-entry palette for a match, storing the index it finds, or
+   0 if none matches after 256 tries.
+
+   That is a direct corroboration of formats/raw-texture.txt: a paletted
+   .RAW page loaded with mode 0 keeps its palette in the bank slot, and
+   this is the code that reads it back.
+
+6.1.  The bank record
+
+   Three globals are indexed by the bank number with the same stride,
+   which pins the record size [verified]:
+
+   +--------------+------------------+---------------------------------------+
+   | Global       | Offset in record | Meaning                               |
+   +==============+==================+=======================================+
+   | DAT_004f9300 | +0x000           | non-zero if the page is 8-bit indexed |
+   +--------------+------------------+---------------------------------------+
+   | DAT_004f9304 | +0x004           | pointer to the 256-entry palette      |
+   +--------------+------------------+---------------------------------------+
+   | DAT_004f9628 | +0x328           | non-zero if the bank holds a texture  |
+   +--------------+------------------+---------------------------------------+
+
+   The stride is 0xce dwords, so a bank record is 824 bytes. The array
+   base is 0x004f9300, not 0x004f9628 as section 4 implies; that address
+   is a field within the record rather than the start of it. Section 4's
+   conclusion is unaffected, since it only used the field as a per-bank
+   test.
+
+   BASE CORRECTED AGAIN. 0x004f9300 is also a field, not the base. The
+   real base is 0x004f92f8, eight bytes lower, and it comes from the
+   static array constructor rather than from inference [verified]:
+
+       _eh_vector_constructor_iterator_(&DAT_004f92f8, 0x338, 0x2e, ...)
+
+   base, element size and count in one call. So the three offsets in
+   the table above are each 8 too small: isIndexed is +0x008, the
+   palette pointer +0x00c, and the page pointer +0x330. The stride of
+   0x338 and this section's conclusions are unaffected.
+
+   The field at +0x008 is also misnamed above. Bankw_FreeBank uses it
+   as the loop bound for freeing the +0x00c pointer array, so it is a
+   COUNT of sub-pages, not a boolean [verified]. Testing it against
+   zero, as this loader does, still selects the paletted case
+   correctly.
+
+   The bank is a C++ class with a constructor, and the array holds
+   forty-six of them. Full record in
+   subsystems/texture-banks.txt; MR_Bank is applied in the DB.
+
+   o The lesson, twice over now: a base derived from field offsets seen
+     at call sites is a guess. Take it from a constructor, an
+     allocation, or a base computation.
+
+
+7.  Reference reader
+
+   tools/mesh3df.py, and now also src/mesh.c.
+
+   The C loader in src/ is a transcription of this note rather than an
+   independent reading, so it is not corroboration. tools/mesh3df.py is
+   what it is checked against: mracer prints the vertex count, face
+   count and bounds of one mesh at start-up so the two can be diffed by
+   eye.
+
+   All 132 .3df files under decomp/DATA pass --check with zero
+   failures.
+
+   python tools/mesh3df.py --check PATH [PATH ...]
+   python tools/mesh3df.py --info  PATH
+   python tools/mesh3df.py --stats PATH [PATH ...]     csv
+   python tools/mesh3df.py --obj OUT.obj PATH          geometry export
+
+   --check parses the mesh, then applies the game's own consistency rule
+   to the paired map and reports the trailing pad, the count of
+   untextured records and the bank indices in use.
+
+8.  Open questions
+
+   o What is in the 512-byte .map header beyond byte 1? It is almost
+     entirely zero in the samples examined.
+   o RESOLVED - record +0x02 is a 5-6-5 flat colour, used for faces
+     whose record has n < 3. See section 5.3. Still open: +0x04,
+     which is 0 in every record of the 3D font bar one, where it is 1.
+   o The face flags word in the .3df itself is separate from the .map
+     flags dword. Its meaning is unknown.
+   o Decode the draw-mode constant table described above.
+   o ANSWERED. Are the two vertex scale globals at 0x004d0688 and
+     0x004d0690 equal? If not, the same mesh loaded through the two
+     entry points has different dimensions.
+
+     THEY ARE NOT EQUAL, and they are not even the same width
+     [verified from the referencing instructions, not from the bytes]:
+
+         Load3df        FMUL double ptr [0x004d0688]   2.8
+         Load3dfAndMap  FMUL float  ptr [0x004d0690]   96.0
+         FUN_004216a0   FMUL float  ptr [0x004d0690]   96.0
+
+     A factor of roughly 34 between the same file loaded two ways. So
+     coordinates are meaningless without knowing which entry point
+     produced them, and a mesh cannot be moved between the two paths
+     without rescaling.
+
+     The width difference is worth stating separately: reading either
+     address as the other's type gives a plausible-looking number
+     rather than an obviously wrong one. 0x004d0688 read as a float is
+     2.7e23; 0x004d0690 read as a double is 1.7e7. Neither looks like
+     a scale factor, but neither looks like garbage either.
+   o No mesh in the shipped data has a face with more than four
+     vertices, but the format permits it and the loader has a polygon
+     path.

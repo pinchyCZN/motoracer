@@ -1,0 +1,394 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      THE TIME-ATTACK GHOST FILE
+
+
+Abstract
+
+   Time attack races you against your own previous run.  The run is
+   a stream of sampled frames, and at the end of a successful race
+   it is promoted to the one being raced and written to disk, so it
+   is already there the next time the mode is entered.
+
+   The file is <trackpath>timatak<suffix><laps>.bin - one per track,
+   per lap count, per direction.  There is no magic number and no
+   version word; three mode words at the front serve as both.
+
+   The 0xf9-byte block in the middle is a bestscor.dat record, which
+   is why the two formats are documented as neighbours.  See
+   bestscor.txt.
+
+Table of Contents
+
+   1. The stream pair
+   2. The frame record
+   3. The file
+      3.1. The path
+      3.2. The layout
+      3.3. Checked against a retail-written file
+   4. The lifecycle
+   5. What the port does
+   6. Open questions
+
+1.  The stream pair
+
+   Two int[6] statics, adjacent, 0x18 bytes each [verified]:
+
+   +------------+------------+------------------------------------+
+   | Address    | Which      | Role                               |
+   +============+============+====================================+
+   | 0x0052c0d8 | playback   | the lap being raced against        |
+   +------------+------------+------------------------------------+
+   | 0x0052c0f0 | record     | the lap being taped now            |
+   +------------+------------+------------------------------------+
+
+   The decompiler hides which is which, because the pointer arrives
+   in ECX.  Read the MOV ECX ahead of each call.
+
+   +--------+------+----------+-------------------------------+
+   | Offset | Size | Field    | Notes                         |
+   +========+======+==========+===============================+
+   | +0x00  |   4  | count    | frames written                |
+   +--------+------+----------+-------------------------------+
+   | +0x04  |   4  | cursor   | playback position             |
+   +--------+------+----------+-------------------------------+
+   | +0x08  |   4  | capacity | the recorder's ONLY bound     |
+   +--------+------+----------+-------------------------------+
+   | +0x0c  |   4  | frames   | pointer to the record array   |
+   +--------+------+----------+-------------------------------+
+   | +0x10  |   4  | lapTime  | float; set only at save time  |
+   +--------+------+----------+-------------------------------+
+   | +0x14  |   4  | clock    | float; advanced by BOTH halves|
+   +--------+------+----------+-------------------------------+
+
+   Three small functions operate on one stream each, and the
+   difference between them is the whole reason a taped lap survives
+   a race load:
+
+   +---------------+------------+-------------------------------+
+   | Function      | Address    | Writes                        |
+   +===============+============+===============================+
+   | Ghost_Empty   | 0x004191a0 | count, cursor, clock          |
+   +---------------+------------+-------------------------------+
+   | Ghost_Rewind  | 0x004191b0 | cursor, clock                 |
+   +---------------+------------+-------------------------------+
+   | Ghost_Promote | 0x004190d0 | all but frames; see 4         |
+   +---------------+------------+-------------------------------+
+
+   NEITHER Empty NOR Rewind TOUCHES frames OR capacity, and Rewind
+   does not touch count.  A race load rewinds the playback stream
+   and empties only the recorder, so the lap to beat persists.
+
+2.  The frame record
+
+   0x34 bytes, and it is the same data model the 0x66 network packet
+   carries - which is why one Racer_RemoteApplyState serves both the
+   ghost and a network peer.  See netplay.txt 3.
+
+   +--------+------+-------------+----------------------------+
+   | Offset | Size | Field       | Notes                      |
+   +========+======+=============+============================+
+   | +0x00  |   4  | time        | the stream clock at sample |
+   +--------+------+-------------+----------------------------+
+   | +0x04  |   4  | speed       |                            |
+   +--------+------+-------------+----------------------------+
+   | +0x08  |  12  | pos[3]      |                            |
+   +--------+------+-------------+----------------------------+
+   | +0x14  |  12  | aim[3]      | matOrientation rows 2, 3   |
+   +--------+------+-------------+----------------------------+
+   | +0x20  |   4  | flags       | snapped, not lerped        |
+   +--------+------+-------------+----------------------------+
+   | +0x24  |   4  | event       | a send-once latch          |
+   +--------+------+-------------+----------------------------+
+   | +0x28  |  12  | eventDir[3] |                            |
+   +--------+------+-------------+----------------------------+
+
+   o THE FLAGS DO NOT INTERPOLATE.  Playback snaps them at the
+     halfway point on a float-bits compare against 0.5
+     (0x004193f5), because a lerped bitfield is meaningless.
+
+   o EVERY SKIPPED RECORD IS SCANNED FOR AN EVENT.  The cursor can
+     step over several records in one frame, and 0x00419420 walks
+     all of them, so a crash taped between two sampled frames still
+     fires.
+
+3.  The file
+
+3.1.  The path
+
+   Built inline by both halves, into the scratch buffer at
+   0x0053f678:
+
+       sprintf(p, "%s%s\timatak", g_szDataDir, track.path)
+       strcat (p, reverse ? "R" : "_")
+       strcat (p, "_")                  only when NOT pocket bike
+       sprintf(p, "%s%1d.bin", p, g_nRaceLaps)
+
+   g_szDataDir at 0x004e8380 is EMPTY, so the path is relative to
+   the install root, and track.path is the track-list field at +0x24
+   - "data\ile01\", carrying its own prefix and trailing separator.
+   A three-lap road ghost on the first island is therefore
+
+       data\ile01\timatak__3.bin
+
+   THE POCKET-BIKE SUFFIX NEVER REACHES THE PATH.  The two arms of
+   the second strcat differ in their destination, which is in the
+   instructions rather than being a decompiler artefact:
+
+       00413940  JZ  0x0041395f        ; pocket bike selected?
+       00413942  MOV EDI, 0x4dbf24     ; "P"
+       00413958  MOV EDI, 0x53f3c0     ; the BESTSCOR KEY buffer
+       0041395d  JMP 0x0041397a        ; skips the load below
+       0041395f  MOV EDI, 0x4dbf28     ; "_"
+       00413975  MOV EDI, 0x53f678     ; the PATH buffer
+
+   So a pocket ghost is timatak<rev><laps>.bin and a normal one is
+   timatak<rev>_<laps>.bin.  Two consequences, both harmless: the
+   names still differ, so the files do not collide; and the stray
+   "P" left on the best-score key is overwritten, because
+   FUN_00464680 rebuilds that buffer from the track name moments
+   later.  Ghost_Load repeats both destinations, so writer and
+   reader agree.
+
+3.2.  The layout
+
+   Little-endian throughout.  No magic, no version.
+
+   +--------+----------+--------------------------------------+
+   | Size   | Field    | Notes                                |
+   +========+==========+======================================+
+   |   4    | pocket   | g_nPocketBikeSelected                |
+   +--------+----------+--------------------------------------+
+   |   4    | reverse  | 0x004dc068                           |
+   +--------+----------+--------------------------------------+
+   |   4    | laps     | g_nRaceLaps                          |
+   +--------+----------+--------------------------------------+
+   | 0xf9   | record   | a bestscor entry; see below          |
+   +--------+----------+--------------------------------------+
+   |   4    | count    | stream[0]                            |
+   +--------+----------+--------------------------------------+
+   |   4    | capacity | stream[2] - see the warning below    |
+   +--------+----------+--------------------------------------+
+   |   4    | lapTime  | stream[4], float bits                |
+   +--------+----------+--------------------------------------+
+   | 0x34*n | frames   | count of them                        |
+   +--------+----------+--------------------------------------+
+
+   THE THREE MODE WORDS ARE THE VERSION CHECK.  Ghost_Load re-reads
+   each one and compares it with the live setting, abandoning the
+   load on the first mismatch and leaving the stream empty.  That is
+   how a ghost taped over three laps is not offered to a five-lap
+   race, and it is also why the filename already encoding the same
+   three things is belt and braces.
+
+   THE RECORD BLOCK IS A BESTSCOR ENTRY, filled at 0x00412d71:
+
+   +--------+------+------------------------------------------+
+   | Offset | Size | Notes                                    |
+   +========+======+==========================================+
+   | +0x00  | 0x0d | the name, "SHADOW" at 0x004dbea8         |
+   +--------+------+------------------------------------------+
+   | +0x0d  | 0xc0 | 48 checkpoint splits, racer+0x2f89       |
+   +--------+------+------------------------------------------+
+   | +0xcd  | 0x2c | unread                                   |
+   +--------+------+------------------------------------------+
+
+   An empty entry is every byte 0x7f, which is what FUN_00411010
+   writes when there is no ghost to name.
+
+   CAPACITY COMES BACK OFF DISK, and it is the recorder's only
+   bound - maybe_Ghost_RecordFrame tests count < stream[2] and
+   nothing else.  A file written by a build with a larger buffer
+   would therefore raise the capacity above the real allocation.
+   Harmless in retail, where every build allocates the same size;
+   a hazard for any reimplementation, which should keep its own
+   capacity and discard the file's.
+
+3.3.  Checked against a retail-written file
+
+   decomp/DATA/ile01/timatak__1.bin was written by MOTO.EXE - it
+   carries a capacity our build never writes - and every prediction
+   in 3.1 and 3.2 holds against it [verified]:
+
+   +------------------+-------------------------------------------+
+   | Field            | Value                                     |
+   +==================+===========================================+
+   | name             | timatak__1.bin, so reverse 0, pocket 0,   |
+   |                  | 1 lap - and the header words agree        |
+   +------------------+-------------------------------------------+
+   | record +0x00     | "SHADOW" NUL, then 0x7f to +0x0c          |
+   +------------------+-------------------------------------------+
+   | record +0x0d     | 18080, 29057, 39681, then zeros - three   |
+   |                  | checkpoints for a one-lap run             |
+   +------------------+-------------------------------------------+
+   | record +0xcd     | 44 bytes, every one 0x7f                  |
+   +------------------+-------------------------------------------+
+   | count            | 2921                                      |
+   +------------------+-------------------------------------------+
+   | capacity         | 10000                                     |
+   +------------------+-------------------------------------------+
+   | lapTime          | 39681.0 - the LAST SPLIT, as a float      |
+   +------------------+-------------------------------------------+
+   | size             | 273 + 2921 * 0x34 = 152165, exact         |
+   +------------------+-------------------------------------------+
+
+   o CAPACITY IS 10000.  That is the number the game ships with, and
+     it bounds how long a lap can be taped - the recorder's only
+     test is count < capacity.
+
+   o lapTime IS THE FINAL SPLIT.  39681 appears both as the third
+     checkpoint and as stream[4], which is what reading it from
+     racer+0x2ddd at save time produces.
+
+   o aim IS A UNIT DIRECTION.  (0.479, -0.007, 0.878) mid-lap sums
+     to 1.000 in square, so matOrientation row2 + row3 is normalised
+     by the time it is taped - row3 is zero on the player too.
+
+   o THE TAPED LAP STARTS AND ENDS AT THE LINE.  Frame 0 is
+     (0, 0, 5130) at speed 0 and frame 2920 is (192, 0, 11418),
+     also at speed 0.
+
+4.  The lifecycle
+
+   Four sites, in order [verified]:
+
+   +---------------------+------------+--------------------------+
+   | When                | Address    | What                     |
+   +=====================+============+==========================+
+   | level load          | 0x0047b42f | Ghost_Empty(playback),   |
+   | maybe_Game_LoadRace |            | then if time attack      |
+   |                     |            | Ghost_Load(playback),    |
+   |                     |            | then Ghost_Empty(record) |
+   +---------------------+------------+--------------------------+
+   | race init           | 0x0047bfe9 | Ghost_Rewind(playback);  |
+   | maybe_Game_InitRace |            | racer[2].active =        |
+   |                     |            | count != 0;              |
+   |                     |            | Ghost_Empty(record)      |
+   +---------------------+------------+--------------------------+
+   | each tick           | 0x0047e031 | playback advance, then   |
+   | Race_TickAllRacers  | 0x0047e10d | record append            |
+   +---------------------+------------+--------------------------+
+   | race over           | 0x00412d61 | record.lapTime =         |
+   | FUN_00412a50        |            | racer[1]+0x2ddd;         |
+   |                     |            | Ghost_Promote(playback,  |
+   |                     |            | record); build the       |
+   |                     |            | entry; Ghost_Save        |
+   +---------------------+------------+--------------------------+
+
+   PROMOTION HAPPENS ONCE, AT RACE END, not per lap, and it is
+   gated on g_nTimeAttack together with racer[1]+0x2f85 - the
+   finishing position - being 0.
+
+   THAT GATE MEANS YOU HAVE TO BEAT THE GHOST.  finishPosition is
+   zero-based and the ghost is an ordinary racer in slot 2, so in
+   time attack there are two active racers and position 0 is only
+   reached by finishing ahead of the recorded lap [inferred - the
+   gate is verified, the reading follows from the field's semantics
+   and the two-racer field].  Losing leaves the saved lap alone,
+   which is how the file comes to hold the best run rather than the
+   most recent one.  An abandoned run does not reach the arm at all.
+
+   A FIFTH SITE DELETES IT.  MenuPage09_Results_Tick's RESET TIME
+   ATTACK builds the same path at 0x0044e305, calls crt_remove -
+   DeleteFileA - on it at 0x0044e3db, and goes to page 6.  CONTINUE
+   lands on the same page; the delete is the entire difference
+   between the two buttons.  The in-memory stream is not touched,
+   because the next level load empties it and then fails to find the
+   file.
+
+   Ghost_Promote's arguments read backwards in the decompiler.  It
+   is __thiscall, and the call site is
+
+       00412d67  PUSH 0x52c0f0        ; src = record
+       00412d6c  MOV  ECX, 0x52c0d8   ; this = dst = playback
+
+   so the lap just taped becomes the lap to beat.  It copies
+   src->count records, assigns every field but frames, and zeroes
+   cursor and clock - the destination keeps its own array.
+
+5.  What the port does
+
+   All of it is in race.c, beside the rest of the ghost.  Rule 13
+   puts it there: it is one competitor's recorded state, reached
+   from the race dispatch.
+
+   +---------------------------+---------------------------------+
+   | race_ghost_promote        | Ghost_Promote                   |
+   +---------------------------+---------------------------------+
+   | race_ghost_path           | the inline path builder         |
+   +---------------------------+---------------------------------+
+   | race_ghost_build_entry    | 0x00412d71                      |
+   +---------------------------+---------------------------------+
+   | race_ghost_save           | Ghost_Save                      |
+   +---------------------------+---------------------------------+
+   | race_ghost_load           | Ghost_Load                      |
+   +---------------------------+---------------------------------+
+   | race_ghost_race_done      | the 0x00412d61 arm              |
+   +---------------------------+---------------------------------+
+   | race_ghost_reset          | InitRace's arm - rewind + empty |
+   +---------------------------+---------------------------------+
+   | race_ghost_load_race      | LoadRace's arm - empty, load,   |
+   |                           | empty                           |
+   +---------------------------+---------------------------------+
+   | race_ghost_erase          | RESET TIME ATTACK, 0x0044e3db   |
+   +---------------------------+---------------------------------+
+   | ghost_empty / ghost_rewind| the two stream primitives       |
+   +---------------------------+---------------------------------+
+
+   o THE DISK LOAD RUNS BEFORE race_build_grid, because the grid
+     reads race_ghost_has_lap to decide whether slot 2 is active.
+     The original reaches the same order across two functions -
+     LoadRace loads, InitRace activates - and our race_load does
+     both jobs, so the order has to be kept by hand.
+
+   o THE SAVE IS REACHED ONLY BY LETTING THE SEQUENCE RUN OUT.
+     It happens in FUN_00412a50's dispatch, seven seconds after the
+     line, and race.c's frame function returns before
+     race_post_race_tick whenever a HUD menu is active - so pressing
+     escape inside those seven seconds freezes the countdown and the
+     lap is lost without a word.  Whether the original keeps ticking
+     the sequence under its in-game menu is unread; FUN_00412a50's
+     own gate is the attract-demo flag and not the pause, so it is
+     not self-gated on a menu.  See post-race.txt 1.
+
+   o THE ARRAY WIRING IS CALLED BY BOTH ARMS.  Either can run
+     first, and a load into an unwired stream clamps the frame
+     count to a capacity of zero - reading nothing, and saying
+     nothing about it.
+
+   o THE FILE'S CAPACITY IS DISCARDED and the frame count is
+     clamped to our own array, per the warning in 3.2.
+     GHOST_MAX_FRAMES is 10000, which is the original's.
+
+   o IT IS NOT AN ASSET, so it does not go through asset_load.
+     This is a file the game WRITES into the install beside the
+     track data, which is the case rule 10 does not cover.
+
+6.  Open questions
+
+   o WHO ALLOCATES THE FRAME ARRAYS.  The SIZE is settled - 10000,
+     see 3.3 - but nothing found writes stream[+0x0c] or
+     stream[+0x08] outside Ghost_Load and Ghost_Promote, so the
+     allocation site itself is still unlocated.
+     [open - 0x0052c0e0 and 0x0052c0e4 have no writer]
+
+   o THE LAST 0x2c BYTES of the record block.  Two dwords near the
+     end are set to 0x7f7f7f7f by FUN_00411010 at +0xf1 and +0xf5,
+     which says they are fields rather than padding, and in a
+     retail-written file the whole run is 0x7f.  So they are a
+     field nothing fills on a ghost; bestscor.txt may settle what
+     writes them on a score.
+
+   o bestscor.dat ITSELF IS NOT PORTED.  FUN_00464680 runs just
+     before the continue prompt in the practice arm and maintains
+     25 records of 0xf9, qsorted, keyed by track name plus the same
+     pocket and reverse suffixes.  So practice currently records
+     the ghost and not the score.
+
+   o WHETHER A RESTART RE-READS THE FILE.  In the original the disk
+     load is on the level-load path and the rewind is on race init,
+     so a restart probably does not re-read.  Our race_load does
+     both, so it does.  The two agree in content, because a
+     completed run writes the file it would re-read, but the call
+     counts differ.

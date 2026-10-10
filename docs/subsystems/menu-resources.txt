@@ -1,0 +1,477 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          MENU RESOURCE TABLE
+
+
+Abstract
+
+   All 209 menu resources, enumerated with their file names. This is the
+   complete asset manifest for the front end.
+
+   +-----------------------+---------------------------------------+
+   | Item                  | Address                               |
+   +=======================+=======================================+
+   | g_resourceTable       | 0x004e3e20, 209 records of 20 bytes   |
+   +-----------------------+---------------------------------------+
+   | sentinel              | 0x004e4e74, id field = -1             |
+   +-----------------------+---------------------------------------+
+   | g_resourceDescriptors | 0x0053a8d8, runtime, 16 bytes per id  |
+   +-----------------------+---------------------------------------+
+   | g_menuObjects         | 0x00504880, one object pointer per id |
+   +-----------------------+---------------------------------------+
+   | Menu_LoadResources    | 0x0040a9a0                            |
+   +-----------------------+---------------------------------------+
+   | Sprite_Load           | 0x0043e8e0                            |
+   +-----------------------+---------------------------------------+
+
+Table of Contents
+
+   1. Record layout
+   2. Integrity
+   3. The manifest
+   4. Open questions
+   5. The flags, answered
+      5.1. f0 is a preload flag
+      5.2. f1 is a localisation flag
+         5.2.1. The six languages
+      5.3. f3 is the sprite kind, not a layer
+      5.4. What the 25 non-preloaded resources are
+
+
+1.  Record layout
+
+   offset  field
+   +0x00   preload   f0: create this sprite at menu init.  Section 5.1
+   +0x04   localised f1: path prefix is per-language.       Section 5.2
+   +0x08   id        resource id; -1 terminates the table
+   +0x0c   name      pointer to the file name
+   +0x10   kind      f3: the sprite kind, 0 to 4.           Section 5.3
+
+   The three flags were unidentified when this note was written. They
+   are answered in section 5; the old f0/f1/f3 spellings are kept there
+   so the question and its answer read together.
+
+   Lang_SetLanguage expands the table into fixed 16-byte descriptors at
+   g_resourceDescriptors, indexed by id, dropping the id field.
+   Menu_Load Resources then walks the descriptors and, where one is
+   populated, creates an object and calls Sprite_Load with the loop
+   counter. The array index is used directly as the resource id, so
+   g_menuObjects[n] always holds resource n. That identity is what let
+   the four joystick sprites be named in input-bindings.txt.
+
+2.  Integrity
+
+   Verified [verified]: 209 records, ids 0 to 208 with no gaps and no
+   duplicates, and every name pointer resolves. The table is 4180 bytes.
+
+   Physical order is not id order. There are 8 places where the id
+   decreases from one record to the next, for example 11, 12, 15, 16,
+   13, 14 and again around 147, 132, 133, 148. That is the signature of
+   ids being appended by hand as screens were added, then slotted into
+   the file wherever convenient. Since everything is indexed by id at
+   run time the disorder is harmless, but do not assume record order
+   means anything.
+
+3.  The manifest
+
+   Names are as they appear in the binary. Much of the vocabulary is
+   French, which fits the studio: fond is background, titre is title,
+   barre is bar, ligne is line, fleche is arrow, haut and bas are up and
+   down, moins is minus, clavier is keyboard, course is race.
+
+   Backgrounds and layers
+
+     0 paralax1.lez      1 paralax2.lez      2 paralax3.lez
+   113 CHFOND.lez      160 SSFOND1.lez     161 SSOMBRE1.lez
+
+   Titles and headings
+
+    3 maintit.lez       8 selmode.lez      17 newgame.lez
+   18 toptitle.lez     25 selrace.lez      60 optitre.lez
+   67 titre.lez        68 stitre.lez
+
+   Mode selection
+
+    4 SOLO_D.lez        5 SOLO_OK.lez       6 LINK_D.lez
+    7 LINK_OK.lez       9 practic2.lez     10 practice.lez
+   11 single2.lez      12 single.lez       13 champio2.lez
+   14 champion.lez     15 Grdprix2.lez     16 Grdprix.lez
+
+   Results and scoring
+
+   19 bestlap.lez      20 bestRace.lez     21 resultsG.lez
+   22 results.lez      23 Totalpts.lez     24 Coupe.lez
+   46 laps.lez        200 podium.lez
+
+   Digits and increment widgets
+
+    26 left.lez         27 left_l.lez       28 right.lez
+    29 right_l.lez      30 num0.lez         31 num1.lez
+    32 num2.lez         33 num3.lez         34 num4.lez
+    35 num5.lez         36 num6.lez         37 num7.lez
+    38 num8.lez         39 num9.lez         40 moin.lez
+    41 moin_l.lez       42 moiflach.lez     43 plus.lez
+    44 plus_l.lez       45 pluflach.lez     96 number1.lez
+    97 number2.lez      98 number3.lez      99 number4.lez
+   100 number5.lez     101 number6.lez     102 number7.lez
+   103 number8.lez
+
+   Bike selection and stat bars
+
+   47 choosefo.lez     48 choosemo.lez     49 features.lez
+   50 featacc.lez      51 featspe.lez      52 featgri.lez
+   53 featbra.lez      54 auto.lez         55 autofla.lez
+   56 autosha.lez      57 manu.lez         58 manufla.lez
+   59 manusha.lez
+
+   The four feat* entries are the bike stat bars: acceleration, speed,
+   grip and braking [inferred] from the abbreviations. auto and manu are
+   the gearbox choice, each with a flash and a shadow variant.
+
+   Buttons and pointer
+
+    61 bouthaut.lez     62 FOCUShau.lez     63 bouthau2.lez
+    64 boutbas.lez      65 FOCUSbas.lez     66 boutbas2.lez
+    70 accept.lez       71 cancel.lez       72 disconet.lez
+    73 exit.lez         74 join.lez         75 options.lez
+    76 start.lez        77 continue.lez     78 Btsave.lez
+    79 BtLoad.lez       80 BtAbort.lez      81 Btback.lez
+    82 BtNextRa.lez     83 BtVali.lez       84 BtUnvali.lez
+    85 Pointeur.lez     86 BtHiscor.lez     87 BtConfig.lez
+   170 btinfo.lez      208 Btupdate.lez
+
+   Frames and rules
+
+   69 tableau.lez     104 ligne.lez
+
+   Pocket bike and reverse toggles
+
+    88 poc_L.lez        89 poc_D.lez        90 rev_L.lez
+    91 rev_D.lez        92 rev_on_D.lez     93 rev_on_L.lez
+    94 rev_offD.lez     95 rev_offL.lez    185 smallrev.lez
+   186 smallpok.lez    198 Modpock.lez     199 Modrever.lez
+
+   Name entry and control configuration
+
+   105 enternam.lez    106 padcard.lez     107 clavcard.lez
+   108 joycard.lez     109 choset.lez      110 setting.lez
+   111 set.lez         112 set2.lez
+
+   The three *card entries are the input device pictures: pad, keyboard
+   (clavier) and joystick.
+
+   Championship screens
+
+   114 CHTITREG.lez    115 CHTITRE.lez     116 CHBARRE1.lez
+   117 CHBARRE2.lez    118 CHLOADA.lez     119 CHLOADB.lez
+   120 CHSAVEA.lez     121 CHSAVEB.lez     122 CHLIGNE1.lez
+   123 CHLIGNE2.lez    124 CHLIGNE3.lez
+
+   Link and multiplayer screens
+
+   125 LKBARRE1.lez    126 LKLIGNE1.lez    127 LKLIGNE2.lez
+   128 LKLIGNE3.lez    129 LKLIGNE4.lez    130 LKLED1.lez
+   131 LKLED2.lez      132 LKLED3.lez      133 LKLED4.lez
+   134 LKCOURSE.lez    135 LKBARRE2.lez    136 LKFEATUR.lez
+   137 LKAUTO.lez      138 LKPOCON.lez     139 LKPOCOFF.lez
+   140 LKLAND.lez      141 LKREVON.lez     142 LKREVOFF.lez
+   143 LKFLG1.lez      144 LKFLD1.lez      145 LKFLG2.lez
+   146 LKFLD2.lez      147 LKBARRE3.lez    148 LKFEATU1.lez
+   149 LKFEATU2.lez    150 LKMANUEL.lez    151 LKLOCK1.lez
+   152 LKLOCK2.lez     153 LKCOMPU1.lez    154 LKCOMPU2.lez
+
+   Thirty entries, the largest group in the table. The multiplayer lobby
+   was evidently the most graphically complex screen in the game.
+
+   Scrolling selection screens
+
+   155 SSBARRE1.lez    156 SSBARRE2.lez    157 SSBARRE3.lez
+   158 SSBARRE4.lez    159 SSSCROL1.lez    162 SSTITRE1.lez
+   163 SSTITRE2.lez    164 SSCURSE1.lez    165 SSCURSE2.lez
+   166 SSFLECH1.lez    167 SSFLECH2.lez    168 SSFLECH3.lez
+   169 SSFLECH4.lez
+
+   Time attack
+
+   171 timeatak.lez    172 attackon.lez    173 attackof.lez
+   174 attakfla.lez    201 resetTA.lez
+
+   Loading and splash
+
+   175 lodanim.lez     176 loadtxt.lez     177 load.lez
+   178 logodsi.lez
+
+   logodsi is the Delphine Software International logo, matching the
+   Dsed and Dsi_ prefixes in the leaked source paths and the
+   DelphineSoft registry key.
+
+   Diagnostics
+
+   179 proc.lez        180 video.lez       181 son.lez
+   182 joy.lez         197 diagnos.lez
+
+   Icons for processor, video, sound (son) and joystick, used by the
+   diagnostics screen.
+
+   Data disk
+
+   183 DATADISK.lez    184 DATTITLE.lez
+
+   Map
+
+   187 maptxt.lez
+
+   Title screens
+
+   188 title.lez       189 title2.lez      190 title3.lez
+   191 title4.lez      192 titleGP.lez     193 title2GP.lez
+   194 title3GP.lez    195 title4GP.lez
+
+   Four title images in two variants, plain and GP. The GP set is
+   presumably for Grand Prix mode [guess].
+
+   Network session
+
+   196 session.lez
+
+   Publisher logos
+
+   202 bmglogo.lez     203 ealogo.lez
+
+   Selected by g_useBmgBranding, which the undocumented -BMG flag sets.
+   See config-globals.txt.
+
+   Joystick direction icons
+
+   204 jtop.lez        205 jleft.lez       206 jright.lez
+   207 jbas.lez
+
+   These encode the stick binding values -4, -2, -3 and -5 respectively.
+   See input-bindings.txt.
+
+4.  Open questions
+
+   ALL FOUR ARE NOW ANSWERED. They are kept as written, with the
+   answers in section 5, because two of the guesses were wrong in an
+   instructive way.
+
+   o ANSWERED, 5.1 and 5.2. What are f0 and f1? Both are 0 or 1 and
+     they vary independently. Likely visibility or ownership flags;
+     find the consumer in Sprite_Load.
+   o ANSWERED, 5.3, and the guess was WRONG. f3 ranges 0 to 4 and is 4
+     only for the parallax layers and CHFOND, 3 for ligne, 2 for
+     tableau and the LKLIGNE3/4 pair. That pattern suggests a draw
+     layer or z-order [guess]. Confirm in the draw path.
+   o ANSWERED elsewhere. The .lez extension is the game's own sprite
+     container format. Nothing is yet known about its internal
+     structure; that is a separate job and a prerequisite for
+     extracting or replacing menu art.
+     -> Fully decoded. See docs/formats/lez.txt.
+   o ANSWERED, 5.4, and the guess was WRONG. Resources with all three
+     flags zero (load, logodsi, title*, bmglogo, ealogo) are
+     full-screen images rather than widgets [inferred].
+   o ANSWERED, and the answer is narrower than the question assumed. The
+     prefixes group by feature, not by page. Only SS (session list, page
+     7) and LK (link, page 8) belong to a single page; CH spans pages 6,
+     20 and 21. Pages were instead identified by scanning each handler
+     for references into g_menuObjects, which gives the exact resource
+     set per page. See docs/subsystems/menu-pages.txt section 3.
+
+
+5.  The flags, answered
+
+   Two functions between them settle all three [verified]: Sprite_Load
+   (0x0043e8e0), which reads a descriptor and builds a path, and the
+   loop at the end of Menu_LoadResources (0x0040a9a0), which decides
+   whether a resource gets an object at all.
+
+5.1.  f0 is a preload flag
+
+   Menu_LoadResources walks all 209 descriptors and creates an object
+   only when BOTH the name pointer and f0 are non-zero:
+
+       if (desc->name == 0 || desc->preload == 0)
+           g_menuObjects[id] = NULL;
+       else
+           g_menuObjects[id] = Sprite_Load(new MR_Sprite, id);
+
+   So f0 = 0 does not mean the resource is unused. It means nothing
+   loads it at menu init, and some other code owns the timing. Section
+   5.4 says who.
+
+5.2.  f1 is a localisation flag
+
+   Sprite_Load branches on it to choose the directory the file name is
+   appended to:
+
+       f1 == 0   ->  the literal "data\menu\bitmap\"
+       f1 != 0   ->  the per-language directory, from the pointer table
+                     at 0x004e8b60 indexed by g_language
+
+   THE FALLBACK IS PER FILE, which is the part worth knowing. When f1
+   is set and the localised file will not open, Sprite_Load rebuilds
+   the path against the US directory and uses that instead. A partially
+   translated release degrades one sprite at a time rather than
+   wholesale. A file missing from the US directory too is still fatal,
+   because the loaders below abort.
+
+   IT IS ALWAYS US, NOT g_language. The fallback arm at 0x0043e9a5
+   loads the table's FIRST entry directly rather than indexing it
+   [verified].
+
+5.2.1.  The six languages
+
+   Two identical pointer tables hold the directory strings - 0x004e8b60,
+   which Sprite_Load indexes, and 0x004e4e88, which Lang_GetMenuDir
+   does. A third at 0x004e4ea0 holds the same six as bare names. The
+   order is the same in all three [verified]:
+
+   +---+---------------------+----------+-----------+---------+
+   | n | directory           | name     | language  | flag    |
+   +===+=====================+==========+===========+=========+
+   | 0 | data\MenuUs\        | MenuUs   | English   | -us     |
+   +---+---------------------+----------+-----------+---------+
+   | 1 | data\MenuFr\        | MenuFr   | French    | -fr     |
+   +---+---------------------+----------+-----------+---------+
+   | 2 | data\MenuGr\        | MenuGr   | German    | -gr     |
+   +---+---------------------+----------+-----------+---------+
+   | 3 | data\MenuIt\        | MenuIt   | Italian   | -it     |
+   +---+---------------------+----------+-----------+---------+
+   | 4 | data\MenuSp\        | MenuSp   | Spanish   | -sp     |
+   +---+---------------------+----------+-----------+---------+
+   | 5 | data\MenuSw\        | MenuSw   | Swedish   | -sw     |
+   +---+---------------------+----------+-----------+---------+
+
+   THE INDEX IS g_language AT 0x004dbce8, and it is NOT a stored
+   setting. It is zero in the image, so English is the default, and
+   the only things that write it are Main_InitAndParseCommandLine -
+   the six flags above, documented in the flag block at 0x004dc664 -
+   and Lang_SetLanguage. There is no Language key in CONFIG.BPT; see
+   settings.txt.
+
+   Lang_GetMenuDir (0x00415a10) bounds it as 0 <= n < 6 before
+   indexing, which is where the count is pinned.
+
+   A RETAIL INSTALL SHIPS ONE OF THEM. The USA DATA folder holds
+   MENUUS.BKF and no other, so five of the six indices need a
+   localised release we do not have - which is why the per-file
+   fallback is not decoration.
+
+   The port carries this as [OPTIONS] Language, a key of OURS since
+   the original has no command line to speak of. See src/menures.c.
+
+5.3.  f3 is the sprite kind, not a layer
+
+   The guess in section 4 was reasonable and wrong. f3 goes straight
+   into MR_Sprite.kind, and kind is a DRAW MODE, not a depth.
+   Sprite_Draw takes a mode argument in which the value 5 is a sentinel
+   meaning "use this sprite's own kind instead", so:
+
+       0  opaque copy
+       1  colour-keyed
+       2  stippled opaque, 50% screen door
+       3  stippled and colour-keyed
+       4  the wave variant, with its own update and its own draw
+
+   See docs/structs/MR_Sprite.txt sections 3 and 5.
+
+   THE MEASUREMENT THAT SETTLES IT. Kind 4 is the one value that is not
+   a blit mode, and Lez_Decode gives it a fixed 0x10000-byte buffer
+   built by reading 128 rows of 128 pixels and writing each row twice -
+   a 128x128 source becoming 128x256. All four kind-4 resources are
+   exactly 128x128, and nothing else in the manifest is [verified]:
+
+       paralax1.lez  128x128     paralax3.lez  128x128
+       paralax2.lez  128x128     CHFOND.lez    128x128
+
+   A z-order would have no reason to correlate with the source
+   dimensions. The four sprites the old guess called layers are layers
+   only in the sense that a scrolling wave effect is what they are for.
+
+5.4.  What the 25 non-preloaded resources are
+
+   The guess that they are full-screen images was also wrong. Most are
+   BRANDING PAIRS, and Menu_LoadResources picks one of each pair
+   explicitly using g_useBmgBranding [verified]:
+
+   +----------------------+----------------------+------------------+
+   | g_useBmgBranding = 1 | g_useBmgBranding = 0 | what it is       |
+   +======================+======================+==================+
+   | titleGP, title2GP,   | title, title2,       | title screen     |
+   | title3GP, title4GP   | title3, title4       | sequence         |
+   +----------------------+----------------------+------------------+
+   | CHTITREG             | CHTITRE              | championship     |
+   |                      |                      | heading          |
+   +----------------------+----------------------+------------------+
+   | Grdprix2, Grdprix    | champio2, champion   | the mode's name  |
+   +----------------------+----------------------+------------------+
+   | resultsG             | results              | results heading  |
+   +----------------------+----------------------+------------------+
+
+   So one build calls the mode GRAND PRIX and the other calls it
+   CHAMPIONSHIP, and the whole difference is eight resource ids and one
+   flag - a release-variant switch sitting in the middle of the menu
+   loader.
+
+
+5.4.1.  What sets g_useBmgBranding
+
+   0x004dc1c4.  Four writers, ALL of them inside
+   Main_InitAndParseCommandLine, and they run in this order
+   [verified]:
+
+   +------------+----------------------------------------------+
+   | Address    | What it does                                 |
+   +============+==============================================+
+   | 0x00414127 | = 0.  The DEFAULT is EA, not BMG             |
+   +------------+----------------------------------------------+
+   | 0x00414279 | = 1 when the registry Version reads 1        |
+   +------------+----------------------------------------------+
+   | 0x0041428c | = 0 when it reads 0                          |
+   +------------+----------------------------------------------+
+   | 0x00414865 | = 1 for -BMG on the command line             |
+   +------------+----------------------------------------------+
+
+   THE REGISTRY VALUE IS THE INSTALLER'S, read by FUN_0045a3f0 -
+   RegOpenKeyExA on HKEY_LOCAL_MACHINE, RegQueryValueExA, four
+   bytes:
+
+       SOFTWARE\DelphineSoft\MotoRacer\CurrentVersion\Moto
+       Version    1 -> BMG,  0 -> EA
+
+   THE OUT PARAMETER IS PRESET TO -1 AND THE READ CAN FAIL
+   SILENTLY, which is what makes the three-way behaviour: a
+   missing key leaves -1, neither branch runs, and the default
+   stands.  So the precedence is default, then registry if the
+   key exists, then -BMG if it is passed.
+
+   o InstallType IS READ FROM THE SAME KEY immediately before,
+     into 0x004e8580, which is preset to 3.  That makes it a
+     free probe: 0x004e8580 still reading 3 means the registry
+     read FAILED, so Version cannot have been consulted either.
+
+   NOTHING WRITES IT AFTER STARTUP.  There is no unlock, no
+   per-mode switch and no language involvement - Language is a
+   different key in the same block.  A build shows one name for
+   its whole run.
+
+   o THE RECONSTRUCTION DEFAULTS TO CHAMPIONSHIP AND THAT IS
+     CORRECT, because the original does.  menu.c carries the
+     whole mechanism - s_bmg and a GP/MR pair for every
+     resource, mesh, scale and animation endpoint - but
+     menu_set_bmg_branding has NO CALLER, so nothing can turn
+     it on.  Neither the registry read nor the -BMG flag is
+     reconstructed.  [open]
+
+   The rest of the f0 = 0 set is the boot sequence - load, lodanim,
+   loadtxt, logodsi, bmglogo, ealogo - plus podium, Modpock and
+   Modrever. Menu_LoadResources loads the boot images itself, by
+   literal id, before the descriptor walk: 0xb1 (177, load) or 0xca /
+   0xcb (202 / 203, bmglogo / ealogo) depending on the same branding
+   flag, and 0xaf (175, lodanim).
+
+   o SO f0 = 0 MEANS "somebody else decides when, and which". It is a
+     statement about ownership, not about size. Several of the entries
+     are indeed full-screen, but that is a consequence rather than the
+     rule.

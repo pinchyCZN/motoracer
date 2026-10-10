@@ -1,0 +1,184 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      THE POST-RACE SEQUENCE
+
+
+Abstract
+
+   Crossing the line does not end a race - it starts a timer.  Seven
+   seconds normally, fourteen when the winner's bike is to keep
+   riding itself while the credits roll, and only then does the game
+   go back to the menus.
+
+   The same machinery serves three things, which is why it reads as
+   one subsystem rather than three: the end of a race, the
+   title-screen attract demo, and replay playback.  All three switch
+   on the SAME trackside shot director, through one condition in
+   Camera_SelectView.
+
+   This note covers the end-of-race half.  The director itself is in
+   camera.txt 5; the credits are not ported.
+
+Table of Contents
+
+   1. The sequence
+   2. The auto-ride, and who gets it
+   3. What the port does
+   4. Open questions
+
+1.  The sequence
+
+   FUN_00412a50 (0x00412a50) runs every frame from maybe_Game_Tick
+   (0x0047d9f9).  Its whole state is one millisecond countdown,
+   DAT_004e9824, stepped by the integer frame delta - with two
+   values that are not durations:
+
+   +-------+----------------------------------------------------+
+   | Value | Meaning                                            |
+   +=======+====================================================+
+   |   -1  | idle - waiting for the race to end                 |
+   +-------+----------------------------------------------------+
+   |  > 1  | counting down                                      |
+   +-------+----------------------------------------------------+
+   |   1   | expired; the transition is due                     |
+   +-------+----------------------------------------------------+
+   |   0   | done; dispatch back to the menus                   |
+   +-------+----------------------------------------------------+
+
+   From idle, g_nRaceOverHud or g_nRaceOverNet going non-zero arms
+   it at 7000 ms and plays a cue.  If the auto-ride gate then says
+   yes it is re-armed at 14000 instead - the extra seven seconds are
+   the credits' window, not a longer pause.
+
+   At 1 the transition runs: start the credits once, and when they
+   report finished, put the player back and fall to 0.  At 0 the
+   dispatch differs by mode - championship, single race and practice
+   each go somewhere different, and time attack writes its record on
+   the way.
+
+2.  The auto-ride, and who gets it
+
+   FUN_00412960 (0x00412960) is the gate, and it is four tests:
+
+       not a replay
+       solo
+       g_nSelectedMode == 1          SINGLE RACE only
+       finishPosition == 0           FIRST PLACE only
+
+   SO THE AUTO-RIDE IS FOR A WINNER.  Second place onward simply
+   stops at the line, which is what a fourth-place finish shows -
+   no camera cuts and no riding on.  Practice and championship never
+   get it at all.
+
+   THE HANDOVER IS ONE FIELD.  The tick dispatch already forks on
+   racer +0x08, humanPlayer, so clearing it hands the bike to the
+   AI.  Everything else is making that not look like a glitch:
+
+   +----------------+---------+-------------------------------+
+   | Field          | Offset  | Action                        |
+   +================+=========+===============================+
+   | humanPlayer    | +0x08   | 0 - the handover              |
+   +----------------+---------+-------------------------------+
+   | engineSpeed    | +0xec   | = speed                       |
+   +----------------+---------+-------------------------------+
+   | aiRoadSpeed    | +0x1a4  | = speed                       |
+   +----------------+---------+-------------------------------+
+   | realSpeedMax   | +0xb4   | *= 0.8  (0x004d03a8)          |
+   +----------------+---------+-------------------------------+
+   | tickInputWord  | +0x2dc8 | 0                             |
+   +----------------+---------+-------------------------------+
+
+   THE ORDER MATTERS in one place: the two speeds are seeded BEFORE
+   the ceiling is scaled, so the AI inherits the speed actually
+   being carried rather than the reduced maximum.  Scaling first
+   would brake the bike on the frame of the handover.
+
+   It also clears the whole input record - both axes to centre
+   (0x8000), every button off, Input_Clear 0x00470fc0 - because a
+   key still held at the line would otherwise fight the AI for as
+   long as it was down.  The counter is hidden and the cockpit view
+   forced off.  The restore reverses all of it.
+
+3.  What the port does
+
+   race.c carries the sequence, the gate and the director;
+   racer.c the per-racer handover; trk.c the camera search.  No new
+   file: each piece went where rule 13 already puts that kind of
+   code.
+
+   +---------------------------+---------------------------------+
+   | race_post_race_tick       | FUN_00412a50                    |
+   +---------------------------+---------------------------------+
+   | race_post_race_reset      | FUN_00410120, its sequence half |
+   +---------------------------+---------------------------------+
+   | race_auto_ride_gate       | FUN_00412960                    |
+   +---------------------------+---------------------------------+
+   | race_auto_ride            | DAT_00504ea0, for the director  |
+   +---------------------------+---------------------------------+
+   | camera_update_trackside   | Camera_UpdateTrackside          |
+   +---------------------------+---------------------------------+
+   | racer_ai_takeover         | the field table above           |
+   +---------------------------+---------------------------------+
+   | racer_restore_human       | the transition's restore        |
+   +---------------------------+---------------------------------+
+   | trk_find_nearest_camera   | Trk_FindNearestCamera           |
+   +---------------------------+---------------------------------+
+
+   mr_place.py --attract declares the bike home in first and lets
+   the sequence arm, so testing needs no lap.  It is single-race
+   only for the same reason the gate is.
+
+   THREE DELIBERATE DIVERGENCES:
+
+   o THE CREDITS ARE A STUB.  race_credits_begin logs and reports
+     "finished", so the fourteen-second window expires on its TIMER
+     rather than on the credits ending.  Behaviourally close, not
+     the same thing.
+
+   o THE NETWORK ARM IS ABSENT.  With neither flag set the original
+     still runs a 3000 ms countdown on DAT_0052c238, the "everybody
+     else has finished" path, which a solo port cannot reach.
+
+   o THE DIRECTOR IS REACHABLE ONLY THROUGH THE AUTO-RIDE.
+     Camera_SelectView switches it on for any of five flags; the
+     other four are the replay and the attract demo, and the port
+     has neither yet.
+
+4.  Open questions
+
+   o The credits subsystem - FUN_0048acd0, FUN_0048ae40,
+     FUN_0048a9e0, FUN_0048b070 and the element destructors.  A
+     self-contained C++ presentation with its own object arrays and
+     CD audio track 12.  Where it should live in the port is
+     deliberately undecided until it is read.
+
+   o FUN_00412a50's state 0 for CHAMPIONSHIP.  It goes to page
+     0x18 or FUN_004580f0 and is not reached yet.  The solo
+     single-race arm is done - it raises the post-race question,
+     FUN_00437b70, [REPLAY] over [YES] and [NO] - and so is
+     practice, which opens the continue prompt and, in time
+     attack, writes the ghost on the way.  What practice still
+     lacks is FUN_00464680, the bestscor.dat table that runs
+     immediately before the prompt; see formats/timatak.txt 6.
+
+   o ITALIAN AND SWEDISH FOR [REPLAY].  The .rdata groups the
+     translations by concept, Sw..Us ascending, with the resource
+     pointer on the Us one; four of the six were located and the
+     other two fall back to English rather than being invented.
+
+   o The gearbox re-seat FUN_0048df90, run last in the restore.  It
+     lands one frame before the game leaves for the menus, so the
+     gear the player nominally resumes in is not observable; its
+     ratio table is reached by a NEGATIVE index off
+     MinAdherenceDerap and was left rather than guessed.
+
+   o DAT_00504eac IS CLOSED, and it was not the plaque's own flag.
+     It means THE RESULT HAS BEEN ACKNOWLEDGED - by a key through
+     Input_OnKeyDown, or by the sequence reaching its transition at
+     0x00412b0c, beside the credits start.  The plaque flying out
+     is one of the things that follows, which is why a port that
+     never set it left the plaque up for ever.
+
+   o FUN_00404da0(0x3e, 500), the post-race cue - a different entry
+     point from audio_cue, and the 500 is unread.

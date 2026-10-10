@@ -1,0 +1,239 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          CODE MAP AND TRIAGE
+
+
+Abstract
+
+   Where the game code actually is, and what is library noise.
+
+   Source: list_functions_enhanced over the whole program (3019 entries,
+   parsed in full), plus cross-references to the 13 leaked assert-path
+   strings.
+
+   The assert paths now carry LINE NUMBERS as well. docs/source-map.txt
+   tabulates all 43 sites as file + line + function, which orders
+   functions within a translation unit rather than merely assigning them
+   to one. Regenerate it with tools/ghidra_assert_map.java.
+
+Table of Contents
+
+   1. Headline numbers [verified]
+   2. The library / game split [verified]
+   3. Translation unit anchors [verified]
+   4. Applied to the Ghidra DB [verified]
+   5. Recommended order of work
+   6. Open questions
+
+
+1.  Headline numbers [verified]
+
+   +---------------------+--------------+-------------------------------------------------------+
+   | Metric              | Count        | Note                                                  |
+   +=====================+==============+=======================================================+
+   | Functions in .text  | 3019         | real function bodies                                  |
+   +---------------------+--------------+-------------------------------------------------------+
+   | Imported / external | ~282         | the EXTERNAL: entries                                 |
+   +---------------------+--------------+-------------------------------------------------------+
+   | Reported total      | 3301         | = 3019 + 282 externals; after repairs                 |
+   +---------------------+--------------+-------------------------------------------------------+
+   | Named by Ghidra     | 888 (29.4%)  | FID, demangler, and our own renames                   |
+   +---------------------+--------------+-------------------------------------------------------+
+   | Still FUN_          | 2131 (70.6%) |                                                       |
+   +---------------------+--------------+-------------------------------------------------------+
+   | Thunks              | 15           |                                                       |
+   +---------------------+--------------+-------------------------------------------------------+
+
+   Correction to an earlier note: "2,824 functions" was a metadata
+   figure, which includes the ~282 imported symbols. The number of real
+   function bodies to analyse is 3019.
+
+2.  The library / game split [verified]
+
+   Named-function density per 64 KB band is not gradual. It is a cliff:
+
+   +------------+-----------+-------+---------+
+   | Band       | Functions | Named | Named % |
+   +============+===========+=======+=========+
+   | 0x00400000 | 159       | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x00410000 | 188       | 1     | 0.5%    |
+   +------------+-----------+-------+---------+
+   | 0x00420000 | 290       | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x00430000 | 165       | 1     | 0.6%    |
+   +------------+-----------+-------+---------+
+   | 0x00440000 | 79        | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x00450000 | 148       | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x00460000 | 86        | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x00470000 | 164       | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x00480000 | 115       | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x00490000 | 127       | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x004a0000 | 73        | 0     | 0.0%    |
+   +------------+-----------+-------+---------+
+   | 0x004b0000 | 385       | 298   | 77.4%   |
+   +------------+-----------+-------+---------+
+   | 0x004c0000 | 563       | 401   | 71.2%   |
+   +------------+-----------+-------+---------+
+
+   Everything below 0x004b0000 is 2 named functions out of 2070.
+   Everything at 0x004b0000 and above is roughly three-quarters named,
+   and every one of those names is a CRT or compiler symbol (200 begin
+   __, 79 begin _, the rest are MFC/runtime).
+
+   0x00401000 - 0x004afxxx    2070 functions   GAME CODE
+   0x004b0000 - 0x004cf5ff     948 functions   MFC / CRT / compiler runtime
+
+   The real target is 2070 functions, not 3019 and certainly not 2753.
+   That is a 37% reduction before any analysis has happened. All 13
+   assert anchors fall below 0x004b0000, which independently confirms
+   the boundary.
+
+   The 249 unnamed functions above 0x004b0000 are almost certainly
+   library code Ghidra's FID did not match [inferred], not stray game
+   code. Treat them as library until something proves otherwise.
+
+3.  Translation unit anchors [verified]
+
+   Each address below is a function that references its translation
+   unit's assert path string, so that function is definitely part of
+   that .obj. A linker lays each object file out contiguously, so these
+   anchors bound the regions between them [inferred].
+
+   +------------------------------------------------+-------------------------------------------+
+   | Anchor address(es)                             | Translation unit                          |
+   +================================================+===========================================+
+   | 0x00401e40                                     | screen3d\bankw.Cpp                        |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x00409c00, 0x0040bd60, 0x0040bef0             | menu\menu.cpp                             |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x00414080                                     | command-line parser and init (TU unknown) |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x0041c050                                     | Dsi_d3d.cpp                               |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x00422280                                     | frame3d.cpp                               |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x004329a5                                     | event.cpp                                 |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x0043e280, 0x0043e700                         | menu\bitmap.cpp                           |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x00449100, 0x00449560, 0x0044af0b, 0x00451505 | menu\pageMainMenu.cpp                     |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x00462c60                                     | player.cpp                                |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x00473da0, 0x00477b30                         | screen3d\dd.cpp                           |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x00479260, 0x00479630                         | menu\menuTools.cpp                        |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x00487xxx - 0x004888bf                        | menu\pageProtocol.cpp                     |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x0048b370, 0x0048b7e0                         | animDecor.cpp                             |
+   +------------------------------------------------+-------------------------------------------+
+   | 0x0049a160                                     | screen3d\screen3d.cpp                     |
+   +------------------------------------------------+-------------------------------------------+
+
+   Approximate layout in address order [inferred] - boundaries are
+   guesses between anchors, not measured:
+
+   0x00401000  screen3d\bankw.Cpp, menu\menu.cpp
+   0x00414000  init / command-line parsing
+   0x00419500  Dsi_d3d.cpp   (see the refinement below)
+   0x00422000  frame3d.cpp
+   0x00433000  event.cpp
+   0x0043e000  menu\bitmap.cpp
+   0x00449000  menu\pageMainMenu.cpp
+   0x00462000  player.cpp
+   0x00473000  screen3d\dd.cpp
+   0x00479000  menu\menuTools.cpp
+   0x00487000  menu\pageProtocol.cpp
+   0x0048b000  animDecor.cpp
+   0x0049a000  screen3d\screen3d.cpp
+   0x004b0000  MFC / CRT
+
+   Note the menu\ files are not adjacent to each other. Object files are
+   placed independently, so a directory in the original tree does not
+   imply one region here. Only the per-object contiguity holds.
+
+   FUN_00476100 sits between the two screen3d\dd.cpp anchors, so it
+   belongs to dd.cpp [inferred]. That is the texture-size clamp
+   identified in subsystems/config-globals.txt, and it places the
+   texture-bound logic in the DirectDraw wrapper rather than in the D3D
+   layer.
+
+   REFINEMENT: Dsi_d3d.cpp starts near 0x00419500, not 0x0041c000
+   [inferred]. The layout above put its boundary at the 0x0041c050
+   assert anchor, but a contiguous run of Cd3d methods straddles that
+   anchor on both sides - Cd3d_Ctor 0x00419520, D3D_EmitTriangle
+   0x00419d60, D3D_EmitLine 0x00419ee0, D3D_EmitProcessVertices
+   0x00419ff0, D3D_CloseExecuteBuffer 0x0041a310,
+   D3D_BeginExecuteBuffer 0x0041a3f0, D3D_ExecuteBuffer 0x0041adb0,
+   and the six render-state emitters 0x0041dde0 to 0x0041e73a. All are
+   __thiscall on g_pCd3d and all write the same execute buffer, so
+   per-object contiguity puts the whole range in one TU. The anchor
+   only proves the TU CONTAINS 0x0041c050, not that it begins there.
+
+   That also splits the hardware renderer across two files: the draw
+   loop D3D_DrawScene 0x004af570 and D3D_WriteVertex 0x004af420 are in
+   the screen3d\screen3d.cpp region, and everything they call to build
+   the buffer is in Dsi_d3d.cpp. The seam of subsystems/renderer.txt
+   section 3.2 is a translation-unit boundary as well as a logical one
+   [inferred].
+
+4.  Applied to the Ghidra DB [verified]
+
+   Both triage operations are done. Re-run tools/ghidra_tu_fence.java if
+   a re-analysis ever clears tags or comments; it is idempotent.
+
+   +--------------------------------------------------------+----------------+
+   | Operation                                              | Result         |
+   +========================================================+================+
+   | LIBRARY function tag on everything at/above 0x004b0000 | 948 functions  |
+   +--------------------------------------------------------+----------------+
+   | Untagged below the fence (the working set)             | 2070 functions |
+   +--------------------------------------------------------+----------------+
+   | TU anchor plate comments                               | 24 addresses   |
+   +--------------------------------------------------------+----------------+
+
+   Query the fence from Ghidra with search_functions_by_tag LIBRARY, or
+   filter it out when hunting game code. Two of the anchor addresses
+   (0x0048713c, 0x004888bf, both menu/pageProtocol.cpp) are not inside
+   defined functions, so they carry a plain address plate comment rather
+   than a function header - worth investigating why that region has
+   undefined code.
+
+5.  Recommended order of work
+
+   1. Fence off the library region. Tag or bookmark
+      0x004b0000-0x004cf5ff as runtime so it stops appearing in
+      searches. Removes 948 functions of noise in one operation and
+      costs nothing to undo.
+   2. Plant the 13 anchors as plate comments or bookmarks naming the
+      translation unit. Cheap, and it makes every later "where am I"
+      question answerable from the listing.
+   3. Then pick a region and go deep. For the renderer mission the
+      ordering is dd.cpp -> Dsi_d3d.cpp -> frame3d.cpp -> screen3d.cpp.
+
+   Start point for depth: FUN_00476100 in dd.cpp. It is small, it
+   consumes four globals already recovered and named in config-
+   globals.txt, and it seeds the DirectDraw surface layer where the
+   16-bit lock lives.
+
+6.  Open questions
+
+   o What are the 249 unnamed functions above 0x004b0000? Spot-check a
+     few to confirm they are library and not game code linked late.
+   o Which TU holds the init path at 0x00414080? It has no assert
+     string.
+   o bankw.Cpp sits at the very bottom of .text. Is "bank" texture
+     memory banking, and does that make it foundational to the renderer?
+   o Several large gaps between function starts (10256 bytes at
+     0x0045f290, 9088 at 0x00442790, 8448 at 0x0047e3d0) may be inline
+     data tables or unanalysed code. Worth a look; find_code_gaps may
+     resolve them.

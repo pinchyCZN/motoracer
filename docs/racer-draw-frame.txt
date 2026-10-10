@@ -1,0 +1,179 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                  MAYBE_RACER_DRAW - THE STACK FRAME
+
+
+Abstract
+
+   maybe_Racer_Draw at 0x0045f290 is 10246 bytes and keeps 159 live
+   stack slots in one frame. Tracing them one at a time re-derives the
+   frame every time and lands in a different untagged region at every
+   level - see racer-draw-audit.txt 26.
+
+   This is the frame, resolved mechanically and checked against eight
+   sites whose offsets were established independently.
+
+Table of Contents
+
+   1. How it is derived
+   2. The prologue and the signature
+   3. The map
+   4. The 0x0045f5a0 block
+   5. Open
+
+1.  How it is derived
+
+   GHIDRA ALREADY KNOWS. Its analyser attaches a stack reference to
+   every ESP-relative operand, computed across control flow, and
+
+       body offset = StackReference.getStackOffset() + 0x424
+
+   holds at all eight anchor sites. No hand arithmetic, no purge
+   table, no push counting.
+
+       for (Reference r : refMgr.getReferencesFrom(insAddr))
+           if (r.isStackReference())
+               body = ((StackReference) r).getStackOffset() + 0x424;
+
+   TWO APPROACHES THAT DO NOT WORK, both tried:
+
+   o A hand-written table of helper stack purges. 57 of the calls are
+     not in it, ESP drifts forty pushes deep, and every offset past
+     the first block is wrong.
+
+   o Walking instructions in address order with
+     Function.getStackPurgeSize(), which resolves every call. This
+     gets 4 of 5 anchors and fails on 0x0046196e by exactly four
+     pushes, BECAUSE A LINEAR WALK CROSSES BRANCHES: the i == 3 path
+     pushes twice and jumps into the shared tail, so a linear reader
+     counts those pushes on the general path too. Stack depth is a
+     control-flow property and has to be computed as one.
+
+2.  The prologue and the signature
+
+       0045f290  SUB ESP, 0x414        1044 bytes of locals
+       0045f296  PUSH EBX / ESI / EDI / EBP
+       0045f29d  MOV EBX, ECX          EBX IS THE RACER throughout
+
+   Body ESP is 0x424 below entry, so the arguments are:
+
+   +----------+---------------------------------------------------+
+   | +0x424   | return address                                    |
+   +----------+---------------------------------------------------+
+   | +0x428   | arg0 - passed as ECX to every transform call.     |
+   |          | 13 references. THERE IS NO arg4; an earlier note  |
+   |          | put this at +0x438, which is the literal at a     |
+   |          | site with pushes pending.                         |
+   +----------+---------------------------------------------------+
+   | +0x42c   | arg1 - THE CAMERA. Held in ESI from 0x0045f9cb.   |
+   |          | A 3x4 at camera+0x68, translation +0x8c..+0x94,   |
+   |          | eye at +0x98.                                     |
+   +----------+---------------------------------------------------+
+   | +0x430   | arg2 - the LOD slot. Compared against -1 and,     |
+   |          | when not -1, stored into racer+0x638.             |
+   +----------+---------------------------------------------------+
+
+   So the signature is __thiscall(racer, arg0, camera, lodSlot).
+
+3.  The map
+
+   The heavily-used slots, by reference count. A count in the forties
+   means a scratch that the whole function shares, not one value.
+
+   +---------+-----+-----------------------------------------------+
+   | offset  |  n  | what                                          |
+   +=========+=====+===============================================+
+   | +0x12c  |  50 | THE FromEuler SCRATCH, rewritten constantly.  |
+   |         |     | Also the matrix the part-loop transform reads |
+   |         |     | at 0x0046196e.                                |
+   +---------+-----+-----------------------------------------------+
+   | +0x010  |  46 | the working matrix. = +0x040 x camera at      |
+   |         |     | 0x004604c8; copied to +0x0ac then +0x238.     |
+   +---------+-----+-----------------------------------------------+
+   | +0x0ac  | 37  | the general scratch; also the part-loop       |
+   |         |     | build at 0x0046154c                           |
+   +---------+-----+-----------------------------------------------+
+   | +0x0dc  |  34 | a vec3 scratch                                |
+   +---------+-----+-----------------------------------------------+
+   | +0x07c  |  33 | a vec3 scratch                                |
+   +---------+-----+-----------------------------------------------+
+   | +0x180  |  25 | a vec3 scratch                                |
+   +---------+-----+-----------------------------------------------+
+   | +0x070  |  20 | a float scratch                               |
+   +---------+-----+-----------------------------------------------+
+   | +0x040  |  15 | = +0x010 x +0x12c at 0x004604ba, refilled     |
+   |         |     | from +0x0ac at 0x00460683                     |
+   +---------+-----+-----------------------------------------------+
+
+   The identified singles:
+
+   +---------+-----+-----------------------------------------------+
+   | +0x084  |     | (0, lift, 0), the rear spring lift            |
+   | +0x0e0  |     | +0x084 through the matrix at +0x298           |
+   | +0x128  |   6 | maybe_Racer_ShadeLevel return, 0x0045f5f4;    |
+   |         |     | read by the part loop at 0x0046147c           |
+   | +0x1bc  |   8 | A VEC3 SCRATCH, not one value - see below.    |
+   |         |     | +0x1c0 and +0x1c4 are its y and z, read once  |
+   |         |     | each at 0x0045fefd and 0x0045ff1c.            |
+   | +0x1c8  |   3 | ptr from the table at 0x00509398, indexed by  |
+   |         |     | racer+0x78 * 73; tested at 0x0045f60f         |
+   | +0x1cc  |  12 | the transformed point plus +0x1bc             |
+   | +0x238  |   3 | MEMBER 3 draw matrix. Identity 0x0045fa49,    |
+   |         |     | written 0x0046070e, read 0x00461525.          |
+   | +0x268  |  10 | = +0x12c x +0x298 at 0x0045f5dd               |
+   | +0x298  |   9 | = +0x12c x +0x2d4 at 0x0045f5b4               |
+   | +0x2d4  |   5 | copy of racer+0x2e55, made at 0x0045f2e5      |
+   | +0x334  |   3 | Matrix34_Copy of +0x268 at 0x0045f603         |
+   | +0x3c4  |   2 | MEMBER 0 draw matrix. Written 0x0045fa38,     |
+   |         |     | read 0x004614ab. VERIFIED byte-exact against  |
+   |         |     | racerdraw_view_matrix.                        |
+   | +0x3f4  |   1 | identity-set at 0x0045fa44                    |
+   +---------+-----+-----------------------------------------------+
+
+   A SLOT WHOSE COUNT IS ALL READS IS FILLED BY A CALLEE. Ghidra marks
+   LEA of a stack address as a read, so +0x1bc reading 8/0 does not
+   mean nothing writes it - Vec3_Add writes it through the pointer.
+
+   +0x1bc IS A SCRATCH, AND CALLING IT "THE SUSPENSION OFFSET" WAS
+   WRONG. racer-draw-audit.txt 23 and 24 name it that. Its build is
+
+       0045f828  +0x1bc = f(racer+0x338, EBP)   0x004570d0
+       0045f834  normalise                      0x0040fcd0
+       0045f867  scale by RoueAxeDistance * 96  0x0046d540
+       0045f87c  Vec3_Add onto rearWheelContact
+       0045f8b7  again, scaled by * 48
+       0045f9b2  Vec3_Add with +0x1b0 and +0x2c8
+       0045fae1  Vec3_Add again, inside the gap
+
+   so it is a direction vector reused several times over, and what it
+   holds at 0x0045feec is whatever the gap last left in it. The
+   addition at 0x0045feea is real; the NAME was an over-reading of a
+   slot that carries different things at different points.
+
+   THIS IS THE HAZARD OF THE WHOLE FRAME. +0x12c has 50 references,
+   +0x010 has 46, +0x0ac 37. A slot is not a variable. Any
+   transcription has to follow the value, not the offset.
+
+4.  The 0x0045f5a0 block
+
+       0045f5a6  +0x12c = FromEuler(angles)
+       0045f5b4  +0x298 = +0x12c x +0x2d4
+       0045f5cf  +0x12c = FromEuler(racer+0x2e3d)
+       0045f5dd  +0x268 = +0x12c x +0x298
+       0045f5e8  +0x128 = maybe_Racer_ShadeLevel(racer, racer+0x30)
+       0045f603  +0x334 = Matrix34_Copy of +0x268
+
+   +0x2d4 is the copy of racer+0x2e55 taken at 0x0045f2e5, so the
+   block composes two euler rotations onto it and keeps both the
+   intermediate and the product. racer+0x2e3d is rearWheelSpin[3], unnamed
+   next to forkDive - being fed to FromEuler makes it an ANGLE TRIPLE.
+
+5.  Open
+
+   o What +0x1cc feeds after 0x0045ff23, which is the last step before
+     the suspension offset can be transcribed.
+   o The vec3 scratches +0x07c, +0x0dc and +0x180 are used by many
+     unrelated steps and need reading per site, not once.
+   o arg0 at +0x428 - it is the transform context, but not named.
+   o racer+0x2e3d has no name.

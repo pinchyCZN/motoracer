@@ -1,0 +1,220 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            MR_MENUCAMERA
+
+
+Abstract
+
+   The camera the 3D menu pages are viewed through. One object per
+   menu, built by MenuCamera_Init (0x0047aec0) and updated once per
+   frame by MenuTools_BuildViewMatrix (0x0047b1d0) from Menu_Tick.
+
+   It holds TWO 3x4 matrices - where the camera is, and the inverse
+   that takes world space into camera space - plus the eye position.
+
+   Ghidra type applied: NO. The field layout below is verified but the
+   record's total SIZE is not, so no struct has been created rather
+   than assert a size that has not been earned.
+
+Table of Contents
+
+   1. Why this is a separate note
+   2. Layout
+   3. What BuildViewMatrix does
+      3.1. The inverse is the rigid-body one
+      3.2. Matrix34_Copy does nothing else, and that is the answer
+      3.3. The element order, settled
+   4. g_cosTable
+   5. Open questions
+
+
+1.  Why this is a separate note
+
+   Because it was nearly not one. The pass that discovered
+   MR_MenuSceneObject applied that class to all EIGHT menuTools
+   functions on the reasonable-looking assumption that a file called
+   menuTools.cpp operates on one object. Seven of the eight do.
+
+   MenuTools_BuildViewMatrix does not, and the error was visible
+   immediately once the type was applied: the decompiler started
+   rendering the function as writing a matrix across vecStart,
+   createArg3, createArg4, vecDelta, vecEndMs, unknown50,
+   vecDurationMs, vecStartMs and vecMode - nine unrelated tween fields
+   in ascending order. A matrix does not land on nine fields with nine
+   different meanings; it lands on twelve contiguous floats.
+
+   o THE LESSON IS THE USEFUL PART. Applying a struct is a claim, and a
+     wrong one is LOUD in a way a missing one is not. The mangled
+     decompilation was better evidence than the clean-looking one that
+     preceded it.
+
+   The class assignment has been undone. MenuTools_SetVecPair, the one
+   method never read in that pass, turned out to be genuine - it sets
+   both current vec3s and clears both active flags - and lost its
+   maybe_ prefix.
+
+
+2.  Layout
+
+   +--------+------+------------+----------------------------------+
+   | Offset | Size | Type       | Field                            |
+   +========+======+============+==================================+
+   | +0x00  | 48   | float[12]  | view - world to camera, the      |
+   |        |      |            | OUTPUT                           |
+   +--------+------+------------+----------------------------------+
+   | +0x30  | 48   | float[12]  | world - where the camera is      |
+   +--------+------+------------+----------------------------------+
+   | +0x60  | 12   | float[3]   | eye position, from the argument  |
+   +--------+------+------------+----------------------------------+
+   | +0x6c  | 12   | float[3]   | the translation copied into      |
+   |        |      |            | world's +0x54..+0x5c row         |
+   +--------+------+------------+----------------------------------+
+
+   MenuCamera_Init sets both matrices to identity - 1.0 at dwords 0, 4
+   and 8 of each, which is the same 3x4 column-major convention
+   transform.c uses - and zeroes the two vec3s plus a dword at +0x90.
+   So the record is at least 0x94 bytes.
+
+   Its constructor is called from FUN_004098b0, which has not been
+   read; that is where the allocation size would come from.
+
+
+3.  What BuildViewMatrix does
+
+   1  stores eye[0..2] at +0x60
+
+   2  converts THREE Euler angles to table indices with __ftol and
+      takes a sin/cos pair for each out of g_trigTable
+
+   3  composes the three rotations into the 3x3 at +0x30..+0x50, then
+      copies +0x6c..+0x74 into the translation row at +0x54..+0x5c
+
+   4  builds the inverse into a stack block - see 3.1
+
+   5  copies that block to +0x00 through Matrix34_Copy - see 3.2
+
+3.1.  The inverse is the rigid-body one
+
+   The stack block is assembled as the 3x3 TRANSPOSED - element order
+   +0x30, +0x3c, +0x48, +0x34, +0x40, +0x4c, +0x38, +0x44, +0x50, which
+   is rows becoming columns - followed by three negated dot products of
+   the original rows against the original translation [verified]:
+
+       t'.x = -(m30*t.x + m34*t.y + m38*t.z)
+       t'.y = -(m3c*t.x + m40*t.y + m44*t.z)
+       t'.z = -(m48*t.x + m4c*t.y + m50*t.z)
+
+   That is R' = transpose(R), t' = -transpose(R) * t: the inverse of a
+   rigid transform, and it is CORRECT ONLY BECAUSE THE MATRIX IS A PURE
+   ROTATION PLUS TRANSLATION. There is no scale in it. A port that ever
+   introduces a scaled camera matrix has to stop using this shortcut,
+   and nothing in the code would complain.
+
+   o SO +0x30 IS WHERE THE CAMERA IS AND +0x00 IS THE VIEW MATRIX. A
+     port wanting to render reads +0x00; one wanting the camera's own
+     position and orientation reads +0x30 and +0x60.
+
+
+3.2.  Matrix34_Copy does nothing else, and that is the answer
+
+   This note carried FUN_004039c0 as an open question: "applied to the
+   assembled inverse before it is stored. A normalise, a copy, or a
+   further multiply - unread."
+
+   IT IS A COPY. Twelve dwords, dst = src, return dst - 83 bytes with
+   nothing else in them [verified]. It is Matrix34_Copy (0x004039c0)
+   now, __thiscall, so a C++ operator= on a 3x4 matrix, with 49 call
+   sites in 28 functions.
+
+   The call site is the standard materialised-temporary shape:
+
+       0047b3a5  LEA  ECX,[ESP+0x34]    ; src, the assembled inverse
+       0047b3af  PUSH ECX
+       0047b3b2  LEA  ECX,[ESP+0x8]     ; this, a second stack temp
+       0047b3ba  CALL Matrix34_Copy     ; temp = src
+       0047b3bf  MOV  ECX,[ESP+0x4]     ; then read it straight back
+       0047b3c3  MOV  [ESI],ECX         ; into the camera at +0x00
+
+   So the inverse is copied to a temporary and then copied again, dword
+   by dword, into the record. Redundant, and exactly what an
+   unoptimised operator= returning a reference produces.
+
+   o SO SECTION 3.1 IS THE WHOLE OF THE MATHS. Nothing happens to the
+     inverse between assembling it and storing it. A port builds the
+     rigid-body inverse and writes it to +0x00, full stop.
+
+3.3.  The element order, settled
+
+   Matrix34_Multiply (0x00403a80, was FUN_00403a80) pins down what a
+   3x4 actually is in this game [verified]:
+
+       out[0..8]   = the 3x3 product, sum of a[row,k] * b[k,col]
+       out[9..11]  = a's translation through b's 3x3, PLUS b[9..11]
+
+   THE 3x3 OCCUPIES [0..8] AND THE TRANSLATION [9..11]. That is why an
+   identity has 1.0 at dwords 0, 4 and 8, which is the pattern
+   MenuCamera_Init writes and the reason section 2 could read the
+   layout off it. Every 3x4 in the game follows this.
+
+   There is a second, byte-identical copy routine at 0x00403a20
+   (Matrix34_Copy2), 24 sites in 17 functions. Two classes with the
+   same layout each got their own operator=. WHICH IS WHICH IS OPEN and
+   nothing yet depends on it; do not assume they are interchangeable
+   just because the bodies are.
+
+
+4.  g_cosTable
+
+   0x005fcb80. 0x4000 entries per full turn, indexed as
+   FLD float ptr [reg*4 + 0x5fcb80].
+
+   IT IS COSINE, AND THAT IS NOW SETTLED [verified]. The builder was
+   found - Trig_BuildCosTable at 0x004901e0, called once from App_Init:
+
+       g_cosTable[i] = cos(2*pi * i / 0x4000)
+
+   It was named g_trigTable here while the question was open; it is
+   g_cosTable in the DB now, typed as float[0x4000] so the decompiler
+   renders every access as a subscript.
+
+   SO THE PAIR THE CALLERS READ IS (cos, sin). Index i and index
+   (i - 0x1000) & 0x3fff, and cos(t - 90deg) = sin(t):
+
+       (g_cosTable[i], g_cosTable[(i - 0x1000) & 0x3fff]) = (cos t, sin t)
+
+   o THE BARE-SCALAR READS ARE MULTIPLIES BY 1.0. This note previously
+     flagged that many callers FLD or FMUL float ptr [0x005fcb80] with
+     no index, and that an FMUL by f(0) "is a no-op if f is cosine and
+     a zeroing if f is sine, which is a large difference to leave
+     open". It is cosine, so they are no-ops - inlined euler-to-matrix
+     code called with a literal angle of zero, which the compiler
+     cannot fold because it cannot know the table's contents.
+
+   o 0x00608b80 IS g_cosTable[0x3000] and its value is -1.19e-12,
+     i.e. zero. Screen3D_TransformVertsShaded builds its second matrix
+     from that and entry 0, so the two constants are (0, 1) and (1, 0)
+     - a fixed -90 degree rotation about one axis, not an arbitrary
+     one. That remains the best available answer to what the shaded
+     transform's override path is for.
+
+   Full treatment, including how the builder was found after the
+   obvious searches failed, is in docs/subsystems/trig-table.txt. The
+   reconstruction is src/trig.c and src/trig.h.
+
+
+5.  Open questions
+
+   o The record's size, and therefore whether anything follows +0x74
+     besides the dword at +0x90 that MenuCamera_Init zeroes.
+     FUN_004098b0 holds the answer.
+
+   o WHICH OF Matrix34_Copy AND Matrix34_Copy2 BELONGS TO WHICH
+     CLASS. Both are 12-dword copies with identical bodies; telling
+     them apart needs the callers typed.
+
+   o WHICH THREE ANGLES. The function reads them through __ftol from
+     the FPU stack and the decompiler loses the source; they are
+     presumably the camera's own orientation, held by whatever owns
+     this object. Menu_Tick is the one caller and has not been read
+     against this layout.

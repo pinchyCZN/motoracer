@@ -1,0 +1,244 @@
+MotoRacer PC Reverse Engineering                            Format Note
+
+
+                        .FNT - BITMAP FONT FACE
+
+
+Abstract
+
+   The source faces a font is assembled from. 33 of them ship, all
+   inside FONTES.BKF, and a font takes up to four.
+
+   THE FORMAT IS FULLY DECODED AND VERIFIED BYTE-EXACT. The file length
+   derived from the header lands on the real length for all 33 faces,
+   with nothing left over and nothing missing. tools/fnt.py --check is
+   the oracle; src/font.c must agree with it.
+
+Table of Contents
+
+   1. Layout
+      1.1. The palette comes before the widths
+      1.2. Pixels are row major
+   2. What the numbers mean
+   3. What the pixel byte means
+      3.1. What paletteEntries actually distinguishes
+   4. How it was verified
+   5. What reads it in the original
+   6. Open questions
+
+
+1.  Layout
+
+   All integers are little-endian u32 [verified].
+
+   +--------+---------------------+------------------------------------+
+   | Offset | Field               | Notes                              |
+   +========+=====================+====================================+
+   | 0x00   | firstChar           | character code of glyph 0          |
+   +--------+---------------------+------------------------------------+
+   | 0x04   | charCount           | glyphs in this face                |
+   +--------+---------------------+------------------------------------+
+   | 0x08   | glyphHeight         | ONE height for every glyph         |
+   +--------+---------------------+------------------------------------+
+   | 0x0c   | paletteEntries      | 0 or 256, never anything else      |
+   +--------+---------------------+------------------------------------+
+   | 0x10   | palette[n][3]       | RGB triples, ONLY when n != 0      |
+   +--------+---------------------+------------------------------------+
+   | ...    | width[charCount]    | u32 each, advance in pixels        |
+   +--------+---------------------+------------------------------------+
+   | ...    | pixels              | sum(width) * glyphHeight bytes     |
+   +--------+---------------------+------------------------------------+
+
+   There is no magic number, no version, and no length field. The file
+   is self-describing only in the sense that the header determines the
+   size exactly - which is what makes --check a real test.
+
+1.1.  The palette comes before the widths
+
+   THIS IS THE ONE THING THAT IS NOT GUESSABLE. The natural reading
+   puts the width table straight after the sixteen-byte header and the
+   palette somewhere later, and that reading works for the 13 faces
+   with no palette and fails for all 20 that have one.
+
+   Both orderings were tested against every file. Palette-then-widths
+   fits 20 of 20; widths-then-palette fits 0 of 20 [verified].
+
+1.2.  Pixels are row major
+
+   Glyphs are concatenated in character order with NO padding and NO
+   alignment - the offset of glyph i is the sum of the widths before it
+   times the height. Each glyph is width x height bytes, stored a ROW
+   AT A TIME.
+
+   Confirmed by rendering rather than by argument. Glyph 0 of
+   HIRES\\CHRONO.FNT, whose firstChar is 0x30, read row major:
+
+       ..#########...
+       .###########..
+       #############.
+       ##############
+       #####.....####
+       ####......####
+       ####......####
+       ####.....#####
+       ##############
+       .#############
+       ..###########.
+       ...#########..
+
+   That is a '0'. Read column major the same bytes are noise.
+
+
+2.  What the numbers mean
+
+   FIRSTCHAR AND CHARCOUNT ARE A CONTIGUOUS RANGE. A face covers
+   firstChar..firstChar+charCount-1 and nothing outside it. That is why
+   a font takes up to four faces: they cover different ranges and the
+   font stitches them into one 256-entry map.
+
+   The ranges in the shipped set are pointed rather than generic -
+   HIRES\\CHRONO.FNT is 0x30..0x3c, thirteen characters, which is the
+   digits plus a few separators, and nothing else. A chrono needs no
+   letters.
+
+   GLYPHHEIGHT IS PER FACE, NOT PER GLYPH, and the width table is per
+   glyph. So glyphs vary in width and never in height, which is what
+   lets the original pack them into a single-row atlas.
+
+   WIDTH IS ALSO THE ADVANCE. There is no separate bearing or kerning
+   table. Inter-character spacing comes from the FONT, not the face -
+   MR_Font's charSpacing at +0x0a20, set from the FontSpacings key in
+   the configuration.
+
+
+3.  What the pixel byte means
+
+   NOT AN INTENSITY, AND NOT A PALETTE INDEX. An earlier version of
+   this note said direct faces store an intensity to blend fore to
+   back. That was wrong, and reading the blitters corrected it.
+
+   THE BYTE INDEXES A 256-ENTRY TABLE THE FONT OWNS, at MR_Font+0x418,
+   which every slot-6 blitter reads as lut[*glyphPixel] [verified].
+   The face supplies pixels; the FONT supplies colour. That is why the
+   same face can be drawn in different colours without touching its
+   pixels, and why setting a colour triggers a table rebuild.
+
+   The base fills that table with a 32-step gradient from backColor to
+   foreColor repeated eight times - entry i gets ramp32[i & 0x1f] - so
+   the byte splits in two:
+
+       bits 0..4    which of 32 gradient steps      b & 0x1f
+       bits 5..7    the blend level, 0 = opaque     b >> 5
+
+   ONE BYTE CARRYING BOTH COLOUR AND ALPHA is the whole design, and the
+   shipped data confirms it. HIRES\MSG.FNT, an AntiAlias8Transp face,
+   uses exactly the values
+
+       0, 31, 63, 95, 127, 159, 191, 223, 255
+
+   which is 31 | (level << 5): always the full foreground step, varying
+   only in alpha. MENULINK.FNT and MENULIN2.FNT are the same.
+
+   ZERO IS TRANSPARENT and is skipped before the table is consulted at
+   all.
+
+3.1.  What paletteEntries actually distinguishes
+
+   +---------------+-------+-------------------------------------------+
+   | paletteEntries| Faces | Meaning                                   |
+   +===============+=======+===========================================+
+   | 0             | 13    | the font's LUT is built from fore/back    |
+   +---------------+-------+-------------------------------------------+
+   | 256           | 20    | the face carries the colours itself       |
+   +---------------+-------+-------------------------------------------+
+
+   Every face belonging to a font declared Pal is palettised; every
+   Direct and AntiAlias8 face is not.
+
+   o BUT paletteEntries == 0 COVERS TWO DIFFERENT THINGS, and that is
+     the trap. A Direct face and an AntiAlias8 face both have no
+     palette, and their bytes do not mean the same thing: DEBUG.FNT
+     (Direct) holds only 29 and 128, while MSG.FNT (AntiAlias8) holds
+     a clean eight-level ramp. Picking a blitter by "does the face
+     have a palette" conflates them - which is exactly why the
+     original has eight blitters and not two.
+
+     DEBUG.FNT through the LUT: 29 & 0x1f = 29, near the foreground -
+     the glyph; 128 & 0x1f = 0, the background - its box. Read as an
+     intensity instead, those are near-black and mid-grey, and the
+     text comes out black on grey.
+
+   HOW THE PALETTE REACHES THE LUT for a Pal face is not read.
+   FontPal_BuildColorLut (0x00495bd0) overrides slot 1 and is the only
+   place it can happen [inferred].
+
+4.  How it was verified
+
+   The test is that the header predicts the file length exactly:
+
+       16
+       + paletteEntries * 3
+       + charCount * 4
+       + sum(width) * glyphHeight
+       == filesize
+
+   for every one of the 33 faces, with the sanity checks that every
+   width is in 1..500 and the height in 1..256. Both candidate field
+   orders were run against the whole set; only one fits, and it fits
+   perfectly.
+
+       python tools/fnt.py --check DATA/extract/FONTES/*/*.FNT
+
+   o A LENGTH THAT COMES OUT EXACT ON 33 FILES IS NOT A COINCIDENCE.
+     Four independent header fields feed a sum over a variable-length
+     table; getting that to land on the byte for every file under a
+     wrong model would take remarkable luck. This is why the format is
+     tagged verified without any of the loader having been read.
+
+   The loader in the binary is FUN_00491380, vtable slot 3 of the font
+   class, 360 bytes with 7 callees. It has NOT been read. Reading it
+   would settle the open questions in section 6 and would probably not
+   change anything above.
+
+
+5.  What reads it in the original
+
+   Fonts dispatch face loading through their vtable by file extension,
+   comparing the first three characters of the name against two strings
+   [verified, MR_Font.txt section 3]:
+
+   +------+------------+-----------------------------------------------+
+   | Slot | Function   | Role                                          |
+   +======+============+===============================================+
+   | 3    | 0x00491380 | the .FNT loader                               |
+   +------+------------+-----------------------------------------------+
+   | 5    | 0x00492130 | the OTHER extension - a five-byte stub that   |
+   |      |            | returns 0, in all eight vtables               |
+   +------+------------+-----------------------------------------------+
+
+   o A SECOND FACE FORMAT WAS DESIGNED AND NEVER SHIPPED. Slot 5 is
+     XOR EAX,EAX / RET 0x10 in every class, and all 33 faces are .FNT,
+     so nothing ever called it and no file of that other format exists
+     to look at. Slot 4 is a wrapper around it and is equally dead.
+
+   An unrecognised extension throws a C++ exception rather than failing
+   quietly, so a mistyped face name would have been loud.
+
+
+6.  Open questions
+
+   o WHETHER THE PALETTE IS RGB OR BGR. It is read as RGB here and the
+     rendered glyphs look right, but every shipped face is
+     near-greyscale, so the two orders are hard to tell apart by eye. A
+     face with a strongly coloured palette would settle it; none of the
+     20 obviously is. Reading FUN_00491380 would settle it properly.
+
+   o WHETHER paletteEntries CAN BE ANYTHING BUT 0 OR 256. Only those
+     two occur. The field is a full u32 and the loader may well accept
+     others; nothing shipped exercises it.
+
+   o ANSWERED. The byte is a LUT index, not an intensity, and the
+     0x200-byte region at MR_Font+0x418 is that LUT. See section 3.
+
+   o HOW A Pal FACE'S PALETTE REACHES THE LUT. FontPal_BuildColorLut
+     (0x00495bd0) is the only candidate and has not been read.

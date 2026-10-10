@@ -1,0 +1,352 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                             GAME BRING-UP
+
+
+Abstract
+
+   App_Init at 0x00472c40 is everything between the command line being
+   parsed and the Delphine logo appearing. At 1408 bytes it was the
+   largest unnamed function in screen3d\dd.cpp, and naming it completes
+   that translation unit.
+
+   This note also records maybe_Hud_BindCornerSigns, the other function
+   finished in the same pass, which is a HUD routine that happens to
+   live in dd.cpp.
+
+   +---------------------------+------------+
+   | Item                      | Address    |
+   +===========================+============+
+   | App_InitEntry             | 0x00473520 |
+   +---------------------------+------------+
+   | App_Init                  | 0x00472c40 |
+   +---------------------------+------------+
+   | maybe_Hud_BindCornerSigns | 0x00473370 |
+   +---------------------------+------------+
+   | the corner-sign table     | 0x005d2eb8 |
+   +---------------------------+------------+
+
+Table of Contents
+
+   1. The entry wrapper
+   2. The bring-up sequence
+      2.1. The whole boot chain, for a port skeleton
+         2.1.1. The entry is an MFC override
+            2.1.1.1. DECIDED: plain Win32, not MFC
+         2.1.2. The display comes up from InitInstance
+   3. Failure handling
+   4. The corner-sign table
+   5. dd.cpp is complete
+   6. Open questions
+
+1.  The entry wrapper
+
+   Main_InitAndParseCommandLine calls App_InitEntry once, at 0x00415408.
+   It is three statements [verified]:
+
+       maybe_g_appInitStarted = 1;
+       return App_Init() != 0;
+
+   The flag is also written by FUN_00427e80 and read by FUN_00461f70 and
+   FUN_00461aa0, so it is shared state rather than a private startup
+   marker. Not identified.
+
+2.  The bring-up sequence
+
+   In order, with the parts this project has already documented cross-
+   referenced [verified]:
+
+   +------+------------------------------------+--------------------+
+   | Step | What                               | See                |
+   +======+====================================+====================+
+   | 1    | Input_SetDefaultBindings           | input-bindings.txt |
+   +------+------------------------------------+--------------------+
+   | 2    | Trig_BuildCosTable, g_cosTable     | trig-table.txt     |
+   +------+------------------------------------+--------------------+
+   | 3    | seed 25 racer slots, stride 0x3209 | racers.txt         |
+   +------+------------------------------------+--------------------+
+   | 4    | Data/Design/Texts/LowRes.RAW       | -                  |
+   +------+------------------------------------+--------------------+
+   | 5    | Data/Config.spt, Settings_LoadAll  | settings.txt       |
+   +------+------------------------------------+--------------------+
+   | 6    | detail level forced to 4 if HW 3D  | renderer-mode.txt  |
+   +------+------------------------------------+--------------------+
+   | 7    | Data/list.spt                      | -                  |
+   +------+------------------------------------+--------------------+
+   | 8    | Data/champ_<c>.spt by difficulty   | -                  |
+   +------+------------------------------------+--------------------+
+   | 9    | the seven texture banks            | dd-statics.txt     |
+   +------+------------------------------------+--------------------+
+   | 10   | fonts, then a font rebuild pass    | -                  |
+   +------+------------------------------------+--------------------+
+   | 11   | construct g_menu (0xd4c bytes)     | MR_Menu.txt        |
+   +------+------------------------------------+--------------------+
+   | 12   | Data/Demo/{EA,BMG}.dem by branding | -                  |
+   +------+------------------------------------+--------------------+
+   | 13   | Menu_GotoPage(25) - Delphine logo  | menu-pages.txt     |
+   +------+------------------------------------+--------------------+
+
+   STEP 2 IS THE SECOND INSTRUCTION-LEVEL CALL IN THE FUNCTION, at
+   0x00472c66, right after the input bindings and before anything reads
+   a file [verified]. It fills g_cosTable, the 0x4000-entry cosine
+   table every rotation in the game indexes, and it is the table's only
+   writer. Nothing checks whether it has run - an unbuilt table is all
+   zeros and every rotation collapses. See trig-table.txt.
+
+   Step 3 is a useful independent confirmation of the racer array. The
+   loop writes an incrementing index at each slot base and advances by
+   0x3209 until it passes 0x005d22c9, which is exactly 25 slots from
+   0x00583fe8 - the same geometry racers.txt derived from the other end.
+
+   Step 6 is the one gameplay-visible decision made here: when the
+   hardware renderer is up, in mode 0, and the selected device reports
+   texture support, the detail level is forced to 4 regardless of what
+   the settings file said.
+
+   Step 9 walks the bank array at 0x005d3a20 with a 0x149 stride,
+   calling maybe_Cdd_LoadRawToSurface then maybe_DdCaps_FreeTexture for
+   each, with maybe_g_deferBlits raised across the whole loop. So the
+   banks are loaded and immediately released - a preload and measure
+   pass rather than a load that sticks.
+
+   Step 12 chooses between Data/Demo/EA.dem and Data/Demo/BMG.dem on
+   g_useBmgBranding. Electronic Arts and BMG Interactive were the two
+   publishers of the original release [inferred].
+
+   At the end it chmods three files to 0x180 - Data/bestscor.dat,
+   Data/Config.bpt and Data/list.bpt - making them writable. That is how
+   the game copes with files marked read-only by having been installed
+   from a CD [inferred].
+
+2.1.  The whole boot chain, for a port skeleton
+
+   Section 2 covers what App_Init does. What a new project needs is what
+   surrounds it - where the display comes up, and how the frame loop is
+   entered. The chain is short [verified]:
+
+       MFC WinMain
+        +- CWinApp::InitInstance      0x00414080
+        |    +- parse the command line
+        |    +- FUN_004995a0 -> maybe_Cdd_SetVideoMode -> Cdd_Init
+        |    +- App_InitEntry -> App_Init      (the 12 steps above)
+        +- MFC message pump
+             +- the game vtable at 0x004d04c8
+                  +- maybe_Game_Tick         0x0047d660
+                  +- maybe_Game_RenderFrame  0x0047ff90
+
+2.1.1.  The entry is an MFC override
+
+   Main_InitAndParseCommandLine at 0x00414080 is __thiscall and has
+   exactly one reference in the image - a vtable slot at 0x004d0478, no
+   direct call anywhere [verified]. It is CWinApp::InitInstance, which
+   is why the database showed it no callers, and it matches the late-
+   boundary repair recorded in CLAUDE.md that moved this function's
+   entry back 0x22 bytes.
+
+   So the program is an MFC application and the entry point a port has
+   to supply is not WinMain but an InitInstance override. The MFC
+   surface at this level is small - InitInstance and the message pump -
+   so replacing it with a plain WinMain and a PeekMessage loop is
+   straightforward, and avoids linking MFC for a first build.
+
+   o Worth deciding early, because it determines whether the MSVC
+     project is an MFC project or a plain Win32 one.
+
+2.1.1.1.  DECIDED: plain Win32, not MFC
+
+   The reconstruction targets plain Win32 plus Direct3D 9. No MFC.
+   Project decision, 2026-08-31.
+
+   The evidence supports it more strongly than the paragraph above
+   suggested. MFC is not doing the windowing at all [verified]:
+
+   +-------------------------+----------------------------------------+
+   | Job                     | Who actually does it                   |
+   +=========================+========================================+
+   | register the class      | RegisterClassA, called directly by     |
+   |                         | FUN_004157d0                           |
+   +-------------------------+----------------------------------------+
+   | create the window       | CreateWindowExA, same function         |
+   +-------------------------+----------------------------------------+
+   | the window procedure    | maybe_Event_WndProc 0x00432980, a      |
+   |                         | plain switch falling through to        |
+   |                         | DefWindowProcA - not a message map     |
+   +-------------------------+----------------------------------------+
+   | keyboard                | WM_KEYDOWN / WM_KEYUP / WM_CHAR plus   |
+   |                         | GetKeyState                            |
+   +-------------------------+----------------------------------------+
+   | mouse                   | WM_MOUSEMOVE, WM_?BUTTONDOWN/UP,       |
+   |                         | SetCapture / ReleaseCapture            |
+   +-------------------------+----------------------------------------+
+   | joystick                | winmm joyGetPosEx / joyGetDevCapsA     |
+   +-------------------------+----------------------------------------+
+   | drawing                 | DirectDraw; there is no WM_PAINT and   |
+   |                         | no WM_SIZE handler at all              |
+   +-------------------------+----------------------------------------+
+
+   So the window is already a hand-rolled Win32 window with a hand-
+   rolled procedure, and input is already raw messages - there is no
+   DirectInput either. See window-proc.txt for the full message map.
+
+   That leaves five places MFC is genuinely reached, and each has an
+   obvious replacement [verified]:
+
+   +----------------------+-------------------------------------------+
+   | MFC use              | Replacement                               |
+   +======================+===========================================+
+   | CWinApp::InitInstance| WinMain                                   |
+   +----------------------+-------------------------------------------+
+   | the MFC message pump | GetMessage / TranslateMessage /           |
+   |                      | DispatchMessage, or PeekMessage for a     |
+   |                      | render loop                               |
+   +----------------------+-------------------------------------------+
+   | CString              | std::string, or a small owned type        |
+   +----------------------+-------------------------------------------+
+   | AfxMessageBox        | MessageBoxA - which the binary already    |
+   |                      | calls directly elsewhere                  |
+   +----------------------+-------------------------------------------+
+   | one modal CDialog    | WM_COMMAND id 0x9c43 only; a debug or     |
+   |                      | about box, droppable outright             |
+   +----------------------+-------------------------------------------+
+
+   o One caveat, and it is the only one. CString is not confined to
+     error paths: MR_DisplayMode's field at +0x00 is very likely a
+     CString, and dd-statics.txt records CString::Format building mode
+     description strings. So replacing it touches a reconstructed
+     struct layout, not just message text. Decide the replacement
+     string type before transcribing MR_DisplayMode, or the field
+     width changes underneath the struct. See MR_DisplayMode.txt.
+
+   o The message pump is where the frame loop lives, so a plain
+     PeekMessage loop calling Game_Tick and Game_RenderFrame directly
+     also lets a port skip the nine-entry game vtable at 0x004d04c8
+     described below. Two pieces of MFC-shaped indirection removed by
+     one decision.
+
+   o Nothing in the renderer depends on this either way. Screen3D_Open
+     takes an HWND and never asks where it came from.
+
+2.1.2.  The display comes up from InitInstance, not App_Init
+
+   FUN_004995a0 is called from two places, Main_InitAndParseCommandLine
+   and App_Init, and it reaches maybe_Cdd_SetVideoMode and so Cdd_Init
+   [verified]. So the surfaces exist before App_Init's step 9 loads the
+   texture banks, which is what that step requires.
+
+   That ordering is the one hard constraint in the boot sequence:
+   display first, assets second, menu last. Everything else in section 2
+   is asset loading that can be stubbed while a port is brought up.
+
+   o A minimal first build therefore needs: an InitInstance equivalent,
+     the display bring-up, enough of App_Init to have something to draw,
+     and the frame loop of renderer.txt section 3.1. Steps 2, 6, 7, 11
+     and 12 of section 2 - racers, champ tables, demo files, the logo
+     page - are not on the path to a first frame.
+
+   o Both Game_Tick and Game_RenderFrame are VIRTUAL, reached through
+     the nine-entry vtable at 0x004d04c8 that Game_StaticCtor
+     (0x00413f30) installs. A port can call them directly and skip the
+     vtable entirely; nothing else dispatches through it that matters
+     for drawing.
+
+
+3.  Failure handling
+
+   The function is a ladder of nested failure exits, each unwinding one
+   more constructed object through an SEH state variable. Every rung
+   returns 0, and the caller treats 0 as fatal.
+
+   This is consistent with the conclusion in dd-errors.txt that ASSET
+   LOADING failures are fatal while runtime display failures are not.
+   Everything App_Init can fail at is an asset or an allocation.
+
+4.  The corner-sign table
+
+   maybe_Hud_BindCornerSigns clears a 16-entry table of 0x18-byte
+   records at 0x005d2eb8 and then walks g_meshArrayA binding meshes to
+   slots BY NAME [verified]:
+
+   +-------------------+------------+---------------------------+
+   | Mesh name         | Placed at  | Meaning                   |
+   +===================+============+===========================+
+   | counter           | (93, 0)    | a lap or position counter |
+   +-------------------+------------+---------------------------+
+   | g_45 / d_45       | (320, 400) | 45 degree left / right    |
+   +-------------------+------------+---------------------------+
+   | g_90 / d_90       | (320, 400) | 90 degree left / right    |
+   +-------------------+------------+---------------------------+
+   | g_chica / d_chica | (320, 400) | chicane left / right      |
+   +-------------------+------------+---------------------------+
+
+   g_ and d_ are gauche and droite. These are the turn-warning signs
+   shown ahead of a corner.
+
+   THE COORDINATES ARE INSETS FROM THE BOTTOM RIGHT, not positions
+   [verified, 0x0048650c]. Hud_DrawSignMeshes builds
+
+       offsetX = g_viewMaxX - recordX * scaleX
+       offsetY = g_viewMaxY - recordY * scaleY
+
+   so (93, 0) puts the counter plate in the BOTTOM-RIGHT corner - 93
+   units in from the right edge and flush with the bottom - and
+   (320, 400) puts a corner sign at x 319, y 79, near the top. An
+   earlier reading of these as screen positions had the counter along
+   the top edge, which is the opposite of where it is.
+
+   AND THE CALLER IS NOT App_Init. maybe_Game_InitRace (0x0047bf70)
+   is its only caller, which it has to be: the meshes it binds are
+   TRACK DECOR TEMPLATES and do not exist until a track is loaded.
+   The string "counter" appears in all eleven .trk files.
+
+   The record is 0x18 bytes: +0x00 the mesh index, initialised to -1 for
+   unbound; +0x04 and +0x08 the screen position; +0x0c unknown, cleared;
+   +0x10 a flag defaulting to 1 which only "counter" overrides, to 0.
+
+   Sixteen slots for seven known names, so nine are unused or bound
+   elsewhere. Note the placements are absolute 640x480 pixel coordinates
+   with no scaling, which matters for a port that wants resolutions the
+   original did not offer.
+
+5.  dd.cpp is complete
+
+   With App_Init, App_InitEntry and maybe_Hud_BindCornerSigns named,
+   screen3d\dd.cpp has no unnamed functions left over 16 bytes
+   [verified]:
+
+   +-----------------------+-------+---------+-----------------------+
+   | Range                 | Named | Unnamed | Thunks under 17 bytes |
+   +=======================+=======+=========+=======================+
+   | 0x00472000-0x00478fff | 70    | 0       | 56                    |
+   +-----------------------+-------+---------+-----------------------+
+
+   The 56 excluded entries are the SEH unwind thunks and fragments
+   described in code-map.txt, not real functions.
+
+   Note that the cluster at 0x00479080 and above is menuTools.cpp, not
+   dd.cpp - code-map.txt puts the boundary at 0x00479000. It contains
+   several substantial unnamed functions, but under the spine-first rule
+   they are translate-list and off-spine.
+
+   dd.cpp is now covered by twelve notes: dd-init, dd-chain, dd-primary-
+   surface, dd-main-surface, dd-present, dd-blit, dd-caps, dd-vidmem,
+   dd-statics, dd-errors, mode-change and this one. The next spine
+   target is screen3d\screen3d.cpp or Dsi_d3d.cpp.
+
+6.  Open questions
+
+   o maybe_g_appInitStarted at 0x0052c234 - what FUN_00461f70 and
+     FUN_00461aa0 do with it.
+
+   o Why the texture banks are loaded and immediately freed at step 9. A
+     sizing pass is the obvious guess but nothing has been read that
+     consumes a measurement.
+
+   o The .spt format, used three times here and not documented anywhere.
+     Config.spt, list.spt and champ_<c>.spt.
+
+   o The nine unused corner-sign slots, and what +0x0c in the record is
+     for.
+
+   o What the fonts at g_fontTable +0x28 and +0x2c are, which get a flag
+     written at their +0x5480.

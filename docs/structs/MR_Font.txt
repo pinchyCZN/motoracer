@@ -1,0 +1,883 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                                MR_FONT
+
+
+Abstract
+
+   Size: 0x54a6 [verified] - PUSH 0x54a6 into operator new at six sites
+   in maybe_Font_LoadAll, each followed by Font_Ctor.
+
+   Allocated at: 0x0042698c and five sibling sites, all in
+   maybe_Font_LoadAll (0x00426460). Freed in FUN_00473540, which then
+   clears g_fontTable. Ghidra type applied: yes. Belongs to: the font
+   module at 0x00490000-0x00497000.
+
+   A bitmap font. It owns up to four source faces, a texture atlas built
+   from their glyphs, and a prebuilt drawing descriptor per character.
+   Fonts live in g_fontTable at 0x004f1810 and are reached by id through
+   Font_Get.
+
+   There are eight configured font types across six classes. See section
+   4.
+
+Table of Contents
+
+   1. Fields
+   2. The three per-character tables
+      2.1. colorLut, and it is the whole design
+      2.2. The eight blitters, all read
+      2.3. The five LUT builders
+   3. Faces and the atlas
+   4. The class family
+      4.1. The vtable, all seven slots
+   5. The font table
+      5.1. The read schema, and why a parser cannot guess it
+      5.2. The face paths name a file that is not shipped
+      5.3. Nothing here is localised
+   6. Accessors
+      6.1. The blit target block, and a shipped Beep
+         6.1.1. A one-shot Beep on a null target
+      6.2. The antialias fallback
+   7. Intensity is scaled by font kind
+   8. Open questions
+
+1.  Fields
+
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | Offset | Size   | Type              | Name          | Confidence | Evidence                                   |
+   +========+========+===================+===============+============+============================================+
+   | 0x0000 | 4      | void**            | vtable        | verified   | 0x004d1e68 base, 0x004d1ea8 shaded         |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0004 | 4      | int               | kind          | verified   | 1 from Font_Ctor, 5 from FontShaded_Ctor   |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0008 | 0x10   | byte[]            | unk_08        | unknown    | never observed                             |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0018 | 0x400  | void*[256]        | glyphPixels   | verified   | per character, a pointer into the owning   |
+   |        |        |                   |               |            | face's bitmap                              |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0418 | 0x200  | ushort[256]       | colorLut      | verified   | RGB565 by PIXEL BYTE; see section 2.1      |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0618 | 0x400  | int[256]          | glyphWidth    | verified   | advance in pixels; 0 means the character   |
+   |        |        |                   |               |            | is absent                                  |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a18 | 4      | int               | glyphHeight   | verified   | one height for all glyphs; multiplied by   |
+   |        |        |                   |               |            | width for the bitmap size                  |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a1c | 4      | int               | unk_a1c       | unknown    |                                            |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a20 | 4      | int               | charSpacing   | verified   | added between characters when advancing    |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a24 | 4      | int               | unk_a24       | unknown    | cleared on surface loss                    |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a28 | 4      | int               | atlasWidth    | verified   | taken from the chosen texture format       |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a2c | 4      | int               | atlasHeight   | verified   | likewise                                   |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a30 | 4      | int               | atlasPages    | verified   | incremented whenever a glyph row overflows |
+   |        |        |                   |               |            | atlasWidth                                 |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a34 | 4      | int               | surfacePitch  | verified   | desc.lPitch, re-read after the atlas moves |
+   |        |        |                   |               |            | into a texture bank                        |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a38 | 4      | int               | hasSurface    | verified   |                                            |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a3c | 4      | void*             | surface       | verified   | DirectDraw surface; vtable +0x60 and +0x6c |
+   |        |        |                   |               |            | are IsLost and Restore                     |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0a40 | 0x400  | int[256]          | glyphAtlasX   | verified   | x of each glyph within the atlas           |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x0e40 | 0x400  | int[256]          | glyphAtlasY   | verified   | y of each glyph, (page - 1) * glyphHeight  |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x1240 | 4      | int               | unk_1240      | inferred   | out-param, its ADDRESS is the last         |
+   |        |        |                   |               |            | argument to D3D_AllocTextureSlot           |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x1244 | 4      | int               | bankIndex     | verified   | -1 from the constructor; released on       |
+   |        |        |                   |               |            | surface loss. RENAMED from textureHandle - |
+   |        |        |                   |               |            | it indexes MR_Bank, it is not a handle     |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x1248 | 0x4000 | MR_FontGlyph[256] | glyphs        | verified   | prebuilt drawing descriptor per character, |
+   |        |        |                   |               |            | 0x40 each                                  |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5248 | 4      | int               | loaded        | verified   | Font_Rebuild sets it last; Font_Get        |
+   |        |        |                   |               |            | refuses a font without it                  |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x524c | 4      | int               | faceCount     | verified   | 0 to 4                                     |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5250 | 0x204  | MR_FontFace[4]    | faces         | verified   | 0x81-byte path records; the count is what  |
+   |        |        |                   |               |            | bounds the array at 4                      |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5454 | 4      | byte[4]           | faceFirstChar | verified   | first character code each face supplies    |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5458 | 0x10   | int[4]            | faceCharCount | verified   | how many characters each face supplies     |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5468 | 0x10   | int[4]            | faceUnk_5468  | inferred   | passed as the fourth argument to the       |
+   |        |        |                   |               |            | loader vtable call                         |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5478 | 4      | int               | unk_5478      | unknown    |                                            |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x547c | 4      | int               | scanMaxAlpha  | verified   | non-zero makes Font_Rebuild scan every     |
+   |        |        |                   |               |            | glyph pixel                                |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5480 | 4      | int               | unk_5480      | unknown    |                                            |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5484 | 0x10   | void*[4]          | faceBitmap    | verified   | decoded pixel buffer per face; all four    |
+   |        |        |                   |               |            | freed on reload                            |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5494 | 3      | byte[3]           | foreColor     | verified   | RGB; Font_SetColors compares and copies it |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x5497 | 3      | byte[3]           | backColor     | verified   | RGB; likewise. FontBackColors in config    |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x549a | 4      | byte*             | palettePixels | verified   | the face's RGB triples, or null            |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+   | 0x549e | 4      | int               | paletteCount  | verified   | entry count; used as a MODULO              |
+   | 0x54a2 | 4      | int               | maxAlpha      | verified   | highest byte value found across all glyph  |
+   |        |        |                   |               |            | pixels; unaligned                          |
+   +--------+--------+-------------------+---------------+------------+--------------------------------------------+
+
+   The layout is unusually well bounded for a struct this large. Every
+   array length is fixed by a loop counter in the constructor or in
+   Font_Rebuild rather than guessed from the gaps, and the fields add up
+   to the allocation size exactly.
+
+2.  The three per-character tables
+
+   Three 256-entry arrays are indexed by character code, and
+   Font_Rebuild writes all three in one pass [verified]:
+
+   +--------+-------------+--------------------------------------------------+
+   | Offset | Name        | Holds                                            |
+   +========+=============+==================================================+
+   | 0x0018 | glyphPixels | pointer to the glyph's pixels in the face bitmap |
+   +--------+-------------+--------------------------------------------------+
+   | 0x0618 | glyphWidth  | advance width; zero means absent                 |
+   +--------+-------------+--------------------------------------------------+
+   | 0x0a40 | glyphAtlasX | x position within the atlas                      |
+   +--------+-------------+--------------------------------------------------+
+   | 0x0e40 | glyphAtlasY | y position, (page - 1) * glyphHeight             |
+   +--------+-------------+--------------------------------------------------+
+
+   Font_Rebuild reaches them through one moving pointer. It sets piVar7
+   to glyphWidth + character, then addresses the others as
+   piVar7[-0x180], piVar7[0x10a] and piVar7[0x20a] - offsets of -0x600,
+   +0x428 and +0x828 bytes, which land exactly on the other three
+   tables. That is what makes the four array bases certain.
+
+   A fourth 0x200-byte region at 0x0418 sits between glyphPixels and
+   glyphWidth and is never touched by anything read so far.
+
+2.1.  colorLut, and it is the whole design
+
+   The 0x200 bytes at 0x0418 sat between two per-character tables and
+   this note had them as "never touched by anything read so far", with
+   section 7 guessing a third per-character table.
+
+   IT IS NOT PER CHARACTER. It is 256 RGB565 entries INDEXED BY THE
+   GLYPH'S PIXEL BYTE, which every slot-6 blitter reads as
+   lut[*glyphPixel] [verified from two of them independently].
+
+   Font_BuildColorLut (0x00490b90, slot 1, was Font_BuildCharRange)
+   fills it. It walks a 32-entry gradient from backColor to foreColor
+   in 16.16 fixed point,
+
+       step = ((fore - back) << 16) >> 5      per channel
+
+   packs each through Color_Pack888ToSurface, and then writes
+   lut[i] = ramp32[i & 0x1f] over the requested index range.
+
+   o SO SLOT 1'S RANGE ARGUMENT IS A LUT INDEX RANGE, NOT A CHARACTER
+     RANGE, even though slot 0 passes (1, 0xff) and the obvious
+     reading is "every character". Nothing about it is per character -
+     the same 32 colours repeat eight times across the 256 entries.
+     The old name Font_BuildCharRange encoded that misreading.
+
+   THE PIXEL BYTE THEREFORE SPLITS IN TWO:
+
+       bits 0..4   which of 32 gradient steps       b & 0x1f
+       bits 5..7   the blend level, 0 = opaque      b >> 5
+
+   which is what makes AntiAlias8 work with one byte per pixel, and
+   what the shipped faces show: HIRES\MSG.FNT uses exactly
+   0, 31, 63, ... 255, that is 31 | (level << 5).
+
+   The face supplies pixels and the FONT supplies colour. That is why
+   one face can be drawn in several colours without touching it, and
+   why slot 0 has to call slot 1 when a colour changes.
+
+
+2.2.  The eight blitters, all read
+
+   Slot 6 has eight distinct implementations and every one has now
+   been read. They fall into four behaviours, not eight [verified]:
+
+   +----------------------+------------+------------------------------+
+   | Class                | Address    | Slot 6 does                  |
+   +======================+============+==============================+
+   | Direct               | 0x00493100 | lut[b], opaque               |
+   +----------------------+------------+------------------------------+
+   | Pal                  | 0x00495840 | THE SAME, byte for byte in   |
+   |                      |            | behaviour                    |
+   +----------------------+------------+------------------------------+
+   | Moto                 | 0x00495d50 | THE SAME again               |
+   +----------------------+------------+------------------------------+
+   | DirectTrame          | 0x00492d20 | lut[b] through a halftone    |
+   +----------------------+------------+------------------------------+
+   | CustomColor          | 0x00494170 | gradient computed per pixel  |
+   +----------------------+------------+------------------------------+
+   | CustomColorTrame     | 0x00494590 | the same, through a halftone |
+   +----------------------+------------+------------------------------+
+   | AntiAlias8           | 0x00494bb0 | lut[b] blended, /8 tables    |
+   +----------------------+------------+------------------------------+
+   | AntiAlias8Transp     | 0x00495280 | lut[b] blended, /7 explicit  |
+   +----------------------+------------+------------------------------+
+
+   o THREE OF THEM ARE ONE ROUTINE COMPILED THREE TIMES. Direct, Pal
+     and Moto are all 898 bytes; 113 and 251 bytes differ from the
+     base respectively and EVERY difference is register allocation.
+     Pal and Moto specialise entirely in slot 1, so their blitters had
+     nothing to change. A byte-level difference between two of these
+     does not imply a behavioural one.
+
+   o CustomColor DOES NOT USE THE LUT. It computes
+     (fore*step + back*(31-step))/31 per pixel from b & 0x1f. THAT IS
+     WHY ITS SLOT 0 AND SLOT 1 ARE BARE RETURNS - there is no table to
+     maintain, so a colour change takes effect on the next glyph with
+     no rebuild. The three-byte RET 0x8 overrides are the point of the
+     class, not stubs.
+
+   o THE TWO SHADED CLASSES GENUINELY DIFFER. AntiAlias8 blends
+     through the seven (i*n)/8 tables; AntiAlias8Transp does the same
+     blend with explicit arithmetic and an alpha of level/7:
+
+         alpha = bias + (b > 0x1f ? (b & 0xe0) : 0);
+         if (alpha < 0xe1) {
+             alpha = (alpha << 8) / 0xe0;
+             out   = src - ((src - dst) * alpha >> 8);
+         }
+
+     So level 0 is opaque and level 7 is FULLY TRANSPARENT. The /8
+     tables can never reach zero ink and this can - which is what
+     "Transp" means, and it also confirms independently that rising
+     level means rising transparency.
+
+2.3.  The five LUT builders
+
+   Slot 1 has five implementations and they are five ways of filling
+   the same table [verified]:
+
+   +-------------+------------+-------------------------------------+
+   | Class       | Address    | Fills                               |
+   +=============+============+=====================================+
+   | base        | 0x00490b90 | lut[i] = ramp32[i & 0x1f], a        |
+   |             |            | back->fore gradient                 |
+   +-------------+------------+-------------------------------------+
+   | AntiAlias8  | 0x00494b90 | forwards to the base, 18 bytes      |
+   +-------------+------------+-------------------------------------+
+   | Pal         | 0x00495bd0 | lut[i] = palette[i % paletteCount]  |
+   +-------------+------------+-------------------------------------+
+   | Moto        | 0x004960e0 | TWO ZONES - see below               |
+   +-------------+------------+-------------------------------------+
+   | CustomColor | 0x00494150 | nothing, a bare RET 0x8             |
+   +-------------+------------+-------------------------------------+
+
+   MOTO IS THE ONLY HYBRID. It fills lut[1..14] with a FOURTEEN-step
+   gradient, (fore*k + back*(14-k))/14, and lut[32..62] from the face
+   palette, leaving everything else alone. It also IGNORES ITS RANGE
+   ARGUMENTS entirely - the zones are hardcoded - so slot 0 calling it
+   with (1, 0xff) rebuilds exactly those two zones regardless.
+
+   Fourteen steps matches the data: the MOTO faces hold pixel values
+   0..15, which land in the gradient zone.
+
+   o EVERY BUILDER SHARES A STORE IDIOM worth recognising: the index
+     is incremented BEFORE the store and the base is written as
+     0x416, so 0x416 + (i+1)*2 lands on lut[i]. Reading the store
+     address literally puts every table one entry out.
+
+
+3.  Faces and the atlas
+
+   A font is assembled from up to four source files. The face path
+   records are 0x81 bytes each and the array is exactly 0x204 bytes
+   wide, which is four of them - the count and the space agree
+   [verified].
+
+   Font_Rebuild picks a loader by file extension, comparing the first
+   three characters against two strings and dispatching through vtable
+   slot +0xc or +0x14. An unrecognised extension throws a C++ exception
+   rather than failing quietly.
+
+   Glyphs are then packed left to right into the atlas. When the next
+   glyph would exceed atlasWidth the row is closed, atlasPages is
+   incremented and packing continues at x = 0. Afterwards each
+   character's MR_FontGlyph is filled by dividing its pixel coordinates
+   by the atlas dimensions, giving normalised texture coordinates - so
+   the descriptors are texture-ready and the draw path does no per-glyph
+   arithmetic.
+
+4.  The class family
+
+   Fonts are declared in configuration, not in code. Font_LoadAll reads
+   the keys FontNumber, FontTypes, FontSpacings, FontForeColors,
+   FontBackColors and FontData, and for each declared font compares its
+   type name against eight known names [verified]:
+
+   +------------------+--------+---------------------------+-------------+------------+
+   | Type name        | Size   | Constructor               | kind chain  | vtable     |
+   +==================+========+===========================+=============+============+
+   | Direct           | 0x54a6 | Font_Ctor                 | 1           | 0x004d1e68 |
+   +------------------+--------+---------------------------+-------------+------------+
+   | DirectTrame      | 0x54a6 | Font_Ctor, vtable swapped | 1           | 0x004d0710 |
+   +------------------+--------+---------------------------+-------------+------------+
+   | CustomColor      | 0x54a6 | FontCustomColor_Ctor      | 1 -> 3      | 0x004d1e88 |
+   +------------------+--------+---------------------------+-------------+------------+
+   | CustomColorTrame | 0x54a6 | the same, vtable swapped  | 1 -> 3      | 0x004d06f0 |
+   +------------------+--------+---------------------------+-------------+------------+
+   | AntiAlias8       | 0x70a6 | FontShaded_Ctor           | 1 -> 5      | 0x004d1ea8 |
+   +------------------+--------+---------------------------+-------------+------------+
+   | AntiAlias8Transp | 0x70a6 | FontShadedTransp_Ctor     | 1 -> 5 -> 6 | 0x004d1ec8 |
+   +------------------+--------+---------------------------+-------------+------------+
+   | Pal              | 0x54a6 | FontPal_Ctor              | 1 -> 7      | 0x004d1ee8 |
+   +------------------+--------+---------------------------+-------------+------------+
+   | Moto             | 0x54a6 | FontMoto_Ctor             | 1 -> 7 -> 8 | 0x004d1f08 |
+   +------------------+--------+---------------------------+-------------+------------+
+
+   The kind chain is read straight out of each constructor. Every one of
+   them begins by running the base constructor body, which installs
+   vtable 0x004d1e68 and sets kind to 1, and then overwrites both. Where
+   a constructor does that twice, as FontShadedTransp_Ctor and
+   FontMoto_Ctor do, the class is two levels deep. That is the ordinary
+   C++ derived-constructor pattern and it is what makes the hierarchy
+   legible:
+
+       MR_Font (1)
+         +-- CustomColor (3)
+         +-- AntiAlias8 (5)
+         |     +-- AntiAlias8Transp (6)
+         +-- Pal (7)
+               +-- Moto (8)
+
+   The two Trame variants are not classes at all. Font_LoadAll
+   constructs the plain object and then assigns a different vtable over
+   the top, in the caller rather than in a constructor. Trame is French
+   for a halftone screen, so these are presumably the screened or
+   dithered renderings of the same font data [inferred].
+
+   Only two sizes exist. The six classes that fit 0x54a6 differ from
+   each other only in vtable and kind; the two AntiAlias8 classes add
+   one array at offset 0x54a6, the first byte past the base: seven
+   256-entry tables of (i * level) / 8 for level 7 down to 1. Seven
+   times 0x400 is 0x1c00, exactly 0x70a6 minus 0x54a6, so they add that
+   and nothing else [verified]. Those are precomputed intensity ramps,
+   matching Font_DrawTextInternal's special handling of kinds 5 and 6.
+
+   A second pass then assigns each font a usage condition drawn from
+   twelve names: GameMsgLowRes, GameMsgHiRes, InGameLowRes, InGameHiRes,
+   InGameMenu, InGameMenuLowRes, InGameMenuHiRes, InGameGeneric,
+   InGameHelpMenu, OutGame, Obsolete and NoCondition. Several are
+   explicitly low-resolution or high-resolution variants of the same
+   role, which is the same pairing Font_Get switches between [inferred].
+
+   An unrecognised type name throws a C++ exception rather than falling
+   back.
+
+4.1.  The vtable, all seven slots
+
+   All eight vtables have now been read, and the shape README section
+   24.3 predicted is exactly right [verified]:
+
+   +------+-------+---------------------------+----------+------------+
+   | Slot | Off   | Role                      | Distinct | Base       |
+   +======+=======+===========================+==========+============+
+   | 0    | +0x00 | set fore/back colour      | 2        | 0x00490b00 |
+   +------+-------+---------------------------+----------+------------+
+   | 1    | +0x04 | rebuild a character range | 5        | 0x00490b90 |
+   +------+-------+---------------------------+----------+------------+
+   | 2    | +0x08 | load .FNT face, range     | 1        | 0x00492100 |
+   +------+-------+---------------------------+----------+------------+
+   | 3    | +0x0c | load .FNT face            | 1        | 0x00491380 |
+   +------+-------+---------------------------+----------+------------+
+   | 4    | +0x10 | load other face, range    | 1        | 0x00492140 |
+   +------+-------+---------------------------+----------+------------+
+   | 5    | +0x14 | load other face           | 1        | 0x00492130 |
+   +------+-------+---------------------------+----------+------------+
+   | 6    | +0x18 | draw one glyph            | 8        | 0x00493100 |
+   +------+-------+---------------------------+----------+------------+
+
+   THERE IS NO SLOT 7. +0x1c is already the next object; the value
+   there differs between vtables and is not a code address in two of
+   them.
+
+   o SLOT 5 IS A STUB IN EVERY CLASS - five bytes, XOR EAX,EAX /
+     RET 0x10. It is the loader for a second face extension, and since
+     all 33 shipped faces are .FNT, nothing ever called it. Slot 4
+     wraps it and is equally dead. A second face format was designed
+     and never used; see formats/fnt.txt section 5.
+
+   o SLOTS 2 AND 4 ARE WRAPPERS, identical but for which loader they
+     tail-call. Each converts an inclusive (firstChar, lastChar) pair
+     into (firstChar, count) and forwards - slot 2 to slot 3, slot 4
+     to slot 5.
+
+   SLOT 0 IS WHAT PINNED DOWN foreColor AND backColor. It compares
+   three bytes at +0x5494 against its first argument and three at
+   +0x5497 against its second, copies each only if it differs, and
+   calls slot 1 over (1, 0xff) if EITHER changed - once, not twice.
+   Those are the FontForeColors and FontBackColors the configuration
+   supplies, and the early-out matters because menu code sets the same
+   colour every frame.
+
+   CustomColor and CustomColorTrame override BOTH slot 0 and slot 1
+   with three-byte bare returns. They ignore colour changes and never
+   rebuild, which is self-consistent: nothing they depend on can
+   change.
+
+   o SO IN C THE FAMILY IS THREE FUNCTION POINTERS AND FOUR ORDINARY
+     FUNCTIONS. src/font.c implements it, and the four shared slots
+     are plain functions there because they are plain functions here -
+     virtual only because the base declared them so.
+
+
+5.  The font table
+
+   Font ids are positional. Font_LoadAll stores each object at
+   g_fontTable[i] where i is its index in the configuration list, so the
+   identity of every id comes from the data file and not from the
+   executable [verified].
+
+   The file is Data\Fonts.Spt, shipped as DATA\FONTS.BPT. Its string
+   encoding was solved in order to read this; see formats/bpt.txt
+   section 6. The header declares 35 fonts and the loader rejects any
+   count above 48.
+
+   +----+----------------+------------------+----------------+
+   | Id | Name           | Type             | Condition      |
+   +====+================+==================+================+
+   | 0  | ChronoLowRes   | Direct           | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 1  | MotoLowRes     | Pal              | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 2  | PlayerLowRes   | Pal              | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 3  | TimeLowRes     | Direct           | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 4  | ChronoHiRes    | Direct           | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 5  | MotoHiRes      | Pal              | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 6  | PlayerHiRes    | Pal              | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 7  | TimeHiRes      | Direct           | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 8  | InfosDebug     | Direct           | NoCondition    |
+   +----+----------------+------------------+----------------+
+   | 9  | MenuLink       | AntiAlias8Transp | NoCondition    |
+   +----+----------------+------------------+----------------+
+   | 10 | SpritesLowRes  | Pal              | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 11 | SpritesHiRes   | Pal              | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 12 | Messages       | AntiAlias8Transp | NoCondition    |
+   +----+----------------+------------------+----------------+
+   | 13 | GameMsgLowRes  | AntiAlias8Transp | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 14 | GameMsgHiRes   | AntiAlias8Transp | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 15 | SpeedLcdHiRes  | Pal              | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 16 | SpeedLcdLowRes | Pal              | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 17 | MenuHiRes      | Direct           | OutGame        |
+   +----+----------------+------------------+----------------+
+   | 18 | Symbol         | CustomColor      | Obsolete       |
+   +----+----------------+------------------+----------------+
+   | 19 | PosLowRes      | Direct           | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 20 | PosHiRes       | Direct           | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 21 | MenuLabel      | AntiAlias8Transp | OutGame        |
+   +----+----------------+------------------+----------------+
+   | 22 | MotorLcdHiRes  | Pal              | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 23 | MotorLcdLowRes | Pal              | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 24 | Keyboard       | Pal              | OutGame        |
+   +----+----------------+------------------+----------------+
+   | 25 | FinalPosHiRes  | Pal              | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 26 | FinalPosLowRes | Pal              | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 27 | Generic        | Direct           | InGameGeneric  |
+   +----+----------------+------------------+----------------+
+   | 28 | CounterHiRes   | Pal              | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 29 | CounterLowRes  | Pal              | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 30 | KeyboardHelp   | Pal              | InGameHelpMenu |
+   +----+----------------+------------------+----------------+
+   | 31 | DataDiskMenu   | Direct           | OutGame        |
+   +----+----------------+------------------+----------------+
+   | 32 | GameMenuHiRes  | Pal              | InGameHiRes    |
+   +----+----------------+------------------+----------------+
+   | 33 | GameMenuLowRes | Pal              | InGameLowRes   |
+   +----+----------------+------------------+----------------+
+   | 34 | Help           | Pal              | InGameHelpMenu |
+   +----+----------------+------------------+----------------+
+
+   This settles the twelve pairs Font_Get swaps between. Every one of
+   them is the LowRes and HiRes form of a single font, with no
+   exceptions [verified]:
+
+   +---------+--------------------------------+
+   | Pair    | Names                          |
+   +=========+================================+
+   | 0 / 4   | ChronoLowRes / ChronoHiRes     |
+   +---------+--------------------------------+
+   | 1 / 5   | MotoLowRes / MotoHiRes         |
+   +---------+--------------------------------+
+   | 2 / 6   | PlayerLowRes / PlayerHiRes     |
+   +---------+--------------------------------+
+   | 3 / 7   | TimeLowRes / TimeHiRes         |
+   +---------+--------------------------------+
+   | 10 / 11 | SpritesLowRes / SpritesHiRes   |
+   +---------+--------------------------------+
+   | 13 / 14 | GameMsgLowRes / GameMsgHiRes   |
+   +---------+--------------------------------+
+   | 16 / 15 | SpeedLcdLowRes / SpeedLcdHiRes |
+   +---------+--------------------------------+
+   | 19 / 20 | PosLowRes / PosHiRes           |
+   +---------+--------------------------------+
+   | 23 / 22 | MotorLcdLowRes / MotorLcdHiRes |
+   +---------+--------------------------------+
+   | 26 / 25 | FinalPosLowRes / FinalPosHiRes |
+   +---------+--------------------------------+
+   | 29 / 28 | CounterLowRes / CounterHiRes   |
+   +---------+--------------------------------+
+   | 33 / 32 | GameMenuLowRes / GameMenuHiRes |
+   +---------+--------------------------------+
+
+   The direction is uniform once the ids are named. The branch taken
+   when g_cfgSmallFonts is clear and g_cfgScreenMode is 2 maps LowRes to
+   HiRes in all twelve cases; the other branch maps HiRes to LowRes.
+   Screen mode 2 is 640x480, the highest of the three supported modes,
+   so the rule reads plainly: at the highest resolution with small fonts
+   turned off, a request for a low-resolution font is answered with its
+   high-resolution twin, and otherwise the reverse [verified].
+
+   Three ids the code hardcodes now have names. Font 8, the last-resort
+   fallback, is InfosDebug. Font 0x1b, substituted when a kind 5 or 6
+   font is unavailable, is 27, Generic - a plain Direct font with the
+   InGameGeneric condition, which is a sensible thing to fall back to.
+
+   Id 18, Symbol, carries the condition Obsolete, and it is the only
+   CustomColor font in the table. Neither of the two CustomColorTrame or
+   DirectTrame types is used by any font, so four of the eight type
+   branches in Font_LoadAll are dead in the shipped data [verified].
+
+   The file also carries per-font spacing, foreground and background
+   colours, and the face list. The face records confirm the multi-face
+   design: font 9, MenuLink, declares two faces,
+   Data\Fontes\HiRes\MenuLink.Raw for characters 32 to 95 and
+   MenuLin2.Raw for 192 to 211, which is why MR_Font carries four face
+   slots with a first character and a count each.
+
+5.1.  The read schema, and why a parser cannot guess it
+
+   A .bpt carries NO TYPE TAGS.  tools/bpt.py guesses - it takes a
+   plausible length, trial-decodes, and accepts the string only if
+   the bytes come out printable - and its own docstring says why
+   that is a dump tool's trick and not the game's: the real reader
+   knows only because it calls ReadValue and ReadString in a FIXED
+   ORDER.
+
+   So a port reads Fonts by transcribing that order.  Guessing
+   desynchronises the moment a small integer looks like a length.
+
+   Font_LoadAll (0x00426460) reads SIX KEYED SECTIONS, rewinding
+   before each one.  Every section after the first is a list of
+   records that begins with an id and ENDS ON AN ID OF -1.
+
+   +------------------+--------------------------------------------+
+   | Key              | Record                                     |
+   +==================+============================================+
+   | FontNumber       | one int, the count.  Rejected outside      |
+   |                  | 0..0x30, and the table is allocated to it  |
+   +------------------+--------------------------------------------+
+   | FontTypes        | int id, str name, str type, str condition  |
+   +------------------+--------------------------------------------+
+   | FontSpacings     | int id, int a, int b                       |
+   |                  | stored at font+0xa20 and font+0xa1c        |
+   +------------------+--------------------------------------------+
+   | FontForeColors   | int id, int r, int g, int b                |
+   +------------------+--------------------------------------------+
+   | FontBackColors   | int id, int r, int g, int b                |
+   +------------------+--------------------------------------------+
+   | FontData         | int id, int firstChar, int lastChar,       |
+   |                  | int kind, str path                         |
+   +------------------+--------------------------------------------+
+
+   o THE FACE COUNT IS DERIVED, NOT STORED.  The loader passes
+     (lastChar - firstChar) + 1 to the face adder at 0x004929f0,
+     which is what settles the second and third ints as a
+     CHARACTER RANGE rather than a start and a count.  MenuLink
+     reads 32, 95 and then 192, 211 - the two ranges section 5
+     already describes.
+
+   o AN ID OUTSIDE 0..count THROWS, in every section.  So does an
+     unrecognised type or condition name.  The file is trusted to
+     be consistent with its own FontNumber.
+
+   o A STRAY INT SITS BETWEEN THE COUNT AND THE FIRST ID, and
+     both read 35 in the shipped file.  Font_LoadAll cannot
+     settle which is which: Settings_ReadInt collapses to a
+     single read on a compiled .bpt - the key-matching loop is
+     skipped entirely and the key name is never compared - so
+     the two reads look identical in the disassembly.
+
+     THE FILE SETTLES IT.  Skipping the second value parses all
+     4347 bytes to the last one, with every section ending on
+     its -1 and every id inside 0..34; not skipping it makes the
+     first id 35, which Font_LoadAll would throw on.  src/fonts.c
+     detects rather than assumes - an id outside the range is
+     consumed and logged.
+
+   o THE SECTIONS ARE SPARSE.  35 fonts, but only 28 spacings, 17
+     foreground colours and 20 background ones, and 38 faces over
+     35 fonts because some declare two.  A reader must key on the
+     id in each record and not assume one record per font.
+
+   o Font_Rebuild RUNS ON EVERY FONT AT THE END, after all six
+     sections.  Colours and spacing are therefore set before any
+     LUT is built, which is why nothing rebuilds per key.
+
+5.2.  The face paths name a file that is not shipped
+
+   FontData paths read Data\\Fontes\\HiRes\\MenuLink.Raw,
+   and FONTES.BKF holds HIRES\\MENULINK.FNT.  The extension in the
+   manifest is not the extension on disk for any of the HiRes or
+   LowRes faces; only SYMBOL.RAW and DELPHINE\\DEBUG.RAW are
+   genuinely .RAW.
+
+   A reader therefore has to strip the Data prefix - rule 10 wants
+   a logical name anyway - and swap the extension.  Script_Open
+   does the same trick for scripts, uppercasing its argument and
+   replacing whatever extension it finds with BPT, so the pattern
+   is the file system's convention rather than a special case.
+   [inferred - the swap is forced by the data; the instruction
+   that performs it has not been read.]
+
+5.3.  Nothing here is localised
+
+   There is no language in any of it.  The paths carry LowRes and
+   HiRes and no language directory, and no section is read twice.
+   What varies an id is RESOLUTION: Font_Get substitutes between
+   the twelve LowRes/HiRes pairs in section 5 on g_cfgSmallFonts
+   and the screen mode.  Menu SPRITES are localised; fonts are
+   not.
+
+
+6.  Accessors
+
+   +------------+-----------------------+-----------------------------------------------+
+   | Address    | Name                  | Role                                          |
+   +============+=======================+===============================================+
+   | 0x00490700 | Font_Ctor             | base constructor                              |
+   +------------+-----------------------+-----------------------------------------------+
+   | 0x004949f0 | FontShaded_Ctor       | derived constructor                           |
+   +------------+-----------------------+-----------------------------------------------+
+   | 0x00492170 | Font_Rebuild          | load faces, pack the atlas, build descriptors |
+   +------------+-----------------------+-----------------------------------------------+
+   | 0x004903d0 | Font_Get              | id to font, with the small/large swap         |
+   +------------+-----------------------+-----------------------------------------------+
+   | 0x00493ee0 | Font_DrawText         | wrapper Menu_Draw calls                       |
+   +------------+-----------------------+-----------------------------------------------+
+   | 0x00493820 | Font_DrawTextInternal | measure, wrap, blit                           |
+   +------------+-----------------------+-----------------------------------------------+
+   | 0x00426460 | Font_LoadAll          | reads config, allocates one object per font   |
+   +------------+-----------------------+-----------------------------------------------+
+
+   Six further methods in the 0x00492000-0x00494000 range take a font as
+   this and are in the MR_Font class namespace in the database, but have
+   not been read: 0x00492b10, 0x00492c20, 0x00492d20, 0x00493100,
+   0x00493490 and 0x00490840.
+
+6.1.  The blit target block, and a shipped Beep
+
+   Font_DrawTextInternal at 0x00493820 does not blit through DirectDraw.
+   It writes pixels directly, through a four-field descriptor in a
+   contiguous global block [verified]:
+
+   +------------+------------------+----------------------------+
+   | Address    | Holds            | Written by                 |
+   +============+==================+============================+
+   | 0x004e704c | width            | maybe_Cdd_CreateOffScreen  |
+   +------------+------------------+----------------------------+
+   | 0x004e7050 | height           | maybe_Cdd_CreateOffScreen  |
+   +------------+------------------+----------------------------+
+   | 0x004e7054 | stride in pixels | FUN_004236b0               |
+   +------------+------------------+----------------------------+
+   | 0x004e7058 | the bits pointer | FUN_00423590, FUN_004236b0 |
+   +------------+------------------+----------------------------+
+
+   All four are read only by this function. The address arithmetic is:
+
+       addr = bits + (stride * y + x) * 2;
+
+   another hardcoded two bytes per pixel, now recorded in
+   subsystems/pixel-format.txt section 1.1.3. It matters because it sits
+   outside screen3d\ - a port that converts the rasterizer and forgets
+   the font code gets a correct 3D scene with garbled text.
+
+   The same block continues with three dead fields at 0x004e705c,
+   0x004e7060 and 0x004e7064 - the tile grid of subsystems/dd-
+   present.txt section 6, written once and read by nothing.
+
+6.1.1.  A one-shot Beep on a null target
+
+   If the computed address comes out zero - which happens when the bits
+   pointer is null, so nothing has locked the target - the function does
+   this [verified]:
+
+       if (addr == 0) {
+           if (DAT_004f1830 == 0) {
+               DAT_004f1830 = 1;
+               Beep(0, 0);
+           }
+       }
+
+   A developer diagnostic that shipped. The latch at 0x004f1830 is read
+   and written only here and never reset, so the beep sounds at most
+   once per run. Beep(0, 0) with both arguments zero is the default
+   system beep on Windows 95.
+
+   o It is a useful marker rather than a curiosity: if a port ever hears
+     it, text is being drawn with no surface locked, and the original
+     would have silently skipped that draw after the first warning.
+
+   o The function also has its own surface-loss recovery - on
+     DDERR_SURFACELOST it frees the font's texture through
+     D3D_FreeBankTextures, clears its handle and calls Font_Rebuild. So
+     fonts restore themselves independently of the bank machinery in dd-
+     statics.txt.
+
+
+6.2.  The antialias fallback
+
+   Font_Get carries a substitution that is easy to read past
+   [verified, 0x00490549]:
+
+       if (DAT_004f1814 && !DAT_004f1828 && (kind == 5 || kind == 6))
+               font = g_fontTable[0x1b];        /* 27, Generic */
+
+   so while that flag is set EVERY AntiAlias8 and AntiAlias8Transp
+   font is replaced by Generic - HiRes\Generic.raw.
+   Font_DrawTextInternal (0x00493820) carries the matching gate and
+   draws NOTHING at all for a kind 5 or 6 font under the same
+   condition.
+
+   o DAT_004f1828 IS ONLY EVER WRITTEN AS 0 (0x004961d0), so it
+     never rescues anything and the condition is effectively the one
+     flag.
+
+   o DAT_004f1814 IS A REBUILD LATCH, NOT A CAPABILITY BIT.  App_Init
+     sets it around its font-construction loop and clears it after
+     (0x00473042, 0x00473069); Font_Rebuild and Font_ReloadAll set it
+     the same way, and FUN_00496940 - which frees every font's D3D
+     bank textures - clears it. [inferred: every writer is
+     rebuild-scoped]
+
+   o SO A RUNNING BUILD WITH IT STUCK AT 1 IS SHOWING THE FALLBACK,
+     not the intended fonts.  Read live as 1 in a paused mid-race
+     MOTO whose display mode had failed, which made the grid
+     countdown draw in Generic instead of GameMsg and Messages - one
+     typeface where there should be two, at one size where there
+     should be 17 and 21 pixels.
+
+     THAT IS A TRAP FOR VISUAL COMPARISON.  A capture from such a
+     build is evidence about the fallback path and nothing else, and
+     matching the reconstruction to it would bake the degraded look
+     in.
+
+
+7.  Intensity is scaled by font kind
+
+   Font_DrawTextInternal (0x00493820) does NOT hand its intensity
+   argument to the blitter untouched.  At 0x00493d47 it scales the
+   caller's 0..100 value, and the three scales have nothing in
+   common [verified]:
+
+   +---------------------------+---------------------------+-------+
+   | Case                      | Scale                     | Range |
+   +===========================+===========================+=======+
+   | kind 5, AntiAlias8        | (a << 11)    / 100 >> 8   | 0..8  |
+   +---------------------------+---------------------------+-------+
+   | kind 6, AntiAlias8Transp  | (a * 0xe000) / 100 >> 8   | 0..224|
+   +---------------------------+---------------------------+-------+
+   | hardware renderer         | (a * 0x3f00) / 100 >> 8   | 0..63 |
+   +---------------------------+---------------------------+-------+
+   | anything else             | unchanged                 | 0..100|
+   +---------------------------+---------------------------+-------+
+
+   The hardware arm is chosen by g_rendererReady and g_rendererMode
+   and wins over the kind test.
+
+   o THE RANGES ARE THE BLITTERS', NOT ARBITRARY.  The kind 6 glyph
+     blitter adds the bias to the glyph byte's top three bits and
+     drops the pixel at 0xe1, so 224 is exactly "fully transparent"
+     for that kind.  The kind 5 tables stop at 8.
+
+   o SO THE SAME ALPHA MEANS DIFFERENT THINGS TO DIFFERENT FONTS,
+     and a caller that passes a value scaled for one kind to a font
+     of another gets a fade that finishes in the first few per cent
+     of its duration.  The widget system relies on this: every
+     message widget hands over a plain 0..100 and lets the font
+     decide.
+
+
+8.  Open questions
+
+   o ANSWERED. +0x5494 and +0x5497 are foreColor[3] and backColor[3];
+     +0x549a and +0x549e are palettePixels and paletteCount, resolved
+     by FontPal_BuildColorLut. The packed tail is fully mapped.
+
+   o THE .FNT FACE FORMAT IS NOW DECODED, byte-exact against all 33
+     shipped faces. See formats/fnt.txt and tools/fnt.py. That was the
+     blocker on loading anything, and it is gone.
+
+   o ANSWERED. ALL EIGHT SLOT-6 BLITTERS AND ALL FIVE SLOT-1 BUILDERS
+     have been read. See sections 2.2 and 2.3.
+
+   o THE ANTIALIAS8 TABLE INDEXING still has an off-by-one that
+     reading the decompilation could not settle, though
+     FontShadedTransp_DrawGlyph has since confirmed the direction
+     independently. base + level*0x400 for the source
+     and 0x74a6 - level*0x400 for the destination do not line up with
+     the constructor's fill order of (i*n)/8 for n from 7 down to 1
+     without one, and the two readings differ over whether the blend
+     weights sum to 8/8 or 7/8. src/font.c takes the sensible one.
+     Reading the disassembly rather than the decompilation would
+     settle it.
+
+   o Six fields are still unknown, and the 0x200-byte gap at 0x0418 is
+     the largest. Given its position between two per-character tables it
+     is probably a third one, 256 entries of two bytes, but nothing read
+     so far touches it.
+
+   o maxAlpha at 0x54a2 is an unaligned dword, and the twelve bytes
+     before it take byte-level accesses at five distinct offsets. That
+     region is packed and has not been resolved into fields.
+
+   o ANSWERED. MR_FontGlyph IS AN MR_Primitive. Both blitters that
+     have been read pass this->glyphs + ch to Screen3D_QueueScreenQuad
+     as an MR_Primitive*, and MR_Primitive is also 0x40 bytes. It is
+     the hardware path's prebuilt primitive, one per character - not
+     an execute-buffer fragment. The "five pairs" reading was the wrong
+     frame: MR_Primitive's fifth (u,v) pair is the wrap slot, the same
+     duplicate-corner-0 trick used throughout the geometry path.
+
+   o ANSWERED. FontShadedTransp_Ctor sets kind 6, chaining base to
+     AntiAlias8 to AntiAlias8Transp. See section 4.
+
+   o ANSWERED. All 35 ids are named and all twelve Font_Get pairs are
+     LowRes/HiRes twins. See section 5.

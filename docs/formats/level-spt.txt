@@ -1,0 +1,290 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                    LEVEL.SPT - THE TRACK MANIFEST
+
+
+Abstract
+
+   The file every race hangs off. Page 1's tick builds its name with
+   sprintf("%sLevel.Spt", trackPath) and hands it to FUN_00427e80,
+   which reads about 194 positional values naming every other asset a
+   race needs and carrying every AI tuning constant. Nothing about a
+   race can be loaded until this is read, which is what makes it the
+   first step towards gameplay rather than an arbitrary one.
+
+   The file has NO NAMES IN IT. Values are positional; the names are
+   in the reader. So the read order IS the format, and this note is
+   really a transcription of that order - checked, not trusted.
+
+Table of Contents
+
+   1. Where It Lives
+   2. The Read Order
+      2.1. The eleven asset names
+      2.2. The bank table, and the slot-0 asymmetry
+      2.3. Placement and the starting grid
+      2.4. The nine zone keys
+      2.5. The thirteen tuning keys
+      2.6. The two counted runs
+   3. Why the Order Can Be Believed
+   4. What Every Island Says
+   5. The Reconstruction
+   6. Open Questions
+
+1.  Where It Lives
+
+   ".Spt" IS ".BPT" ON DISK. The script loader rewrites any requested
+   extension to .BPT unless the name contains .DEM, so
+
+       data\ile01\Level.Spt   ->   ILE01\LEVEL.BPT
+
+   which under CLAUDE.md rule 10 is a member of ILE01.BKF, not a loose
+   file. The container format - a Park-Miller XOR mask over positional
+   values and length-prefixed strings - is documented in bpt.txt and
+   decoded by tools/bpt.py.  [verified]
+
+2.  The Read Order
+
+   Every entry below is one call in FUN_00427e80, in sequence. The
+   "kind" column matters because the reader is not consistent: some
+   values are read as INTEGERS and then stored into float fields,
+   while others are parsed as floats outright.
+
+   +--------+---------------------------------------------------------+
+   | Kind   | Meaning                                                 |
+   +========+=========================================================+
+   | str    | Settings_ReadString or Script_ReadString                |
+   | int    | Settings_ReadInt, stays an integer                      |
+   | int/f  | Settings_ReadInt, then cast to float by the caller      |
+   | float  | Script_ReadFloat or FUN_004257e0                        |
+   +--------+---------------------------------------------------------+
+
+2.1.  The eleven asset names
+
+   +-----+-------+-----------------+-------------------------------+
+   | Idx | Kind  | Key             | ile01 value                   |
+   +=====+=======+=================+===============================+
+   |   0 | int   | NewMotorEngine  | 1                             |
+   |   1 | str   | FileLand        | ile01.trk                     |
+   |   2 | str   | FileFrame3d     | Frames3d.Spt                  |
+   |   3 | str   | FileDecor       | Decor.Spt                     |
+   |   4 | str   | (DecorInv)      | DecorInv.Spt                  |
+   |   5 | str   | FileNet         | Moto.net                      |
+   |   6 | str   | FileMap         | Map.raw                       |
+   |   7 | str   | FileMoto        | data\motoSpd.spt              |
+   |   8 | str   | (Pocket)        | data\PktSpeed.spt             |
+   |   9 | str   | FileBalise      | balise.spt                    |
+   |  10 | str   | FileSmallMap    | Map1.raw                      |
+   |  11 | str   | FileBank        | data\moto\bnk00_00.raw        |
+   +-----+-------+-----------------+-------------------------------+
+
+   Two of the eleven are read with Script_ReadString and so have no
+   key name in the binary at all; the names in brackets are ours, from
+   position and content. FileMoto at index 7 is the BIKE MANIFEST, and
+   that confirms from the other side what bikes.h records: it is the
+   file that names the eight carac scripts.  [verified]
+
+2.2.  The bank table, and the slot-0 asymmetry
+
+   Twenty texture-bank slots follow, each {page, pageD3D, flags}. The
+   count is the READER'S, not the file's: the loop walks a fixed table
+   0x40 bytes at a time and stops at 0x51c9e7, so a manifest always
+   describes twenty banks whether it uses them or not. Unused entries
+   are the string "NULL".
+
+   SLOT 0 IS SHORT BY ONE STRING, and this is the single easiest place
+   to get the whole file wrong. FileBank above has already consumed
+   slot 0's page name, so the loop is entered with that pair half
+   read: slot 0 supplies only its D3D name and its flags, and slots
+   1..19 supply both names and the flags. Miss it and every value from
+   here to the end of the file is off by one.  [verified]
+
+   The D3D name is a SEPARATE ARTWORK SET, not a variant path -
+   bnkD3D02.raw beside bnk00_02.raw - and where a slot has no hardware
+   version the field is "NULL".
+
+2.3.  Placement and the starting grid
+
+   +-----+-------+---------------------+-----------------+
+   | Idx | Kind  | Key                 | ile01           |
+   +=====+=======+=====================+=================+
+   |  71 | int   | StepGlobal          | 22              |
+   |  72 | int   | YScaleLevel         | 0               |
+   |  73 | int/f | StartPositionX      | 42447           |
+   |  74 | int/f | StartPositionY      | 83              |
+   |  75 | int/f | StartPositionZ      | 44786           |
+   |  76 | int   | ComputeLandOptimise | 0               |
+   +-----+-------+---------------------+-----------------+
+
+   StartPosition IS THE STARTING GRID, and it is whole numbers in the
+   file turned into floats by three (float) casts in the reader. This
+   is the value the grid scene needs first.
+
+2.4.  The nine zone keys
+
+   Each is read as ONE value plus FOUR more - a base and a per-detail-
+   level override, five in all. The reader walks each set with a
+   stride of 9 floats through a table of per-level records, which is
+   why they interleave in memory but are contiguous in the file.
+
+       LenBPlane  LenRLPlane  FlatZ  HorizFlatZ  MediumZone
+       HightZone  gouraudTexturedZ  texturedZ   gouraudZ
+
+   MediumZone and HightZone are integers; the other seven are floats.
+   ile01's gouraudZ runs 0, 4000, 12000, 22000, 52000 - a distance
+   ladder - which is what these are: the draw-distance and shading
+   thresholds detail-levels.txt describes, per track.  [inferred from
+   the values and the key names; nothing here reads them yet]
+
+2.5.  The thirteen tuning keys
+
+   Three floats each, thirty-nine values, all AI:
+
+       RATTRAPAGE_SPEED / _CURVE / _COUPLE      catch-up
+       ATTENTE1_SPEED   / _CURVE / _COUPLE      wait, band 1
+       ATTENTE2_SPEED   / _CURVE / _COUPLE      wait, band 2
+       CURVE_RANGE  COUPLE_OUT_RANGE  COUPLE_IN_RANGE  SPEED_FACTOR
+
+   "Rattrapage" is catch-up and "attente" is waiting, so this is the
+   rubber-banding table - three bands of it, per track.
+
+   AND THE ORIGINAL NEVER READS IT.  [verified]  The reader stores the
+   thirty-nine floats as a float[3][13] at 0x005427b8, band-major with
+   a row stride of 0x34, spanning 0x005427b8..0x00542853.  Every one
+   of the thirty-nine words carries exactly one xref and it is the
+   FSTP that writes it, all from FUN_00427e80; no instruction anywhere
+   in the image loads the base as an array pointer either.  The table
+   is parsed and dead.
+
+   CONFIRMED AT RUNTIME, not only by xref.  Four hardware watchpoints
+   in rw mode on RATTRAPAGE_SPEED's three bands and on SPEED_FACTOR,
+   armed across a menu, a race start and a full lap, recorded twelve
+   hits and every one was FUN_00427e80's own FSTP.  Nothing else
+   touched them.  x86 has no read-only encoding, so rw traps any
+   access and a read would have fired.
+
+   So a port that leaves tuning[][] unread matches the original, and
+   implementing catch-up from these names would be inventing
+   behaviour MOTO.EXE does not have.  The AI's variety comes from
+   ComputerSpeed, not from here - see subsystems/racers.txt.
+
+2.6.  The two counted runs
+
+   +-----+-------+------------------+--------------------------------+
+   | Idx | Kind  | Key              | Note                           |
+   +=====+=======+==================+================================+
+   | 161 | int   | NbComputer       | 23 on every shipped island     |
+   | ... | float | ComputerSpeed[]  | exactly NbComputer of them     |
+   | 185 | int   | TimeSkill        | plus two more, three in all    |
+   | 188 | int   | NbCheckPoint     | 3 to 5                         |
+   | ... | int   | TimeCheckPoint[] | exactly NbCheckPoint of them   |
+   | 192 | float | FactorPocket     | 0.95 on ile01                  |
+   | 193 | int   | AudioTrack       | the race's CD music track      |
+   +-----+-------+------------------+--------------------------------+
+
+   The reader spells both runs as "one, then count-1 more", which is
+   the same as count of them and is written that way in level.c.
+
+3.  Why the Order Can Be Believed
+
+   A positional format with no names is exactly the kind of thing a
+   plausible-but-wrong reading survives, so the order is checked
+   rather than asserted. tools/level_spt.py holds the same sequence
+   and runs it against the shipped files.
+
+   THE TWO COUNTS ARE THE TEST, and they are strong because they come
+   out of the file itself:
+
+       NbComputer   is followed by exactly that many floats
+       NbCheckPoint is followed by exactly that many ints
+
+   A wrong order almost certainly lands a count on the wrong value,
+   and the stream then ends early or runs off the end. Both must
+   consume to exactly the last record.
+
+   AND THE FILES ARE NOT ALL THE SAME LENGTH, which is what makes it
+   more than one test. The eight islands come in at 194, 195 and 196
+   records, because NbCheckPoint varies from 3 to 5. A fixed-length
+   misreading cannot land on the last record of three different
+   lengths; a correct variable-length one lands on all of them.
+
+       python tools/level_spt.py --check <LEVEL.BPT>...
+
+   reports OK for all eight.  [verified]
+
+4.  What Every Island Says
+
+   +--------+-------------+---------------------------+-----+----+-----+
+   | Island | FileLand    | StartPosition             | CPU | CP | CD  |
+   +========+=============+===========================+=====+====+=====+
+   | ile01  | ile01.trk   | 42447, 83, 44786          |  23 |  3 |   4 |
+   | ile02  | ile02.trk   | 53061, 151, 45834         |  23 |  3 |   7 |
+   | ile03  | track03.trk | 31883, 480, 12054         |  23 |  3 |   2 |
+   | ile04  | ile04.trk   | 19721, 520, 42886         |  23 |  5 |   8 |
+   | ile05  | ile05.trk   | 41646, 900, 17946         |  23 |  5 |   5 |
+   | ile06  | track06.trk | 7788, 1187, 21841         |  23 |  3 |  10 |
+   | ile08  | ile08.trk   | 19721, 520, 42886         |  23 |  4 |   6 |
+   | ile09  | bercy.trk   | 19721, 520, 42886         |  23 |  5 |   9 |
+   +--------+-------------+---------------------------+-----+----+-----+
+
+   o THE LAND FILE IS NOT ALWAYS ileNN.trk. Three of the eight name
+     something else - track03, track06, bercy - so the mesh name must
+     be read from here and never built from the island number.
+
+   o NbComputer IS 23 EVERYWHERE, which matches the 0x17 default the
+     loading page falls back to when its own count is out of range.
+
+   o ile04, ile08 AND ile09 SHARE A STARTING POSITION exactly. Whether
+     that is deliberate reuse or a copy-paste in the source data is
+     not something the binary can answer.
+
+   o EVERY ISLAND HAS ITS OWN CD TRACK, 2 through 10, which is where
+     race music comes from - see audio-cues.txt section 5.5.
+
+5.  The Reconstruction
+
+   src/level.h has the struct and src/level.c the reader, one bpt call
+   per row above. It is DELIBERATELY INERT: nothing consumes a field
+   yet. A parser that can be checked on its own, before anything tries
+   to draw a track, is the point of doing this first.
+
+   page01_enter calls it for the selected track and logs the headline
+   fields, so the parse runs against real data on a real page rather
+   than only in a test.
+
+   Two differences from the original, both deliberate:
+
+   o IT REFUSES A BAD COUNT. The original reads NbComputer and writes
+     that many floats into a fixed array with no check. Ours bounds
+     both runs and fails the load instead.
+
+   o SLOT 0's page NAME IS COPIED FROM FileBank rather than left
+     empty, so banks[0] is a complete record like the other nineteen.
+     The file does not repeat it; see 2.2.
+
+6.  Open Questions
+
+   o WHAT THE NINE ZONE KEYS ACTUALLY DRIVE. The names and the value
+     ladders point at draw distance and shading thresholds, and
+     detail-levels.txt describes the machinery, but nothing has been
+     traced from these fields to a consumer.
+
+   o WHAT StepGlobal AND YScaleLevel MEAN. Read and stored; no
+     consumer read yet. YScaleLevel is 0 on ile01.
+
+   o ANSWERED - StartPosition IS NOT THE GRID. It is a spawn:
+     maybe_Game_CreateRacers puts EVERY racer on it, all 24 stacked on
+     one point, and maybe_Game_InitRace (0x0047bf70) then overwrites
+     all of them. The real grid is track-segment relative - two
+     columns 256 units apart, one pair every three segments, running
+     backwards from the line. Neither the layout nor the pole position
+     can be read out of this file. See game-object.txt 6.4.
+
+     So the obvious reading of this field - "where the player starts"
+     - is wrong, and it would have been easy to build a grid on it and
+     never notice.
+
+   o FileFrame3d, FileDecor, DecorInv, FileNet AND FileBalise are
+     names only. None of those formats has been opened.
+

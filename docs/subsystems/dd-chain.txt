@@ -1,0 +1,223 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                         DIRECTDRAW INIT CHAIN
+
+
+Abstract
+
+   The ordered sequence of init steps called by FUN_00476100. Step 1 is
+   analysed; steps 2 to 4 are named but not yet read.
+
+   The headline result: the game's original C++ method names are
+   recoverable from its assert strings, and the DirectDraw COM object is
+   identifiable from its vtable offsets. Both give us real names instead
+   of guesses.
+
+Table of Contents
+
+   1. Chain overview
+   2. FUN_004752d0 - Cdd::SetCooperativeLevelAndDisplayMode
+      2.1. Windowed path
+      2.2. Fullscreen path
+   3. The Cdd object model
+   4. DAT_005d922c is an IDirectDraw pointer
+   5. Globals resolved by this function
+   6. Applied to the Ghidra DB
+   7. Open questions
+
+
+1.  Chain overview
+
+   FUN_00476100 (Cdd::Init) calls these in order, aborting on the first
+   failure:
+
+   +-------+---------------------------------------+-------------------------------+------------------------------+
+   | Order | Function                              | Gate                          | Status                       |
+   +=======+=======================================+===============================+==============================+
+   | 1     | Cdd_SetCooperativeLevelAndDisplayMode | none; failure aborts          | done, this doc               |
+   +-------+---------------------------------------+-------------------------------+------------------------------+
+   | 2     | Cdd_CreatePrimarySurface              | skipped if g_lpDDSPrimary set | done, dd-primary-surface.txt |
+   +-------+---------------------------------------+-------------------------------+------------------------------+
+   | 3     | Cdd_CreateMainSurface                 | skipped if g_lpDDSMain set    | done, dd-main-surface.txt    |
+   +-------+---------------------------------------+-------------------------------+------------------------------+
+   | 4     | FUN_00475f80(0)                       | gated on DAT_004ee940         | not yet read                 |
+   +-------+---------------------------------------+-------------------------------+------------------------------+
+   | 4     | FUN_00475f80(1)                       | gated on -SnapShot            | not yet read                 |
+   +-------+---------------------------------------+-------------------------------+------------------------------+
+
+2.  FUN_004752d0 - Cdd::SetCooperativeLevelAndDisplayMode
+
+   The name is not a guess. The function builds the failure message
+   "Fatal error in Cdd::SetCooperativeLevelAndDisplayMode" from the
+   string at 0x004eeb74, so this is the original method name verbatim
+   [verified].
+
+   It branches on DAT_005d43a8 into two entirely separate paths:
+
+   +-------------------+--------------------------------------------+------------------------------------+
+   | Condition         | Cooperative level                          | Display mode                       |
+   +===================+============================================+====================================+
+   | DAT_005d43a8 == 0 | DDSCL_NORMAL (8)                           | not set; desktop mode is inherited |
+   +-------------------+--------------------------------------------+------------------------------------+
+   | DAT_005d43a8 != 0 | DDSCL_EXCLUSIVE or DDSCL_FULLSCREEN (0x11) | SetDisplayMode(w, h, bpp)          |
+   +-------------------+--------------------------------------------+------------------------------------+
+
+   This resolves an open question from dd-init.txt. DAT_005d43a8 was
+   flagged there as "bypasses the entire 16-bit mode check, may be the
+   windowed-mode path [guess]". It is exactly that: the fullscreen flag.
+   Zero means windowed.
+
+   The consequence matters for the renderer mission. The 16-bit lock is
+   enforced on the fullscreen path only. In windowed mode the game never
+   calls SetDisplayMode at all; it renders into a window on whatever the
+   desktop already is. That makes -windowed a promising lead for a first
+   modern-display experiment [inferred] - but only a lead, because the
+   internal rasterizer still assumes RGB565 regardless of how the
+   surface was obtained, and the "16 bit screen mode required" check may
+   also be applied to the desktop depth elsewhere. Verify before relying
+   on it.
+
+2.1.  Windowed path
+
+   Calls RestoreDisplayMode, then SetCooperativeLevel(hwnd,
+   DDSCL_NORMAL), then sizes the window:
+
+   o SystemParametersInfoA(SPI_GETWORKAREA) to read the desktop work
+     area.
+   o If the requested mode is exactly 640x480 and the work area matches,
+     the style is masked with 0x7f30ffff, clearing WS_CAPTION,
+     WS_SYSMENU, WS_THICKFRAME and both size boxes: a borderless window.
+   o Otherwise the style is masked with 0x7ffaffff and OR'd with
+     0x00ca0000, giving WS_CAPTION, WS_SYSMENU and WS_MINIMIZEBOX but no
+     resize or maximize: a fixed-size framed window.
+   o AdjustWindowRectEx then SetWindowPos sizes the frame around the
+     client area, a second SetWindowPos with HWND_NOTOPMOST fixes Z
+     order, and the window is clamped so it never starts off the work
+     area.
+
+2.2.  Fullscreen path
+
+   SetCooperativeLevel(hwnd, 0x11) then SetDisplayMode(width, height,
+   bpp). On failure it formats "%dx%d, %d bits per pixel", appends
+   "SetDisplayMode" to the error text, reports it, and calls
+   RestoreDisplayMode before returning 0.
+
+3.  The Cdd object model
+
+   FUN_00473900 is the Cdd constructor [verified]. It stores a vtable
+   pointer into its argument and then zeroes the object's state:
+
+   +--------------------+------------------+-------------------------------------------+
+   | Item               | Address          | Note                                      |
+   +====================+==================+===========================================+
+   | Cdd vtable         | PTR_FUN_004d1800 | written to *this by the constructor       |
+   +--------------------+------------------+-------------------------------------------+
+   | Constructor        | FUN_00473900     | zeroes 11 globals, sets DAT_005d43a8 = 0  |
+   +--------------------+------------------+-------------------------------------------+
+   | Second constructor | FUN_00473950     | also writes DAT_005d43a8; variant [guess] |
+   +--------------------+------------------+-------------------------------------------+
+
+   Note what the constructor does not do: it does not allocate instance
+   fields. Every member it initialises is a global. Cdd is therefore a
+   singleton whose state lives in .data [inferred], which is why the
+   whole DirectDraw layer reads as loose globals rather than as an
+   object. That is worth knowing before trying to reconstruct these as a
+   class.
+
+   The constructor also establishes the default: DAT_005d43a8 = 0, so
+   the object starts in windowed mode and something must set it for
+   fullscreen.
+
+4.  DAT_005d922c is an IDirectDraw pointer
+
+   The call sites use three vtable offsets, and they line up exactly
+   with the IDirectDraw v1 vtable:
+
+   +--------+---------------------+---------------------------------+
+   | Offset | Method              | Call site evidence              |
+   +========+=====================+=================================+
+   | +0x4c  | RestoreDisplayMode  | called with this only           |
+   +--------+---------------------+---------------------------------+
+   | +0x50  | SetCooperativeLevel | called with (this, hwnd, flags) |
+   +--------+---------------------+---------------------------------+
+   | +0x54  | SetDisplayMode      | called with (this, w, h, bpp)   |
+   +--------+---------------------+---------------------------------+
+
+   The flag values corroborate it: 8 is DDSCL_NORMAL, and 0x11 is
+   DDSCL_FULLSCREEN or'd with DDSCL_EXCLUSIVE.
+
+   One caveat. IDirectDraw2::SetDisplayMode takes five arguments, not
+   three. Three arguments here means this pointer is the v1 interface
+   [inferred], yet the binary also contains "Couldn't QI DDraw2". Either
+   a second pointer holds the v2 interface, or Ghidra has not recovered
+   the full argument list. Resolve this before typing the global.
+
+   Typing DAT_005d922c as IDirectDraw* would turn every vtable call in
+   the DirectDraw layer into a named method. That is probably the single
+   highest -leverage typing action available right now.
+
+5.  Globals resolved by this function
+
+   +--------------+--------------------------------+------------------------------------------+
+   | Global       | Previously                     | Now                                      |
+   +==============+================================+==========================================+
+   | DAT_005d43a8 | "may be windowed path" [guess] | fullscreen flag; 0 = windowed [verified] |
+   +--------------+--------------------------------+------------------------------------------+
+   | DAT_005d8944 | param_6, unidentified          | display bit depth [verified]             |
+   +--------------+--------------------------------+------------------------------------------+
+   | DAT_005d922c | unknown                        | IDirectDraw * [verified]                 |
+   +--------------+--------------------------------+------------------------------------------+
+   | DAT_005d63b0 | not seen                       | main window HWND [verified]              |
+   +--------------+--------------------------------+------------------------------------------+
+   | DAT_005d93bc | requested screen width         | confirmed; passed to SetDisplayMode      |
+   +--------------+--------------------------------+------------------------------------------+
+   | DAT_005d9c20 | requested screen height        | confirmed; passed to SetDisplayMode      |
+   +--------------+--------------------------------+------------------------------------------+
+   | DAT_005d99d0 | not seen                       | set to 1 here and in the constructor     |
+   +--------------+--------------------------------+------------------------------------------+
+
+   FUN_004767f0(hresult, CString, 1) is the shared error reporter: it
+   takes a DirectDraw result code and a message. Naming it would clarify
+   every failure path in this subsystem.
+
+6.  Applied to the Ghidra DB
+
+   All of the following is done. Re-run tools/ghidra_dd_types.java if a
+   re-analysis ever clears it; the script is idempotent.
+
+   +---------------------------------------------+--------------------------+
+   | Operation                                   | Result                   |
+   +=============================================+==========================+
+   | IDirectDrawVtbl + IDirectDraw types created | 23 methods               |
+   +---------------------------------------------+--------------------------+
+   | g_pDirectDraw typed as IDirectDraw *        | vtable calls now resolve |
+   +---------------------------------------------+--------------------------+
+   | Functions renamed                           | 8 of 8                   |
+   +---------------------------------------------+--------------------------+
+   | Globals labelled                            | 27 of 27                 |
+   +---------------------------------------------+--------------------------+
+   | g_displayHeight retyped CString * to int    | mis-type corrected       |
+   +---------------------------------------------+--------------------------+
+
+   Ghidra ships no ddraw.h, so IDirectDrawVtbl was declared from the
+   documented IDirectDraw v1 layout. The payoff is immediate: calls that
+   read as (**(code **)(*DAT_005d922c + 0x50))(...) now decompile as
+   g_pDirectDraw->lpVtbl->SetCooperativeLevel(...) everywhere in the
+   DirectDraw layer, not just in this function.
+
+   The v1-versus-v2 question is settled. "Couldn't QI DDraw2" belongs to
+   DX_DetectVersion (FUN_0045adb0), the startup DirectX version probe: it
+   loads DDRAW.DLL, creates a throwaway object, queries for IDirectDraw2
+   only to derive a version number, and releases it. It has nothing to do
+   with the renderer's object, which is IDirectDraw v1. The three-argument
+   SetDisplayMode confirms it.
+
+7.  Open questions
+
+   o RESOLVED. Cdd_CreateDD at 0x00475150 does the QueryInterface: after
+     DirectDrawCreate it QIs g_pDirectDraw for IID_IDirectDraw2 into
+     g_pDirectDraw2, then calls GetAvailableVidMem as a probe to confirm
+     the interface works. Note it does this on the DEFAULT-device path
+     only - when a device is found by enumeration, g_pDirectDraw2 is
+     never set there. See subsystems/dd-vidmem.txt.

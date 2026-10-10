@@ -1,0 +1,263 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                        RENDERER MODE SELECTION
+
+
+Abstract
+
+   Identifies the three globals that kept surfacing in the DirectDraw
+   surface code: DAT_004dc030, DAT_004dc06c and DAT_004dc070. Together
+   they are the renderer's mode and readiness state, and they explain
+   why the surface layer branches the way it does.
+
+   +------------+---------------------------+-----------------------------------+
+   | Address    | Name                      | Note                              |
+   +============+===========================+===================================+
+   | 0x004dc030 | g_use3DHardware           | DetectD3DCard read is dead        |
+   +------------+---------------------------+-----------------------------------+
+   | 0x004dc06c | g_rendererReady           |                                   |
+   +------------+---------------------------+-----------------------------------+
+   | 0x004dc070 | g_rendererMode            | 0 hw, 1 sw; from D3DOnlyEmulation |
+   +------------+---------------------------+-----------------------------------+
+   | 0x004dbff0 | g_fullscreenResolved      | CORRECTED, was g_use3dfxDriver    |
+   +------------+---------------------------+-----------------------------------+
+   | 0x004dc0d4 | g_cfgWidescreen169        | Mode_169                          |
+   +------------+---------------------------+-----------------------------------+
+   | 0x004d15d8 | IID_IDirectDraw2          |                                   |
+   +------------+---------------------------+-----------------------------------+
+   | 0x005d3290 | g_pDirectDraw2            | IDirectDraw2 *                    |
+   +------------+---------------------------+-----------------------------------+
+   | 0x0053c524 | g_ddUsingEnumeratedDevice |                                   |
+   +------------+---------------------------+-----------------------------------+
+   | 0x004ee950 | g_ddUsingDefaultDevice    |                                   |
+   +------------+---------------------------+-----------------------------------+
+   | 0x0041e75f | Cd3d_CreateDD             |                                   |
+   +------------+---------------------------+-----------------------------------+
+   | 0x0042ae30 | Settings_LoadAll          | read; see settings.txt            |
+   +------------+---------------------------+-----------------------------------+
+   | 0x00425bb0 | Settings_ReadInt          |                                   |
+   +------------+---------------------------+-----------------------------------+
+   | 0x00472800 | Cdd_MessageBox            |                                   |
+   +------------+---------------------------+-----------------------------------+
+
+Table of Contents
+
+   1. The mode selector
+      1.1. The value 2
+   2. How the guards read
+   3. g_rendererReady is a success latch
+   4. Cd3d::CreateDD, and a properly verified GUID
+   5. A third split function
+   6. Names and types applied
+   7. Open questions
+
+
+1.  The mode selector
+
+   A run of comparisons at 0x0042bc40, inside the config loader at
+   0x0042ae30, sets all of them from the command-line flags [verified]:
+
+   if (g_cfgNoD3D) {                  // -NoD3D
+       g_rendererMode      = 1;       // software
+       g_use3DHardware     = 0;
+       g_cfgOnlyPrimaryDisplay = 1;
+   }
+   else if (g_cfgUseD3D) {            // -D3D
+       g_rendererMode  = 0;           // hardware
+       g_use3DHardware = 1;
+   }
+   else if (g_cfgUse3dfx) {           // -3DFX
+       g_fullscreenResolved = 1;
+       DAT_004dc0d4    = 0;
+       g_rendererMode  = 0;           // hardware
+       g_use3DHardware = 1;
+   }
+
+   So g_rendererMode is the software/hardware switch and g_use3DHardware
+   is set alongside it. They are not redundant: g_use3DHardware also
+   gates device enumeration and surface capability bits, while
+   g_rendererMode is what the drawing code tests.
+
+   CORRECTED. This document previously said g_use3DHardware is seeded
+   from a stored DetectD3DCard setting that the command line overrides.
+   It is not. Settings_LoadAll reads DetectD3DCard into g_use3DHardware
+   at 0x0042b403 and then unconditionally overwrites it with 1 at
+   0x0042b410, before anything reads it. The stored setting has no
+   effect; only the -NoD3D / -D3D / -3DFX branch below can change it.
+   See settings.txt.
+
+1.1.  The value 2
+
+   RESOLVED. The stored setting is D3DOnlyEmulation and Settings_LoadAll
+   normalises three stored values into two runtime ones: stored 0 gives
+   mode 0 with DAT_0053be0c = 0, stored 2 gives mode 0 with DAT_0053be0c
+   = 1, and anything else gives mode 1, software. So 2 is a second
+   hardware variant distinguished only by DAT_0053be0c. Still do not
+   model g_rendererMode as a bool. See settings.txt.
+
+   DAT_0053be0c IS NOW IDENTIFIED: it is the bilinear texture filtering
+   switch [verified]. D3D_EmitRenderStates passes it straight to
+   D3D_SetTextureFilter (0x0041e2b0), which emits
+   D3DRENDERSTATE_TEXTUREMAG and TEXTUREMIN as 2 D3DFILTER_LINEAR when
+   it is set and 1 D3DFILTER_NEAREST when it is clear.
+
+   So the two hardware variants are hardware point sampled (stored 0)
+   and hardware bilinear (stored 2), and the stored setting name
+   D3DOnlyEmulation is misleading - it selects filtering, not
+   emulation. The global is also toggled live by a key handled in
+   Input_OnKeyDown at 0x00431a91 / 0x00431a9f, so a player can flip
+   filtering during a race. See d3d-render-state.txt section 5.
+
+2.  How the guards read
+
+   With names attached, the branches in the surface code become legible:
+
+   +--------------------------+--------------------------------------------+----------------------+
+   | Site                     | Condition                                  | Effect               |
+   +==========================+============================================+======================+
+   | Cdd_CreatePrimarySurface | g_rendererReady and mode == 0              | use a flip chain     |
+   +--------------------------+--------------------------------------------+----------------------+
+   | Cdd_CreateMainSurface    | -windowSystem and (not ready or mode != 0) | force system memory  |
+   +--------------------------+--------------------------------------------+----------------------+
+   | FUN_0041adb0             | g_rendererReady and mode == 0              | drive the 3D device  |
+   +--------------------------+--------------------------------------------+----------------------+
+   | Cd3d_CreateDD            | not OnlyPrimaryDisplay and g_use3DHardware | enumerate devices    |
+   +--------------------------+--------------------------------------------+----------------------+
+   | both surface fns         | g_use3DHardware                            | add DDSCAPS_3DDEVICE |
+   +--------------------------+--------------------------------------------+----------------------+
+
+   The pattern is consistent and sensible. Hardware 3D wants a flip
+   chain and video memory; the software rasterizer wants a plain surface
+   in system memory, which is exactly what you would expect when the CPU
+   is writing pixels directly.
+
+3.  g_rendererReady is a success latch
+
+   The writers sit in an undefined code region at 0x0041e900 to
+   0x0041eb00 [verified]:
+
+   +------------+---------------------------------+
+   | Address    | Write                           |
+   +============+=================================+
+   | 0x0041e92f | set to ESI on the success path  |
+   +------------+---------------------------------+
+   | 0x0041e98a | 0, right after the error report |
+   +------------+---------------------------------+
+   | 0x0041ea13 | 0, right after the error report |
+   +------------+---------------------------------+
+   | 0x0041ea65 | 0, right after the error report |
+   +------------+---------------------------------+
+   | 0x0041eab7 | 0, right after the error report |
+   +------------+---------------------------------+
+
+   Each zeroing follows a call to the error reporter and precedes a jump
+   to the common exit at 0x0041ee1d. It is a plain "did 3D
+   initialisation succeed" latch.
+
+   That region also recomputes (caps & 0x4000) >> 0xe into
+   g_mainSurfaceInVideoMem, duplicating logic from
+   Cdd_CreateMainSurface, and it references g_lpDDSMain. It is a second,
+   parallel initialisation path belonging to Cd3d rather than Cdd
+   [inferred].
+
+   Ghidra has not defined a function over this region. The writes are
+   reported with no containing function. Worth defining before relying
+   on any decompilation of it.
+
+4.  Cd3d::CreateDD, and a properly verified GUID
+
+   FUN_0041e75f is Cd3d::CreateDD, named from "Fatal error in Cd3d
+   CreateDD" at 0x004e6dfc [verified]. It chooses how the DirectDraw
+   object is obtained:
+
+   if (!g_cfgOnlyPrimaryDisplay && g_use3DHardware) {
+       DirectDrawEnumerateA(callback, &g_pDirectDraw);
+       if (g_pDirectDraw) g_ddUsingEnumeratedDevice = 1;
+   } else {
+       g_ddUsingDefaultDevice = 1;
+       DirectDrawCreate(NULL, &g_pDirectDraw, NULL);
+   }
+
+   Enumeration exists to find a secondary 3D device. In this era a 3Dfx
+   Voodoo was a separate pass-through card enumerating as its own
+   DirectDraw device, which is why -OnlyPrimaryDisplay disables the
+   search.
+
+   It then queries a second interface:
+
+   g_pDirectDraw->QueryInterface(&IID_IDirectDraw2, &g_pDirectDraw2);
+   g_pDirectDraw2->vtbl[0x5c](caps, &total, &free);   // GetAvailableVidMem
+
+   Called first with 0x1000 (DDSCAPS_TEXTURE) then 0x40
+   (DDSCAPS_OFFSCREENPLAIN), which is where the "Memory detected :
+   Txt:%d Primary:%d ..." diagnostic gets its numbers.
+
+   The GUID at 0x004d15d8 is IID_IDirectDraw2, and unlike the surface
+   GUID in dd-main-surface.txt this one is verified by behaviour, not
+   recall: the same GUID is used in DX_DetectVersion where the failure
+   path prints "Couldn't QI DDraw2", and the interface returned here has
+   a method at +0x5c, which only exists on IDirectDraw2 (IDirectDraw v1
+   ends at +0x58 with WaitForVerticalBlank).
+
+   So the game holds both interfaces: g_pDirectDraw (v1) and
+   g_pDirectDraw2 (v2). That completes the answer to the v1/v2 question
+   from dd-chain.txt.
+
+5.  A third split function
+
+   Cdd_CreateMainSurface had the same defect found in step 2: its body
+   was only 0x00475630 to 0x0047564e, the SEH prologue, with everything
+   else orphaned into FUN_0047564f. Repaired; the body is now
+   [0x00475630, 0x004758e8].
+
+   That is two occurrences in three functions, plus the undefined region
+   above and the pageProtocol.cpp anchors. Check the function boundary
+   before trusting any decompilation in this binary. A quick test: if
+   get_function_by_address reports a body of about 31 bytes, it is a
+   stub.
+
+6.  Names and types applied
+
+   +------------+---------------------------+-----------------------+
+   | Address    | Name                      | Note                  |
+   +============+===========================+=======================+
+   | 0x004dc030 | g_use3DHardware           |                       |
+   +------------+---------------------------+-----------------------+
+   | 0x004dc06c | g_rendererReady           |                       |
+   +------------+---------------------------+-----------------------+
+   | 0x004dc070 | g_rendererMode            | 0 hw, 1 sw, 2 unknown |
+   +------------+---------------------------+-----------------------+
+   | 0x004dbff0 | g_use3dfxDriver           | set by -3DFX          |
+   +------------+---------------------------+-----------------------+
+   | 0x004d15d8 | IID_IDirectDraw2          |                       |
+   +------------+---------------------------+-----------------------+
+   | 0x005d3290 | g_pDirectDraw2            | IDirectDraw2 *        |
+   +------------+---------------------------+-----------------------+
+   | 0x0053c524 | g_ddUsingEnumeratedDevice |                       |
+   +------------+---------------------------+-----------------------+
+   | 0x004ee950 | g_ddUsingDefaultDevice    |                       |
+   +------------+---------------------------+-----------------------+
+   | 0x0041e75f | Cd3d_CreateDD             |                       |
+   +------------+---------------------------+-----------------------+
+   | 0x0042ae30 | maybe_LoadRendererConfig  | large, not fully read |
+   +------------+---------------------------+-----------------------+
+   | 0x00472800 | Cdd_MessageBox            |                       |
+   +------------+---------------------------+-----------------------+
+
+   IDirectDraw2Vtbl was created with 24 methods and applied to
+   g_pDirectDraw2.
+
+7.  Open questions
+
+   o What does g_rendererMode == 2 mean?
+   o Define a function over 0x0041e900 to 0x0041eb00 and read it. It is
+     the Cd3d initialisation path and it sets g_rendererReady.
+   o DAT_004dc0d4 is cleared on the 3Dfx branch and read in the flip
+     chain decision. Still unidentified.
+   o maybe_LoadRendererConfig (0x0042ae30) is 4 KB and only partly read.
+     It loads several named settings; a full pass would likely resolve a
+     dozen more config globals at once.
+   o Confirm what FUN_00425bb0 is. It takes a name string and returns a
+     value, so it is the settings reader; naming it would clarify every
+     config load site.

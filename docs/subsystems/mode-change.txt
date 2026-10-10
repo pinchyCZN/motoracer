@@ -1,0 +1,373 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                     APPLYING A DISPLAY MODE CHANGE
+
+
+Abstract
+
+   How a resolution change actually takes effect, end to end. The menus
+   and the F2/F3 hotkeys only set globals and raise a flag; everything
+   real happens later, in one function.
+
+   That function is maybe_Screen3D_UpdateScreen at 0x004592a0. It is
+   also where the 16-bit requirement finally becomes a fatal error
+   rather than a filter, and where three separate fallback ladders all
+   converge on 640x480.
+
+   +-----------------------------+------------+-----------------------------+
+   | Item                        | Address    | Role                        |
+   +=============================+============+=============================+
+   | g_videoSettingsDirty        | 0x004e9ce4 | set by every display change |
+   +-----------------------------+------------+-----------------------------+
+   | FUN_0047ff90                | 0x0047ff90 | tests it, calls the apply   |
+   +-----------------------------+------------+-----------------------------+
+   | maybe_Screen3D_UpdateScreen | 0x004592a0 | the apply                   |
+   +-----------------------------+------------+-----------------------------+
+   | Cdd_FindModeByPixels        | 0x00474cf0 | exact lookup, dir 0         |
+   +-----------------------------+------------+-----------------------------+
+   | Cdd_IsMode16Available       | 0x00474ca0 | validation                  |
+   +-----------------------------+------------+-----------------------------+
+   | Screen3D_SetViewport        | -          | installs the mode           |
+   +-----------------------------+------------+-----------------------------+
+   | Font_ReloadAll              | 0x004961d0 | rebuilds every font         |
+   +-----------------------------+------------+-----------------------------+
+
+Table of Contents
+
+   1. The dirty/apply pair
+   2. The apply function
+      2.1. Finding the mode
+      2.2. Three ladders, all ending at 640x480
+      2.3. What it rebuilds
+   3. The projection scales
+   4. An aside: the dead debug labels
+   5. What this means for the port
+   6. The frame function
+      6.1. An inert RDTSC profiler
+   7. Open questions
+
+1.  The dirty/apply pair
+
+   Nothing that changes a display setting changes the display. The menu
+   actions, the F2 and F3 hotkeys and the F4 widescreen toggle all write
+   their globals and then set g_videoSettingsDirty to 1. There are 21
+   such writers [verified].
+
+   FUN_0047ff90 tests the flag and, if set, calls the apply function,
+   which clears it as its first act. The only store of a literal zero
+   anywhere in the image is that one, at 0x004592ed. Five other writers
+   store a register whose value has not been traced, so the flag is a
+   dirty flag with exactly one consumer [verified].
+
+   This is what closes the loop opened in structs/MR_DisplayMode.txt
+   section 5.2: the hotkeys pick a mode, and this is the machinery that
+   installs it.
+
+2.  The apply function
+
+   The signature is __stdcall with four arguments - the function ends
+   RET 0x10 - and both call sites read the same three globals into the
+   first three [verified]:
+
+   +---------------+----------------------------+------------+
+   | Parameter     | Source global              | Address    |
+   +===============+============================+============+
+   | screenMode    | g_cfgScreenMode            | 0x004dc0c8 |
+   +---------------+----------------------------+------------+
+   | fullscreen    | g_fullscreenResolved       | 0x004dbff0 |
+   +---------------+----------------------------+------------+
+   | widescreen169 | g_cfgWidescreen169         | 0x004dc0d4 |
+   +---------------+----------------------------+------------+
+   | arg4          | DAT_004dc028, unidentified | 0x004dc028 |
+   +---------------+----------------------------+------------+
+
+   The name is NOT confirmed. It is taken from the dead debug string
+   "UpdateScreen" that the function passes to Font_ReloadAll at
+   0x0045956d; see section 4. That is decent evidence but it is a
+   second-hand string rather than an assert path, so the symbol carries
+   the maybe_ prefix [inferred].
+
+   The second call site is worth a note for anyone reading the
+   disassembly. FUN_00410e10 pushes only three arguments and then
+   returns immediately, letting the callee's RET 0x10 clean its own
+   incoming stack slot as the fourth. That is a normal stdcall tail-call
+   and not a miscount [verified].
+
+2.1.  Finding the mode
+
+   The lookup is exact - Cdd_FindModeByPixels with direction 0, which
+   returns -1 rather than wrapping. What happens on a miss depends on
+   the window state, and the two paths have nothing in common
+   [verified]:
+
+       windowed    use a hardcoded pair chosen by screenMode:
+                     0 -> 320x240   1 -> 512x384   else 640x480
+       fullscreen  force 0x4b000 pixels and look up again
+
+   Then g_cfgScreenMode is written back, and again the two paths differ.
+   With a table hit it is copied from the record's sizeClass field. With
+   a miss it is derived from the pixel count by a three-way if-chain.
+   Both give the same answer for the three supported resolutions, which
+   is the fifth independent confirmation of that numbering in this
+   project.
+
+2.2.  Three ladders, all ending at 640x480
+
+   +---+--------------------------------+------------------------------+
+   | # | Trigger                        | Response                     |
+   +===+================================+==============================+
+   | 1 | Cdd_IsMode16Available fails    | retry at 640x480, then abort |
+   +---+--------------------------------+------------------------------+
+   | 2 | Screen3D_SetViewport returns 0 | retry at 640x480             |
+   +---+--------------------------------+------------------------------+
+   | 3 | hardware path fails its guards | g_rendererMode = 1, redo     |
+   +---+--------------------------------+------------------------------+
+
+   Ladder 1 is the one that matters. If Cdd_IsMode16Available says no 16
+   bpp mode of that size was enumerated, the code forces 640x480 and
+   tries once more. If it was ALREADY at 640x480 it gives up:
+
+       Cdd_MessageBox("Error : Could not change screen mode, aborting.");
+       App_Abort();      /* exits the process */
+
+   So this is where the 16-bit requirement stops being a filter and
+   becomes a fatal error. Note what it is NOT: it is not the "16 bit
+   screen mode required !" string, which lives elsewhere. There are two
+   separate refusals.
+
+   Ladder 1 is skipped entirely when windowed. The test is guarded by
+   the fullscreen argument, so a windowed run never requires a 16 bpp
+   mode to exist and can never reach this abort [verified].
+
+   Ladder 3 is the software-renderer fallback. If the hardware path
+   fails its guards the function sets g_rendererMode to 1 and loops back
+   to the top to redo the whole thing. It cannot spin: the value it just
+   wrote satisfies the loop's own exit test on the next pass, so the
+   fallback runs at most once [verified].
+
+   It also raises DAT_00580a58, which the game tick flushes on the next
+   frame as a message box reading "[NOT ENOUGH VIDEO MEMORY] [DIRECT3D
+   NOT AVAILABLE] [IN THIS MODE]". So that is the text the player sees
+   when this ladder fires, one frame later. See subsystems/game-
+   object.txt section 8.1 [verified].
+
+2.3.  What it rebuilds
+
+   After the mode is installed the function reloads everything that
+   depended on the old one. Font_ReloadAll at 0x004961d0 is the largest
+   piece: it walks g_fontTable, releases each font's bank textures and
+   DirectDraw surface, frees the four face bitmaps, clears the 256
+   glyphPixels entries and calls Font_Rebuild. It does this in two
+   passes, plain fonts first and then the kind 5 and 6 MR_FontShaded
+   family [verified].
+
+   That is why the fonts carry an atlas and a per-character descriptor
+   rather than drawing from the source bitmaps directly: the whole thing
+   is rebuilt whenever the surface format can have changed. See
+   structs/MR_Font.txt.
+
+3.  The projection scales
+
+   Two calls set a projection scale from the new dimensions [verified]:
+
+       FUN_0049a0e0(width  * 0x18a / 0x280)
+       FUN_0049a100(height * 0x18a / 0x1e0)
+
+   0x18a is 394, and the divisors are 640 and 480. Both expressions are
+   therefore exactly 394 at 640x480 and scale down proportionally below
+   it. So 640x480 is the reference resolution the projection is defined
+   against, not merely the largest supported one.
+
+   What 394 means has not been established. It is not a power of two and
+   it is not either screen dimension.
+
+4.  An aside: the dead debug labels
+
+   Font_ReloadAll takes two arguments and never reads the second
+   [verified]. It is a real parameter - the function is __stdcall and
+   ends RET 0x10 - but the body ignores it, and every call site passes a
+   string naming the operation in progress.
+
+   These are leftover debug annotations, and they are a naming resource,
+   because each one labels the function that passes it:
+
+   +---------------------+----------------------------+
+   | Label               | Function that passes it    |
+   +=====================+============================+
+   | UpdateScreen        | FUN_004592a0               |
+   +---------------------+----------------------------+
+   | initRace            | FUN_004100a0               |
+   +---------------------+----------------------------+
+   | openHelpMenu        | FUN_0043cf90               |
+   +---------------------+----------------------------+
+   | CloseHelpSubMenu    | FUN_00435620, FUN_004329a5 |
+   +---------------------+----------------------------+
+   | checkGeneric        | FUN_0048ae40               |
+   +---------------------+----------------------------+
+   | CloseGeneric        | FUN_0048ae40, FUN_0048b070 |
+   +---------------------+----------------------------+
+   | handleMenu is TRUE  | FUN_0047d660               |
+   +---------------------+----------------------------+
+   | handleMenu is FALSE | FUN_0047d660               |
+   +---------------------+----------------------------+
+
+   Two cautions. FUN_0048ae40 passes two different labels, so a label
+   names a phase rather than a whole function. And "handleMenu is TRUE"
+   is plainly a state description, not a name. Treat them as strong
+   hints, not as recovered symbols.
+
+5.  What this means for the port
+
+   Three things from this function are useful to the modernization work.
+
+   The dirty/apply split is already the right shape. Every setting
+   change is decoupled from the reconfiguration by a flag, and there is
+   exactly one place that reconfigures. A port only has to replace the
+   body of one function, not chase 21 call sites.
+
+   The windowed path is already independent. It never consults the
+   enumerated mode table, never calls the 16 bpp validator, and cannot
+   reach the abort. Everything the 16-bit lock touches is on the
+   fullscreen side.
+
+   The rebuild boundary is already drawn. Font_ReloadAll shows the
+   engine already knows how to tear down and rebuild every surface-
+   dependent resource on demand, which is exactly the operation a
+   resizable window needs and which the original never had a reason to
+   call for that purpose [inferred].
+
+6.  The frame function
+
+   Section 1 left open when a pending change actually lands. The answer
+   is at the end of the frame.
+
+   FUN_0047ff90, now maybe_Game_RenderFrame, draws one frame. It is
+   bracketed by Screen3D_BeginFrame and Screen3D_EndFrame and increments
+   two frame counters. Its very last act, after EndFrame and the flip,
+   is [verified]:
+
+       if (g_videoSettingsDirty)
+           maybe_Screen3D_UpdateScreen(g_cfgScreenMode,
+                                       g_fullscreenResolved,
+                                       g_cfgWidescreen169,
+                                       DAT_004dc028);
+
+   So a resolution change requested during a frame takes effect at the
+   end of that same frame, never mid-draw. The dirty flag is not a
+   deferral to some later housekeeping pass; it is a one-frame delay
+   that guarantees the surfaces are not swapped underneath a draw in
+   progress.
+
+   The function is VIRTUAL, which is why the database showed it no
+   callers at all. The address 0x0047ff90 occurs exactly once in the
+   whole image, at 0x004d04e8 in .rdata - the last slot of a nine-entry
+   vtable running 0x004d04c8 to 0x004d04e8, installed by FUN_00413f30.
+   There is no direct call anywhere [verified].
+
+   That vtable is worth following up. Two of its other slots are already
+   known to this project: FUN_0047d660, which passes the "handleMenu is
+   TRUE" and "handleMenu is FALSE" debug labels of section 4, and
+   FUN_0047ec50, which is one of the readers of g_displayModes. So the
+   class owns both the frame loop and the display state [inferred].
+
+   The third argument is a bitmask selecting what to draw [verified]:
+
+   +------+------------------------------------------------+
+   | Bit  | Draws                                          |
+   +======+================================================+
+   | 0x01 | a pre-pass through FUN_00499fb0 / FUN_00499fd0 |
+   +------+------------------------------------------------+
+   | 0x02 | the 3D world                                   |
+   +------+------------------------------------------------+
+   | 0x06 | extra world passes; needs 0x02 as well         |
+   +------+------------------------------------------------+
+   | 0x08 | HUD and sprites                                |
+   +------+------------------------------------------------+
+   | 0x10 | FUN_0048acd0                                   |
+   +------+------------------------------------------------+
+   | 0x20 | FUN_00418860, only when 0x40 is clear          |
+   +------+------------------------------------------------+
+   | 0x40 | FUN_004806e0 or FUN_004804d0                   |
+   +------+------------------------------------------------+
+
+6.1.  An inert RDTSC profiler
+
+   The frame function is instrumented throughout. The pattern is a
+   stopwatch, and it appears about six times [verified]:
+
+       Profile_Start();
+       ... a stage of the frame ...
+       g_someTiming = Profile_Stop(1);
+
+   Profile_Start at 0x00459000 does the textbook 1990s TSC availability
+   check before touching the counter: flip EFLAGS bit 21 and read it
+   back to prove CPUID exists, CPUID leaf 0 for the maximum leaf, CPUID
+   leaf 1 and test EDX bit 4 for the TSC feature flag, and only then
+   RDTSC. Profile_Stop at 0x00459090 reads the counter again, subtracts
+   64-bit with a borrow, and divides by a CPU speed constant.
+
+   None of it runs. Both functions test g_profilingEnabled_DEAD at
+   0x004dc12c first and return immediately when it is zero, and that
+   global is never written - a raw byte scan finds exactly two
+   occurrences of its address in the image and both are those reads. Its
+   initialiser is 0. So every timing global in 0x005429c0 to 0x00542a04
+   stays zero forever [verified].
+
+   This is the second dead development switch found on this path:
+
+   +-------------------------+------------+------+--------------------------+
+   | Global                  | Address    | Init | Gates                    |
+   +=========================+============+======+==========================+
+   | g_allowLargeModes_DEAD  | 0x004dc174 | 0    | modes above 640x480      |
+   +-------------------------+------------+------+--------------------------+
+   | g_profilingEnabled_DEAD | 0x004dc12c | 0    | the whole frame profiler |
+   +-------------------------+------------+------+--------------------------+
+
+   Both follow the same shape - a feature left in the binary, reachable
+   only through a flag with no writer. Worth expecting more of them.
+
+   One detail is worth recording even though the code is dead, because
+   it says something about how the game was built. The cycles-to-time
+   conversion divides by g_cpuSpeedDiv100 * 100, and g_cpuSpeedDiv100 is
+   never written either. Its initialiser is 133. There is no runtime
+   calibration anywhere: the profiler was pinned to a 133 MHz
+   development machine [verified].
+
+   The 64-bit delta is also computed carefully and then thrown away -
+   only the low word is returned, so a measurement longer than 2^32
+   cycles reads as garbage. At the assumed 133 MHz that is about 32
+   seconds, which for per-stage frame timing is harmless.
+
+7.  Open questions
+
+   o arg4 is unidentified. It comes from DAT_004dc028 at one call site
+     and is passed through to Screen3D_SetViewport together with the
+     widescreen flag, so it is a viewport parameter of some kind.
+
+   o RESOLVED. It is the frame function, and the test is its last act,
+     so a pending change lands at the end of the frame that requested
+     it. See section 6.
+
+   o RESOLVED. It is App_Abort: it sets g_fatalError, shows "Aborting
+     game.", calls App_Shutdown and then ExitProcess(1). It exits the
+     process. Now marked no-return. See subsystems/game-object.txt
+     section 6.1.
+
+   o The constant 394 in the projection scales is unexplained.
+
+   o Five writers of g_videoSettingsDirty store a register rather than a
+     literal. If any of them stores 0 then the flag has more than one
+     consumer and section 1 needs revising.
+
+   o FUN_004591b0 is a third profiler entry point - it reads
+     g_cpuSpeedDiv100 like Profile_Stop does - and has not been read.
+     maybe_Game_RenderFrame calls it once per frame.
+
+   o PARTLY RESOLVED. It is a real C++ vtable on a single global object,
+     g_game at 0x0052c478, dispatched through g_pGame. Four more slots
+     are now named. The translation unit is still unknown - no assert
+     anchor falls in that range. See subsystems/game-object.txt.
+
+   o arg2 of maybe_Game_RenderFrame is passed straight through to three
+     different callees and has not been traced.

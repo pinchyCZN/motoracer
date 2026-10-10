@@ -1,0 +1,1160 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                  PRIMITIVE KINDS AND DETAIL REDUCTION
+
+
+Abstract
+
+   The 0x46-entry feature table at DAT_006d1f88, built by Screen3D_Open
+   and left undecoded by renderer.txt section 3.5.3, is the level-of-
+   detail system. All eight of its bits are now DECODED - not merely
+   accounted for. Four are quality and distance controls, and four name
+   real rendering features: bit 1 Gouraud, bit 3 do-not-filter, bit 4
+   translucent, bit 5 perspective-correct.
+
+   The mechanism is a kind substitution, not a branch. Every primitive
+   record carries the kind its author asked for at +0x00 and the kind
+   actually drawn at +0x3a. Screen3D_QueuePrimitive looks up the
+   authored kind's feature bits, clears or sets bits according to the
+   detail setting and the primitive's distance, and looks the modified
+   bit pattern back up in a reverse index to get a different kind. The
+   rasterizer and D3D_DrawScene never know detail reduction happened.
+
+   +-------------------------+--------------------+
+   | Item                    | Address            |
+   +=========================+====================+
+   | the feature table       | 0x006d1f88         |
+   +-------------------------+--------------------+
+   | the reverse index       | 0x00624b58         |
+   +-------------------------+--------------------+
+   | built by Screen3D_Open  | 0x004995a0         |
+   +-------------------------+--------------------+
+   | Screen3D_QueuePrimitive | 0x0049c590         |
+   +---------------------------------+------------+
+   | Screen3D_QueuePrimitivePaletted | 0x0049ca70 |
+   +---------------------------------+------------+
+   | g_cfgDetailLevel        | see settings.txt   |
+   +-------------------------+--------------------+
+
+Table of Contents
+
+   1. The two tables
+      1.1. A zero-sentinel collision, and the patch that fixes it
+   2. The eight bits
+      2.1. Bit 6, exempt from reduction
+      2.2. Bits 0, 7 and 2 are a nesting quality tier
+      2.3. Bit 5, the near-distance upgrade
+      2.4. Bit 3, do not filter
+      2.5. Bits 1 and 4 are family identity
+      2.6. Bit 4 is translucency
+   3. Twelve families with a quality ladder
+   4. The reduction itself
+   5. Three families have no floor
+      5.1. The families, read semantically
+      5.2. Gouraud families have no quality ladder
+      5.3. Two gaps are a pair; the third breaks a symmetry
+   6. The whole table
+   7. What a port has to do
+   8. Open questions
+   9. The kind-to-pipeline map, and what it proves
+      9.1. Slot is a pure function of bits 1 and 5
+      9.2. Three routes, not one
+      9.3. Three reduction targets draw nothing
+      9.4. A caveat on the near column of section 6
+   10. The two triangle-split paths
+      10.1. Screen3D_MakeTriangle, the unclipped path
+      10.2. The other path was misnamed: it is the near-plane clipper
+         10.2.1. The edge clip read properly, and one defect in it
+      10.3. What was read, and what was not
+      10.4. There are two copies of this maths
+      10.5. There is a THIRD clipper, and it is the viewport one
+         10.5.1. The working record, and where the UVs really live
+         10.5.2. Two scratch buffers, and the wrap slot again
+         10.5.3. A port does not need it
+
+
+1.  The two tables
+
+   Screen3D_Open builds both in one loop over kinds 0 to 0x45
+   [verified]:
+
+       for (kind = 0; kind < 0x46; kind++) {
+           bits = 0;
+           ...seven switch statements OR in 1, 0x80, 2, 4, 8,
+              0x10, 0x20, 0x40...
+           if (reverseIndex[bits] == 0) reverseIndex[bits] = kind;
+           featureTable[kind] = bits;
+       }
+
+   featureTable maps kind -> feature bits. reverseIndex maps a bit
+   pattern -> the FIRST kind that has it, and is 0x100 dwords, so it is
+   indexed by the full byte. Both are dword arrays - the access is
+   [kind*4 + 0x6d1f88], which corrects renderer.txt section 3.5.3
+   where the table was described as bytes [verified].
+
+   Seven switches produce eight bits because the first switch assigns
+   bit 0 and the second assigns bit 7 to a subset of the same kinds.
+
+1.1.  A zero-sentinel collision, and the patch that fixes it
+
+   Six literal stores follow the loop. renderer.txt read them as "hand-
+   patching a table the loop got almost right". Three of them are
+   no-ops that merely restate what the loop already produced -
+   featureTable[0x25] = 8, reverseIndex[8] = 0x25,
+   featureTable[0x33] = 0x28 and reverseIndex[0x28] = 0x33 are all
+   values the loop computes anyway [verified].
+
+   The two that matter are corrections, and one of them fixes a real
+   defect [verified]:
+
+   +------------------------+------------------------------------------+
+   | Store                  | Why                                      |
+   +========================+==========================================+
+   | featureTable[0] = 0x20 | kind 0 naturally computes 0. Giving it   |
+   |                        | 0x20 puts it in family 0x20 as that      |
+   |                        | family's floor.                          |
+   +------------------------+------------------------------------------+
+   | reverseIndex[0] = 0    | UNDOES A BUG. See below.                 |
+   +------------------------+------------------------------------------+
+   | reverseIndex[0x20] = 0 | makes the reverse index agree with the   |
+   |                        | patched featureTable[0].                 |
+   +------------------------+------------------------------------------+
+
+   The reverseIndex[0] = 0 store is the interesting one. The loop uses
+   zero as its "not yet assigned" sentinel, but kind 0 is a legitimate
+   kind whose natural pattern is also zero. So when kind 0 is processed
+   the guard `if (reverseIndex[0] == 0)` writes 0 over 0 and the slot
+   still reads as unassigned - and kind 0x16, which also computes
+   pattern 0, then claims it. Without the patch reverseIndex[0] would
+   be 0x16 [verified by replaying the loop].
+
+   The literal store puts it back to 0. So this is a sentinel collision
+   the developers hit and papered over at the call site rather than
+   fixing in the loop. Worth transcribing as-is rather than "cleaning
+   up", because a port that uses -1 as the sentinel and drops the patch
+   changes which kind pattern 0 resolves to.
+
+
+2.  The eight bits
+
+   +------+------+--------------------------------+------------------------------+
+   | Bit  | Mask | Meaning                        | Evidence                     |
+   +======+======+================================+==============================+
+   | 0    | 0x01 | quality tier 1                 | stripped by & ~0x85; gates   |
+   |      |      |                                | the bit 5 upgrade            |
+   +------+------+--------------------------------+------------------------------+
+   | 1    | 0x02 | GOURAUD - selects pipeline     | never tested; proven by the  |
+   |      |      | slot 5 or 7 over 4 or 6        | g_spanTable mapping, sect 9  |
+   +------+------+--------------------------------+------------------------------+
+   | 2    | 0x04 | quality tier 3                 | stripped by & ~0x85          |
+   +------+------+--------------------------------+------------------------------+
+   | 3    | 0x08 | do NOT filter this kind        | two independent consumers    |
+   +------+------+--------------------------------+------------------------------+
+   | 4    | 0x10 | TRANSLUCENT - 50/50 blended,   | never tested; proven by the  |
+   |      |      | the filler reads the           | span fillers, section 2.6    |
+   |      |      | destination                    |                              |
+   +------+------+--------------------------------+------------------------------+
+   | 5    | 0x20 | PERSPECTIVE CORRECTION -       | OR'd in when bit 0 set and   |
+   |      |      | selects slot 6 or 7 over 4     | the primitive is close;      |
+   |      |      | or 5. Set for near geometry    | slot proven in section 9     |
+   +------+------+--------------------------------+------------------------------+
+   | 6    | 0x40 | exempt from detail reduction   | skips the whole switch       |
+   +------+------+--------------------------------+------------------------------+
+   | 7    | 0x80 | quality tier 2                 | stripped by & ~0x85          |
+   +------+------+--------------------------------+------------------------------+
+
+2.1.  Bit 6, exempt from reduction
+
+   Screen3D_QueuePrimitive tests `(bits & 0x40) != 0` and skips the
+   entire detail switch when it is set, so the effective kind stays the
+   authored one [verified].
+
+   Its ten kinds are 6, 7, 0x0a, 0x0b, 0x0d, 0x0e, 0x0f, 0x11, 0x44 and
+   0x45. Nine of them carry ONLY bit 6, and 0x11 carries bit 6 plus
+   bit 4. They are the only kinds with no quality tier at all, which
+   fits: something that must never be simplified does not need a
+   simpler variant to fall back to.
+
+   Kinds 0x44 and 0x45 are in this set, and d3d-render-state.txt
+   section 3 has them as the two kinds that take
+   D3D_SetBlendModeFlatAlpha. So the never-reduced set includes at
+   least some blended overlay geometry [verified].
+
+   THOSE TWO MAY BE DEAD. No producer for either kind has been found:
+   no immediate store of 0x44 or 0x45 exists anywhere in the image, the
+   four face constructors are never called with them, and the .map
+   loader cannot emit them. Their appearance in THIS table means
+   nothing either way, because Screen3D_Open builds an entry for all
+   0x46 kinds whether or not anything uses them. See
+   d3d-render-state.txt section 8 for the full negative result and its
+   limits.
+
+2.2.  Bits 0, 7 and 2 are a nesting quality tier
+
+   These three are always cleared together, by `bits &= 0xffffff7a`,
+   which is `& ~0x85` [verified]. They also nest strictly: across all
+   0x46 kinds, bit 2 never appears without bit 7, and bit 7 never
+   appears without bit 0. There is no kind with pattern 0x04, 0x80,
+   0x84 or 0x85-without-0x01.
+
+   So they are not three independent features but one three-step
+   ladder above a floor:
+
+       floor        no tier bits
+       tier 1       bit 0
+       tier 2       bit 0 + bit 7
+       tier 3       bit 0 + bit 7 + bit 2
+
+   Six of the twelve families carry the full ladder. What the tiers
+   ARE - more interpolants, a better filler, a finer texture - is not
+   established here; the software pipeline axes of
+   rasterizer-pipeline.txt section 5 are flat-versus-Gouraud crossed
+   with affine-versus-perspective, which is two axes and four
+   combinations, and a four-step ladder over one family is the same
+   shape. Suggestive, not proven [inferred].
+
+2.3.  Bit 5, the near-distance upgrade - it is PERSPECTIVE CORRECTION
+
+   The only bit ever SET rather than cleared [verified]:
+
+       if ((bits & 1) && depth < threshold) bits |= 0x20;
+
+   The threshold is 3072.0f at detail levels 0 to 3 and 6144.0f at
+   levels 4 and 5 - the float constants 0x45400000 and 0x45c00000. So
+   a higher detail setting widens the radius within which primitives
+   get the upgrade, rather than changing what the upgrade is.
+
+   Note the guard is bit 0, the lowest quality tier. A primitive with
+   no tier at all never gets upgraded no matter how close it is.
+
+   WHAT the upgrade is, is now settled by section 9: setting bit 5
+   moves a kind from pipeline slot 4 or 5 to slot 6 or 7, and slots 6
+   and 7 are exactly the two that read vertex +0x18, which
+   rasterizer-pipeline.txt section 6.1 identifies as the perspective
+   correction interpolant [verified for the slot move, inferred for the
+   naming, on that section's evidence].
+
+   That makes the whole mechanism a textbook 1997 optimisation, and one
+   worth stating plainly because it is the single most useful thing the
+   feature table does: MotoRacer draws distant geometry with affine
+   texture mapping and switches to perspective-correct mapping only
+   within a radius of the camera. The radius is the detail setting.
+
+   o This also explains the bit 0 guard. Only a primitive that has some
+     quality tier - in practice, a textured one - has anything to gain
+     from perspective correction.
+
+2.4.  Bit 3, do not filter
+
+   Two independent consumers agree [verified]:
+
+   o D3D_DrawScene calls D3D_SetTextureFilter with
+     ((&DAT_006d1f88)[kind] & 8) == 0, so a set bit selects
+     D3DFILTER_NEAREST.
+   o FUN_004232e0 at 0x00423393 computes
+     `useFilter = DoesFilter && !(bits & 8)`, where DoesFilter is the
+     device capability at +0x28 of the 0x194-stride device record that
+     d3d-textures.txt section 8.11 names from the game's own format
+     strings.
+
+   Two call sites, two subsystems, same sense. This is the best
+   established of the eight.
+
+   The sibling queue function at 0x0049ca70 also tests it, jointly with
+   bit 0: `(bits & 9) == 9` forces the effective kind to 0x2a, which is
+   the floor of family 0x08 [verified].
+
+2.5.  Bits 1 and 4 are family identity
+
+   Neither is tested anywhere in the image. The feature table has only
+   four readers - Screen3D_Open which writes it, Screen3D_QueuePrimitive
+   and 0x0049ca70 which do detail reduction, D3D_DrawScene which tests
+   bit 3, and FUN_004232e0 which tests bit 3 [verified].
+
+   So bits 1 and 4 exist only as part of the lookup key. They survive
+   every mask the reduction applies, which is exactly what makes them
+   the thing that identifies which family a kind degrades within.
+
+   RESOLVED FOR BIT 1. Cross-referencing the feature bits against
+   g_spanTable, which maps kind to software pipeline slot, decides it -
+   see section 9. Bit 1 selects the Gouraud pipeline and bit 5 selects
+   the perspective-correct one, exactly and without exception across all
+   24 kinds that use a real pipeline slot [verified].
+
+   RESOLVED FOR BIT 4 TOO - see section 2.6. It is translucency. The
+   earlier objection, that 0x08, 0x09 and 0x14 carry bit 4 without
+   being blended in hardware, dissolves once their span fillers are
+   read: they are the empty ones.
+
+2.6.  Bit 4 is translucency
+
+   Bit 4 marks a primitive as 50/50 BLENDED. Every bit-4 kind that has
+   a real span filler has a blending one, and they are the only fillers
+   in the family that READ the destination [verified]:
+
+   +------+-------+------------------------------------+----------------+
+   | Kind | Bits  | Span filler                        | Inner statement|
+   +======+=======+====================================+================+
+   | 0x0c | 0x10  | maybe_Screen3D_SpanBlendFlat       | dst/2 + flat/2 |
+   |      |       | 0x004a4110                         | no texture     |
+   +------+-------+------------------------------------+----------------+
+   | 0x2c | 0x91  | maybe_Screen3D_SpanTexKeyedBlend-  | dst/2 + texel/2|
+   |      |       | Affine, 0x004a57f0                 | keyed, affine  |
+   +------+-------+------------------------------------+----------------+
+   | 0x3e | 0xb1  | maybe_Screen3D_SpanTexKeyedBlend-  | dst/2 + texel/2|
+   |      |       | Persp, 0x004a5890                  | keyed, persp   |
+   +------+-------+------------------------------------+----------------+
+
+   All three compute the packed-RGB half blend with g_halveMask, which
+   maybe_Color_BuildHalveMask derives from the runtime pixel format - so
+   the arithmetic is not tied to 5/6/5.
+
+   The remaining bit-4 kinds with span records are 0x08 and 0x09, whose
+   fillers are EMPTY, and 0x14, which takes the slot-0 short circuit.
+   An empty filler is what a disabled or vestigial kind looks like, so
+   they neither support nor contradict the reading.
+
+2.6.1.  Two independent confirmations
+
+   o THE HARDWARE PATH AGREES EXACTLY. D3D_DrawScene sends precisely
+     kinds 0x0c, 0x2c and 0x3e to D3D_SetBlendMode, and nothing else.
+     Its non-PowerVR pair is INVSRCALPHA/INVSRCALPHA with the alpha
+     stamped to 0x80, which evaluates to 0.5*src + 0.5*dst - the same
+     operation the software fillers compute by shifting. See
+     d3d-render-state.txt section 3.1. Both back ends implement one
+     blend, and bit 4 is what marks it.
+
+   o BIT 5 SEPARATES THE PAIR. Kinds 0x2c and 0x3e differ by exactly
+     one bit - 0x91 against 0xb1, which is bit 5 - and their fillers
+     are the AFFINE and PERSPECTIVE versions of an identical inner
+     statement. That is bit 5 confirmed as perspective correction from
+     a third direction, and bit 4 confirmed as the thing the two share.
+
+2.6.2.  What it means for a port
+
+   The blend fillers are the only span routines that read the frame
+   buffer. Every other mode - stencil, keyed, keyed-half, copy - is
+   write-only.
+
+   o That is exactly the read-modify-write hardware alpha blending
+     replaces for free. A D3D9 back end maps the write-only modes to
+     plain textured draws and the bit-4 kinds to one blend state.
+
+   o It also means bit 4 is the one feature-table bit a port must
+     honour at draw time rather than at kind-selection time, alongside
+     bit 3.
+
+   ALL EIGHT BITS ARE NOW DECODED. Section 2's table is complete.
+
+
+3.  Twelve families with a quality ladder
+
+   Splitting each pattern into family (bits 1, 3, 4, 5 - mask 0x3a) and
+   tier (bits 0, 7, 2 - mask 0x85) accounts for every non-exempt kind
+   with nothing left over [verified]:
+
+   +------------+------------------+------------------+--------+--------+
+   | Family     | floor            | tier 1           | tier 2 | tier 3 |
+   +============+==================+==================+========+========+
+   | 0x00       | 0x16             | 0x01 0x18        | 0x10   | 0x15   |
+   +------------+------------------+------------------+--------+--------+
+   | 0x02       | 0x05 0x17        | 0x03 0x12        | -      | -      |
+   |            |                  | 0x19 0x1a        |        |        |
+   +------------+------------------+------------------+--------+--------+
+   | 0x08       | 0x25 0x2a        | 0x02 0x28 0x29   | 0x26   | 0x27   |
+   +------------+------------------+------------------+--------+--------+
+   | 0x0a       | NONE             | 0x04 0x13        | -      | -      |
+   +------------+------------------+------------------+--------+--------+
+   | 0x10       | 0x0c 0x2e        | 0x08 0x30        | 0x2c   | 0x2d   |
+   +------------+------------------+------------------+--------+--------+
+   | 0x12       | 0x2f             | 0x09 0x14        | -      | -      |
+   |            |                  | 0x2b 0x31        |        |        |
+   +------------+------------------+------------------+--------+--------+
+   | 0x20       | 0x00             | 0x1c 0x22        | 0x1f   | 0x20   |
+   +------------+------------------+------------------+--------+--------+
+   | 0x22       | 0x1b 0x21        | 0x1d 0x1e        | -      | -      |
+   |            |                  | 0x23 0x24        |        |        |
+   +------------+------------------+------------------+--------+--------+
+   | 0x28       | 0x33 0x39        | 0x32 0x37        | 0x35   | 0x36   |
+   +------------+------------------+------------------+--------+--------+
+   | 0x2a       | NONE             | 0x34 0x38        | -      | -      |
+   +------------+------------------+------------------+--------+--------+
+   | 0x30       | NONE             | 0x3b 0x41 0x42   | 0x3e   | 0x3f   |
+   +------------+------------------+------------------+--------+--------+
+   | 0x32       | 0x3a 0x40        | 0x3c 0x3d 0x43   | -      | -      |
+   +------------+------------------+------------------+--------+--------+
+
+   The families pair off by bit 1 - 0x00 with 0x02, 0x08 with 0x0a,
+   0x10 with 0x12, 0x20 with 0x22, 0x28 with 0x2a, 0x30 with 0x32 - and
+   in every pair the bit-1 member has no tier 2 or 3. Whatever bit 1
+   selects, it is incompatible with the top two quality tiers.
+
+   Several kinds share one pattern. Where they do, the reverse index
+   resolves to the lowest-numbered of them, so 0x2a and 0x39 and 0x40
+   are reachable as authored kinds but never as reduction targets.
+
+
+4.  The reduction itself
+
+   The whole of it, from Screen3D_QueuePrimitive [verified]:
+
+       prim[0x3a] = prim[0x00];               /* default: no change */
+       bits = featureTable[prim[0x00]];
+       if (menuGate || (bits & 0x40) || DAT_004f1a18) goto queue;
+       switch (g_cfgDetailLevel) {
+       case 0: case 1:
+           if ((bits & 1) && depth < 3072.0f) bits |= 0x20;
+           bits &= ~0x85;
+           break;
+       case 2:
+           if ((bits & 1) && depth < 3072.0f) bits |= 0x20;
+           if (!(prim[0x38] & 8)) bits &= ~0x85;
+           break;
+       case 3:
+           if (depth < 3072.0f && (bits & 1)) bits |= 0x20;
+           break;
+       case 4: case 5:
+           if (depth < 6144.0f && (bits & 1)) bits |= 0x20;
+           break;
+       }
+       prim[0x3a] = reverseIndex[bits];
+   queue:
+
+   +-------+---------------------------------------------------------+
+   | Level | Behaviour                                               |
+   +=======+=========================================================+
+   | 0, 1  | always strip the quality tier                           |
+   +-------+---------------------------------------------------------+
+   | 2     | strip it unless the primitive sets its own flag bit 3   |
+   |       | at +0x38 - a per-primitive opt-out                      |
+   +-------+---------------------------------------------------------+
+   | 3     | keep the tier; upgrade near primitives within 3072      |
+   +-------+---------------------------------------------------------+
+   | 4, 5  | keep the tier; upgrade near primitives within 6144      |
+   +-------+---------------------------------------------------------+
+
+   Three things are worth pulling out.
+
+   o Levels 0 and 1 are identical, and so are 4 and 5. Six settings,
+     four distinct behaviours. app-init.txt records detail level being
+     forced to 4 when hardware 3D is active, which by this table is the
+     same as 5.
+
+   o The upgrade is applied BEFORE the strip at levels 0 to 2, so at
+     those levels setting bit 5 and then clearing bits 0, 7 and 2 can
+     still change which kind comes out. The order is not incidental.
+
+   o DAT_004f1a18 and the menu gate disable reduction wholesale. So the
+     menus draw at authored detail regardless of the setting.
+
+
+5.  Three families have no floor
+
+   Families 0x0a, 0x2a and 0x30 have tier-1 members but no kind whose
+   pattern is the family value alone. Stripping the tier from any of
+   them produces a pattern no kind owns, reverseIndex returns its
+   zero-initialised 0, and the primitive is drawn as kind 0
+   [verified by replaying the construction].
+
+   +--------+---------------------------------+----------------------+
+   | Family | Kinds that fall through         | Land on              |
+   +========+=================================+======================+
+   | 0x0a   | 0x04 0x13                       | kind 0x00            |
+   +--------+---------------------------------+----------------------+
+   | 0x2a   | 0x34 0x38                       | kind 0x00            |
+   +--------+---------------------------------+----------------------+
+   | 0x30   | 0x3b 0x41 0x42 0x3e 0x3f        | kind 0x00            |
+   +--------+---------------------------------+----------------------+
+
+   Kind 0 is family 0x20's floor, so these nine kinds do not degrade
+   within their own family - they cross into another one, losing bits 1,
+   3 and 4 in the process. Every other kind degrades to a sibling.
+
+   Whether that is deliberate or an oversight is not established
+   [inferred either way]. The argument for oversight is that the
+   pattern is otherwise perfectly regular and that the same
+   zero-as-sentinel weakness of section 1.1 is what makes an unowned
+   pattern silently return kind 0 instead of failing. The argument for
+   deliberate is that kind 0 is patched into existence specifically as
+   a floor, and a universal fallback is a reasonable thing to want.
+
+   o Either way it is observable: at detail 0 or 1, nine kinds change
+     family. A port that reproduces the tables faithfully reproduces
+     this; a port that "fixes" it by giving those families a floor will
+     render low detail differently from the original.
+
+
+5.1.  The families, read semantically
+
+   Now that all four family bits have meanings - bit 1 Gouraud, bit 3
+   do-not-filter, bit 4 translucent, bit 5 perspective - the twelve
+   families stop being numbers [verified, by replaying the
+   construction]:
+
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | Fam  | Shading | Filter   | Blend       | Mapping| Floor     | T2/3|
+   +======+=========+==========+=============+========+===========+=====+
+   | 0x00 | flat    | filtered | opaque      | affine | 0x16      | yes |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x02 | Gouraud | filtered | opaque      | affine | 0x05,0x17 | no  |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x08 | flat    | NOFILTER | opaque      | affine | 0x25,0x2a | yes |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x0a | Gouraud | NOFILTER | opaque      | affine | NONE      | no  |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x10 | flat    | filtered | TRANSLUCENT | affine | 0x0c,0x2e | yes |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x12 | Gouraud | filtered | TRANSLUCENT | affine | 0x2f      | no  |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x20 | flat    | filtered | opaque      | PERSP  | 0x00      | yes |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x22 | Gouraud | filtered | opaque      | PERSP  | 0x1b,0x21 | no  |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x28 | flat    | NOFILTER | opaque      | PERSP  | 0x33,0x39 | yes |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x2a | Gouraud | NOFILTER | opaque      | PERSP  | NONE      | no  |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x30 | flat    | filtered | TRANSLUCENT | PERSP  | NONE      | yes |
+   +------+---------+----------+-------------+--------+-----------+-----+
+   | 0x32 | Gouraud | filtered | TRANSLUCENT | PERSP  | 0x3a,0x40 | no  |
+   +------+---------+----------+-------------+--------+-----------+-----+
+
+   Twelve is 2 x 2 x 3, not 2^4: shading, mapping, and three blend and
+   filter combinations. No family is both NOFILTER and TRANSLUCENT,
+   which is consistent - a colour-keyed blend already reads the
+   destination, and filtering a keyed texture is the thing bit 3 exists
+   to prevent.
+
+5.2.  Gouraud families have no quality ladder
+
+   The right-hand column splits perfectly on bit 1 [verified]:
+
+   o all six FLAT families carry tier 2 and tier 3
+   o all six GOURAUD families stop at tier 1
+
+   So the three-step quality ladder of section 2.2 exists only for flat
+   shading. That is a sensible economy - Gouraud is already the
+   expensive path, and the engine offers it in one grade rather than
+   three - and it halves the number of tier variants that actually
+   exist.
+
+   It also explains a count. Six families with a full ladder is exactly
+   the six triads of section 2.2, which were derived from the bit
+   patterns alone without knowing what bit 1 meant.
+
+5.3.  Two gaps are a pair; the third breaks a symmetry
+
+   Read semantically, the three floorless families are not three of a
+   kind [verified for the facts, inferred for the intent]:
+
+   o 0x0a and 0x2a are BOTH "Gouraud + do not filter", one affine and
+     one perspective. So that combination has no unadorned form in
+     either mapping mode. Two gaps with one cause, and a consistent
+     one: the engine simply never needs an unfiltered Gouraud
+     primitive stripped of its quality tier.
+
+   o 0x30 is "flat, translucent, perspective", and it is the odd one.
+     Its affine counterpart 0x10 has a floor, and its Gouraud
+     counterpart 0x32 has a floor. It is the only gap that breaks a
+     symmetry the other eleven families keep.
+
+5.3.1.  What family 0x30 costs
+
+   Kind 0 is family 0x20's floor - flat, filtered, OPAQUE, perspective.
+   So when a family 0x30 member is reduced, a TRANSLUCENT primitive
+   becomes an OPAQUE one [verified arithmetic]:
+
+       0x3e  keyed translucent perspective  ->  kind 0, opaque
+       0x3f  the same at tier 3             ->  kind 0, opaque
+       0x3b, 0x41, 0x42  tier 1             ->  kind 0, opaque
+
+   The affine equivalents do not have this problem: family 0x10 members
+   reduce to 0x0c or 0x2e, which are still translucent.
+
+   o That is the sharpest form of the anomaly. Losing a quality tier is
+     the intent of detail reduction; losing TRANSPARENCY is not, and
+     nothing else in the table does it.
+
+   o It cannot be checked at runtime in this project - see CLAUDE.md
+     rule 8 - so it stays a prediction from the tables. But it is a
+     prediction with no free parameters: the feature bits, the reverse
+     index and the two hand-patched entries are all read out of
+     Screen3D_Open.
+
+   o FOR A PORT: reproduce it. The temptation is to give family 0x30 a
+     floor, or to strip bit 5 alongside the quality tier so it lands on
+     0x0c. Either would look better and neither is what the original
+     does.
+
+
+6.  The whole table
+
+   Kind, bit pattern, the bits written out high-to-low, the kind it
+   reduces to at low detail, and the kind it reduces to when it is
+   also near enough for the bit 5 upgrade. A dash is an exempt kind.
+
+    kind bt 76543210 low  near     kind bt 76543210 low  near
+    0x00 20 ..X..... 0x00 0x00   0x23 23 ..X...XX 0x1b 0x1b
+    0x01 01 .......X 0x00 0x00   0x24 23 ..X...XX 0x1b 0x1b
+    0x02 09 ....X..X 0x25 0x33   0x25 08 ....X... 0x25 0x25
+    0x03 03 ......XX 0x05 0x1b   0x26 89 X...X..X 0x25 0x33
+    0x04 0b ....X.XX 0x00 0x00   0x27 8d X...XX.X 0x25 0x33
+    0x05 02 ......X. 0x05 0x05   0x28 09 ....X..X 0x25 0x33
+    0x06 40 .X......    -    -   0x29 09 ....X..X 0x25 0x33
+    0x07 40 .X......    -    -   0x2a 08 ....X... 0x25 0x25
+    0x08 11 ...X...X 0x0c 0x00   0x2b 13 ...X..XX 0x2f 0x3a
+    0x09 13 ...X..XX 0x2f 0x3a   0x2c 91 X..X...X 0x0c 0x00
+    0x0a 40 .X......    -    -   0x2d 95 X..X.X.X 0x0c 0x00
+    0x0b 40 .X......    -    -   0x2e 10 ...X.... 0x0c 0x0c
+    0x0c 10 ...X.... 0x0c 0x0c   0x2f 12 ...X..X. 0x2f 0x2f
+    0x0d 40 .X......    -    -   0x30 11 ...X...X 0x0c 0x00
+    0x0e 40 .X......    -    -   0x31 13 ...X..XX 0x2f 0x3a
+    0x0f 40 .X......    -    -   0x32 29 ..X.X..X 0x33 0x33
+    0x10 81 X......X 0x00 0x00   0x33 28 ..X.X... 0x33 0x33
+    0x11 50 .X.X....    -    -   0x34 2b ..X.X.XX 0x00 0x00
+    0x12 03 ......XX 0x05 0x1b   0x35 a9 X.X.X..X 0x33 0x33
+    0x13 0b ....X.XX 0x00 0x00   0x36 ad X.X.XX.X 0x33 0x33
+    0x14 13 ...X..XX 0x2f 0x3a   0x37 29 ..X.X..X 0x33 0x33
+    0x15 85 X....X.X 0x00 0x00   0x38 2b ..X.X.XX 0x00 0x00
+    0x16 00 ........ 0x00 0x00   0x39 28 ..X.X... 0x33 0x33
+    0x17 02 ......X. 0x05 0x05   0x3a 32 ..XX..X. 0x3a 0x3a
+    0x18 01 .......X 0x00 0x00   0x3b 31 ..XX...X 0x00 0x00
+    0x19 03 ......XX 0x05 0x1b   0x3c 33 ..XX..XX 0x3a 0x3a
+    0x1a 03 ......XX 0x05 0x1b   0x3d 33 ..XX..XX 0x3a 0x3a
+    0x1b 22 ..X...X. 0x1b 0x1b   0x3e b1 X.XX...X 0x00 0x00
+    0x1c 21 ..X....X 0x00 0x00   0x3f b5 X.XX.X.X 0x00 0x00
+    0x1d 23 ..X...XX 0x1b 0x1b   0x40 32 ..XX..X. 0x3a 0x3a
+    0x1e 23 ..X...XX 0x1b 0x1b   0x41 31 ..XX...X 0x00 0x00
+    0x1f a1 X.X....X 0x00 0x00   0x42 31 ..XX...X 0x00 0x00
+    0x20 a5 X.X..X.X 0x00 0x00   0x43 33 ..XX..XX 0x3a 0x3a
+    0x21 22 ..X...X. 0x1b 0x1b   0x44 40 .X......    -    -
+    0x22 21 ..X....X 0x00 0x00   0x45 40 .X......    -    -
+
+   Reproduced by replaying Screen3D_Open's construction, including all
+   six literal stores. The switch membership lists are in the
+   decompilation of 0x004995a0.
+
+   THERE IS NOW A SCRIPT, and it runs the other way round:
+
+       python tools/gen_detail_table.py src/detail_table.inc
+
+   It parses this table out of this note, rebuilds the reverse index
+   the way Screen3D_Open does, and CHECKS its own output against the
+   low and near columns above for all seventy kinds before emitting
+   anything. That makes the table above load-bearing rather than
+   decorative - the reconstruction is generated from it, so an error
+   here would be an error in the build.
+
+   Running it also reproduces section 1.1 independently: withhold the
+   reverseIndex[0] = 0 patch and the replayed loop yields 0x16, which
+   is what that section predicts.
+
+
+7.  What a port has to do
+
+   Very little, and that is the point. Detail reduction is entirely
+   contained in Screen3D_QueuePrimitive - it happens before anything is
+   queued, and both back ends see only the resulting kind at +0x3a
+   [verified].
+
+   o Transcribe the two tables as static data rather than rebuilding
+     them from seven switches. They are 0x46 and 0x100 dwords and they
+     never change after Screen3D_Open. That also sidesteps the
+     zero-sentinel subtlety of section 1.1, provided the transcription
+     is taken from the POST-patch state.
+
+   o Keep bit 3 wired to the sampler filter. It is the only bit a
+     renderer back end reads, and both the software and hardware paths
+     honour it.
+
+   o The rest of the bits need no interpretation at all in a port. They
+     are a lookup key; reproducing the key and the table reproduces the
+     behaviour without knowing what tier 2 means.
+
+   o Do not "fix" section 5. Nine kinds crossing families at low detail
+     is observable original behaviour.
+
+
+8.  Open questions
+
+   o What the quality tiers actually change. The four-step ladder over
+     six families is the same shape as the 2 x 2 pipeline matrix of
+     rasterizer-pipeline.txt section 5, but nothing yet connects a
+     specific kind to a specific pipeline slot. The walker table at
+     0x004f1ee0, indexed by kind, is where that connection lives and it
+     has not been read.
+   o What bits 1 and 4 distinguish. They are never tested, so only the
+     per-kind drawing behaviour can say - which again means the walker
+     table.
+   o What DAT_004f1a18 is. It disables detail reduction wholesale and
+     is not identified.
+   o Whether the three floorless families are a defect. See section 5.
+   o IDENTIFIED - 0x0049ca70 is Screen3D_QueuePrimitivePaletted, the
+     path taken when a face's bank has palettes. Screen3D_CullAndQueueFaces
+     chooses between it and Screen3D_QueuePrimitive on
+     bank.subPageCount != 0 [verified], which also explains why the
+     kind-0x2a substitution lives there: it is a paletted-only
+     concern. 0x004dc098, which gates that substitution, is
+     g_cfgDetailLevel itself.
+
+
+9.  The kind-to-pipeline map, and what it proves
+
+   g_spanTable at 0x004f1a70 is the table that maps a primitive kind to
+   a software pipeline slot. It is NOT the walker table at 0x004f1ee0 -
+   that one is keyed by slot, has only 0x0c records, and
+   rasterizer-pipeline.txt section 3.1 already has it mapped. Both are
+   scattered at startup by Screen3D_ScatterTableByKey, so the static
+   bytes are a dense key-first list, not the runtime array.
+
+   Reading the 32 static records and applying the scatter gives the
+   record layout, confirmed field by field against the reads in
+   Screen3D_DispatchPrimitive at 0x004af07d [verified]:
+
+   +--------+---------------------------------------------------------+
+   | Offset | Field                                                   |
+   +========+=========================================================+
+   | +0x00  | key - the primitive kind; < 0 means empty slot          |
+   +--------+---------------------------------------------------------+
+   | +0x04  | pipeline slot; 0 short-circuits to the span function    |
+   +--------+---------------------------------------------------------+
+   | +0x08  | walker flag; 0 picks walker A, non-zero walker B        |
+   +--------+---------------------------------------------------------+
+   | +0x0c  | the span function, installed into DAT_00655d08          |
+   +--------+---------------------------------------------------------+
+
+9.1.  Slot is a pure function of bits 1 and 5
+
+   Twenty-four kinds use a real pipeline slot. For every one of them the
+   slot is predicted exactly by two feature bits, with no exceptions
+   [verified]:
+
+   +-------+-------+------+-------------+--------------------+
+   | bit 1 | bit 5 | Slot | Flat colour | Reads vertex +0x18 |
+   +=======+=======+======+=============+====================+
+   | clear | clear | 4    | yes         | no                 |
+   +-------+-------+------+-------------+--------------------+
+   | SET   | clear | 5    | no          | no                 |
+   +-------+-------+------+-------------+--------------------+
+   | clear | SET   | 6    | yes         | yes                |
+   +-------+-------+------+-------------+--------------------+
+   | SET   | SET   | 7    | no          | yes                |
+   +-------+-------+------+-------------+--------------------+
+
+   The right-hand columns are rasterizer-pipeline.txt section 5, which
+   derived the 2 x 2 matrix from the setup functions and their argument
+   counts without knowing what selected between them. This is the
+   missing half: the feature table is the selector.
+
+   +------+-------------------------------------------------------+
+   | Slot | Kinds                                                 |
+   +======+=======================================================+
+   | 4    | 0x01 0x02 0x08 0x10 0x15 0x25 0x26 0x27 0x2c 0x44     |
+   |      | 0x45                                                  |
+   +------+-------------------------------------------------------+
+   | 5    | 0x03 0x04 0x09 0x12                                   |
+   +------+-------------------------------------------------------+
+   | 6    | 0x1c 0x1f 0x20 0x32 0x33 0x35 0x36 0x3e               |
+   +------+-------------------------------------------------------+
+   | 7    | 0x1d                                                  |
+   +------+-------------------------------------------------------+
+   | 0    | 0x00 0x05 0x13 0x14 0x28 0x29 0x2a                    |
+   +------+-------------------------------------------------------+
+   | 2    | 0x0c                                                  |
+   +------+-------------------------------------------------------+
+
+   Slots 0 and 2 are overrides and do not follow the rule. Slot 0 is the
+   short-circuit - the dispatcher calls the span function directly with
+   no setup and no edge walker. Slot 2 holds only kind 0x0c, the
+   untextured blend path of rasterizer-pipeline.txt section 9.1, which
+   is also the slot with no emitter and no walkers.
+
+   o Only ONE kind, 0x1d, uses slot 7. Gouraud plus perspective
+     correction is the most expensive combination the software
+     rasterizer offers and exactly one primitive kind asks for it.
+
+9.1.1.  Independent corroboration from the kind identities
+
+   Screen3D_DispatchPrimitive already carried a plate comment, written
+   in an earlier session from the innermost span routines and without
+   reference to the feature table, naming seven kinds. Lining those up
+   against the bits decoded here is a clean cross-check [verified]:
+
+   +------+------+------+-------------------------+---------------------+
+   | Kind | Bits | Slot | Identity from the plate | Agrees?             |
+   +======+======+======+=========================+=====================+
+   | 0x01 | 0x01 | 4    | opaque textured         | flat, affine        |
+   +------+------+------+-------------------------+---------------------+
+   | 0x02 | 0x09 | 4    | colour-KEYED textured   | bit 3 set - a keyed |
+   |      |      |      |                         | texture must not be |
+   |      |      |      |                         | filtered or the key |
+   |      |      |      |                         | bleeds              |
+   +------+------+------+-------------------------+---------------------+
+   | 0x03 | 0x03 | 5    | occluder                | bit 1 set           |
+   +------+------+------+-------------------------+---------------------+
+   | 0x04 | 0x0b | 5    | deferred shaded         | bit 1 set           |
+   +------+------+------+-------------------------+---------------------+
+   | 0x09 | 0x13 | 5    | GOURAUD SHADED          | bit 1 set, slot 5   |
+   +------+------+------+-------------------------+---------------------+
+   | 0x2a | 0x08 | 0    | textured stencil        | bit 3 set           |
+   +------+------+------+-------------------------+---------------------+
+
+   Two of these are decisive.
+
+   o Kind 9 is named "Gouraud shaded" from its span routine alone, and
+     it is one of the four kinds this section predicts into slot 5, the
+     no-flat-colour slot, purely from feature bit 1. Two independent
+     derivations, same answer. Bit 1 is Gouraud.
+
+   o Kind 2 is the colour-keyed kind and carries bit 3, "do not
+     filter". Bilinear filtering a colour-keyed texture blends the key
+     colour into its neighbours and fringes the cutout - so the bit is
+     not an arbitrary quality flag but a correctness requirement. That
+     is a much better reason for the bit to exist than the one section
+     2.4 could give from the call sites.
+
+9.2.  Three routes, not one
+
+   Reading the dispatcher settles how the two tables and the jump table
+   relate. Screen3D_DispatchPrimitive picks one of three routes on the
+   queue node field at +0x10, which the MR_QueueNode type now identifies
+   as the PALETTE pointer - null on the plain software path, non-null
+   for a paletted primitive [verified]:
+
+   +---------------------------+--------------------------------------+
+   | Condition                 | Route                                |
+   +===========================+======================================+
+   | node[+0x10] != 0          | a 0x2b-entry jump table on kind,     |
+   |                           | bytes at 0x004af100, targets at      |
+   |                           | 0x004af0e0 - the specialised path    |
+   +---------------------------+--------------------------------------+
+   | node[+0x10] == 0 and      | three hand-coded cases on kind:      |
+   | DAT_006d20a0 != 0         | 6, then 7 or 0x0b, else 0x0049a300   |
+   +---------------------------+--------------------------------------+
+   | node[+0x10] == 0 and      | g_spanTable - the pipeline path      |
+   | DAT_006d20a0 == 0         | described above                      |
+   +---------------------------+--------------------------------------+
+
+   The jump-table route covers kinds 0 to 0x2a and returns immediately
+   for anything above, which is the "43 kinds the dispatcher switches
+   on" that renderer.txt records. The pipeline route returns immediately
+   when the span record key is negative.
+
+9.3.  Three reduction targets draw nothing on the pipeline route
+
+   Thirty-eight of the seventy kinds have no g_spanTable record at all.
+   That is expected for kinds the hardware path owns, but three of them
+   are targets that detail reduction can produce [verified]:
+
+   +--------+--------------------------------------------------------+
+   | Target | Reached from                                           |
+   +========+========================================================+
+   | 0x1b   | 0x03, 0x12 near-upgraded at detail 0 or 1; 0x1d at any |
+   |        | low detail                                             |
+   +--------+--------------------------------------------------------+
+   | 0x2f   | 0x09, 0x14 at low detail                               |
+   +--------+--------------------------------------------------------+
+   | 0x3a   | 0x09, 0x14 near-upgraded at detail 0 or 1              |
+   +--------+--------------------------------------------------------+
+
+   0x1b is at least within the jump table 0 to 0x2a range, so it can
+   still draw by the specialised route. 0x2f and 0x3a are above 0x2a,
+   so BOTH routes drop them and they reach no drawing code at all.
+
+   o That means kinds 0x09 and 0x14 become invisible on the pipeline
+     route at low detail. The mechanism is verified - the early-out at
+     0x004af094 and the 0x2a range check at 0x004aef3f are both plain
+     in the disassembly - but whether these kinds actually occur in a
+     shipped track at detail 0 has NOT been observed. Treat it as a
+     hazard to check at runtime rather than a confirmed visual bug.
+
+   o A port that reproduces the tables faithfully reproduces this too.
+     Worth a breakpoint before concluding a port has a missing-geometry
+     bug of its own making.
+
+9.4.  A caveat on the near column of section 6
+
+   The near column there is the detail 0 and 1 case, where the upgrade
+   is applied and THEN the quality tier is stripped. At detail 3 to 5
+   there is no strip, so the near target is reverseIndex[bits | 0x20]
+   instead - which is how kind 0x03 becomes 0x1d, the slot 7 kind, when
+   it comes close to the camera at full detail. Those are the
+   interesting transitions and the section 6 table does not show them.
+
+10.  The two triangle-split paths
+
+   Screen3D_QueuePrimitive does not always queue the primitive it was
+   given. On the hardware path with hwFlags set it splits the face into
+   triangles first, and it picks between two implementations on one bit
+   [verified]:
+
+       if ((hwFlags & 1) == 0) {
+           Screen3D_MakeTriangle(0,1,2, verts, prim, buf, &count);
+           if (prim->wQuadMarker != 0xffff)
+               Screen3D_MakeTriangle(0,2,3, verts, prim, buf, &count);
+       } else {
+           maybe_Screen3D_BlendVariants(0,1,2, ...);
+           if (prim->wQuadMarker != 0xffff)
+               maybe_Screen3D_BlendVariants(0,2,3, ...);
+       }
+
+   Both take the same seven arguments and both are called twice with
+   (0,1,2) then (0,2,3), so they are interchangeable implementations of
+   one job. What selects them is hwFlags bit 0, which
+   Screen3D_CullAndQueueFaces sets when any vertex of the face is at or
+   behind the near plane.
+
+10.1.  Screen3D_MakeTriangle, the unclipped path
+
+   0x00499460, 316 bytes, read in full [verified]. It copies one
+   triangle out of the source face:
+
+   o kind, colour index, bank index and flags are copied straight over
+   o the three chosen (u,v) pairs are copied, and slot 3 REPEATS slot 0
+   o the three chosen vertex indices are copied, and index 3 repeats
+     index 0
+   o wQuadMarker is set to 0xffff, marking a triangle
+
+   So a triangle is stored as a degenerate quad and downstream code can
+   always read four slots.
+
+   It also confirms MR_Primitive's uv layout from a second direction:
+   the reads are at src + 0x04 + slot*8 and src + 0x08 + slot*8, which
+   is the four interleaved (u,v) pairs at +0x04, +0x0c, +0x14 and
+   +0x1c. That layout was first derived from the flat-colour test in
+   Load3dfAndMap; two unrelated functions now agree on it.
+
+   One detail worth carrying: it takes the source's EFFECTIVE kind
+   (+0x3a) and writes it to BOTH kind fields of the copy. Detail
+   reduction has already happened by the time a face is split, and the
+   split triangles carry the reduced kind as though it were authored.
+
+10.2.  The other path was misnamed: it is the near-plane clipper
+
+   maybe_Screen3D_BlendVariants at 0x00497e40 has been renamed
+   Screen3D_ClipTriangleNear. The old name had nothing to do with
+   blending. Five independent lines agree [verified]:
+
+   +---+--------------------------------------------------------------+
+   | 1 | it is selected exactly when the face crosses the near plane  |
+   +---+--------------------------------------------------------------+
+   | 2 | its ONLY callee interpolates an edge to the near plane       |
+   +---+--------------------------------------------------------------+
+   | 3 | it calls that helper twelve times, in SIX PAIRS              |
+   +---+--------------------------------------------------------------+
+   | 4 | it advances the output buffer by sizeof(MR_Primitive) ten    |
+   |   | times                                                        |
+   +---+--------------------------------------------------------------+
+   | 5 | it writes the vertex pool in fourteen places; the unclipped  |
+   |   | path never touches the pool                                  |
+   +---+--------------------------------------------------------------+
+
+   The second is the one that settles it. Screen3D_ClipEdgeNearHw
+   (0x00497d60, renamed from FUN_00497d60) is a textbook edge clip:
+
+       t = (nearZ - a->camZ) / (b->camZ - a->camZ);
+       out->camX = a->camX + t * (b->camX - a->camX);
+       out->camY = a->camY + t * (b->camY - a->camY);
+       out->camZ = nearZ;
+       out->invZ = 1.0f / nearZ;
+       out->screenX = g_viewCentreX + proj(camX);
+       out->screenY = g_viewCentreY - proj(camY);
+       out->shade   = interpolated;
+
+   No function that blends anything calls that.
+
+10.2.1.  The edge clip read properly, and one defect in it
+
+   That sketch is right in outline and wrong in three details, all of
+   which the decompiler hides and the disassembly states [verified].
+
+   THE DIVISION COMES FIRST. Each delta is divided by dz and then
+   scaled, rather than forming t once and multiplying:
+
+       out->camX = (nearZ - a->camZ) * ((b->camX - a->camX) / dz)
+                   + a->camX
+
+   Same value in exact arithmetic, different rounding in single
+   precision.
+
+   NO PROJECTION SCALE APPEARS, and that is a cross-check rather than
+   an omission: camX and camY arrive ALREADY viewport-scaled, because
+   Screen3D_TransformVertsFlat folds the scales into the matrix once
+   per call. Interpolating them keeps them scaled. Two stages read in
+   different sessions agreeing on that is good evidence for both.
+
+   THE SHADE IS INTERPOLATED IN INTEGER ARITHMETIC, and this one is a
+   defect:
+
+       dzi = (int)(b->camZ - a->camZ);      /* __ftol, truncates */
+       ds  = b->shade - a->shade;
+       if (dzi != 0) ds /= dzi;             /* INTEGER divide */
+       out->shade = (int)(a->shade + (nearZ - a->camZ) * ds);
+
+   That is a shade slope per WHOLE UNIT OF Z, computed with a
+   truncating integer divide and then scaled by a float distance. It
+   is not the lerp the position gets, and it loses precision on every
+   edge.
+
+   o WHEN |dz| < 1 THE INTEGER IS ZERO AND THE DIVIDE IS SKIPPED
+     ENTIRELY, leaving ds as the full shade difference and multiplying
+     it by the distance. For a short, nearly z-parallel edge that
+     produces a wildly wrong intensity rather than a small error.
+
+   src/clip.c reproduces this rather than correcting it. A "fixed"
+   lerp would diverge from the original exactly where the original
+   looks worst, which is the least useful place to differ.
+
+   ONE NAMING NOTE. The 1.0f numerator is the constant at 0x004d1f4c,
+   which the DB calls _maybe_g_minDenom after its use as a minimum
+   triangle area elsewhere. At this site it is just the float one -
+   the compiler pooled the constant. The name is misleading here; it
+   is left alone rather than churning every note that cites it, but a
+   reader should not conclude the clipper knows anything about
+   triangle areas.
+
+   The third is the one that explains the SIZE. Six is exactly the
+   number of ways a triangle can straddle a plane - three with one
+   vertex in front, three with two - and each case clips precisely two
+   edges. The six cases are unrolled rather than looped, which is most
+   of the 5652 bytes against the unclipped path's 316.
+
+   Ten output advances against six cases fits the classic split: three
+   one-vertex cases emitting a single triangle, three two-vertex cases
+   emitting two, plus a trivial path. That arithmetic is [inferred] -
+   the individual cases were not enumerated.
+
+10.3.  What was read, and what was not
+
+   This identification is structural: call graph, case count, buffer
+   advances and pool writes. The 5652-byte body was NOT read line by
+   line, and two things remain open:
+
+   o which case emits one triangle and which emits two
+   o the winding of the emitted triangles
+
+   Neither affects the identification, and both are the kind of detail
+   a port needs only when it reaches the clipper itself.
+
+   IT HAS NOW REACHED IT, and neither turned out to matter. src/clip.c
+   implements the same clip as ONE Sutherland-Hodgman loop instead of
+   six unrolled cases - a divergence in shape, not in result, since
+   walking a convex polygon's edges and keeping the inside points plus
+   the crossings produces exactly the "one vertex in front gives a
+   triangle, two give a quad" split the unrolled cases enumerate.
+
+   And the winding question dissolves rather than being answered:
+   Sutherland-Hodgman emits in input order so winding is preserved
+   anyway, but the CULL HAS ALREADY RUN by the time a face reaches the
+   queue, and the hardware back end draws with culling disabled
+   precisely because the engine culls on the CPU. Nothing downstream
+   tests winding again.
+
+10.5.  There is a THIRD clipper, and it is the viewport one
+
+   Screen3D_QueuePrimitive's split path does not stop at
+   Screen3D_MakeTriangle or Screen3D_ClipTriangleNear. Every triangle
+   either produces then goes through Screen3D_ClipPolygonViewport
+   (0x00497080, renamed from FUN_00497080), and the fan loop in
+   QueuePrimitive turns ITS output into the queued primitives.
+
+   So the split path is three stages, not two [verified]:
+
+       face -> Make or ClipNear -> up to 4 triangles
+            -> ClipPolygonViewport  (per triangle)
+            -> up to 8 corners -> fanned -> queued
+
+   It is Sutherland-Hodgman against the four screen edges, in this
+   order and with this asymmetry:
+
+       1  x <= g_viewMaxX + 1
+       2  y <= g_viewMaxY + 1
+       3  x >= DAT_00624374        the left margin
+       4  y >= g_viewTopMargin
+
+   The right and bottom bounds are the maxima PLUS ONE while the left
+   and top are the margins themselves, so the box is
+   [left, maxX+1] x [top, maxY+1].
+
+10.5.1.  The working record, and where the UVs really live
+
+   0x1c bytes, seven dwords [verified]:
+
+   +--------+--------+-------------------------------------------+
+   | Offset | Type   | Field                                     |
+   +========+========+===========================================+
+   | +0x00  | int    | screenX, from MR_Vertex +0x10             |
+   +--------+--------+-------------------------------------------+
+   | +0x04  | int    | screenY, from +0x14                       |
+   +--------+--------+-------------------------------------------+
+   | +0x08  | int    | shade, from +0x0c                         |
+   +--------+--------+-------------------------------------------+
+   | +0x0c  | float  | u * invZ                                  |
+   +--------+--------+-------------------------------------------+
+   | +0x10  | float  | v * invZ                                  |
+   +--------+--------+-------------------------------------------+
+   | +0x14  | float  | invZ, from +0x18                          |
+   +--------+--------+-------------------------------------------+
+   | +0x18  | float  | z, written only in the final pass         |
+   +--------+--------+-------------------------------------------+
+
+   THE UVs ARE PREMULTIPLIED BY 1/z BEFORE CLIPPING AND DIVIDED BACK
+   OUT AFTER. The setup stores u*invZ and v*invZ, the four passes
+   interpolate +0x0c, +0x10 and +0x14 linearly, and the tail does
+   z = 1/invZ then u *= z, v *= z.
+
+   That is required in SCREEN space, where a plain lerp of u and v is
+   wrong. It is also the reason the NEAR-plane clipper needs no such
+   thing: that one works in CAMERA space, before the projection divide,
+   where the transform is still affine and u and v are linear in the
+   same parameter as the position.
+
+   o SO src/clip.c's PLAIN LERP IS CORRECT, and its comment saying so
+     was previously hedged as "almost certainly". Two clippers, two
+     spaces, two different correct answers.
+
+10.5.2.  Two scratch buffers, and the wrap slot again
+
+   g_clipPolyA (0x0060d2d0) and g_clipPolyB (0x0060d1e8) are 0xe8 bytes
+   each - EIGHT records of 0x1c, then the COUNT at +0xe0, which is the
+   [0x38] dword the callers read. g_pClipPolySrc and g_pClipPolyDst are
+   swapped after every pass; g_pClipPolyCursor is the write position.
+
+   Eight is exactly the bound: a triangle clipped by four planes yields
+   at most seven corners, plus one for the closing duplicate.
+
+   AND THE CLOSING DUPLICATE IS THE SAME IDEA AS EVERYWHERE ELSE. After
+   building the three input corners the function copies corner 0 into
+   slot 3, and after each pass copies the new corner 0 in again. Each
+   pass then walks edges as record[i] against record[i+1] - the next
+   record's x being seven dwords on - with no modulo and no special
+   last case. MR_Primitive's fifth (u,v) pair and fifth vertex index do
+   the same job for the same reason.
+
+10.5.3.  A port does not need it
+
+   D3D9 clips to the viewport itself, perspective-correctly, so this
+   entire function is replaced by doing nothing. It is worth reading
+   only for what it settles about the UVs above - which is the whole
+   reason it was read.
+
+10.4.  There are two copies of this maths
+
+   The software path has its own near-plane edge clip at
+   maybe_Screen3D_ClipEdgeNear (0x0049d8f0), recorded in
+   structs/MR_Vertex.txt section 3 in the same form. So the engine
+   carries the same interpolation twice, once per back end.
+
+   o A port should collapse them. They differ only in which vertex
+     array they write into, and both produce the same fields.
+
+   o Note the clipped vertices land in the SAME per-frame bump pool
+     that Screen3D_TransformVertsFlat fills. A clip-heavy frame
+     therefore consumes pool slots on top of the transformed ones, and
+     nothing bounds either - see rasterizer-pipeline.txt section
+     38.0.1.
+
+   With this the geometry path is mapped end to end: transform, cull,
+   split or clip, queue, draw.
+

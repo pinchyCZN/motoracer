@@ -1,0 +1,130 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                        DATA\BESTSCOR.DAT
+
+
+Abstract
+
+   The all-time track records: who holds the best lap on each track
+   and in what time.  Loaded at race start and shown as a row of the
+   BEST LAP block, which is why retail has a time up there before
+   anybody has completed a lap.
+
+   Read by FUN_004656c0 (0x004656c0).  Verified against
+   decomp/DATA/BESTSCOR.DAT, 297767 bytes.
+
+Table of Contents
+
+   1. Layout
+   2. The key
+   3. Open questions
+
+1.  Layout
+
+       char magic[4]                    "00.1"
+       repeated to end of file:
+           char key[0x20]               the track key, NUL padded
+           Record best                  0xf9 bytes
+           Record table[8]              0xf9 bytes each
+
+       Record:                          0xf9 bytes
+           char holder[9]               at +0, NUL terminated
+           char initials[..]            at +9, NUL terminated
+           u32  raceMs                  at +0xf1
+           u32  lapMs                   at +0xf5
+
+   THE RECORD CARRIES TWO NAMES AND TWO TIMES, and reading it as
+   one of each gets the results page wrong.  +0 is a holder name
+   the game ships - DSI on every stock row - and +9 is the THREE
+   LETTERS the player types on the results screen, which is what
+   that page draws.  The entry code caps typing at three
+   characters.
+
+   +0xf1 is the RACE time and +0xf5 the LAP time.  Page 9 lists
+   the race times and shows the lap time on its BEST LAP line.
+   The bytes between +9 and +0xf1 are unread. [open]
+
+   One entry is 0x20 + 9 * 0xf9 = 0x8e1 bytes and the search is a
+   linear walk comparing key against the one built in section 2.
+   131 entries at that stride plus the 4-byte magic is 297767 bytes,
+   the file size exactly, so the stride is confirmed by fit and there
+   is no trailing data [verified].
+
+   o RECORD 0 IS THE BEST LAP, NOT ROW 1 OF THE TABLE.  It is
+     built differently and the file shows it plainly: its
+     initials are EMPTY and its raceMs is the 0x7f7f7f7f
+     sentinel, leaving only a lap time [verified, every DSI row].
+     The loader FUN_004656c0 sends it to 0x00540230 and the other
+     eight to the table at 0x005cf500, which is the same split.
+
+     So the results page lists records 1 to 5, not 0 to 4.  A
+     reader that starts at 0 shows a sentinel where a time
+     belongs.
+
+   o THE MISS VALUE IS 0x7f7f7f7f, the same sentinel every other
+     time reader tests.  FUN_00411010 clears the struct to it before
+     the load and the caller re-clears it if the load returns 0, so
+     a track with no record draws no row rather than a zero one.
+
+   THE FILE IS WRITTEN AT RUN TIME, SO INDIVIDUAL VALUES IN IT ARE
+   NOT EVIDENCE.  MOTO.EXE stores a new record through FUN_00458310,
+   and decomp/DATA/BESTSCOR.DAT has been played against: 9 of its
+   131 entries carry a holder that is not DSI, and SPEED_BAY's best
+   lap now reads 1435 ms [verified, 2026-09-27].  A 1.4-second lap
+   is a teleport, not a lap.
+
+   Treat it the way releases.txt 4.3 treats CARAC2.BPT.  The LAYOUT
+   is sound - every one of the 131 entries parses - but a TIME may
+   be ours.  DSI on the holder field is the tell that a row is
+   still Delphine's; the nine that are not are listed by
+   tools/bestscor.py.
+
+2.  The key
+
+   IT IS NOT JUST THE TRACK NAME.  FUN_004656c0 builds it from the
+   track list entry at g_pTrackList + index * 0x130 + 4, then
+   appends:
+
+   +------------------------+------------+------------+---------------------+
+   | Condition              | Appended   | At         | Label               |
+   +========================+============+============+=====================+
+   | g_nPocketBikeSelected  | "POC"      | 0x004ea58c | s_reckey_suffix_poc |
+   +------------------------+------------+------------+---------------------+
+   | DAT_004dc068 (reverse) | "REV"      | 0x004ea588 | s_reckey_suffix_rev |
+   +------------------------+------------+------------+---------------------+
+   | g_nSelectedMode == 0   | "TRA" then | 0x004ea584 | s_reckey_suffix_tra |
+   |                        | g_nRaceLaps|            |                     |
+   +------------------------+------------+------------+---------------------+
+
+   All three read out of the DB [verified].  They append in that
+   order, so a key is
+
+       <track>[POC][REV][TRA<laps>]
+
+   and the 131 keys in the shipped file are exactly that product:
+   eight tracks x {plain, POC} x {plain, REV} x {plain, TRA1..TRA4},
+   plus FUN_FAIR and SEA_OF_SAND with no variants.  So a record is
+   per track AND bike class AND direction AND lap count, and the
+   plain track name matches only a forward superbike race in a mode
+   other than 0.
+
+3.  Open questions
+
+   o THE PORT STILL BUILDS THE PLAIN NAME, so it finds nothing for
+     a pocket bike, a reversed track or mode 0.  The suffixes it
+     needs are in section 2; this is a gap in race_load_track_record
+     and no longer an unknown.
+
+   o THE WRITE HALF.  FUN_00458310 (0x0047eb0d calls it) is what
+     stores a new record; it is not transcribed, so this port reads
+     records and never sets one.
+
+   o WHAT THE EIGHT-ENTRY TABLE IS FOR.  Nothing read so far
+     consumes it.
+
+   o SEA_OF_SAND, the last entry, has 0x7f in the final byte of its
+     key field and a holder reading "SI" where every other row reads
+     "DSI" - as though one byte of the holder were overwritten.  It
+     is the only entry like it.  Mutable data, so probably not worth
+     chasing.

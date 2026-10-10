@@ -1,0 +1,459 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          INPUT BINDING TABLE
+
+
+Abstract
+
+   The complete control scheme: 7 actions, each with a keyboard binding
+   and a joystick binding, persisted as named settings. Supersedes the
+   first version of this document, which mis-identified the label table.
+
+   +--------------------------+------------------------------------+
+   | Item                     | Address                            |
+   +==========================+====================================+
+   | g_actionBindings         | 0x0053eae0, MR_ActionBinding[7]    |
+   +--------------------------+------------------------------------+
+   | g_stringResources        | 0x004e2920, MR_StringResource[191] |
+   +--------------------------+------------------------------------+
+   | g_stringTable            | 0x0053b5e8, 192 runtime slots      |
+   +--------------------------+------------------------------------+
+   | g_keyScanTable           | 0x0053eb20                         |
+   +--------------------------+------------------------------------+
+   | Input_SetActionKey       | 0x004310f0                         |
+   +--------------------------+------------------------------------+
+   | Input_SetActionButton    | 0x00431140                         |
+   +--------------------------+------------------------------------+
+   | Input_SetDefaultBindings | 0x00430f20                         |
+   +--------------------------+------------------------------------+
+   | Input_InitJoysticks      | 0x004189c0                         |
+   +--------------------------+------------------------------------+
+   | Input_BuildKeyScanTable  | 0x0043e0f0                         |
+   +--------------------------+------------------------------------+
+   | Lang_SetLanguage         | 0x00415a70                         |
+   +--------------------------+------------------------------------+
+
+Table of Contents
+
+   1. The binding table
+   2. The seven actions
+   3. Button encoding, resolved
+   4. Joystick threshold
+   5. The string resource table
+   6. The key-down handler and its hotkeys
+      6.1. The hotkeys
+      6.2. HELP.GEN - what the game ADVERTISES
+      6.3. The port's own keys
+   7. Also found
+   8. Open questions
+
+
+1.  The binding table
+
+   Base 0x0053eae0, stride 8, ending at 0x0053eb18: seven entries
+   [verified].
+
+   struct MR_ActionBinding {
+       int key;      // virtual key code, -1 = unbound
+       int button;   // see encoding below, -1 = unbound
+   };
+
+   Bounds confirmed three ways: the loader tests the index against 7,
+   the pointer walk terminates at base + 7*8, and both setters reject
+   index > 6.
+
+   Settings_LoadAll builds the setting names at run time rather than
+   storing 21 literals:
+
+   for (i = 0; i < 7; i++) {
+       sprintf(buf, "Action%dKey", i);
+       bindings[i].key    = Settings_ReadInt(buf);
+       sprintf(buf, "Action%dBtn", i);
+       bindings[i].button = Settings_ReadInt(buf);
+   }
+
+   Ghidra renders that loop's table pointer as a constant code address,
+   so the base and stride come from disassembly, not the decompiler.
+
+   Both setters unbind a code from every other action before assigning,
+   so a key or button can only serve one action at a time.
+
+2.  The seven actions
+
+   +-------+--------------+---------------+----------------+
+   | Index | Action       | Default key   | Default button |
+   +=======+==============+===============+================+
+   | 0     | Accelerate   | 0x26 VK_UP    | 0              |
+   +-------+--------------+---------------+----------------+
+   | 1     | Brake        | 0x28 VK_DOWN  | 1              |
+   +-------+--------------+---------------+----------------+
+   | 2     | Turn Left    | 0x25 VK_LEFT  | -2             |
+   +-------+--------------+---------------+----------------+
+   | 3     | Turn Right   | 0x27 VK_RIGHT | -3             |
+   +-------+--------------+---------------+----------------+
+   | 4     | Higher Gear  | 0x5a Z        | 2              |
+   +-------+--------------+---------------+----------------+
+   | 5     | Lower Gear   | 0x41 A        | 3              |
+   +-------+--------------+---------------+----------------+
+   | 6     | Turbo/Stunts | 0x20 VK_SPACE | not assigned   |
+   +-------+--------------+---------------+----------------+
+
+   Correction. The first version of this document said the mapping was
+   "verified from the table itself" because each label record begins
+   with an index field. That was wrong: 0x004e2920 is a general string-
+   resource table and that field is a resource id, not an action index.
+   Records 0 to 6 holding the seven action names was suggestive, not
+   proof.
+
+   The mapping is nonetheless verified, by a different route. The
+   control-config menu at 0x00445360 switches on the action number and
+   picks the label directly [verified]:
+
+   CMP EBP, 5
+   JA  default
+   JMP [EBP*4 + 0x445888]      ; cases 0..5 -> g_stringTable[0..5]
+   default:                    ; -> g_stringTable[6]
+
+   So resource id equals action index for 0 to 6. The default keys
+   corroborate indices 0 to 3 independently.
+
+3.  Button encoding, resolved
+
+   The formatter at 0x0044548e branches on the stored value [verified]:
+
+   +----------------+-----------------------------------------+----------------------+
+   | Stored value   | Meaning                                 | Resource             |
+   +================+=========================================+======================+
+   | >= 0           | button number, formatted with the value | 9, "%s Button %d"    |
+   +----------------+-----------------------------------------+----------------------+
+   | -1             | unbound                                 | 8, "%s None"         |
+   +----------------+-----------------------------------------+----------------------+
+   | -2             | stick direction                         | 10, "%s Stick Left"  |
+   +----------------+-----------------------------------------+----------------------+
+   | -3             | stick direction                         | 11, "%s Stick Right" |
+   +----------------+-----------------------------------------+----------------------+
+   | -4             | stick direction                         | 12, "%s Stick Up"    |
+   +----------------+-----------------------------------------+----------------------+
+   | -5             | stick direction                         | 13, "%s Stick Down"  |
+   +----------------+-----------------------------------------+----------------------+
+   | other negative | falls through to unbound                | 8                    |
+   +----------------+-----------------------------------------+----------------------+
+
+   The chain is a literal sequence of CMP EAX,-2 / -3 / -4 / -5 with a
+   default that falls through to the None case.
+
+   All six cases are now VERIFIED. -2 = Left and -3 = Right follow from
+   the defaults, which bind them to Turn Left and Turn Right. -4 = Up
+   and -5 = Down were previously inferred from resource ordering; they
+   are now confirmed from the sprite filenames, below.
+
+   The confirmation came from the sprites rather than the strings. In
+   this menu the four directions are drawn as images, not text: each
+   branch loads a display object from 0x00504bb0 to 0x00504bbc, which is
+   why nothing in the binary cross-references the Stick string slots.
+   Menu_LoadResources populates that object array with the array index
+   used directly as the resource id, so the four objects are resources
+   204 to 207, and the resource table names their files: jtop.lez,
+   jleft.lez, jright.lez and jbas.lez. The j prefix is joystick and bas
+   is French for down, which is consistent with the studio. Mapping
+   those back through the branch addresses gives -4 Up, -2 Left, -3
+   Right, -5 Down, and the two directions already known from the
+   defaults agree.
+
+4.  Joystick threshold
+
+   g_cfgJoystickThreshold (0x004dbf7c, set by -J) has exactly one
+   consumer, Input_InitJoysticks [verified]:
+
+   if ((int)g_cfgJoystickThreshold < 0)
+       state->threshold = 0x800;
+   else
+       state->threshold = g_cfgJoystickThreshold;
+
+   The built-in help says the default is 2000; the code uses 0x800,
+   which is 2048 [verified]. A documentation slip in the original, not a
+   decompilation artifact.
+
+   Input_InitJoysticks also caps the device count at 8, reads JOYCAPS
+   for each, and polls with joyGetPosEx flags 0x483, which is X, Y,
+   BUTTONS and CENTERED. There is no Z axis in the flag set. Per device
+   it stores three axis centres of 0x8000 and copies the threshold into
+   three per-axis slots, then marks a stick "digital only" when both
+   axes read exactly 0x8000, 0 or 0xffff.
+
+5.  The string resource table
+
+   0x004e2920 is 191 records of 28 bytes, terminated by a record whose
+   id is -1 at 0x004e3e04 [verified].
+
+   struct MR_StringResource {
+       int   id;                          // -1 terminates
+       char *en, *fr, *de, *it, *es, *sv;
+   };
+
+   Lang_SetLanguage(lang) fills 192 runtime slots at g_stringTable with
+   an "INVALID STRING" placeholder, then walks the table selecting the
+   column for the chosen language and falling back to English when a
+   translation pointer is null. Slots are indexed by the record's id,
+   and 191 records against 192 slots is a clean fit.
+
+   Language column order is en, fr, de, it, es, sv, matching the
+   -us/-fr/-gr/-it/-sp/-sw switches. g_language (0x004dbce8) holds the
+   index and is set both from the registry and from those switches.
+
+6.  The key-down handler and its hotkeys
+
+   Input_OnKeyDown at 0x00431250 is where the binding table is actually
+   consumed, and it turns out to carry a second, larger job: a live
+   hotkey set.
+
+   Its signature was wrong in the database and the correction matters,
+   because an undefined return type had let the decompiler unify every
+   returned global into MR_Menu * and the body was close to unreadable.
+   The function ends RET 0xc and its sole caller pushes [EBP+8],
+   [EBP+0x10] and [EBP+0x14] - the hWnd, wParam and lParam of a window
+   procedure frame - so it is __stdcall(hWnd, vkey, lParam) returning
+   int [verified]. Its sibling maybe_Input_OnKeyUp at 0x00432700 was
+   already named and clears the same two latches this function sets.
+
+   Every key value in the switch decodes as a Windows virtual-key code,
+   which is the independent check that wParam is what it looks like.
+
+   It runs in three stages [verified]:
+
+       1  If the menu is up, delegate to Menu_OnKey and return.
+       2  Otherwise search g_actionBindings for the key. A hit gives
+          an action index 0..6 - the seven actions of section 2 -
+          and sets that action's bit in the player input word.
+       3  Then a 33-case switch of hotkeys, live during play.
+
+   Stage 2 is the join to the rest of this note: the linear scan of
+   g_actionBindings terminating at &DAT_0053eb18 is a second
+   confirmation that the table holds exactly seven records, since
+   0x0053eb18 minus 0x0053eae0 is 0x38 and the record is 8 bytes
+   [verified].
+
+6.1.  The hotkeys
+
+   These are the cases whose effect is legible from this function alone
+   [verified]:
+
+   +-----------+-----------+----------+-------------------------------------------+
+   | Key       | VK        | Modifier | Effect                                    |
+   +===========+===========+==========+===========================================+
+   | SHIFT     | 0x10      | -        | g_shiftDown = 1                           |
+   +-----------+-----------+----------+-------------------------------------------+
+   | CTRL      | 0x11      | -        | g_ctrlDown = 1                            |
+   +-----------+-----------+----------+-------------------------------------------+
+   | PAUSE / P | 0x13 0x50 | -        | pause toggle                              |
+   +-----------+-----------+----------+-------------------------------------------+
+   | ESC       | 0x1b      | -        | back out, or quit                         |
+   +-----------+-----------+----------+-------------------------------------------+
+   | D         | 0x44      | CTRL     | dither toggle, prints Dither : %s         |
+   +-----------+-----------+----------+-------------------------------------------+
+   | F         | 0x46      | CTRL     | small fonts toggle                        |
+   +-----------+-----------+----------+-------------------------------------------+
+   | H         | 0x48      | CTRL     | antialias cycle, prints AntiAlias %s      |
+   +-----------+-----------+----------+-------------------------------------------+
+   | J         | 0x4a      | CTRL     | select joystick, re-inits it              |
+   +-----------+-----------+----------+-------------------------------------------+
+   | K         | 0x4b      | CTRL     | select keyboard                           |
+   +-----------+-----------+----------+-------------------------------------------+
+   | L         | 0x4c      | CTRL     | texture filter toggle, prints Filter : %s |
+   +-----------+-----------+----------+-------------------------------------------+
+   | U         | 0x55      | CTRL     | speed unit toggle                         |
+   +-----------+-----------+----------+-------------------------------------------+
+   | keypad +  | 0x6b      | -        | detail level up, stops at 4               |
+   +-----------+-----------+----------+-------------------------------------------+
+   | keypad -  | 0x6d      | -        | detail level down, stops at 0             |
+   +-----------+-----------+----------+-------------------------------------------+
+   | F2        | 0x71      | -        | RESOLUTION DOWN                           |
+   +-----------+-----------+----------+-------------------------------------------+
+   | F3        | 0x72      | -        | RESOLUTION UP                             |
+   +-----------+-----------+----------+-------------------------------------------+
+   | F4        | 0x73      | -        | widescreen 16:9 toggle                    |
+   +-----------+-----------+----------+-------------------------------------------+
+   | F7        | 0x76      | in race  | lap counter cycle                         |
+   +-----------+-----------+----------+-------------------------------------------+
+   | F8        | 0x77      | in race  | display signal toggle                     |
+   +-----------+-----------+----------+-------------------------------------------+
+   | F9        | 0x78      | in race  | map mode, cycles 0 to 4                   |
+   +-----------+-----------+----------+-------------------------------------------+
+
+   The modifier column is not decoration. Most of the video toggles are
+   guarded by g_ctrlDown, so they are CTRL+key rather than bare letters
+   - which is what keeps them from colliding with the driving bindings
+   that stage 2 has already matched against. The resolution keys are the
+   exception: F2 and F3 carry no modifier guard at all.
+
+   Several cases are guarded instead by DAT_004e8944, which is non-zero
+   only during a race [inferred from its position in the guards, not
+   read directly].
+
+   Eleven further cases have not been read: INSERT, A, G, S, T, V,
+   keypad * and /, F1, F10, F11 and F12. Two of them are worth noting
+   now - G (0x47) and F10 (0x79) fall straight to the common return and
+   do nothing at all. They are live cases with empty bodies, so
+   something was removed [verified].
+
+   THE THREE CAMERA KEYS ARE READ, and they are three separate
+   mechanisms rather than one view control - camera.txt 1.13:
+
+   +-----+-------------------+----------------------------------------+
+   | Key | Advertised as     | What it writes                         |
+   +=====+===================+========================================+
+   | TAB | REAR VIEW         | camera+0x3c = pi and camera+0x21c = 1, |
+   |     |                   | HELD - maybe_Input_OnKeyUp clears both |
+   +-----+-------------------+----------------------------------------+
+   | F5  | CHANGE VIEW       | camera+0x220 = (n + 1) & 3 at          |
+   |     |                   | 0x00432096 - four chase DISTANCES      |
+   +-----+-------------------+----------------------------------------+
+   | SF5 | TRACK NEXT BIKE   | advances g_viewedRacerIndex past every |
+   |     |                   | inactive slot, only once the local     |
+   |     |                   | racer's state is 2 or 3                |
+   +-----+-------------------+----------------------------------------+
+   | F6  | 1RST PERSON VIEW  | g_bFirstPersonKey (0x004dc00c) = 1 -   |
+   |     |                   | itself at 0x004320d8; Camera_SelectView|
+   |     |                   | turns that into camera MODE 6 unless   |
+   |     |                   | the viewed racer is crashed            |
+   +-----+-------------------+----------------------------------------+
+
+   All four end in maybe_Camera_SignalCut (0x0046d750), and all but
+   TAB are gated on DAT_004e8944.
+
+   The set overlaps the command-line flag documentation at 0x004dc664 -
+   dither, filter, antialias, detail, resolution - which suggests the
+   hotkeys and the flags were two front ends on the same development
+   switches [inferred].
+
+6.2.  HELP.GEN - what the game ADVERTISES
+
+   The F1 help screen is not built from strings in the image. It is
+   read from HELP.GEN, a plain-text markup file - 1988 bytes in
+   MENUUS.BKF, with a French copy expected in MENU.BKF. So the whole
+   advertised control scheme can be read without running the game,
+   which matters because at 16 bpp the screen itself is illegible.
+
+   A record looks like
+
+       {[SF5][W50][FKeyboardHelp]][W-1][FHelp]\(CHANGE VIEW\)}
+
+   where [Skey] is the key, the ] is a glyph index into the
+   KeyboardHelp font - HIRES/KEYBHELP.FNT, which is why the keycaps
+   draw as symbols - and the text between \( and \) is the label.
+   S prefixes SHIFT, C prefixes CTRL.
+
+   +-------+---------------------------+-------+----------------------+
+   | Key   | Advertised as             | Key   | Advertised as        |
+   +=======+===========================+=======+======================+
+   | F1    | THIS HELP                 | CV    | VOICES ON/OFF        |
+   | SF1   | ON SCREEN INFO            | CS    | SOUND FX ON/OFF      |
+   | F2    | LOWER SCREEN RESOLUTION   | CA    | AUDIO TRACK ON/OFF   |
+   | F3    | UPPER SCREEN RESOLUTION   | CJ    | JOYSTICK/JOYPAD MODE |
+   | F4    | 16/9 SCREEN MODE ON/OFF   | CK    | KEYBOARD MODE        |
+   | F5    | CHANGE VIEW               | CF    | FONT SIZE            |
+   | SF5   | LINK : TRACK NEXT BIKE    | CP    | PAUSE THE GAME       |
+   | F6    | 1RST PERSON VIEW          | CU    | KMH/MPH              |
+   | F7    | COUNTER TYPE              | /     | MASTER VOLUME DOWN   |
+   | F8    | SIGNALS ON/OFF            | *     | MASTER VOLUME UP     |
+   | F9    | MAP TYPE                  | S/    | WAVE VOLUME DOWN     |
+   | F11   | ON SCREEN SOUND MENU      | S*    | WAVE VOLUME UP       |
+   | F12   | ON SCREEN DISPLAY MENU    | C/    | CD VOLUME DOWN       |
+   | ESC   | ABORT THE GAME            | C*    | CD VOLUME UP         |
+   | TAB   | REAR VIEW                 |       |                      |
+   +-------+---------------------------+-------+----------------------+
+
+   o IT CLOSES TEN OF THE FOURTEEN unread cases section 6.1 lists.
+     TAB, F1, F5, F6, F11, F12, keypad * and /, and the CTRL forms of
+     A, S and V all have a stated purpose now. INSERT, G, T and F10
+     remain unexplained - and G and F10 were already noted as falling
+     straight through.
+
+   o AND THE HANDLER DOES THINGS THE HELP DOES NOT ADMIT TO. CTRL+D
+     dither, CTRL+H antialias, CTRL+L texture filter and keypad +/-
+     detail level are all in the key-down handler and appear nowhere
+     in HELP.GEN. Undocumented, and useful: they are the video
+     toggles a port wants to reach.
+
+   o F1 IS HELP, NOT PAUSE. Pause is CTRL+P. A session that pressed
+     F1 expecting to freeze the game got a MODAL HELP OVERLAY
+     instead, which looks identical from outside - the game stops
+     responding and the screen stops moving. Every memory probe taken
+     that way was read with the help screen up rather than with the
+     game paused.
+
+
+6.3.  The port's own keys
+
+   Harness keys, none of which exist in the original - so they are
+   chosen from what retail leaves free rather than matched to it.
+   The full set is in main.cpp's WM_KEYDOWN; the two that change
+   what the frame LOOKS like are worth stating here:
+
+   +------+--------------------------------------------------------+
+   | F    | borderless fullscreen, on and off                      |
+   +------+--------------------------------------------------------+
+   | F4   | 16:9, on and off - the key retail uses, 0x00431fd2     |
+   +------+--------------------------------------------------------+
+   | F6   | texture filter, on and off - CTRL+L in retail          |
+   +------+--------------------------------------------------------+
+
+   16:9 IS A STORED SETTING - Mode_169 - and F4 flips it directly,
+   so it is saved with the rest on exit.  The key and the options
+   page are two ways to the same switch, which is what the original
+   does: Menu_ToggleWidescreen (0x0043a370) and the inline F4 case
+   at 0x00431fd2 take the same two steps.
+
+   FULLSCREEN HAS NO SETTING AT ALL, so there is nothing to write -
+   but the WINDOW POSITION is saved on exit, and that needs care.
+   Borderless fullscreen is the window's NORMAL state as far as
+   Windows is concerned, unlike maximised, which rcNormalPosition
+   sees through.  Quitting while fullscreen would therefore pin the
+   window to the whole screen for ever, so main.cpp saves the rect
+   the window had BEFORE going fullscreen.
+
+   SMALLFONTS HAS NO KEY HERE AND RETAIL'S IS CTRL+F.  The setting
+   is stored and defaults to 1 on both sides - config-file.txt 4.1 -
+   but nothing in the port flips it at run time, so the ini is the
+   only way to change it.
+
+   THE COST OF ADDING THE KEY IS NOT THE KEY.  The twin id resolves
+   at OPEN time, so an already-built MR_Font keeps the face it was
+   built from and every open font has to be reopened - which is why
+   the original's setter (0x004866d0) rebuilds both in-race menus,
+   every live widget list and the font banks.  Ours is most of the
+   way there: six of hud.c's seven font loaders already cache the
+   smallFonts value they were built with and reopen on a change,
+   hud_counter_font_load being the pattern.  hud_font_load and
+   menu.c's four loaders do not, so the work is converting those
+   five, not writing the key.
+
+   THE FULLSCREEN IS A WINDOW, NOT A DISPLAY MODE.  Nothing calls
+   ChangeDisplaySettings and nothing goes exclusive, so the desktop
+   resolution never changes and the other windows on it are left
+   alone.  It is not topmost either - HWND_TOP keeps it an ordinary
+   window, so alt-tab and the console behave.
+
+7.  Also found
+
+   Input_BuildKeyScanTable (0x0043e0f0) builds a byte array at
+   g_keyScanTable from the seven action keys passed through toupper,
+   then appends F1 to F8 (0x70 to 0x77) and TAB (9). That is the set of
+   keys the game watches, so it is the natural place to look when
+   tracing how a keypress reaches an action.
+
+8.  Open questions
+
+   o RESOLVED. The four sprites are resources 204 to 207: jtop.lez,
+     jleft.lez, jright.lez, jbas.lez, now labelled g_sprStickUp,
+     g_sprStickLeft, g_sprStickRight and g_sprStickDown.
+   o Where are string resources 10 to 13 actually used? Nothing
+     references their runtime slots.
+   o g_bindingColumn (0x004e90d0) selects whether the menu formats the
+     key or the button column. Trace what sets it.
+   o Input_SetDefaultBindings opens with two loops that test for -1 and
+     then assign -1, a no-op as decompiled. Check the disassembly before
+     transcribing.
+   o g_cfgInputDevice and g_cfgJoyType select the device; neither is
+     traced to a consumer yet.

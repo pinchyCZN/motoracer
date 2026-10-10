@@ -1,0 +1,202 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                                MR_MENU
+
+
+Abstract
+
+   Size: 0xd4c [verified] - PUSH 0xd4c into operator new at 0x004730d7,
+   immediately before the constructor call and the store to the global.
+
+   Allocated at: 0x004730d7, in FUN_00472c40 (startup). Freed at:
+   0x00473661, in FUN_00473540, which then clears the global. Global
+   pointer: 0x004dc0c4, zero in the image. Ghidra type applied: yes.
+   Belongs to: menu/menu.cpp.
+
+   The one and only menu instance. It holds the current page index, the
+   cursor and keyboard state the pages react to, a fixed array of 32
+   buttons that each page rebuilds on entry, and the timing for the 1200
+   ms page transition. Every one of the 68 page handlers in
+   subsystems/menu-pages.txt reaches it through the global.
+
+Table of Contents
+
+   1. Fields
+   2. Relationships
+   3. Accessors
+   4. What bounds the layout
+   5. Open questions
+
+1.  Fields
+
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | Offset | Size  | Type              | Name               | Confidence | Evidence                               |
+   +========+=======+===================+====================+============+========================================+
+   | 0x000  | 4     | int               | active             | verified   | gate in FUN_00415960; 0 = menus not    |
+   |        |       |                   |                    |            | running                                |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x004  | 4     | int               | hitTestDirty       | verified   | Menu_HitTest returns the cached        |
+   |        |       |                   |                    |            | hoverIndex when 0                      |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x008  | 4     | int               | prevInputMask      | verified   | Menu_Tick copies DAT_005083b8 here at  |
+   |        |       |                   |                    |            | the end of every frame                 |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x00c  | 4     | int               | pendingKey         | verified   | set by Menu_OnKey, switched on,        |
+   |        |       |                   |                    |            | cleared by Menu_ClearActivated         |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x010  | 4     | int               | hoverIndex         | verified   | written by Menu_HitTest; -1 when       |
+   |        |       |                   |                    |            | nothing is under the cursor            |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x014  | 4     | int               | prevHoverIndex     | verified   | Menu_UpdateHover plays sound 0x29 when |
+   |        |       |                   |                    |            | it differs from hoverIndex             |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x018  | 4     | int               | activatedIndex     | verified   | returned by Menu_GetActivated; -1 by   |
+   |        |       |                   |                    |            | Menu_ClearActivated                    |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x01c  | 4     | uint              | transitionStart    | verified   | timeGetTime at the start;              |
+   |        |       |                   |                    |            | Menu_UpdateTransition subtracts it     |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x020  | 4     | uint              | transitionEnd      | verified   | Menu_Tick sets it to transitionStart + |
+   |        |       |                   |                    |            | 0x4b0, ie 1200 ms                      |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x024  | 4     | uint              | lastInputTime      | verified   | Menu_Tick compares now - this > 30000  |
+   |        |       |                   |                    |            | to start the attract demo              |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x028  | 4     | int               | field_28           | unknown    | Menu_Tick clears it on page entry; no  |
+   |        |       |                   |                    |            | reader found                           |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x02c  | 4     | float             | transitionProgress | verified   | (now - transitionStart) *              |
+   |        |       |                   |                    |            | DAT_004d02b4, in Menu_UpdateTransition |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x030  | 4     | int               | needsRedraw        | verified   | Menu_Draw does nothing at all unless th|
+   |        |       |                   |                    |            | 17 examined; see below                 |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x034  | 4     | int               | forceRedraw        | verified   | Menu_UpdateHover folds it into         |
+   |        |       |                   |                    |            | non-zero                               |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x038  | 4     | ?                 | -                  | unknown    | NEVER accessed anywhere in game code   |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x03c  | 4     | int               | pageIndex          | verified   | index into g_menuPageTable; see        |
+   |        |       |                   |                    |            | subsystems/menu-pages.txt              |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x040  | 4     | int               | buttonCount        | verified   | MAX_BUTTON assert fires when it        |
+   |        |       |                   |                    |            | exceeds 0x1f                           |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0x044  | 0xb00 | MR_MenuButton[32] | buttons            | verified   | stride 0x58 from both Add functions;   |
+   |        |       |                   |                    |            | 32 from the constructor loop           |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0xb44  | 4     | int               | field_b44          | unknown    | Menu_Tick clears it on page entry; no  |
+   |        |       |                   |                    |            | reader found                           |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0xb48  | 0x200 | byte[512]         | -                  | unknown    | no constant-displacement access        |
+   |        |       |                   |                    |            | anywhere in game code                  |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+   | 0xd48  | 4     | int               | transitionActive   | verified   | set by Menu_Tick on entry, cleared by  |
+   |        |       |                   |                    |            | Menu_UpdateTransition                  |
+   +--------+-------+-------------------+--------------------+------------+----------------------------------------+
+
+   needsRedraw is the gate on the whole draw pass: Menu_Draw wraps its
+   entire per-button loop in a test of it, so when it is clear the menu
+   simply is not repainted. Four methods set it and Menu_Draw is the
+   only reader.
+
+2.  Relationships
+
+   o Pointed to by: the global at 0x004dc0c4, and nothing else. There is
+     exactly one instance.
+   o Contains: MR_MenuButton[32] inline at +0x44. See
+     structs/MR_MenuButton.txt.
+   o Indexes: g_menuPageTable at 0x004dbb38 through pageIndex. See
+     subsystems/menu-pages.txt.
+   o Does NOT own the menu sprites. Those live in g_menuObjects at
+     0x00504880, indexed by resource id. See subsystems/menu-
+     resources.txt.
+
+3.  Accessors
+
+   The seventeen methods called with this object in ECX. Everything
+   else, including all 68 page handlers, goes through these.
+
+   +------------+-----------------------------+------------------------------------+
+   | Address    | Name                        | Touches                            |
+   +============+=============================+====================================+
+   | 0x004098e0 | Menu_Ctor                   | +0x00, 04, 30, 34, 3c, 40, d48     |
+   +------------+-----------------------------+------------------------------------+
+   | 0x00409990 | Menu_Dtor                   | +0x00                              |
+   +------------+-----------------------------+------------------------------------+
+   | 0x004099a0 | Menu_UpdateHover            | +0x00, 0c, 10, 14, 30, 34, d48     |
+   +------------+-----------------------------+------------------------------------+
+   | 0x00409a30 | maybe_Menu_StartAttractDemo | +0x04, 10, 3c                      |
+   +------------+-----------------------------+------------------------------------+
+   | 0x00409bf0 | Menu_RequestRedraw          | +0x30, 34                          |
+   +------------+-----------------------------+------------------------------------+
+   | 0x00409c00 | Menu_Tick                   | +0x04..0x28, 3c, 40, b44, d48      |
+   +------------+-----------------------------+------------------------------------+
+   | 0x00409eb0 | Menu_GotoPage               | +0x04, 10, 3c                      |
+   +------------+-----------------------------+------------------------------------+
+   | 0x00409f70 | Menu_SetPage                | +0x00, 04, 08, 0c, 10, 14, 18, 3c  |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040a0f0 | Menu_OnKey                  | +0x04, 0c, 10, 18, 24, 40, buttons |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040bd40 | Menu_ClearButtons           | +0x30, 40                          |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040bd60 | Menu_AddTextButton          | +0x40, buttons                     |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040bef0 | Menu_AddSpriteButton        | +0x40, buttons                     |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040c0c0 | Menu_HitTest                | +0x04, 10, 40, buttons             |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040c1b0 | Menu_GetActivated           | +0x18, d48                         |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040c1e0 | Menu_ClearActivated         | +0x0c, 18                          |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040c1f0 | Menu_Draw                   | +0x10, 30, 40, buttons             |
+   +------------+-----------------------------+------------------------------------+
+   | 0x0040c500 | Menu_UpdateTransition       | +0x1c, 20, 2c, d48                 |
+   +------------+-----------------------------+------------------------------------+
+
+4.  What bounds the layout
+
+   Three independent facts pin the structure, which is why the size can
+   be called verified rather than reconstructed [verified]:
+
+   o The allocation is a literal 0xd4c.
+   o The button stride is 0x58, appearing identically in
+     Menu_AddTextButton and Menu_AddSpriteButton, and the count is 32
+     from both the MAX_BUTTON assert and the constructor's 32-iteration
+     loop. 0x44 + 32 * 0x58 = 0xb44.
+   o Menu_Tick writes field_b44 and transitionActive at exactly 0xb44
+     and 0xd48, the first slot after the array and the last slot before
+     the end of the allocation. They agree with the arithmetic without
+     being derived from it.
+
+   A census of all seventeen methods found 34 distinct field offsets and
+   no access that falls outside the layout above, so the structure is
+   complete in the sense that nothing observed contradicts it.
+
+5.  Open questions
+
+   o The 512 bytes at 0xb48 are the largest gap. A scan of all 198860
+     game-code instructions found no constant displacement in
+     0xb48..0xd47 on any register. The three candidates that first
+     appeared were false positives: 0xbb8 is the immediate value 3000
+     stored to unrelated globals, and 0xc6c and 0xc84 belong to a
+     different object in FUN_00405bc0. So the region is either dead
+     space or is reached through a pointer computed elsewhere.
+
+   o field_38 is never touched at all. Together with the 512-byte gap
+     that is 516 of 3404 bytes, about 15 percent, with no observed use.
+
+   o field_28 and field_b44 are both cleared by Menu_Tick on page entry
+     and never read by any of the seventeen methods. Their readers, if
+     any, are elsewhere.
+
+   o field_28 and field_b44 remain the only header fields that are
+     written and never read. Both are cleared by Menu_Tick on page
+     entry.
+
+   o ANSWERED. Menu_OnKey's eleven switch cases and the nine constant
+     keyCode values buttons register are all Windows virtual-key codes,
+     now the MR_MenuKey enum. See structs/MR_MenuButton.txt sections 3
+     and 4.

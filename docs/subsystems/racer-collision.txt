@@ -1,0 +1,520 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                   RACER AGAINST RACER COLLISION
+
+
+Abstract
+
+   Bikes push each other, and sometimes knock each other off.  It is
+   one function, maybe_Game_CollideRacers (0x0047ecd0), 4794 bytes,
+   run once a frame from the game object's vtable slot +0x18 - not
+   from the per-racer tick, which is why nothing in the racer path
+   leads to it.
+
+   IMPORTED, whole, as race_collide_racers in src/race.c together
+   with its three helpers.  It concerns more than one racer, which is
+   what puts it in race.c rather than racer.c.
+
+Table of Contents
+
+   1. Where it sits
+   2. The three gates
+   3. The response
+   4. Which outcome
+      4.1. The speed each racer is left with
+      4.2. hard is NOT coin-flipped
+      4.3. Who actually falls off
+      4.4. What it does NOT look at
+   5. The helpers
+   6. What the port has
+      6.1. Divergences in the import
+   7. Testing it
+      7.1. How to set one up so the numbers mean something
+      7.2. The result
+      7.3. The pipeline is complete
+   8. Open questions
+
+1.  Where it sits
+
+   The game class vtable is nine entries at 0x004d04c8, installed by
+   Game_StaticCtor [verified]:
+
+   +--------+------------+------------------------------+
+   | Slot   | Address    | What                         |
+   +========+============+==============================+
+   | +0x08  | 0x0047bf70 | maybe_Game_InitRace          |
+   +--------+------------+------------------------------+
+   | +0x14  | 0x0047d660 | maybe_Game_Tick              |
+   +--------+------------+------------------------------+
+   | +0x18  | 0x0047ecd0 | maybe_Game_CollideRacers     |
+   +--------+------------+------------------------------+
+   | +0x20  | 0x0047ff90 | maybe_Game_RenderFrame       |
+   +--------+------------+------------------------------+
+
+   Its one argument is the frame's time step: speeds inside are
+   computed as distance / arg.
+
+   THE CALL SITE IS NOT FOUND.  Tick and RenderFrame are both called
+   through the same vtable from a loop that has not been read, and
+   collision between them is the only order that makes sense - the
+   positions it corrects are the ones the tick just wrote and the ones
+   the draw is about to use.  [inferred]
+
+   *** IT DOES NOTHING IN PRACTICE MODE. *** The entire body is under
+
+       if (g_nSelectedMode != 0)
+
+   so bikes pass through each other in mode 0 and collide in a single
+   race and a championship.  That is the original's behaviour, and it
+   is the first thing to check when a test appears to show no
+   collision at all.
+
+2.  The three gates
+
+   A double loop over racers 1 .. g_racerCount-1 with a 25x25
+   already-paired bitmap on the stack, so each pair is tested at most
+   once a frame.  Then, cheapest first [verified]:
+
+   +-----+------------------------------------------------------------+
+   | #   | Gate                                                       |
+   +=====+============================================================+
+   | 1   | both racers active (+0x68)                                 |
+   +-----+------------------------------------------------------------+
+   | 2   | FOUR SEGMENTS apart at most, a forward distance            |
+   |     | that wraps - FUN_0046c9f0 on the segmentStarts             |
+   +-----+------------------------------------------------------------+
+   | 3   | a SWEPT SPHERE test, radius 48 each, prev to               |
+   |     | current, contact time in 0.05 .. 1.0                       |
+   +-----+------------------------------------------------------------+
+
+   So the contact diameter is 96 units and the test is swept, not
+   instantaneous - two bikes closing fast cannot tunnel through each
+   other inside one step.
+
+3.  The response
+
+   For each racer, its travel this step gives a SPEED and a unit
+   DIRECTION:
+
+       d     = position - positionPrev
+       speed = |d| / dt * 0.78125
+       n     = d / |d|,  or d unchanged when |d| is zero
+
+   The pair is then ordered so the FASTER one is first, and both are
+   moved:
+
+       position = (position - positionPrev) * t + positionPrev - n
+
+   which rewinds each to where it was at the contact time and pushes
+   it one unit out along its own direction.  positionPrev is NOT
+   touched.  Both racers then have their two wheel contact points
+   rebuilt from the orientation - the same arithmetic
+   maybe_Racer_PlaceWheels uses, inlined here because PlaceWheels also
+   rewrites the position history.
+
+   Both get flImpactBlend (+0x31d1) set to 200.0, and both run
+   FUN_00466220, which clears stuntOrOverspeed and - for a human
+   player in a solo game - stuntHeld.
+
+   Finally both run maybe_Racer_UpdateLean.
+
+4.  Which outcome
+
+   One of four bits is ORed into each racer's riderStateBits
+   (+0x2dac), and two of the four also call maybe_Racer_BeginCrash:
+
+   +------+-----------+---------------------------------------------+
+   | Bit  | Crash?    | When                                        |
+   +======+===========+=============================================+
+   | 0x04 | no        | same direction, a shove                     |
+   +------+-----------+---------------------------------------------+
+   | 0x08 | yes       | same direction, hard enough                 |
+   +------+-----------+---------------------------------------------+
+   | 0x10 | no        | head on, soft                               |
+   +------+-----------+---------------------------------------------+
+   | 0x20 | yes       | head on, hard                               |
+   +------+-----------+---------------------------------------------+
+
+   HEAD ON IS dot(nFast, nSlow) < 0 - the two travel directions, not
+   the contact normal.
+
+   CRASH is decided from the speed DIFFERENCE:
+
+       |dv| > 25                                       or
+       |dv| > 12.5 and either rider leans past 0.698132 (40 deg) or
+       either rider is in a wheelie (wheelieAngle != 0)
+
+   and is FORCED when either racer is airborne and either is a human
+   player - landing on somebody is always a crash.
+
+   *** AND THEN A COIN FLIP KILLS IT THREE TIMES IN FOUR. ***
+
+       if (Game_RandNext(0x2b) & 3) crash = 0;
+
+   A qualifying impact only actually crashes a quarter of the time;
+   the other three are demoted to a shove.  A test that produces one
+   hit and sees no crash has proved nothing.
+
+4.2.  hard is NOT coin-flipped, and that is the important asymmetry
+
+   The flip touches `crash` and nothing else.  `hard` is computed
+   before it and survives, and `hard` is what the HEAD-ON branch
+   reads.  So [verified]:
+
+   +----------------+------------------+--------------------------+
+   | Direction      | Decided by       | Random?                  |
+   +================+==================+==========================+
+   | same           | crash            | YES, one impact in four  |
+   +----------------+------------------+--------------------------+
+   | head on        | hard             | NO, deterministic        |
+   +----------------+------------------+--------------------------+
+
+   hard is (spFast > 22.222 || spSlow > 22.222 || either wheelie),
+   forced when either is airborne and either is human.  So a HEAD-ON
+   WITH EITHER BIKE OVER 80 km/h ALWAYS PUTS BOTH RIDERS DOWN.  That
+   is the knock-down-from-speed case and there is no luck in it.
+
+4.3.  Who actually falls off
+
+   The two halves do not test the same thing, so a crash is not
+   symmetric [verified]:
+
+   +----------------+--------+------------------------------------+
+   | Direction      | Rider  | Falls off when                     |
+   +================+========+====================================+
+   | same           | faster | crash                              |
+   +----------------+--------+------------------------------------+
+   | same           | slower | crash, BUT ONLY IF IT IS AN AI -   |
+   |                |        | the human branch has no crash test |
+   |                |        | at all and always takes bit 4      |
+   +----------------+--------+------------------------------------+
+   | head on        | both   | hard                               |
+   +----------------+--------+------------------------------------+
+
+   THE PLAYER CANNOT BE KNOCKED OFF BY BEING REAR-ENDED.  Run into
+   the back of somebody and you can go down; be run into from behind
+   and you are only shoved.  An AI in the same position can fall.
+
+4.4.  What it does NOT look at
+
+   THE BIKE'S HEADING IS NEVER READ.  matOrientation plays no part in
+   any of the decisions - only the TRAVEL direction, which is the
+   per-frame displacement normalised.
+
+   So a T-BONE IS NOT A HEAD-ON.  headOn is dot(nFast, nSlow) < 0,
+   and two bikes crossing at right angles give a dot near zero, which
+   fails that test - a square side impact takes the SAME-DIRECTION
+   path and is therefore coin-flipped like any other.  Only genuinely
+   opposed travel gets the deterministic branch.
+
+   It does read LEAN (+0x2e1d) and wheelieAngle (+0x307d), so how far
+   the bike is banked over does matter even though which way it
+   points does not.
+
+4.1.  The speed each racer is left with
+
+   The two halves of the pair are NOT treated symmetrically, and each
+   half has a human branch and an AI branch.  In every case the speed
+   a racer keeps is derived from the OTHER one's:
+
+   +--------+--------+----------------------------------------------+
+   | Racer  | Rider  | Same direction          | Head on            |
+   +========+========+=========================+====================+
+   | faster | human  | slower * 0.95           | 0, and collideDir  |
+   |        |        |                         | = nSlow, push 5.56 |
+   +--------+--------+-------------------------+--------------------+
+   | faster | AI     | slower * 0.9            | 5.5556, moveDir    |
+   |        |        |                         | = nSlow            |
+   +--------+--------+-------------------------+--------------------+
+   | slower | human  | collideDir = nFast, its | a combined         |
+   |        |        | push speed from |n|*1.1 | direction, see     |
+   |        |        | minus its own speed     | below              |
+   +--------+--------+-------------------------+--------------------+
+   | slower | AI     | a combined direction    | speed = fast -     |
+   |        |        | and speed * 1.1         | slow               |
+   +--------+--------+-------------------------+--------------------+
+
+   THE SLOWER RACER GETS A COMBINED DIRECTION in three of the four
+   cells:
+
+       v = nFast * speedFast + nSlow * speedSlow
+
+   normalised, with its length carried as the push magnitude.  That is
+   the momentum of the pair pointed at the one that was hit.
+
+   Both crash branches clamp a speed over 22.222221 (80 km/h) down to
+   it before calling BeginCrash, and the slower racer's push speed is
+   floored at 5.5555553 (20 km/h).
+
+   THE HUMAN AND AI BRANCHES DIFFER IN WHERE THE SPEED LANDS.  The
+   human path writes speed and then runs Racer_SetLongSpeed,
+   Gearbox_SyncRoadSpeed and maybe_Gearbox_SpeedToEngine to resync the
+   drivetrain; the AI path writes speed, engineSpeed and aiRoadSpeed
+   directly.
+
+5.  The helpers
+
+   FUN_00411f00, SWEPT SPHERE AGAINST SWEPT SPHERE.  A textbook
+   quadratic; the constants at 0x004d0390 and 0x004d0394 are its 2 and
+   its 4 [verified]:
+
+       d = (a1 - a0) - (b1 - b0)
+       p = a0 - b0
+       a = |d|^2                 |a| < 1e-05 -> no relative motion
+       b = 2 * dot(d, p)
+       c = |p|^2 - (rA + rB)^2
+
+   Both roots must be non-negative - spelled as an unsigned compare of
+   the float bits against 0x80000001 - and the SMALLER is returned.
+   It does NOT test t <= 1; the caller does, with the same float-bits
+   idiom against 0x3f800001.
+
+   FUN_0046c9f0, the forward segment distance, three lines.
+
+   FUN_00466220, two flag clears.
+
+6.  What the port has
+
+   Almost everything except the function itself.  MR_Racer carries
+   every field it writes, and most are already named:
+
+   +----------+--------------------+---------------------------------+
+   | Offset   | Port name          | Role here                       |
+   +==========+====================+=================================+
+   | +0x0004  | soloMode           | with humanPlayer, picks branch  |
+   +----------+--------------------+---------------------------------+
+   | +0x0008  | humanPlayer        | human or AI response            |
+   +----------+--------------------+---------------------------------+
+   | +0x0030  | position           | rewound and pushed              |
+   +----------+--------------------+---------------------------------+
+   | +0x003c  | positionPrev       | the sweep's start, left alone   |
+   +----------+--------------------+---------------------------------+
+   | +0x0068  | active             | gate 1                          |
+   +----------+--------------------+---------------------------------+
+   | +0x00bc  | matOrientation     | rebuilds the wheel contacts     |
+   +----------+--------------------+---------------------------------+
+   | +0x0124  | speed              | rewritten from the other's      |
+   +----------+--------------------+---------------------------------+
+   | +0x0174  | unk_0174           | THE PUSH DIRECTION              |
+   +----------+--------------------+---------------------------------+
+   | +0x0180  | f_0180             | THE PUSH MAGNITUDE              |
+   +----------+--------------------+---------------------------------+
+   | +0x018c  | moveDir            | written on the AI head-on path  |
+   +----------+--------------------+---------------------------------+
+   | +0x01a4  | aiRoadSpeed        | AI branch only                  |
+   +----------+--------------------+---------------------------------+
+   | +0x2dac  | riderStateBits     | the four outcome bits           |
+   +----------+--------------------+---------------------------------+
+   | +0x2e1d  | lean               | the 40-degree crash test        |
+   +----------+--------------------+---------------------------------+
+   | +0x2e85  | stuntOrOverspeed   | cleared                         |
+   +----------+--------------------+---------------------------------+
+   | +0x307d  | wheelieAngle       | crash test                      |
+   +----------+--------------------+---------------------------------+
+   | +0x31c1  | segmentStart       | gate 2                          |
+   +----------+--------------------+---------------------------------+
+   | +0x31d1  | flImpactBlend      | set to 200                      |
+   +----------+--------------------+---------------------------------+
+   | +0x31f9  | stuntHeld          | cleared for a human in solo     |
+   +----------+--------------------+---------------------------------+
+
+   *** THE RECEIVING END IS ALREADY WIRED. *** racer.c's integrate
+   step already reads +0x174 as a displacement direction and +0x180 as
+   its magnitude:
+
+       disp[i] += *(float *)(r->unk_0174 + i * 4) * scale
+       scale    = f_0180 * INT_MOVE_SCALE * dt
+
+   so what is missing is only the function that SETS them.  That also
+   settles what unk_0174 is and it should be renamed.
+
+   racer_begin_crash, physics_set_long_speed, physics_sync_road_speed,
+   physics_speed_to_engine and racer_update_lean were all already
+   imported, so the collision needed no new callee.
+
+6.1.  Divergences in the import
+
+   o THE ORDER OF THE TWO HALVES.  The original moves BOTH racers and
+     then runs both outcome blocks; the port does one racer end to end
+     and then the other.
+
+     CHECKED FIELD BY FIELD RATHER THAN ASSERTED.  The two outcome
+     blocks write only their own racer's speed, engineSpeed,
+     aiRoadSpeed, riderStateBits, collideDir, collideSpeed and
+     moveDir, and read only their own plus the four values passed in
+     - nFast, nSlow, spFast, spSlow - which are snapshotted from the
+     positions BEFORE either racer moves.  The separation step writes
+     only its own position, wheel contacts and flImpactBlend.  There
+     is no field one half writes and the other reads, so the two
+     orders cannot produce different numbers.
+
+     Confirmed empirically: with both games on the same bike the
+     impact lands within 0.4 units and 0.07 m/s - see section 7.2 -
+     and the fifteen frames before it are identical to the decimal.
+
+   o THE GEARBOX IS THE PLAYER'S.  racer_begin_crash drops a gearbox
+     to first, and the port has exactly ONE MR_Gearbox because the
+     original keeps the gear on the racer at +0x7c and the separate
+     object has not been retired.  The import first handed that
+     object to EVERY crash, so two opponents touching would have put
+     the player into first gear.  race_gearbox_of passes it only for
+     a human player and NULL otherwise; racer_begin_crash still sets
+     r->gear, which is the field the original writes.
+
+   o rand() FOR Game_RandNext.  Same one-in-four rate, different
+     stream, so WHICH impacts crash differs from the original.
+
+   o THE NETWORK BRANCHES ARE NOT REPRODUCED - the local-player test
+     against the player id at DAT_0050dbdc + 0x400, and FUN_00456bf0.
+     Solo picks its branch on humanPlayer, which is what the original
+     does once g_nSoloMode is set.
+
+   o [DEBUG] collideinpractice=1 lifts the practice-mode gate.  Off by
+     default and it changes nothing when unset; it exists because
+     without it the only way to reach this code is to drive a whole
+     single race.
+
+7.  Testing it
+
+   tools/mr_place.py --pair puts a second bike a fixed distance from
+   the first, both facing the same way, on both games:
+
+       python tools/mr_place.py --to both --at 0 0 2100 --yaw 0 \
+              --speed 0 --pair 2 --side ahead --gap 160
+
+   Three things will make a test look like a failure when it is not:
+   practice mode disables collision entirely, the four-segment gate is
+   FORWARD only, and a qualifying impact crashes one time in four.
+
+7.1.  How to set one up so the numbers mean something
+
+   Three traps, all of them hit before the method below worked.
+
+   DO NOT INJECT A SPEED AND COMPARE TRAJECTORIES.  Writing speed and
+   gearboxRoadSpeed without engineSpeed leaves the drivetrain
+   inconsistent, and it pulls the speed back down within one frame -
+   differently on each side.  Measured with NO obstacle anywhere near:
+   both set to 30, and one step later MOTO read 6.76 and the port
+   5.05, having travelled 57.4 and 42.9 units.  That difference is the
+   setup, not the collision.  Accelerate from rest with identical
+   input instead.
+
+   PIN THE OBSTACLE EVERY STEP.  An AI racer set to speed 0 does not
+   stay there: it drives from aiRoadSpeed and its own target, and one
+   step took it 258 units in MOTO and 469 in the port.  Writing
+   position, positionPrev, speed, gearboxRoadSpeed, engineSpeed and
+   aiRoadSpeed before each step makes it a static wall.
+
+   YOU CANNOT FAKE MOTION BY WRITING positionPrev.  The racer tick
+   runs racer_save_prev_frame first, which overwrites it with the
+   current position - so an obstacle given a backward positionPrev to
+   force a head-on is read as stationary by the time the collision
+   runs, and the hit comes out same-direction.  Producing a real
+   head-on needs a racer genuinely travelling the other way.
+
+   MATCH THE FRAME COUNTS.  MOTO runs TWO frames per SEND_INPUT and
+   the port runs what it is asked, so "SEND_INPUT 1 1" pairs with
+   "SEND_INPUT keys=z frames=2" - confirmed against MOTO 0x004e981c
+   and the port's s_race_ticks, 2 and 2.
+
+7.2.  The result
+
+   Racer 1 accelerated from rest at z 2058 into an obstacle pinned at
+   z 3400, contact therefore due at z 3304:
+
+   +------+---------------------+---------------------+
+   | step | MOTO      z      sp | port      z      sp |
+   +======+=====================+=====================+
+   | 14   |      3284.9   17.82 |      3203.7   21.47 |
+   +------+---------------------+---------------------+
+   | 15   |      3309.6    1.44 |      3310.0    1.51 |
+   +------+---------------------+---------------------+
+
+   THE FIFTEEN FRAMES OF RUN-UP ARE IDENTICAL TO THE DECIMAL, dz
+   +0.0 at every step, and both stop dead on the same step within a
+   frame of the predicted contact.  The impact frame differs by 0.4
+   units and 0.07 m/s.
+
+   AN EARLIER RUN SHOWED 17.82 AGAINST 21.47 ON THE APPROACH and that
+   was not a divergence at all - the two games were on different
+   bikes.  Worth remembering before reading any run as a defect: the
+   bike must be the same selection on both sides.
+
+   riderStateBits reads 0 on both after the impact, because both
+   clear it at the top of the next tick.  It is a one-frame report,
+   so the SPEED COLLAPSE is the evidence, not the bits; crashLatch
+   (+0x30c1) is the evidence for a knock-down.
+
+   A second run with the obstacle further out hit at 23.38 m/s on
+   both sides and neither rider went down, which is what the 25 m/s
+   threshold predicts.  Free acceleration reaches 40 m/s in gear 3
+   with both games agreeing to 0.02 m/s over forty steps, so the
+   over-25 route is reachable in an ordinary race.
+
+   Once a racer is INSIDE the contact distance the sweep stops firing:
+   the first root goes negative and the test rejects it, so both
+   games then drive on through.  Nothing pushes an overlap apart.
+
+7.3.  The pipeline is complete - audited, not assumed
+
+   Every input the crash decision reads is live in the port and every
+   consequence is imported [verified]:
+
+   +-------------------------+-------------------------------------+
+   | Crash decision reads    | Written by                          |
+   +=========================+=====================================+
+   | speed, positions        | the drivetrain                      |
+   +-------------------------+-------------------------------------+
+   | lean +0x2e1d            | racer_ai_lean / racer_lean_response |
+   +-------------------------+-------------------------------------+
+   | wheelieAngle +0x307d    | physics.c, the wheelie state machine|
+   +-------------------------+-------------------------------------+
+   | onGround +0x2db8        | racer_update_ground_contact         |
+   +-------------------------+-------------------------------------+
+   | humanPlayer +0x08       | the roster - reads 1/0 for player   |
+   |                         | and AI on BOTH games, checked live  |
+   +-------------------------+-------------------------------------+
+
+   +-------------------------+-------------------------------------+
+   | Consequence             | Port                                |
+   +=========================+=====================================+
+   | throw the rider off     | racer_begin_crash                   |
+   +-------------------------+-------------------------------------+
+   | play the crash out      | racer_update_crash, called on the   |
+   |                         | player path AND in racer_tick_ai    |
+   +-------------------------+-------------------------------------+
+   | get back up             | racer_reset_crash                   |
+   +-------------------------+-------------------------------------+
+   | player stops driving    | ApplyDrive and ApplySteering gated  |
+   |                         | on !crashLatch                      |
+   +-------------------------+-------------------------------------+
+   | AI stops driving        | racer_ai_follow_line, FIVE          |
+   |                         | crashLatch                          |
+   |                         | gates - the same count as           |
+   |                         | Racer_AiFollowLine                  |
+   +-------------------------+-------------------------------------+
+
+   EVERY CALLER OF maybe_Racer_BeginCrash IS ACCOUNTED FOR.  There are
+   four: this collision, maybe_Racer_UpdateGroundContact (the wall,
+   imported), FUN_00455280 (a network message, not ported) and
+   Race_TickAllRacers - which is inside the TIME ATTACK GHOST branch,
+   replaying a recorded crash onto the ghost racer, and is not a
+   collision path at all.
+
+   Observed end to end: forcing the wheelie route, which makes crash
+   true at any closing speed, put the rider down on 2 of 6 impacts -
+   the one-in-four flip working as read.
+
+8.  Open questions
+
+   o THE CALL SITE of vtable slot +0x18 is not found.
+
+   o Game_RandNext's sequence is not reproduced, so WHICH impacts
+     crash will differ from the original even when the rate does not.
+
+   o FUN_00456bf0, the network collision message, is not read.
+
+   o The local-player test in a network game reads f_2dcc against a
+     player id at DAT_0050dbdc + 0x400; only the solo branch is
+     covered here.

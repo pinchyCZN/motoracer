@@ -1,0 +1,1737 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                           THE FX PARTICLES
+
+
+Abstract
+
+   One pool of 128 records drives every puff of dust in the game:
+   the wheel spray, the crash smoke and the rider's landing. This
+   note is the whole chain - the record, the allocator, the burst
+   helper, the per-frame tick and the draw.
+
+   The port has none of it. racer_fx_gate, racer_fx_in_range and
+   racer_fx_particle_count are written and have no callers; nothing
+   else exists. So a crash produces no smoke and a slide leaves no
+   spray. See port-divergences.txt 2.22.
+
+Table of Contents
+
+   1. The pool
+   2. The record
+   3. Spawning
+      3.1. maybe_Fx_Burst
+      3.2. Where the crash calls it
+   4. The tick
+   5. The draw
+      5.1. It is a detail-level feature
+   6. The texture
+   7. What a port still needs
+   8. Open questions
+   9. The skid ribbons - the other pool, and it is now in the port
+      9.1. The first 4096 bytes are the PRIMITIVES
+      9.2. It is not textured, and the colour is derived
+      9.3. What the port has, and the one thing it does not
+   10. maybe_Racer_EmitWheelFx, imported whole
+      10.1. The constants, read rather than guessed
+      10.2. What runs and what does not
+      10.3. The edge never fired - tickInputWord was never written
+      10.4. The width reads velDir, not moveDir
+         10.4.1. Why the port's marks are thinner - still open
+         10.4.2. BRAKING IS NOT DIVERGENT - a measurement trap
+         10.4.3. The width on a STRAIGHT is denormal noise
+         10.4.4. The brake ramp timer never reset
+         10.4.5. And the drag was being thrown away while braking
+      10.5. A reset does not clear the marks
+
+1.  The pool
+
+   +---------------------------+------------+-------------------------+
+   | Item                      | Address    | Note                    |
+   +===========================+============+=========================+
+   | g_fxParticles             | 0x0052c498 | 128 x 260 bytes         |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_SpawnParticle    | 0x00457620 | find a slot, construct  |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_InitParticle     | 0x004afe90 | the constructor         |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_FreeParticle     | 0x004afe30 | clears the in-use flag  |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_ResetParticlePool| 0x00413dd0 | frees all 128           |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_TickAllParticles | 0x00457590 | walk, tick the live     |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_TickParticle     | 0x004b0730 | one particle, one frame |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_DrawAllParticles | 0x004575c0 | walk, draw the live     |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_DrawParticle     | 0x004b0be0 | queue two quads         |
+   +---------------------------+------------+-------------------------+
+   | maybe_Fx_Burst            | 0x00467c40 | spawn N in a frame      |
+   +---------------------------+------------+-------------------------+
+
+   THE POOL IS A MEMBER OF g_game, at 0x0052c478 + 0x20, and that
+   matters for anyone hunting the readers: the tick and the draw
+   index off the game pointer and never mention 0x0052c498, so a
+   displacement search finds only the three functions that take the
+   base directly. Both were found with a hardware watchpoint on a
+   live slot instead.
+
+   ALLOCATION IS A LINEAR SCAN for the first record whose +0xfc is
+   zero, and a full pool SILENTLY DROPS the request. With 24
+   particles per player frame from the wheel spray the pool does
+   fill - measured, 122 of 128 busy two frames after a crash - so a
+   burst arriving on a full pool is ordinary behaviour rather than
+   an error case.
+
+2.  The record
+
+   260 bytes, and all of it is now accounted for. Offsets are
+   bytes; the constructor and the tick both index in dwords.
+
+   +--------+------+--------------+---------------------------------+
+   | Offset | Size | Field        | Note                            |
+   +========+======+==============+=================================+
+   | +0x000 |   4  | kind         | 5 for smoke and spray; 1..4 is  |
+   |        |      |              | a second family the same tick   |
+   |        |      |              | and draw handle                 |
+   +--------+------+--------------+---------------------------------+
+   | +0x004 |  12  | position     | world                           |
+   +--------+------+--------------+---------------------------------+
+   | +0x010 |  12  | velocity     | the burst's matrix term         |
+   +--------+------+--------------+---------------------------------+
+   | +0x01c |  12  | rotation     | accumulated, zeroed at spawn    |
+   +--------+------+--------------+---------------------------------+
+   | +0x028 |  12  | rotation rate| added to the above each frame   |
+   +--------+------+--------------+---------------------------------+
+   | +0x038 |   4  | life, int    | as spawned, never decremented   |
+   +--------+------+--------------+---------------------------------+
+   | +0x03c |   4  | life, float  | THE COUNTDOWN                   |
+   +--------+------+--------------+---------------------------------+
+   | +0x040 |  64  | MR_Primitive | the front quad                  |
+   +--------+------+--------------+---------------------------------+
+   | +0x080 |  64  | MR_Primitive | the back quad                   |
+   +--------+------+--------------+---------------------------------+
+   | +0x0c0 |  48  | corners      | four xyz, model space, Z = 0    |
+   +--------+------+--------------+---------------------------------+
+   | +0x0f0 |   4  | size         | an INT, not a float             |
+   +--------+------+--------------+---------------------------------+
+   | +0x0fc |   4  | in use       | the allocator's only test       |
+   +--------+------+--------------+---------------------------------+
+
+   THE TWO PRIMITIVES LIVE IN THE RECORD, which is what makes it 260
+   bytes for something that is conceptually a point and a velocity.
+   maybe_Fx_DrawParticle passes +0x40 straight to
+   Screen3D_CullAndQueueFacesEx with a count of 2.
+
+   +0x0f0 IS AN INT AND READS AS 0.0 IF YOU DUMP IT AS A FLOAT. The
+   values are 40 and 80, whose bit patterns are denormals. The
+   corners are built from it as +-2 * size, so a puff is 160 or 320
+   units across.
+
+   THE LIFETIME PAIR IS A COUNTDOWN AND ITS ORIGINAL. Only the float
+   is decremented; the int keeps the spawn value. That settles the
+   question maybe_Fx_InitParticle's plate comment left open.
+
+3.  Spawning
+
+3.1.  maybe_Fx_Burst
+
+       void maybe_Fx_Burst(int count, float x, float y, float z,
+                           int lifeBase, uint lifeMask, float m[12])
+
+   THE MATRIX IS PASSED BY VALUE, and that is why the argument list
+   reads six long at both call sites. Each does SUB ESP,0x30 and
+   fills the 48 bytes with Matrix34_Copy before pushing the scalars.
+
+   Per particle:
+
+       life    = (rand() & lifeMask) + lifeBase
+       pos     = (x, y + _DAT_004d10a0, z)      THE SAME FOR ALL
+       vel     = f3*m.row0 + f2*m.row1 + f1*m.row2 + m.row3
+                 each f is a fresh rand() & 3
+       rotRate = three rand()s sign-extended from 5 bits, times
+                 _DAT_004d1150 - DRAWN ONCE, BEFORE THE LOOP
+       size    = ((rand() & 1) * 5 + 5) * 8     40 or 80
+       colour  = Color_Pack16(4, 4, 4)
+       kind    = 5
+
+   THE THREE COMPONENTS OF THE MATRIX TERM ARE THE VELOCITY, NOT A
+   POSITION OFFSET, and that is worth stating because the shape of
+   the expression invites the other reading. Every particle in a
+   burst starts at the same point and separates because it is
+   thrown differently.
+
+   IT IS THROWN IN THE CALLER'S OWN FRAME. A 0..3 cube along the
+   matrix's rows, so a bike going down sideways throws its smoke
+   sideways rather than along the world axes.
+
+   THE ROTATION RATE IS SHARED BY THE WHOLE BURST. Its three rands
+   are drawn before the loop, so every particle spins the same way
+   and only the throw and the life differ - which is what makes a
+   burst read as one puff coming apart rather than as a firework.
+
+   CONFIRMED AGAINST FIVE LIVE SLOTS. A crash on ile01 with the bike
+   at (1248, 0, 2058) heading +x, matOrientation rows (0,0,-1)
+   (0,1,0) (1,0,0), filled slots 123..127 with rotation rates all
+   exactly (5, 14, 3)/32 and velocities whose x and -z components
+   were the integers 0..3 the formula predicts.
+
+3.2.  Where the crash calls it
+
+   +------------+---------------------------+---------------------------+
+   | Site       | Call                      | When                      |
+   +============+===========================+===========================+
+   | 0x004681b3 | (6, position, 0xf, 0x10,  | the bike goes down        |
+   |            |  matOrientation)          |                           |
+   +------------+---------------------------+---------------------------+
+   | 0x004686f6 | (4, riderPosition, 7, 4,  | the rider lands, and only |
+   |            |  matRiderRoot)            | when crashLaunchDir.y is  |
+   |            |                           | over 0.05                 |
+   +------------+---------------------------+---------------------------+
+
+   So a crash is six particles at the bike with lives 16..31, then
+   four more where the rider hits with lives 4..10. The landing puff
+   is smaller, shorter and gated - a rider already sliding when the
+   crash starts never produces it.
+
+   The wheel spray is the third client, from maybe_Racer_EmitWheelFx
+   at 0x0046790b - 24 particles a frame for the human player, 4 for
+   an AI. See racers.txt 9.12.2.
+
+4.  The tick
+
+   THE CONSTANTS, read out of the running binary. Watch the widths:
+   the two the tick integrates with are DOUBLES whose low dwords read
+   as absurd floats.
+
+   +----------------+-----------+------------------------------------+
+   | Address        | Value     | Use                                |
+   +================+===========+====================================+
+   | 0x004d2070     | -0.0864   | particle gravity, a DOUBLE         |
+   +----------------+-----------+------------------------------------+
+   | 0x004d2078     | 0.8       | horizontal drag per frame, DOUBLE  |
+   +----------------+-----------+------------------------------------+
+   | 0x004d2088     | 1.0       | float, in the billboard frame      |
+   +----------------+-----------+------------------------------------+
+   | 0x004d10a0     | 10.0      | float, the burst's y bias - but    |
+   |                |           | see the open question              |
+   +----------------+-----------+------------------------------------+
+   | 0x004d1150     | 0.03125   | 1/32, the rotation-rate scale, a   |
+   |                |           | DOUBLE                             |
+   +----------------+-----------+------------------------------------+
+
+   maybe_Fx_TickParticle(p, dt), called for every live slot. Kind 5:
+
+       size = (int)p.size                    re-truncated
+       rebuild the four corners from it
+       rebuild BOTH quads, UVs (224,160) (255,160)
+                               (255,191) (224,191)
+       colour Color_Pack16(0x80,0x80,0x80) on both
+
+       vel.y  += dt * _DAT_004d2070          gravity
+       pos.y  += vel.y * dt
+       vel.x  *= _DAT_004d2078               drag, a plain multiply
+       pos.x  += vel.x * dt
+       vel.z  *= _DAT_004d2078
+       pos.z  += vel.z * dt
+       rot    += rotRate
+       life   -= dt
+       if (life < 0) free the slot
+
+   ONLY GRAVITY IS INTEGRATED. X and Z are damped by a per-frame
+   multiply and never accelerated, so a burst drifts with its launch
+   velocity, sinks and stops. There is no ground collision: a
+   particle spawned below the road falls through it and is only ever
+   removed by its life running out.
+
+   THE QUADS ARE REBUILT EVERY FRAME WITH DIFFERENT UVs FROM THE
+   ONES THE CONSTRUCTOR WROTE - (225,0) (255,31) at spawn against
+   (224,160) (255,191) here. The tick runs before the draw, so the
+   spawn UVs are never seen. Both are constants; there is no frame
+   animation, whatever the eight stacked puff frames in Rect A
+   suggest (d3d-textures.txt 5.2.1).
+
+5.  The draw
+
+   maybe_Fx_DrawParticle(p, ?, camera):
+
+       build a billboard frame from the particle's rotation and the
+         camera, translation = position - camera+0x98
+       Matrix34_Multiply(M, frame, camera + 0x68)
+       verts = Screen3D_TransformVertsFlat(M, &corners, 4, 0x1f)
+       Screen3D_CullAndQueueFacesEx(verts, &primitives, 2, 1)
+
+   FOUR VERTICES, TWO FACES - the same quad wound 0,1,2,3 and
+   3,2,1,0, so the billboard is double-sided. A port that relies on
+   backface culling alone loses half of every particle.
+
+   The two arms of the function, kind 1..4 and kind 5, are the same
+   work; the compiler duplicated the block rather than sharing it.
+
+5.1.  It is a detail-level feature
+
+   +------------------+-----------------------------------------+
+   | g_cfgDetailLevel | Effect                                  |
+   +==================+=========================================+
+   | 0, 1             | nothing is drawn at all                 |
+   +------------------+-----------------------------------------+
+   | 2                | DAT_004f258c counts to 8 - one call in  |
+   |                  | eight draws                             |
+   +------------------+-----------------------------------------+
+   | 3 and up         | every call draws                        |
+   +------------------+-----------------------------------------+
+
+   THE COUNTER IS GLOBAL, NOT PER PARTICLE. At detail 2 it is every
+   eighth particle across the whole pool, not every eighth frame of
+   one, so the effect thins the spray evenly rather than making
+   individual puffs flicker.
+
+6.  The texture
+
+   Both quads take texId 0x44 through maybe_Prim_InitQuad, and the
+   UVs the tick writes are a 32 x 32 texel patch at u 224..255,
+   v 160..191.
+
+   bnk00_01.raw is the bike's 256 x 256 particle atlas and its Rect
+   A holds eight stacked 34 x 32 frames of a dust puff, luminance
+   keyed. See d3d-textures.txt 5.2.1. How 0x44 resolves to that
+   page is not established here. [open]
+
+7.  What a port still needs
+
+   THE SIMULATION HALF IS NOW WRITTEN - src/fx.c and the spray loop
+   in racer.c. The pool, the free-slot scan, the constructor, the
+   kind-5 tick and the 24-particle emitter are all imported whole,
+   with the tick wired into race_update at GAME level rather than
+   into the racer loop. What is left is the draw.
+
+   THE DRAW HALF NEEDS ONE MORE READ. The billboard frame is inlined
+   into maybe_Fx_DrawParticle and Ghidra renders it with
+   extraout_ST0 / extraout_ST1 phantoms. Those names are guesses,
+   and reading them as variables is exactly what produced a wrong
+   mat34_from_euler once already (model.c). It wants a symbolic
+   simulation of the x87 block, stack and all, before it is
+   transcribed - not a transcription of the decompiler's output.
+
+   Everything below that maps onto the port as it stands:
+   Screen3D_TransformVertsFlat is model.c's transform,
+   Screen3D_CullAndQueueFacesEx is cull.c plus queue_primitive, and
+   MR_Primitive is already the same 64-byte record.
+
+7.1.  The brake spray, measured live - and three corrections
+
+   Triggered by accelerating briefly and braking for one frame on
+   ile01, then reading the pool [verified].  48 slots went live, all
+   kind 5.
+
+   THE SPAWN HEIGHT QUESTION IN SECTION 8 IS ANSWERED, and it was
+   asking about the wrong client.  The spray reads
+
+       pos.y  6.85 .. 7.02      with the bike and the rear contact
+                                both at y = 0
+       vel.y -0.57 .. -0.64     life 23.4 of 30, so 6.6 ticks in
+
+   and -0.0864 * 6.6 is -0.570.  So the spray DOES spawn at
+   y + 10.0 - _DAT_004d10a0 straight - and integrates down from
+   there exactly as the tick says.  The -29.6 that section 8 could
+   not explain was a CRASH burst, which spawns at the bike matrix
+   rather than the rear contact.  Two clients, two spawn points.
+
+   THE TICK AND THE DRAW ARE GAME-LEVEL, NOT RACER-LEVEL.
+   maybe_Fx_TickAllParticles has ONE caller, maybe_Game_Tick at
+   0x0047d887, and maybe_Fx_DrawAllParticles has ONE, 
+   maybe_Game_RenderFrame at 0x00480279.  Only the SPAWN is inside
+   the racer tick, through maybe_Racer_EmitWheelFx.  A port that
+   hangs the tick off the racer will run it once per racer.
+
+   THE PARTICLE GROWS, WHICH SECTION 4 DOES NOT SAY.  Watching one
+   slot for its whole life [verified]:
+
+   +------+------+----------+-------+
+   | tick | size | corner.x | life  |
+   +======+======+==========+=======+
+   |    0 |   16 |   -30.00 | 23.40 |
+   +------+------+----------+-------+
+   |    1 |   18 |   -34.00 | 16.80 |
+   +------+------+----------+-------+
+   |    2 |   20 |   -38.00 | 10.20 |
+   +------+------+----------+-------+
+   |    3 |   22 |   -42.00 |  3.60 |
+   +------+------+----------+-------+
+   |    4 |   24 |        - | freed |
+   +------+------+----------+-------+
+
+   size rises by 2 every tick and the corners follow it, so a puff
+   EXPANDS as it fades.  The spray spawns with 14 and the first
+   readable value is already 16.
+
+   THE CORNERS ARE +-2*size AFTER ALL - AN ORDERING ARTEFACT, and the
+   disassembly settles it:
+
+       004b094b  EAX = [ESI+0xf0]            size, read FIRST
+       004b0951  FST  [ESP+0xa0]             ST0 = dt
+       004b0958  FMUL [0x004d2058]           dt * 0.6, a DOUBLE
+       004b095e  EDI = EAX*2                 the corners take THIS
+       004b0969  FILD size
+       004b096d  FADDP                       size + dt*0.6
+       004b096f  __ftol -> [ESI+0xf0]         and only now store it
+
+   so the corners are built from the PRE-increment size and the
+   +-2*(size-1) that every sample fitted is that one step of lag.
+
+   AND THE GROWTH IS +1 A TICK, NOT +2. dt is about 3.3, so
+   3.3 * 0.6 = 1.98 and truncation takes it to +1: 14 -> 15.98 -> 15,
+   then 16.98 -> 16. The +2 in the table above is MOTO's SEND_INPUT
+   overrun - frames=1 runs two - so each row is two ticks apart. That
+   reconciles every number: sizes 16, 18, 20 two ticks apart with
+   corners -30, -34, -38 from 15, 17, 19.
+
+   LIFE FALLS 3.3 A TICK - 6.6 per two-tick step - and the slot is
+   freed on the tick life goes NEGATIVE, not the one it reaches zero.
+   The test is on the float's sign bit, so -0.0 does not free it.
+
+7.2.  What the spray passes, read whole
+
+   maybe_Racer_EmitWheelFx's loop at 0x0046760a..0x0046790b, once per
+   particle, count 24 for a human and 4 for an AI:
+
+       rot rate    three rand()s sign-extended from 5 bits * 1/32,
+                   DRAWN PER PARTICLE here - unlike maybe_Fx_Burst,
+                   which draws them once for the whole burst (3.1)
+       throw       a = rand() & 3, b = rand() & 3, and b is NEGATED
+                   unless buttons & 4 - steering flips the spread
+       velocity    m[0]*b + m[6]*a + m[9], and the same for y and z
+                   with rows 1,7,10 and 2,8,11.  The m[3..5] term is
+                   multiplied by 0.0 and drops out.
+       position    lerp BACK along rear -> rearPrev by i * K1158,
+                   so the 24 particles lay a trail behind the wheel
+                   rather than stacking on one point
+       life        ((rand() & 1) * 2 + 2) * 15   ->  30 or 60
+       colour      Color_Pack16(4, 4, 4)
+       call        Fx_SpawnParticle(14, pos, vel, rot, life, 0,
+                                    colour, 5)
+
+   THE FIRST ARGUMENT IS 14 AND IT IS THE SIZE, not the kind - the
+   kind is the LAST argument and is 5.  14 grows to 16 by the first
+   readable tick.
+
+7.3.  The port verified against the pool
+
+   TWO TESTS, because the RNG cannot be shared.  MOTO and the port
+   each run their own CRT rand(), so slot values can never match and
+   an exact pool diff is meaningless.  What is testable splits in
+   two: the SHAPE of a spawn, and the ARITHMETIC of the tick.
+
+   THE SPAWN, after one brake frame [verified]:
+
+   +-------------------+-------------------+-------------------+
+   | property          | MOTO (2 frames)   | port (1 frame)    |
+   +===================+===================+===================+
+   | live slots        | 48                | 24                |
+   +-------------------+-------------------+-------------------+
+   | kinds             | [5]               | [5]               |
+   +-------------------+-------------------+-------------------+
+   | lifetimes         | [30, 60]          | [30, 60]          |
+   +-------------------+-------------------+-------------------+
+   | pos.y - rear.y    | 6.69 .. 9.06      | 8.82 .. 9.06      |
+   +-------------------+-------------------+-------------------+
+   | rot rate, max     | 0.156 .. 0.969    | 0.313 .. 0.969    |
+   +-------------------+-------------------+-------------------+
+
+   24 a frame, kind 5 only, exactly the two lifetimes, the spawn lift
+   landing under 10.0 and falling, and rotation rates on the 1/32
+   grid.  Every difference is MOTO's SEND_INPUT overrun running two
+   frames to the port's one.
+
+   THE TICK IS BIT-EXACT.  Seeding ONE identical particle into slot 0
+   of both pools takes the generator out of the picture entirely;
+   integrated for twelve ticks, position, velocity, rotation, life,
+   size and the corners agree to the last digit at every step, with
+   max |dpos| = 0 throughout [verified].
+
+   A HARNESS TRAP WORTH KEEPING: SET_MEM caps the command length and
+   a 260-byte record exceeds it.  The first run of this test wrote
+   NOTHING, said nothing about it, and compared two leftover
+   particles - which looked like a real 11-unit divergence.  Write
+   the record in chunks and read it back before trusting the result.
+
+7.4.  The billboard frame, read and then measured
+
+   Section 7 said this needed a symbolic read of the x87 block rather
+   than a transcription of the decompiler's extraout_ST0/ST1
+   phantoms.  Both were done and the phantoms were a FALSE ALARM.
+
+   THE THREE SUBTRACTIONS, 0x004b0c52..0x004b0c6f, traced on the x87
+   stack:
+
+       FLD  pos.x                        (x)
+       FLD  pos.y                        (y, x)
+       FLD  pos.z                        (z, y, x)
+       FSUB cam[0xa0]                    (dz, y, x)
+       FXCH ST2                          (x, y, dz)
+       FSUB cam[0x98]                    (dx, y, dz)
+       FXCH                              (y, dx, dz)
+       FSUB cam[0x9c]                    (dy, dx, dz)
+
+   so the camera position is +0x98/+0x9c/+0xa0 and the three deltas
+   are the ordinary ones.  Ghidra assigned one of them to the WRONG
+   matrix slot, which is what made the row look scrambled.
+
+   THE ROTATION COLLAPSES TO A Y-AXIS TURN.  The compiler emitted a
+   full three-axis euler build, but two of the three angles are
+   CONSTANT - g_cosTable[0] at 0x005fcb80 is 1.0 and
+   g_cosTable[0x3000] at 0x00608b80 is 0.0 - so nearly every term
+   vanishes:
+
+       row0  ( cos, 0, -sin)
+       row1  (   0, 1,    0)
+       row2  ( sin, 0,  cos)
+
+   with the angle from camera+0xc0 * _DAT_004d2080 through the
+   0x4000-entry table.  Everything else in that block multiplies by
+   1.0 or 0.0.
+
+   MEASURED AT THE CALL, hooking 0x004b0ed9 - the LEA after
+   Matrix34_Multiply in the KIND-5 arm [verified].  Two live smoke
+   particles:
+
+       matrix rows passed to Screen3D_TransformVertsFlat
+           ( 0.00000,  0.00000,  1.00000)
+           ( 0.02454,  0.99970, -0.00000)
+           (-0.99970,  0.02454,  0.00000)
+           (142.53331, -149.38609, 237.11681)
+
+   That sample was taken LOOKING STRAIGHT DOWN THE TRACK, where
+   camera+0xc0 is 0 and the turn is degenerate - so the rotation came
+   back as the view matrix unchanged.  Recaptured with the camera 30
+   degrees off axis it is not:
+
+       ( 1.00000 -0.00001 -0.00007)
+       ( 0.00000  0.99623 -0.08677)     the view's PITCH, alone
+       ( 0.00007  0.08677  0.99623)
+
+   camera+0xc0 IS THE CAMERA'S YAW, NEGATED - see camera.txt 1.10 -
+   so RotY of it CANCELS the view's yaw and leaves the pitch.  That is
+   the billboard: the quad ends up facing the camera.
+
+   TREATING THE TURN AS IDENTITY MAKES SMOKE GO EDGE-ON as the camera
+   swings, and vanish near 90 degrees.  Nothing shows on a
+   straight-line brake test, which is why the degenerate sample looked
+   conclusive.
+
+   Solving the translation back through the view rotation gives
+   (237.12, -145.84, -146.16) against a pos - camera of
+   (237.12, -145.84, -114.04): x and y to the digit, and z apart by
+   exactly the distance the camera travelled between reading it and
+   the hook firing.  So the translation is pos - camera, plainly.
+
+   THE HOOK MUST GO IN THE KIND-5 ARM.  0x004b0c44 sends kind 5 to a
+   DUPLICATED block at 0x004b0dae, so a hook in the first arm - which
+   is what reads naturally from the decompiler's output - takes zero
+   hits forever.
+
+   KINDS 1..4 ARE THE TYRE TRAIL, not dead code.  They reach the pool
+   through a DIFFERENT constructor - maybe_Fx_SpawnTrail (0x004576a0)
+   into FUN_004b00e0 - so counting the callers of
+   maybe_Fx_SpawnParticle does not enumerate the kinds.  Section 11
+   has the whole path.
+
+   SO THE DRAW IS:
+
+       frame          = RotY(camera[0xc0] * K2080)
+       frame.transl   = particle.pos - camera.pos
+       M              = frame * camera[0x68]
+       verts          = TransformVertsFlat(M, particle.corners, 4, 0x1f)
+                        CullAndQueueFacesEx(verts, particle.quad, 2, 1)
+
+7.5.  The quads, and what a live record actually holds
+
+   maybe_Prim_InitQuad (0x00422d20) was already read - the DB comment
+   on it has the full byte layout, and it matches MR_Primitive as the
+   port already declares it.  What it does NOT tell you is what the
+   record holds once the two calls after it have run, and that is
+   where the useful facts are.  Read off a live smoke particle
+   [verified]:
+
+   +----------------+-------------------------------------------+
+   | field          | value                                     |
+   +================+===========================================+
+   | kind, effKind  | 0x44                                      |
+   +----------------+-------------------------------------------+
+   | colorIndex     | 0xffdf                                    |
+   +----------------+-------------------------------------------+
+   | bankIndex      | 1                                         |
+   +----------------+-------------------------------------------+
+   | flags          | 0                                         |
+   +----------------+-------------------------------------------+
+   | flatColor      | 0x00f8f8f8                                |
+   +----------------+-------------------------------------------+
+   | vertexIndex    | 0,1,2,3,0   and   3,2,1,0,3               |
+   +----------------+-------------------------------------------+
+
+   0xffdf IS Color_Pack16(0x80,0x80,0x80) SATURATED.  The packer is
+   (r << 11) | (g << 6) | b on FIVE-bit channels, so 0x80 clamps to
+   31 in all three: 0xf800 | 0x7c0 | 0x1f.  Deriving it as 0x80 >> 3
+   gives 0x8410 and a visibly darker puff.
+
+   AND THE ALPHA BYTE IS ZERO, unlike the ribbon and the shadow which
+   both carry 0xff there.  0x00f8f8f8 is the bare 5-5-5 unpack
+   shifted left three.
+
+   THE UVs IN THE LIVE RECORD ARE NOT THE ONES PASSED.  The tick hands
+   InitQuad (224,160)(255,160)(255,191)(224,191), but the record
+   afterwards reads 1.0 in the first eight slots with only the ninth
+   pair holding (224,160).  FUN_00423060, called immediately after
+   each InitQuad, rewrites them.  What it computes is unread.
+
+   THAT DOES NOT BLOCK THE PORT and should not be transcribed
+   blindly: CLAUDE.md puts the primitive queue on the REPLACE list,
+   the DB comment on InitQuad says the same, and our renderer
+   consumes MR_Primitive.uv directly in texels.  So the port writes
+   the texel UVs the tick passes and lets its own queue read them.
+   [open - what FUN_00423060 does to the UV block, and whether it
+   matters once the texture is bound]
+
+7.6.  Black smoke, and why an unbound bank is worse than none
+
+   The draw went in and the particles appeared BLACK where retail has
+   white.  Everything in the record was right - read back off a live
+   port particle, kind 0x44, colorIndex 0xffdf, flatColor 0x00f8f8f8,
+   texel UVs and both windings, all matching MOTO.
+
+   THE BANK INDEX IS NOT PORTABLE, and copying the original's literal
+   1 is what did it.  MOTO's bank table has stride 824 with the name
+   at +76, and reading it out gives
+
+       bank 0   data\speed\bnk00_00.raw
+       bank 1   data\speed\bnk00_01.raw     <- the particle atlas
+       bank 2   data\ile01\bank\bnk00_02.raw
+
+   so the page is loaded whatever track is running - "SPEED" there is
+   a shared asset directory, not the Speed Bay track.  THE PORT LOADS
+   THE SAME FILE AT BANK 4: its level list starts at
+   RACE_TRK_BANK_BASE = 8 and its contents differ from the
+   original's, so bank 1 is simply empty.
+
+   AND AN UNBOUND BANK DRAWS BLACK RATHER THAN UNTEXTURED, which is
+   the part worth keeping.  prim_is_textured correctly returns 0 -
+   the bank is not loaded - so the COLOUR comes out of the flat path,
+   which is 0xfff8f8f8 shaded at intensity 31, a near-white.  But the
+   blend ladder's texture bit is built from the KIND ALONE, without
+   asking whether a page is bound (drawscene.c says so outright), and
+   kind 0x44 is not one of the three untextured kinds.  So the device
+   is told to modulate against a texture that is not there.
+
+   The bank is now resolved BY NAME once, and a particle whose atlas
+   is missing does not draw at all - which is right in a way that
+   drawing black is not.
+
+   ONE COMMENT CORRECTED: drawscene.c said "Nothing in the game is
+   known to produce kind 0x44 or 0x45".  The smoke produces 0x44 at
+   both InitQuad call sites.  0x45 is still unproduced.
+
+7.7.  Still black - the atlas is nearly black, and the key was not
+      being cut away
+
+   Binding the right bank was necessary and not sufficient.  With
+   s_fxBank resolving to 4 and the primitive carrying it, the smoke
+   was still black.
+
+   THE ATLAS IS DARK ON PURPOSE.  Sampling bank 4's page over the
+   tick's UV patch - u 224..255, v 160..191 - gives RGB565 values of
+   0x2124 and 0x0861, which unpack to (4, 9, 4) and (1, 3, 1) out of
+   (31, 63, 31).  Rows 160 and 191 are entirely zero.  So the puff is
+   a nearly-black smudge surrounded by pure black, and NOTHING
+   modulated by it can come out white.
+
+   THE BLACK IS THE COLOUR KEY, AND IT WAS NOT BEING CUT AWAY.
+   Bank 4's flags are 0x0013 - SRC16 and KEYED both set - so those
+   zero texels are meant to VANISH.  The original keys at the
+   DirectDraw level: D3D_AllocTextureSlot sets a DDCOLORKEY of black
+   with DDCKEY_SRCBLT, and a keyed texel is absent whatever blend
+   mode is in force.
+
+   THE PORT COUPLED THE TEST TO THE BLEND.  drawscene expressed the
+   key as alpha in the texture and then turned the alpha test on with
+
+       int keyed = (blend == R_BLEND_SRCALPHA);
+
+   which is right for every kind that reaches the ladder's
+   conditional row and wrong for the four that return before it:
+   0x2c, 0x3e, 0x44 and 0x45 all take the half blend.  A keyed
+   texture on one of those blended its key colour in at fifty per
+   cent - and the particles are kind 0x44 on a keyed bank.
+
+   IT IS NOW ASKED OF THE TEXTURE.  The depth rule still asks about
+   the BLEND, deliberately: a half-blended surface is translucent and
+   must not write depth, which is a different question from whether
+   its texels are keyed.
+
+   WHAT THIS PREDICTS ELSEWHERE: any other keyed texture drawn at
+   kind 0x2c, 0x3e or 0x45 was showing its key colour too, and will
+   now stop.  Nothing else in the port is known to use those kinds
+   yet, so the smoke is the first thing to exercise the path.
+
+   AND IT WAS STILL NOT ENOUGH.  The key cuts away the pure black
+   AROUND each frame - 17.4 per cent of Rect A - and leaves the puff
+   itself, which is genuinely dark.  See 7.8.
+
+7.8.  The atlas is BRIGHTENED AT UPLOAD, and the port does not do it
+
+   The particle UVs, u 224..255 and v 160..191, land inside RECT A of
+   bnk00_01.raw - x 222..255, y 0..255 - and Rect A is not an
+   ordinary keyed region.  d3d-textures.txt 5.2 has it:
+
+       each texel is converted to HSV by Color_RgbToHsv (0x0041bb20),
+       THE ALPHA IS TAKEN FROM THE RESULT, the value component is
+       then SCALED BY A CONSTANT, and Color_HsvToRgb (0x0041bd30)
+       converts back
+
+   so what the original uploads is the BRIGHTENED colour carrying a
+   BRIGHTNESS-DERIVED alpha.  The port's bank_texture uploads the raw
+   texel with binary alpha - 0 on the key, 255 everywhere else.
+
+   THAT IS THE WHOLE REMAINING GAP.  Rect A holds eight stacked
+   34 x 32 frames of a dust puff "fading light to dark across the
+   sequence", and v 160..191 is frame 5 of 8 - one of the darker
+   ones.  Sampled raw it reads (4, 9, 4) and (1, 3, 1) out of
+   (31, 63, 31).  Uploaded raw and drawn opaque, that is a black
+   blob; uploaded the original's way it is a pale translucent wisp
+   that fades as the sequence dims.
+
+   RECT B IS THE SAME MECHANISM AND SIMPLER: a flat alpha of 8 out of
+   15 over x 0..119, y 0..40, which is the bike's shadow silhouette.
+
+   BOTH ARE NOW IMPLEMENTED in bank_texture, with the constants read
+   off maybe_D3D_LoadRawToTexture at 0x0041cef7..0x0041cf7e:
+
+       Rect A   alpha = (int)(v * 16), then v *= 5, then back to RGB
+       Rect B   a flat alpha of 8, the MOV EDI,8 at 0x0041cf79
+
+   and the four-bit alpha scaled to eight for our A8R8G8B8 pages.
+   d3d-textures.txt 5.2 carries the derivation.
+
+   THE COLOUR KEY STILL WINS INSIDE THE RECTANGLES.  The original
+   keys at the surface with a DDCOLORKEY, which is independent of the
+   per-texel alpha - so Rect B's black surround is cut away rather
+   than drawn at its flat half-alpha.  Rect A needs no special case:
+   a black texel has v = 0 and the brightness alpha is 0 anyway.
+
+   WHICH PAGES GET IT is the original's four-way path match, not a
+   test on the file name.  The literals are
+
+       data\SpeedPkt\bnk00_01.raw     data\speed\bnk00_01.raw
+       data\ktmcross\bnk00_01.raw     data\KTMpkt\bnk00_01.raw
+
+   and only two distinct pages sit behind them: SPEED is byte-identical
+   to SPEEDPKT, KTMCROSS to KTMPKT.  The four names are per bike
+   DIRECTORY.
+
+   WE COMPARE DIRECTORY AND FILE, CASE-INSENSITIVELY, and ignore any
+   leading prefix, because our logical names are archive-relative where
+   the original's are ini-configured paths.  The original needs four
+   spellings only because its strcmp is case-sensitive.
+
+   A BARE TAIL MATCH ON THE FILE NAME IS WRONG.  The title screen loads
+   PAGES\TITLEDSI\BNK00_01.RAW, so a name-only test hands it the
+   dust atlas's alpha - the right-hand 34 columns brightened and a
+   half-alpha band across the top.
+
+   THE HALF-SIZE PAGE HALVES EVERY BOUND, arm two at 0x0041c3b9, taken
+   when bank flag 8 is set.  No stock data reaches it; the atlas ships
+   full size.
+
+       full   Rect A  x 222..255  y 0..255   Rect B  x 0..119  y 0..40
+       half   Rect A  x 111..127  y 0..127   Rect B  x 0.. 59  y 0..20
+
+   WHY THE CHASE TOOK THREE ROUNDS, recorded so the next one is
+   shorter: the symptom "black where retail is white" had THREE
+   independent causes stacked - an unbound bank (7.6), a colour key
+   that was never cut away (7.7), and this. Each fix was necessary,
+   none was sufficient, and after each one the symptom looked
+   unchanged. A texture that draws black is worth suspecting of more
+   than one fault.
+
+7.9.  The crash burst - the other emitter
+
+   maybe_Fx_Burst (0x00467c40) is the second and last thing that
+   spawns a particle.  Both its call sites are in the crash, and both
+   pass the matrix BY VALUE - SUB ESP,0x30 then Matrix34_Copy before
+   the six scalars, which is why the argument list reads as eighteen.
+   RET 0x48 confirms it.
+
+   +----------------------------+-------+----------------+-----------+
+   | Call site                  | Count | Position       | Frame     |
+   +============================+=======+================+===========+
+   | 0x004681b3 BeginCrash      |   6   | racer+0x30     | +0xbc     |
+   |                            |       | position       | matOrien- |
+   |                            |       |                | tation    |
+   +----------------------------+-------+----------------+-----------+
+   | 0x00468708 UpdateCrash     |   4   | racer+0x30b5   | +0x3085   |
+   |                            |       | riderPosition  | matRider- |
+   |                            |       |                | Root      |
+   +----------------------------+-------+----------------+-----------+
+
+   The bike puff is the last thing BeginCrash does.  The rider puff is
+   gated on crashLaunchDir.y clearing 0.05 (_DAT_004d1198).
+
+   LIFE IS TWO VALUES, NOT A RANGE.  It is (rand() & mask) + base, and
+   the mask is a SINGLE BIT at both sites:
+
+       bike    (rand & 0x10) + 0xf    ->  15 or 31
+       rider   (rand & 4)    + 7      ->   7 or 11
+
+   so a burst is half short-lived and half long-lived rather than
+   evenly spread.  An earlier note gave these as 0x10..0x1f and
+   4..0xa, which is what the arguments look like if base and mask are
+   read the wrong way round.
+
+   THE RATES ARE DRAWN ONCE, BEFORE THE LOOP.  Every particle in one
+   burst spins together, and only the offset, the size and the life
+   differ - which is what makes a burst read as one puff rather than
+   as a firework.  THE WHEEL SPRAY IS THE OPPOSITE and draws its rates
+   per particle; the two must not be copied to each other.
+
+   THE SPREAD IS A 0..3 CUBE IN THE CALLER'S OWN FRAME, so a machine
+   going down sideways throws its dust sideways.  All three rows count
+   here, where the spray multiplies the middle row by zero.
+
+   BOTH THE RATES AND THE THREE COEFFICIENTS ARE CONSUMED IN REVERSE
+   of the order they are drawn - the third draw becomes rot[0] and
+   scales row0.  Getting that backwards still looks like dust, so it
+   shows up in a pool diff and not in a screenshot.
+
+   THE RIDER PUFF IS NOT A ONE-SHOT.  It sets riderStateBits bit 0x40
+   at 0x0046870d, but nothing tests that bit - the OR is the only
+   access to racer+0x2dac in the whole of UpdateCrash - and
+   crashLaunchDir.y is rewritten every frame at 0x0046856a.  So it
+   fires on each frame the rider is coming down hard.
+
+   EVERY CONSTANT IS THE SPRAY'S.  The rate scale (_DAT_004d1150,
+   0.03125), the lift (_DAT_004d10a0, 10.0) and the colour
+   (Color_Pack16(4,4,4) = 0x2104) are the same values, and the first
+   two are the same addresses.
+
+   THE OTHER TWO TRIPLES, and this is easy to get backwards:
+   maybe_Fx_SpawnParticle's args 5..7 become the particle's VELOCITY
+   and args 8..10 its ROTATION RATE.  Settled by the bit-exact pool
+   diff of the spray, where the matrix-derived triple reads back as
+   velocity and the sign-extended one as rotation rate.
+
+8.  Open questions
+
+   o The billboard frame - ANSWERED, section 7.4. A Y rotation from
+     camera+0xc0 with translation pos - camera, measured at the call.
+
+   o texId 0x44 does NOT select a page - the bank index beside it
+     does, and it is a literal 1 meaning data\speed\bnk00_01.raw.
+     0x44 is a primitive KIND, and its only effect in the renderer is
+     that it is not one of the three untextured kinds. See 7.6.
+
+   o THE ATLAS IS FOUND BY NAME, AND THAT NAME IS NOT ONE BIKE'S.
+     The original stores a LITERAL BANK INDEX OF 1 in every particle,
+     and slot 1 holds whichever bike's BNK00_01.RAW the level loaded -
+     SPEED on a road track, KTMCROSS on a dirt one.  The port cannot
+     copy the index because its bank slots differ (next item), so it
+     searches by name instead.
+
+     THAT SEARCH WAS PINNED TO "SPEED" AND BROKE EVERY DIRT LEVEL.
+     fx_particle_bank returned -1, the quads took a bank index of
+     0xffff, and the draw skipped them - no brake smoke and no tyre
+     specks at all, on the snow track and every other KTM level.
+     Nothing logged, because a missing atlas is a silent skip.
+
+     IT IS THE SAME PAGE THE RECTANGLE TREATMENT WANTS, so the test
+     now lives once in bank_is_bike_atlas and matches all four bike
+     directories.  The FX pool and the texture upload were asking the
+     same question in two places and one of them had the wrong
+     answer.
+
+     AND THE CACHE IS CLEARED ON RACE LOAD.  fx_particle_reset_all
+     drops it, because the bike's page is a DIFFERENT SLOT on a
+     different level and a stale index would draw the specks out of
+     whatever now sits there.
+
+   o WHY THE PORT'S LEVEL BANK LIST DIFFERS FROM THE ORIGINAL'S.
+     MOTO has two speed\ pages at 0 and 1 then ile01 from 2; the port
+     has ile01 pages from RACE_TRK_BANK_BASE + 1 and the speed\ pair
+     somewhere else entirely. Both games find the same files, so this
+     is a slot-assignment difference rather than a missing asset -
+     but it is why no index can be copied across. [open]
+
+   o Kinds 1..4 - ANSWERED, and they are the TYRE TRAIL. See section
+     11.  An earlier note here called them dead on the grounds that
+     maybe_Fx_SpawnParticle is the only thing that sets a kind and
+     both its callers pass 5.  THE PREMISE WAS WRONG: there is a
+     SECOND constructor writing the same pool, FUN_004b00e0, reached
+     through maybe_Fx_SpawnTrail, and the kind it writes is the
+     SURFACE ID.
+
+   o THE VERTICAL SPAWN HEIGHT - ANSWERED for both emitters. The
+     spray is rear contact + 10.0, see 7.1; the burst is the bike's
+     own position (racer+0x30) or the rider's (racer+0x30b5) plus
+     the SAME 10.0, see 7.9. The -29.6 reading was a burst measured
+     against the rear contact, which is not where it spawns.
+
+   o THE CORNER FORMULA, section 7.1. +-2*(size-1) fits every
+     sample and +-2*size does not.
+
+9.  The skid ribbons - the other pool, and it is now in the port
+
+   The particles are one of TWO fx pools and the smaller half of the
+   work.  The ribbons are the black strip a sliding tyre leaves, and
+   they are transcribed: src/fx.c carries the record, the
+   initialiser, the appender and the draw.
+
+   +---------------------------+------------+------------------------+
+   | Item                      | Address    | Note                   |
+   +===========================+============+========================+
+   | g_fxRibbons               | 0x00542a28 | 16 x 5640 bytes        |
+   | FUN_00457120              | 0x00457120 | init one, 64 faces     |
+   | FUN_00457300              | 0x00457300 | init all sixteen       |
+   | maybe_Fx_UpdateRibbon     | 0x00457390 | bounds-check the slot  |
+   | maybe_Fx_AppendRibbonQuad | 0x00457200 | append two vertices    |
+   | FUN_004573e0              | 0x004573e0 | transform and queue    |
+   +---------------------------+------------+------------------------+
+
+   FUN_004573e0 is called from maybe_Game_RenderFrame at 0x0048027e,
+   beside maybe_Fx_DrawAllParticles.
+
+9.1.  The first 4096 bytes are the PRIMITIVES
+
+   racers.txt 9.16.1 records them as "NOT touched by the appender"
+   and guesses at "32 bytes per vertex ... nothing read so far uses
+   them".  THAT IS SETTLED AND THE GUESS WAS WRONG.  The draw passes
+   ribbon+0 to Screen3D_CullAndQueueFacesEx as the FACE ARRAY, and
+   4096 / 64 is 64 MR_Primitives.  The appender does not touch them
+   because the INITIALISER builds them once:
+
+       +0x0000   64 x MR_Primitive
+       +0x1000  128 x vec3
+       +0x1600  int quadCount, capped 62
+       +0x1604  int vertexCount
+
+   FUN_00457120 lays a TRIANGLE STRIP over the vertex pairs - 32
+   iterations, two triangles each, indices advancing by two:
+
+       Face_InitTriangle(0x0c, colour, i,     i + 1, i + 2)
+       Face_InitTriangle(0x0c, colour, i + 1, i + 3, i + 2)
+
+   so 64 faces cover all 128 vertices with no gaps.
+
+9.2.  It is not textured, and the colour is derived
+
+   Kind 0x0c is one of the three prim_is_textured rejects outright,
+   so a ribbon draws as its flat colour and nothing else - no bank,
+   no UVs.  That is why the record has no texture fields.
+
+   The colour is Color_Pack16(8, 8, 8) = 0x4208, which
+   Face_InitTriangle unpacks 5-5-5 and shifts left 3 into flatColor
+   0x404040 - a dark grey.  Color_Pack16 is (r << 11) | (g << 6) | b,
+   NOT true 565: green gets five bits at shift 6 and bit 5 is never
+   written.
+
+9.3.  What the port has, and the one thing it does not
+
+   fx_ribbon_reset_all runs at race setup and each racer is handed
+   two slots into fxSlot0 and fxSlot1 - sixteen over an eight-bike
+   field is exactly two each.  fx_ribbon_draw_all runs beside
+   fx_draw_all_particles, where the original draws it.
+
+   NOTHING APPENDS YET.  maybe_Fx_UpdateRibbon's only callers are two
+   sites inside maybe_Racer_EmitWheelFx (0x00467459 and 0x00467518),
+   passing fxSlot0 and fxSlot1 with a wheel contact pair and
+   segmentStart as the search hint.  That function is 2998 bytes and
+   drives the spray as well as the ribbon, so it is its own import.
+   The pool is live, drawn and empty until it lands.  [open]
+
+10.  maybe_Racer_EmitWheelFx, imported whole
+
+   2998 bytes, called once per racer per tick from all three tick
+   variants and only when maybe_Racer_UpdateGroundContact set its
+   flag.  It drives all three effects, which is why it could not be
+   sliced for the ribbon alone.
+
+   ORDER MATTERS AND IT IS NOT THE SHADOW'S.  maybe_Racer_Tick calls
+   it at 0x0045d7e4, AFTER UpdateLean (0x0045d7c9), so it sees the
+   SWUNG wheel contacts - a wheelie throws its spray from the raised
+   wheel.  The shadow is built at 0x0045d7c2, BEFORE the lean, and
+   sees the flat ones.  Two consumers of the same two fields, one
+   step apart, wanting opposite things.  See racer-draw-audit.txt 62.
+
+   THE STRUCTURE:
+
+       1  the copy-protection check - NOT reconstructed, no payload
+       2  the range gate, [viewed - 10, viewed + 30]
+       3  the trail, gated on onGround and a positive surface id
+       4  a speed floor of 5.0, and everything below sits behind it
+       5  a fresh ribbon pair on the rising edge of brake or fxGate
+       6  the two ribbons, rear to fxSlot0 and front to fxSlot1
+       7  the spray
+
+10.1.  The constants, read rather than guessed
+
+   +--------------------+-------------+---------------------------+
+   | 0x004d1138         | double 0.55 | trail speed scale         |
+   | 0x004d1150         | double 1/32 | the rand spread scale     |
+   | 0x004d1158         | float  1/32 | spray back-interpolation  |
+   | 0x004d10a0         | float  10.0 | spray spawn height        |
+   | 0x004d1064         | float  50.0 | the trail timer wrap      |
+   | 0x004d0e88         | double 2.0  | skid widen step           |
+   | 0x40a00000         | float   5.0 | the speed floor           |
+   | 0x3f000000         | float   0.5 | the slip gate             |
+   | 0x41c80000         | float  25.0 | the wheelie window        |
+   +--------------------+-------------+---------------------------+
+
+   THE SKID WIDTH WIDENS TWICE AS FAST AS IT NARROWS: +2.0 while the
+   slide worsens, -1.0 otherwise, clamped 1.0 to 12.0.  An AI is
+   pinned at 5.0 and never runs the update at all.
+
+10.2.  What runs and what does not
+
+   +---------------------+--------------------------------------------+
+   | the ribbons         | COMPLETE. fx_ribbon_append is written and  |
+   |                     | the allocator is the original's ring, so   |
+   |                     | braking repeatedly recycles the oldest of  |
+   |                     | sixteen rather than running out.           |
+   +---------------------+--------------------------------------------+
+   | the trail           | gated behind Trk_SurfaceAtPoint            |
+   |                     | (0x0040ec60), which the port does not      |
+   |                     | have. The stub returns 0, so the branch    |
+   |                     | never fires. [open]                        |
+   +---------------------+--------------------------------------------+
+   | the spray           | the gate and the LOD count are transcribed |
+   |                     | and run; maybe_Fx_SpawnParticle is a stub, |
+   |                     | so the loop spawns nothing. [open - the    |
+   |                     | particle pool, section 7]                  |
+   +---------------------+--------------------------------------------+
+
+   Both gaps are marked in place with their addresses and the
+   branches still run, rather than being dropped - CLAUDE.md 15.1.
+   So SKID MARKS WORK AND SMOKE DOES NOT, and the smoke needs the
+   particle pool rather than anything further from this function.
+
+10.3.  The edge never fired - tickInputWord was never written
+
+   First run after the import: no marks on screen, and the pool said
+   why.  Every one of the sixteen ribbons held vertexCount 2 and
+   quadCount 0, and the racer's slots walked 2/3 -> 8/9 -> 12/13
+   across three brakes.
+
+   So the emitter WAS running and the allocator WAS handing out
+   slots - two per frame of braking rather than two per brake.  Each
+   fresh ribbon got exactly one append before the next frame replaced
+   it, and a ribbon needs TWO appends before it has a quad to draw.
+   Zero quads means the draw skips it, so nothing was ever queued.
+
+   THE CAUSE IS ONE FIELD.  The rising-edge test is
+
+       (tickInputWord & 2) == 0 && (buttons & 2) != 0
+
+   and tickInputWord was read in two places and written in NONE, so
+   the left half was permanently true and every braking frame looked
+   like the first.
+
+   maybe_Racer_Tick stores the buttons into racer+0x2dc8 at
+   0x0045d7fd - the last instruction of its call list, AFTER
+   maybe_Racer_EmitWheelFx reads the old value at 0x004671fa.  That
+   ordering is the whole mechanism: the field holds the PREVIOUS
+   frame's word precisely because the latch trails the reader.
+
+   Added at the end of race_tick_physics.  The port has no buttons
+   argument there - race_poll_input leaves the word on the racer - so
+   it latches inputWord | inputWord2, which is what the dispatch and
+   the emitter both use.
+
+   o AN UNWRITTEN FIELD IS NOT AN INERT ONE.  It read zero, which is
+     a legal value, and it turned an edge into a level.  The tell was
+     in the pool rather than the code: sixteen ribbons all stuck at
+     the same tiny count is an allocation rate problem, not a
+     geometry one.
+
+   o AND A DIAGNOSTIC READ THE WRONG OFFSET. The first pass reported
+     onGround 0 throughout, which would have meant the ribbon branch
+     could never run; it was read at 0x2e2d where MR_Racer puts the
+     field at 0x2db8. Read correctly it is 1. Nothing was concluded
+     from the bad value, but it was one step from a second wrong
+     diagnosis.
+
+10.4.  The width reads velDir, not moveDir
+
+   maybe_Racer_SlipSpeed is __thiscall on MODEL INSTANCE 0, racer+0x24,
+   and reads instance+0x10c off it.  That is racer+0x130, velDir - NOT
+   racer+0x18c, moveDir.  All six callers pass racer+0x24: the two
+   verified here are maybe_Racer_ApplySteering, which loads
+   LEA ECX,[ESI+0x24] at 0x00466249, and maybe_Racer_ApplyCornering,
+   which already holds the instance in ESI at 0x0045d15c.
+
+   THE TWO FIELDS ARE EQUAL WHILE THE BIKE GOES WHERE IT POINTS, so a
+   straight-line comparison cannot separate them.  Measured in a
+   braking left turn:
+
+       +----------------+-------------+-------------+
+       |                | MOTO        | port        |
+       +================+=============+=============+
+       | row0 . velDir  |   -0.009067 |    0.000014 |
+       | row0 . moveDir |    0.224900 |    0.234270 |
+       | skidWidthPrev  |    0.009067 |    3.923388 |
+       +----------------+-------------+-------------+
+
+   MOTO's stored skidWidthPrev matches |row0 . velDir| exactly and the
+   port's matched |row0 . moveDir| exactly, which settles it without a
+   hook.  Both call sites in the port passed moveDir and now pass
+   velDir; the steering path at race.c is the same fix, and it feeds
+   maybe_Racer_ApplySteering rather than the ribbon.
+
+   THE FIX IS NECESSARY BUT NOT SUFFICIENT: THE PORT'S matOrientation
+   IS A PURE YAW.  Both sides seed velDir the same way -
+   ModelInstance_Integrate transforms (0,0,1) through matOrientation
+   and stores it at 0x0048d6c5, and racer_integrate does the same - so
+   that write is the original's and is not the defect.  What differs is
+   the matrix it is seeded from:
+
+       +--------+------------------------------------------+
+       | MOTO   | row1 = (-0.023506, 0.999700, 0.006898)   |
+       | port   | row1 = ( 0.000000, 1.000000, 0.000000)   |
+       +--------+------------------------------------------+
+
+   row0 . row2 is zero by construction, so against a yaw-only matrix
+   physics_slip_speed returns a STRUCTURAL zero and the width can
+   never widen.  MOTO reads -0.009770 where we read -0.000034.
+
+   THE PITCH COMES FROM maybe_Racer_UpdateAirborne (0x00466660), 382
+   bytes, which the port does not have.  On its grounded arm, gated on
+   the brake bit and longSpeed > 0.1, it composes a nose-down PI/128
+   into matOrientation through Racer_ComposeOrientation at 0x004666f4.
+   FUN_0045d0c0 passes the angle through only while
+   maybe_Racer_ChassisAttitude stays inside a band, so the dive
+   saturates at one step instead of accumulating.
+
+   [verified] live: MOTO on gas alone holds an exact identity, and
+   four brake frames give row1 = (0, 0.999699, 0.024541) - and
+   0.024541229 is sin(PI/128) to eight places.
+
+   Racer_SetLongSpeed (0x0048cbe0) is also uncalled here against 14
+   sites in MOTO, but wiring it in first changes nothing: it preserves
+   the two body components it is not setting, and both are zero
+   against a yaw-only matrix, so it returns the heading it was handed.
+
+   maybe_Racer_UpdateAirborne IS NOW IMPORTED WHOLE, as
+   racer_update_airborne, and runs in the tick at the original's own
+   place - after ground contact, at 0x0045d7a6.  See racers.txt
+   9.18.9.  matOrientation now carries the brake dive on both sides
+   and, in a braking turn, agrees to 3e-5:
+
+       +--------+-------------------------------------------+
+       | MOTO   | row1 = (-0.014024, 0.999705, 0.019853)    |
+       | port   | row1 = (-0.014055, 0.999703, 0.019896)    |
+       +--------+-------------------------------------------+
+
+   The ribbon LENGTH already matched before that: the same run laid a
+   58-quad pair on both sides.
+
+10.4.1.  Why the port's marks are thinner - still open
+
+   THE SLIP DROPOUT IS NOT A DEFECT.  Single-frame stepping catches
+   frames where velDir and row2 coincide and the slip is exactly zero
+   in BOTH binaries - MOTO shows |velDir - row2| = 3.7e-09 with slip
+   0.0000000.  MOTO's width is not pinned at the floor either.
+
+   THE DEVIATION IS EXACTLY ONE TABLE INDEX ON BOTH SIDES.
+   2*pi/16384 is 3.83495e-04, and that is the magnitude both binaries
+   show - it is quantisation residue, not physics.  What differs is
+   WHICH AXIS it lands on.  Eight frames of braking into a left turn,
+   walls off, both sides stepped two frames:
+
+   +------+---------------------------+---------------------------+
+   |      | MOTO                      | port                      |
+   +======+===========================+===========================+
+   | d    | alternates - lateral on   | LATERAL EVERY FRAME, and  |
+   |      | some frames, vertical on  | always the same sign      |
+   |      | others                    |                           |
+   +------+---------------------------+---------------------------+
+   | slip | noisy: ~0, then +-0.011   | smooth monotone decay,    |
+   |      | when the residue is       | -0.0084 down to -0.0049   |
+   |      | lateral                   |                           |
+   +------+---------------------------+---------------------------+
+   | width| 5, 6, 10, 11, 12, 11, 12  | 2, 3, 1, 1, 1, 1, 1, 1    |
+   +------+---------------------------+---------------------------+
+
+   The width rule widens by 2 whenever |slip| exceeds the previous
+   frame's and narrows by 1 otherwise, so a NOISY slip widens and a
+   smoothly decaying one narrows.  THAT is why the port's marks are
+   thinner than retail.  The open question is what makes MOTO's
+   residue move between axes.
+
+   THREE EXPLANATIONS HAVE BEEN TESTED AND KILLED, all of them by
+   measurement rather than by reading:
+
+   o "THE TERRAIN FIT IS NOT TRANSCRIBED."  False.  It is
+     racer_frame_from_forward, reached through racer_orient_grounded
+     from racer_update_ground_contact, and it matches the original
+     step for step - Vec3_Cross(worldUp, forward) at 0x004696b3,
+     Vec3_Cross(forward, lateral) at 0x004696d1, then the nine stores
+     at 0x004696f6..0x0046973c.  Both probes are snapped in their own
+     segment on both sides.
+
+   o "MOTO'S MATRIX IS OFF-INDEX AND OURS IS ON-INDEX."  Not
+     established, and the test that suggested it was invalid: it took
+     asin(row1.z), but row1.z is sin(yaw)sin(pitch)cos(roll) +
+     cos(yaw)sin(roll), which is not the sine of any single quantised
+     angle.  The port's value only looked clean because its yaw was
+     near zero on a straight.
+
+   o "MOTO QUANTISES LESS OFTEN THAN WE DO."  False.  A trace hook on
+     0x004666f9 - the instruction after UpdateAirborne's
+     Racer_ComposeOrientation call - took four hits in four braking
+     frames, so the dive branch and its quantise run EVERY frame in
+     the original too.
+
+   WHAT WAS LEFT IN THAT WINDOW - AND IT WAS THE WHOLE ANSWER.
+   maybe_Racer_Tick runs maybe_Racer_ApplyCornering at 0x0045d792,
+   BETWEEN ModelInstance_Integrate seeding velDir at 0x0045d770 and
+   UpdateGroundContact at 0x0045d79c.  The port had that function only
+   as THREE SLICES in physics.c - physics_camber, physics_centripetal
+   and physics_cornering_step - and NOTHING CALLED ANY OF THEM.  They
+   were dead code, and turnRadius was only ever set to FLT_MAX.
+
+   The function ends by calling Racer_SetSlipSpeed (0x0048d2c0), which
+   is the exact mirror of Racer_SetLongSpeed with the incoming scalar
+   paired against ROW 0 instead of ROW 2.  THAT IS THE ONLY THING IN
+   THE GAME THAT PUTS A LATERAL COMPONENT INTO velDir.  Without it
+   velDir can hold nothing but the heading Integrate seeded plus
+   quantisation residue - which is exactly what the port's numbers
+   showed, and why the residue always landed on the same axis: there
+   was no lateral velocity for it to land beside.
+
+   So the family that 10.4 started from is now complete:
+
+   +--------------------------+------------+---------------------+
+   | maybe_Racer_SlipSpeed    | 0x0048d0f0 | READS  the lateral  |
+   | maybe_Racer_LongSpeed    | 0x0048ca10 | READS  the long.    |
+   | Racer_SetLongSpeed       | 0x0048cbe0 | WRITES the long.    |
+   | Racer_SetSlipSpeed       | 0x0048d2c0 | WRITES the lateral  |
+   +--------------------------+------------+---------------------+
+
+   racer_apply_cornering is imported whole and runs at the original's
+   place in the tick.  [needs a Debug rebuild and a re-measure]
+
+10.4.3.  The width on a STRAIGHT is denormal noise
+
+   Re-measured on a harness that can be trusted - full placement,
+   four-frame batches, walls off (racers-convergence.txt 9.18.15).
+
+   THE RULE IS IDENTICAL.  0x00467532..0x0046757f:
+
+       if (skidWidthPrev < |slip|) width += 2  else  width -= 1
+       clamp [1.0, 12.0]
+
+   which is racer_skid_width exactly.
+
+   AND SO IS THE SLIP WHEN THERE IS ANY.  First braking frame,
+   straight: MOTO -0.00849 against the port's -0.00850.  In a braking
+   turn: -0.01293 against -0.01209, and +0.00171 against +0.00213.
+
+   BUT ON A STRAIGHT MOTO'S SLIP IS DENORMAL NOISE.  A trace hook on
+   the width update, capturing skidWidthPrev and skidWidth per frame:
+
+       +---+---------------+---------------+-------+-----------+
+       | n | |slip|        | prev          | width | decision  |
+       +===+===============+===============+=======+===========+
+       | 0 |   6.59e-13    |   1.43e-08    |  1.00 | narrow    |
+       | 3 |   1.50e-18    |   5.81e-19    |  1.00 | WIDEN +2  |
+       | 4 |   1.46e-19    |   1.50e-18    |  3.00 | narrow    |
+       | 6 |   9.85e-19    |   7.48e-20    |  1.00 | WIDEN +2  |
+       +---+---------------+---------------+-------+-----------+
+
+   The rule is comparing this frame's noise against last frame's, so
+   the width is a coin flip at the 1e-19 level and MOTO's streak
+   flickers between 1 and 3 on a dead straight.
+
+   THE PORT PRODUCES EXACT ZEROS THERE, so prev < |slip| is never
+   true and the width pins at 1.  That is the whole of the
+   "not quite as wide as retail" report on a straight: not the rule,
+   not the slip, but whether the residue survives.  MOTO computes the
+   dot product on the x87 stack in 80-bit; physics_slip_speed uses
+   double and the terms cancel exactly.
+
+   IN A CORNER IT DOES NOT MATTER - the slip is real, and the widths
+   run in the same band on both, 2 to 7.
+
+   [open] whether to chase the residue at all.  It is a numerical
+   difference of 1e-19 with a visible consequence, and matching it
+   means reproducing an x87 cancellation in double - which is the
+   kind of thing CLAUDE.md 5a exists to stop being faked.  Worth
+   deciding deliberately rather than drifting into.
+
+10.4.4.  The brake ramp timer never reset
+
+   Braking in a turn shed speed too fast - MOTO -0.594 m/s a frame
+   against the port's -0.808 - while straight-line braking matched
+   exactly.  The cause is not cornering.
+
+   FOUND BY HOOKING, not by diffing endpoints.  A trace hook at
+   0x0048f9f6, inside maybe_Physics_TickDrivetrain at the brake
+   apply, capturing the step and both speeds every frame:
+
+       +---+------------+--------------+-----------+
+       | n | brakeStep  | gearboxRoad  | d(gbox)   |
+       +===+============+==============+===========+
+       | 0 |  0.15278   |    34.1608   |     -     |
+       | 3 |  0.15278   |    33.5697   |  -0.1952  |
+       | 6 |  0.15278   |    32.9868   |  -0.1938  |
+       | 7 |  0.91667   |    32.7934   |  -0.1934  |
+       +---+------------+--------------+-----------+
+
+   0.15278 is 100/6 through the km/h and dt scaling - the RAMPED
+   force.  The port, stepped one frame at a time over the same
+   manoeuvre, read brakeHoldMs 1221, 1254, 1287 and a step of
+   0.91667: full force from the first frame.
+
+   brakeHoldMs ONLY EVER WENT UP.  physics_apply_brake adds the
+   frame's milliseconds to it and nothing ever cleared it, so after
+   the first brake of a race the counter was past the 200 ms ramp
+   threshold forever.  The original clears it at 0x0048f930, on the
+   frame all three brake conditions fail - driveInterlock at
+   instance+0x88, the brake flag, and the countdown at 0x004dc0b4.
+
+   Fixed: physics_drivetrain_frame now zeroes it on the non-braking
+   branch.  STRAIGHT-LINE BRAKING HID THIS COMPLETELY, because by the
+   time that test braked both sides were long past 200 ms and both
+   used full force.
+
+   AND THE METHOD IS THE POINT.  Endpoint diffing could see only that
+   the port arrived slower; it took a per-frame capture of an
+   INTERMEDIATE value - the brake step, which is never stored in the
+   racer - to show that the two were applying different forces rather
+   than the same force to different states.
+
+10.4.5.  And the drag was being thrown away while braking
+
+   With the ramp timer fixed, brakeHoldMs matched frame for frame -
+   0, 33, 66, 99, 132, 165, 198, 231 on both - and the deceleration
+   went from -0.923 to -0.159 a frame against MOTO's -0.195.  A
+   second, smaller difference remained, and it DECAYED with speed on
+   MOTO while the port's stayed flat: the classic shape of a v^2
+   term.
+
+       +--------+-------------+-------------+
+       |        | MOTO        | port        |
+       +========+=============+=============+
+       | ramped |   -0.400    |   -0.319    |
+       | full   |   -1.904    |   -1.846    |
+       |        | decaying to |  flat       |
+       |        |   -1.882    |             |
+       +--------+-------------+-------------+
+
+   Full brake alone is 0.91667 a frame, 1.833 over a two-frame row.
+   MOTO loses about 0.036 a frame beyond it and the port 0.0065,
+   against physics_drag's own prediction at 30 m/s of
+   30*30*33*0.3/280*0.001 = 0.0318.
+
+   THE DRAG WAS BEING COMPUTED AND DISCARDED.  The resync stand-in at
+   the end of physics_drivetrain_frame copies gearboxRoadSpeed ONTO
+   speed while braking and the other way while driving - so
+   subtracting the drag from speed and then copying over it lost it,
+   but only on the braking path.  Now subtracted from both.
+
+   Both of these hid behind the same thing: the brake ramp.  While
+   brakeHoldMs never reset, the port braked at full force from frame
+   one and the missing drag was 0.7 per cent of a very large number.
+
+   AFTER BOTH FIXES the curve has the right SHAPE - the port decays
+   with speed where it used to be flat:
+
+       +----+-------------+-------------+-----------+
+       | n  | MOTO d      | port d      | delta     |
+       +====+=============+=============+===========+
+       |  5 |   -1.9038   |   -1.9159   |  -0.0120  |
+       |  7 |   -1.8885   |   -1.9000   |  -0.0115  |
+       |  9 |   -1.8753   |   -1.8863   |  -0.0109  |
+       +----+-------------+-------------+-----------+
+
+   WHAT IS LEFT IS CONSTANT, about 0.0055 a frame, and being
+   speed-independent it is not drag.  physics_rolling_resistance at
+   this bike and dt is 0.02 * 33 * 0.00981 = 0.00648 a frame, which
+   is the right size - so the obvious move was to stop applying it
+   while braking.
+
+   THAT WOULD HAVE BEEN WRONG.  The site is 0x0048fe0d inside
+   maybe_Physics_TickDrivetrain, calling Trk_RollResistanceAt
+   (0x00459f90) with the bike's position, and a trace hook at
+   0x0048fdf4 took FOUR HITS IN FOUR BRAKING FRAMES.  The original
+   applies rolling resistance on a braking frame like any other, so
+   race.c's unconditional application is right and the 0.6 per cent
+   is NOT this.
+
+   Trk_RollResistanceAt is eight bytes returning a constant 0.02 and
+   reading none of the position it is handed - the twin of
+   Trk_SurfaceGripAt eight bytes below it, which does the same with
+   1.0.  Both were meant to make the surface matter and neither was
+   finished.
+
+   THE RESIDUAL, DECOMPOSED.  At 30 m/s the three known terms are
+
+       brakeStep  0.91667      full brake, byte-identical both sides
+       drag       0.03182      v*v*dt*0.3/motoMasse/1000
+       roll       0.00647      0.02*dt*0.00981
+       sum        0.95497
+
+   against MOTO measured at 0.95190 and the port at 0.95795.  So MOTO
+   loses 0.0031 LESS than the three terms predict and the port 0.0030
+   MORE.  The port applying exactly those three cannot come out above
+   their sum, which points at ORDER rather than magnitude.
+
+   THE ORDERING CANDIDATE IS DEAD.  The thought was that the port
+   drags the PRE-brake speed while the original drags the post-brake
+   one.  Read out at 0x00490042:
+
+       0049003e  TEST EBX,EBX            airborne?
+       00490042  FLD  [ESI+0x100]        speed
+       00490048  FMUL [ESI+0x100]        * speed
+       0049004e  FMUL [ESP+0xa8]         * dtMs
+       00490055  FMUL [0x004d1e28]       * 1.6   airborne
+       00490070  FMUL [0x004d1e2c]       * 0.3   grounded
+       0049007f  FDIV [carac + 0x1c]     / motoMasse, index 7
+       00490086  FMUL [0x004d1c80]       * 0.001
+
+   It reads instance+0x100 - speed - and the brake writes
+   instance+0x108, gearboxRoadSpeed (0x0048fa06).  DIFFERENT FIELDS,
+   so the brake never touches what the drag reads and BOTH sides drag
+   the pre-brake speed.  The formula, the constants and the divisor
+   all match physics_drag exactly.
+
+   So the residual is not the drag's input, not the roll, not the
+   brake step and not a double application.  It is in how the pieces
+   are combined into the longitudinal speed - the assembly around
+   [ESP+0x10] that the roll is applied to at 0x0048fe82, which the
+   port does not have at all.  [open]
+
+   AT 0.6 PER CENT WITH THE CURVE SHAPE CORRECT this is well past the
+   point where it affects the ribbon, which is what the thread was
+   for.
+
+10.4.2.  BRAKING IS NOT DIVERGENT - a measurement trap
+
+   An earlier reading here said the port braked 2.5x too weakly.  IT
+   DOES NOT.  Braking matches:
+
+       +--------+--------------------------------------------+
+       | MOTO   | speedPrev 14.04704 -> speed 13.12387       |
+       |        | one frame, delta -0.92317                  |
+       | port   | one frame, delta -0.9225                   |
+       +--------+--------------------------------------------+
+
+   0.07 per cent apart, and both agree with the formula: frein 100,
+   clamped, times 1/3.6 (0x004d1e10) times dtMs 33 times 0.001
+   (0x004d1c80) is 0.916667.  The constants are byte-identical, the
+   apply is a single subtraction from gearboxRoadSpeed at 0x0048fa06
+   in both, brakeHoldMs advances 33 a frame in both, and there is
+   exactly ONE brake block in maybe_Physics_TickDrivetrain - the
+   clamp at 0x004d1df0 and the ramp at 0x004d1e08 each have a single
+   xref.
+
+   WHAT WENT WRONG IN THE MEASUREMENT: moto_send_input runs a MINIMUM
+   OF TWO FRAMES for a one-frame request, so a stepper asking each
+   side for one frame advances MOTO twice and the port once.  Every
+   per-row delta came out doubled.  The tell was sitting in the same
+   struct the whole time - speedPrev holds the previous FRAME's speed,
+   and 14.04704 - 13.12387 is one brake step, not two.
+
+   ANY per-frame comparison against MOTO must step both sides by two,
+   or read the deltas out of speedPrev rather than out of successive
+   samples.  Bulk sends are exact at two frames and above, so only
+   single-frame stepping is affected.
+
+   ON A STRAIGHT THE WIDTH IS DRIVEN BY FLOATING-POINT DUST.  The rule
+   is widen when |slip| exceeds the previous frame's |slip| and narrow
+   otherwise, so with skidWidthPrev at 0.0 any nonzero slip widens.
+   MOTO's straight-line slip is around 2e-19 rather than a clean zero,
+   which is why its width climbs while parked-and-braking; the port's
+   was exactly 0.0 and narrowed instead.  This is not a defect on
+   either side and there is nothing to match here - it is the reason a
+   straight-line width comparison means nothing.
+
+10.5.  A reset does not clear the marks
+
+   [verified] live, both binaries, by reading all sixteen quadCount
+   fields before and after the reset key:
+
+       MOTO   (36,38) (36,38) (4,6) (4,6) (22,24) (22,24) ...
+              unchanged across the reset
+       port   all sixteen cleared to (0,0)
+
+   MOTO leaves the pool alone, so marks laid before a reset stay on
+   the track until the sixteen-slot ring recycles them.  The port
+   clears them because its reset re-runs race setup, which calls
+   fx_ribbon_reset_all.  A DIVERGENCE, not yet reconciled - the fix is
+   to move fx_ribbon_reset_all off the reset path, and it is the
+   user's call whether the harness reset should match.
+
+11.  THE TYRE TRAIL - kinds 1..4, and why they are not dead
+
+   The dirt specks a wheel leaves OFF THE ROAD.  Step 2 of
+   maybe_Racer_EmitWheelFx, and the other half of the particle pool.
+
+11.1.  The path, and the mistake that hid it
+
+       maybe_Racer_EmitWheelFx  0x00466f5e
+         -> maybe_Fx_SpawnTrail 0x004576a0   scans the SAME 128 slots
+            -> FUN_004b00e0     0x004b00e0   the kinds-1..4 constructor
+
+   maybe_Fx_SpawnTrail's scan starts at 0x0052c594, which is the
+   particle pool's base 0x0052c498 plus 0xfc - the inUse field - with
+   the same 260-byte stride and the same 128 slots.  ONE POOL, TWO
+   CONSTRUCTORS.
+
+   AN EARLIER NOTE CALLED KINDS 1..4 DEAD, reasoning that
+   maybe_Fx_SpawnParticle is the only thing that sets a kind and both
+   its callers pass 5.  Both halves of that were true and the
+   conclusion was still wrong, because a second constructor writes the
+   same records.  Counting the callers of ONE allocator does not
+   enumerate what can appear in a shared pool.
+
+11.2.  The kind IS the surface id
+
+   FUN_004b00e0 switches on its last argument, which the emitter fills
+   from Trk_SurfaceAtPoint, and has an arm for 1, 2, 3 and 4 only:
+
+   +------+---------------------+--------------+---------------------+
+   | kind | Color_Pack16        | atlas rect   | reads as            |
+   +======+=====================+==============+=====================+
+   |  1   | (9, 8, 6)           | 113,174 ..   | brown dirt          |
+   |      |                     | 186,230      |                     |
+   +------+---------------------+--------------+---------------------+
+   |  2   | (0x14, 0x0d, 5)     | 2,109 ..     | sand                |
+   |      |                     | 108,206      |                     |
+   +------+---------------------+--------------+---------------------+
+   |  3   | (0, 0x0b, 4)        | 113,109 ..   | grass               |
+   |      |                     | 186,170      |                     |
+   +------+---------------------+--------------+---------------------+
+   |  4   | (0x13, 0x14, 0x15)  | 133,43 ..    | pale grey           |
+   |      |                     | 216,105      |                     |
+   +------+---------------------+--------------+---------------------+
+
+   SURFACE 0 IS THE ROAD and takes the switch's default, which returns
+   WITHOUT setting inUse - so the slot stays free and nothing is
+   drawn.  That is the whole mechanism behind specks that stop on
+   tarmac and resume on the verge; there is no separate road test.
+
+   THE PRIMITIVE KIND IS 0x26, not the smoke's 0x44.
+
+   THE TWO GREYS THE CALLER PASSES ARE NEVER READ.  The emitter builds
+   Color_Pack16(9,9,9) and (8,8,8) and hands them over; the body uses
+   the switch colour instead.
+
+11.3.  The speck spreads and collapses
+
+   Two counters, both truncated to int every frame [verified,
+   0x004b0774..0x004b07ea]:
+
+       while sizeSpawned*2 >= size and size <= 0x100
+           size   += dt * 3.84        0x004d202c
+           height += dt * 3.84
+       otherwise
+           height -= dt * 1.28        0x004d2030
+           size   += dt * 1.28
+
+   The quad stands on y = 0 and rises to `height`, width `size`, so it
+   spreads sideways while flattening.  IT DIES WHEN height GOES
+   NEGATIVE - there is NO life countdown on this arm, unlike kind 5.
+
+   THE BALLISTICS ARE THE CRASH'S, not the smoke's: direction kept
+   normalised with the magnitude in +0x34, gravity folded in and the
+   pair renormalised each frame.
+
+       v = dir * speed;  v.y += dt * -0.024525      0x004d2038
+       speed = |v|;  dir = v / speed
+       pos += dir * speed * dt * 0.01 * 128.0   0x004d2048, 0x004d2050
+
+11.4.  The size, and the cadence
+
+   Both __ftol operands were lost by the decompiler and are recovered
+   from 0x00466f71..0x00467011 [verified]:
+
+       n = (int)(speed / realSpeedMax * 64.0)        0x004d1060
+           NOTHING is emitted unless n > 4
+       A = matOrientation row2 + its translation - the image of the
+           unit Z basis point, so A is the heading
+       m = (int)(n * (1.0 - |dot(A, moveDir)|) * 5.0)
+                                        0x004d0e70, 0x004d0f78
+       size = (n + 2*m) / 3
+
+   SO IT GROWS WITH SPEED AND WITH SLIP.  dot is 1 going straight,
+   which zeroes m and gives the smallest speck.
+
+   THE CADENCE IS A FREE-RUNNING PHASE, DAT_004ea508, advanced ONLY by
+   the viewed racer so the whole field shares one rhythm:
+
+       phase += frameDelta
+       if (50.0 < phase) phase -= 50.0     0x004d1064
+       emit only while phase < 30.0        the 0x41f00000 compare
+
+   At 3.3 a tick that is about nine ticks emitting then six idle - the
+   streak-then-pause the trail draws on the ground.
+
+11.5.  What is implemented, and the one thing blocking it
+
+   fx_init_trail, fx_spawn_trail, fx_tick_trail and the draw are all
+   in, and the emitter carries the size formula and the cadence.
+
+   THE GATE IS IN TOO, as of trk_surface_at_point.  What follows is
+   how it was blocked and what unblocked it.
+
+   Trk_SurfaceAtPoint (0x0040ec60) is nineteen lines
+   and fully decoded, but it reads TWO SEGMENT FIELDS THE PORT DOES
+   NOT LOAD - bandLo at +0xf0 and bandHi at +0xf4:
+
+       d = dot(row0, point - origin) - dot(row0, row3)
+       return (bandLo < d && d < bandHi) ? surfaceIn : surfaceOut
+
+   Read live on ile01 they are -1024.0 and +1024.0 on every segment,
+   with surfaceIn 0 (road) and surfaceOut 2 (sand) - which is exactly
+   the beach.  They are NOT written by any instruction: the immediate
+   -1024.0f appears ONCE in the whole image, in .rdata, used by a mesh
+   builder.  They come from the FILE - 639 occurrences in ile01.trk at
+   roughly 144-byte spacing - and our loader stops before them.
+
+   THE LOADER WAS ALREADY READING THEM, as an unnamed `tail` pair,
+   and nothing had looked at the values - see trk.txt 2.1.  Naming
+   them was the whole fix.
+
+   VERIFIED offline against MOTO's live segment data, sweeping the
+   bike laterally along the segment's row 0 on ile01 segment 776:
+
+       offset     0  ->  d  -715.2  -> surface 0, road
+       offset   800  ->  d    84.8  -> surface 0, road
+       offset  1500  ->  d   784.8  -> surface 0, road
+       offset  -800  ->  d -1515.2  -> surface 2, SAND
+       offset -2000  ->  d -2715.2  -> surface 2, SAND
+
+   d tracks the lateral offset one for one, which is the check that
+   row 0 really is the lateral axis and unit length.
+
+11.6.  Verified against MOTO
+
+   Both games placed at 1800, 0, 7168 on ile01 - off the road, band
+   1024, surfaceOut 2 - and driven the same number of steps.
+
+   THE ONE PARTICLE ALIVE IN BOTH POOLS AT THE SAME INSTANT MATCHES
+   EXACTLY, in the shrink arm:
+
+       MOTO slot 4   spawn 13   size 42 -> 50 (+8)   height 10 -> 0
+       ours slot 1   spawn 13   size 42 -> 50 (+8)   height 10 -> 0
+
+   A PARTICLE CROSSING THE CAP MID-FRAME LOOKS WRONG AND IS NOT.
+   MOTO's slot 0 read size +16 with height +7 in the same frame -
+   different deltas, where the grow arm moves both by the same k.
+   Two ticks a frame is the answer: one grow tick then one shrink
+   tick gives size +k+k' and height +k-k', which is 16.8 and 8.4
+   before truncation.  Do not read it as a defect.
+
+   THE CADENCE IS RIGHT.  Both phases advance 6.6 a step and wrap at
+   50.0.  They sit at DIFFERENT OFFSETS, which is expected of a
+   free-running counter, and that offset is most of why a live count
+   differs between the two at any one moment.
+
+   THE ROAD REALLY IS SILENT.  Placed at 0, 0, 7168 - on the road -
+   and driven ten steps at speed 45, BOTH pools hold zero trail
+   particles.  Kind 5 keeps spawning throughout, so the pool is live
+   and it is the surface gate doing the work.
+
+11.6.1.  Through a turn, which is where the slip term lives
+
+   A STRAIGHT LINE TESTS HALF THE SIZE FORMULA.  dot(forward,
+   moveDir) is 1 going straight, so m is 0 and size collapses to
+   n / 3; the whole slip half is dead and a wrong constant there
+   would not show.
+
+   Driven through a left turn off-road, both games read the same
+   inputs to the formula [verified]:
+
+       dot(fwd, moveDir)   0.93966 on both
+       1 - |dot|           0.06034 on both
+       speed                47.274 on both
+
+   and the formula predicts
+
+       n    = int(47.274 / 80 * 64)      = 37
+       m    = int(37 * 0.06034 * 5)      = 11
+       size = (37 + 2*11) / 3            = 19
+
+   THE NEWEST PARTICLE ON BOTH SIDES IS 19.  Older ones in the same
+   pool read 16 and 18, spawned earlier in the turn at a different
+   dot - which is why comparing the SET of spawn sizes proves
+   nothing and comparing the newest against the formula proves it.
+
+11.6.2.  The spray's throw flips with the bars
+
+   maybe_Racer_EmitWheelFx picks -(rand & 3) or +(rand & 3) on
+   buttons & 4, so the spray goes the OPPOSITE way to the steering.
+   Recovered by projecting the particle's stored vector back onto the
+   bike's lateral axis - lat = (vel - row3) . row0 - from a matched
+   placement:
+
+       brake + left    MOTO -0.19 .. 2.40    ours -0.27 .. 2.40
+       brake + right   MOTO -2.40 .. 0.23    ours -2.40 .. 0.23
+
+   Same sign, same bounds to the digit.  The live COUNTS differ by a
+   few (114/108, 107/112) because the two rand streams are
+   independent; that is not a signal.
+
+11.6.3.  The particle counts, and why a saturated pool cannot be read
+
+   A steady donut on the dirt bike once read MOTO {5:79, 4:26} against
+   ours {5:103, 4:8} - a three-to-one gap on the trail.  IT WAS NOT A
+   PARTICLE DEFECT.  Every bit of it came from the slide being wrong:
+   fxGate never set (9.68), matBikeRoot yawed by the slip angle
+   (9.69), and the lean on the dead branch (9.70).  With those fixed
+   the same test reads, averaged over twelve frames:
+
+       kind 4 (trail)   MOTO  16.75   ours  14.08
+       kind 5 (spray)   MOTO 104.08   ours 106.50
+       total            MOTO 120.83   ours 120.58
+
+   THE TOTAL IS THE POOL, NOT THE EMITTERS.  128 slots, and both sides
+   sit against the cap oscillating 112..128.  A SATURATED POOL CANNOT
+   SHOW A SPAWN-RATE DIFFERENCE - only which emitter won the slots -
+   so the 2.7-particle split between trail and spray is allocation
+   order, and the totals agreeing to 0.2 per cent is the real result.
+
+   MEASURE IT UNSATURATED INSTEAD.  Straight off-road, gas only, no
+   slide - so the spray gate never opens and the trail has the pool to
+   itself:
+
+       kind 4 (trail)   MOTO 6.00   ours 5.50
+       kind 5 (spray)   both 0.00
+
+   Half a particle, which is one frame of the free-running cadence
+   phase.  Nothing left to chase.
+
+   WHAT WAS CHECKED AND MATCHED ALONG THE WAY: the per-frame count
+   (24 human / 4 AI), the lifetimes ({30, 60} on both), the life
+   decrement (6.6 a frame on both), the spawn order (trail in step 2,
+   spray in step 5), and sizeSpawned (63..67 against 64..69, each
+   matching its own side's formula from its own live speed and slip).
+
+11.7.  The trap that made it look unimplemented
+
+   The size term is speed / realSpeedMax * 64, reading racer+0xb4,
+   and racer+0xb4 HAS NO WRITER IN THIS PORT - MOTO holds 80.0 and
+   ours holds 0.0.  Transcribed literally it divides by zero, the
+   n > 4 gate can never pass, and NOT ONE SPECK SPAWNS.  Everything
+   downstream was correct and invisible.
+
+   Every other limiter in the port already reads the CARAC's copy for
+   an unrelated reason - racer+0xb4 is the field the copy protection
+   zeroes - and this one has to as well.  physics.c around
+   physics_set_long_speed carries the warning.
+
+   THE SHAPE TO RECOGNISE: an effect that draws nothing at all, with
+   no error and no wrong pixels, is usually a GATE that cannot open
+   rather than a renderer that cannot draw.  Read the pool before
+   reading the draw - 25 live particles, all kind 5, said at once
+   that the emitter and not the billboard was at fault.
+

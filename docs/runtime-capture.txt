@@ -1,0 +1,2011 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                    CAPTURING THE ORIGINAL AT RUNTIME
+
+
+Abstract
+
+   Every claim in this project is static. CLAUDE.md rule 8 forbids the
+   agent from launching MOTO.EXE, and the reason is sound: it does not
+   run correctly as-is and a launch costs a hung window. But the rule
+   forbids the AGENT running it, not the USER - "asking the user to
+   run it and report back is fine".
+
+   That distinction turns the one thing this project cannot do into
+   something it can: read the original's own numbers at the moment it
+   draws, instead of deriving them and hoping.
+
+   THE HARNESS IS BUILT. tools/mrhook is a DLL that loads into the
+   game, answers the install check in memory, and dumps those numbers
+   to a text file on a hotkey. It changes no bytes in the EXE. This
+   note is why it takes that shape and what to point it at;
+   tools/mrhook/README.txt is how to run it.
+
+   THE FIRST CAPTURE HAS BEEN TAKEN - 23 blocks, all eight bikes, on
+   the bike-select page. Section 6 records what it settled, including
+   two things the reconstruction had confidently wrong.
+
+Table of Contents
+
+   1. Why it is worth the setup
+   2. The shape of it - a proxy DLL, not a debugger
+      2.1. Why not just create the registry key
+      2.2. The addresses the harness reads
+      2.3. Why not the Ghidra debugger
+   3. What to capture, in priority order
+      3.1. Page 10, the immediate blockers
+      3.2. The cheap wins everywhere else
+   4. Rules that still apply
+      4.1. Movement tests: rails off, both sides reset
+   5. What it would NOT settle
+   6. The first capture, 2026-09-03
+      6.0. RETRACTED: the pose finding
+      6.1. What it settled
+      6.2. What it corrected
+      6.3. What it did not answer
+   7. The second capture, 2026-09-03
+      7.1. The per-part record, verified
+      7.2. The pose is not a shipped .rot
+      7.3. The wheels do not close
+      7.4. New: SPEEDPKT, and the .PIV files
+   8. What PilotRot resolves to
+      8.1. The list, and where it lands
+      8.2. Nothing on the menu selects from it
+      8.3. A real bug: the .ROT header
+   9. Reading the assembly: where the angles come from
+      9.1. The part record is a tree node
+      9.2. The menu wears staticPied after all
+      9.3. The transform matches ours exactly
+      9.4. What is left, and what the next capture reads
+   10. SOLVED: the third capture
+      10.1. Three bugs, all in skl.c
+      10.2. What it cost, and why
+   11. Verified to the vertex, and the two pose paths
+      11.1. The end-to-end check
+      11.2. The two paths that pose a racer
+      11.3. What is still wrong: the front wheel
+      11.4. Comparing the port against the capture
+   12. The port matches, and the premise was still wrong
+      12.1. What the dump proved
+      12.2. Two things maybe_Racer_Draw actually does
+   13. SOLVED: the vertices are drawn with the INVERSE
+      13.1. The assembly
+      13.2. The proof, without running anything
+      13.3. What was actually wrong, and for how long
+      13.4. The scaffolding, and what was kept
+   14. The front wheel: structure found, one scalar open
+      14.1. What overwrites the front wheel matrix
+      14.2. The vector helpers, now named
+      14.3. CLOSED - the two scalars are known
+      14.4. Reading the two earlier pairs
+      14.5. RETRACTED: the stack anomaly was a miscount
+      14.6. CLOSED - the trace that resolved 14.3
+      14.7. CLOSED - the numeric constraint on the two matrices
+      14.8. Why hand-tracing the stack has to stop here
+      14.9. The suspension term, located
+   15. The agent: querying the game instead of inferring
+      15.1. What it is
+      15.2. What it does not solve, and why that is fine
+   16. Trace hooks, and the test that can fail
+      16.1. The measurement
+      16.2. What it settled
+      16.3. What it did not settle
+   17. Data watchpoints, and the hole they close
+      17.1. What a displacement search structurally cannot find
+      17.2. The mechanism
+      17.3. The three that will cost a session if forgotten
+      17.4. What this does not replace
+      17.5. A mode=rw watch and a hook capture cannot share an
+            address
+   18. Finding the replay buffer - two instruments that found nothing
+   19. When an instrument finds nothing, vary the content
+
+1.  Why it is worth the setup
+
+   The reconstruction has reached the point where the remaining
+   errors are SMALL and SYSTEMATIC, and those are the expensive kind
+   to chase statically. A wheel that is a few units too high, a rider
+   whose arms sit slightly wrong, a bike that is a little too low -
+   each of them has half a dozen plausible causes and no way to
+   choose between them by reading more code.
+
+   THE FAILURE MODE THIS AVOIDS IS FUDGING. The temptation with a
+   near-miss is to nudge a constant until the picture matches, which
+   CLAUDE.md rule 5a bans precisely because it is indistinguishable
+   from a fix until the real code lands. A dumped value ends the
+   argument instead of settling it by eye.
+
+   It also converts a large class of [inferred] tags to [verified] in
+   one pass. Most of them are of the form "this global is probably X
+   because nothing writes it and the initialiser is Y" - one read at
+   the right breakpoint answers each.
+
+2.  The shape of it - a proxy DLL, not a debugger
+
+   BUILT: tools/mrhook. A DLL the loader maps into MOTO.EXE, which
+   answers the install check in memory and dumps the values we want to
+   mrcapture.txt on F11. tools/mrhook/README.txt is the operating
+   manual; this section is why it took that shape.
+
+   IT CHANGES NO BYTES IN THE EXE ON DISK. MOTO.EXE statically imports
+   two exports from ddraw.dll, two from dplayx.dll BY ORDINAL, and one
+   from dsound.dll, so a DLL of the right name in the application
+   directory is mapped before the entry point runs. Nothing is patched
+   on disk and the DB goes on describing the binary exactly.
+
+   o dplayx WON OVER ddraw for two reasons, and the second is the one
+     that matters on a modern machine. Nothing on the path to page 10
+     needs DirectPlay, so stubs that fail both calls cost nothing -
+     where a ddraw proxy would have to return a working IDirectDraw or
+     the game dies. And DIRECTPLAY IS AN OPTIONAL WINDOWS FEATURE, OFF
+     BY DEFAULT ON WINDOWS 10: without dplayx.dll the loader refuses
+     to start the process at all, before any of our code could run.
+     The stub is also the fix for a failure that would otherwise come
+     first.
+
+   o IT DETOURS NOTHING. The first design hooked four functions. That
+     was dropped once it was clear every value we want persists in a
+     GLOBAL for as long as the page is up - so a snapshot on a hotkey
+     gets all of it with no trampolines and no risk to the frame loop.
+
+   o THE ONLY PATCHED CODE IS THE TWO REGISTRY READERS, replaced
+     outright rather than hooked. Both are __stdcall with three
+     arguments (RET 0xc) and nothing wants their real behaviour, so
+     there is no trampoline to get wrong.
+
+   o CORRECTION - RUN decomp\MOTO.EXE, NOT ORIGINAL_MOTO.EXE. An
+     earlier draft of this note said the opposite, on the
+     reasonable-sounding grounds that the untouched binary is the
+     purer subject. That is WRONG FOR CAPTURE: with no CD present the
+     protection fails, and a failing protection makes Carac_Load
+     SUBTRACT 1 FROM EVERY BIKE'S NbSpeed. A carac dump from the
+     untouched binary would be quietly wrong.
+
+     The patched copy has the protection satisfied and both
+     colour-depth gates open, and none of its seven patches touches
+     the geometry path. It is the better subject on both counts. See
+     docs/binary-modifications.txt.
+
+2.1.  Why not just create the registry key
+
+   The check is HKEY_LOCAL_MACHINE\SOFTWARE\DelphineSoft\MotoRacer\
+   CurrentVersion\Moto, read at 0x0045a330 with the root hardcoded
+   as (HKEY)0x80000002 and the value required to be REG_SZ [verified].
+   Main_InitAndParseCommandLine (0x00414100) wants five values:
+
+   +-------------+--------+------------+---------------------------+
+   | Value       | Type   | Goes to    | Purpose                   |
+   +=============+========+============+===========================+
+   | DataPath    | string | 0x004e8480 | prefix File_Open and      |
+   |             |        |            | Trk_Load prepend to every |
+   |             |        |            | asset path                |
+   +-------------+--------+------------+---------------------------+
+   | SavingPath  | string | 0x004e8380 | save location             |
+   +-------------+--------+------------+---------------------------+
+   | Language    | string | stack      | vs FRENCH, GERMAN,        |
+   |             |        |            | ITALIAN, SPANISH,         |
+   |             |        |            | SWEDISH; anything else    |
+   |             |        |            | means English             |
+   +-------------+--------+------------+---------------------------+
+   | Version     | dword  | 0x004dc1c4 | 1 or 0 sets a mode flag   |
+   +-------------+--------+------------+---------------------------+
+   | InstallType | dword  | 0x004e8580 | defaults to 3             |
+   +-------------+--------+------------+---------------------------+
+
+   Creating the key would work, and was the first plan. Answering in
+   process is better: WRITING HKLM NEEDS ADMINISTRATOR, and from a
+   32-bit process it lands in WOW6432Node, which is one more thing to
+   be wrong about. The DLL needs neither and leaves nothing behind on
+   the machine.
+
+   It also honours the standing instruction that none of our code
+   touches the registry.
+
+2.2.  The addresses the harness reads
+
+   +---------------------+------------+----------------------------+
+   | What                | Address    | Note                       |
+   +=====================+============+============================+
+   | menu racer          | 0x00584421 | Game_LoadBikeAndBanks      |
+   |                     |            | passes it as this          |
+   +---------------------+------------+----------------------------+
+   | racer matrix        | +0x00bc    | PlaceWheels rotates by it  |
+   +---------------------+------------+----------------------------+
+   | body instance       | +0x0024    | MR_ModelInstance           |
+   +---------------------+------------+----------------------------+
+   | front wheel         | +0x01a8    | likewise                   |
+   +---------------------+------------+----------------------------+
+   | rear wheel          | +0x032c    | likewise                   |
+   +---------------------+------------+----------------------------+
+   | lod slot            | +0x0638    | should read 0              |
+   +---------------------+------------+----------------------------+
+   | g_meshSkl           | 0x0053a6a8 | stride 0x70; +0x04 verts,  |
+   |                     |            | +0x30 vertexCount          |
+   +---------------------+------------+----------------------------+
+   | g_bikeCarac         | 0x00509278 | stride 0x124, value i at   |
+   |                     |            | +i*4                       |
+   +---------------------+------------+----------------------------+
+   | camera records      | 0x005161c0 | stride 0x238, pos at +0x98 |
+   +---------------------+------------+----------------------------+
+   | camera index        | 0x004dc0f8 |                            |
+   +---------------------+------------+----------------------------+
+   | g_projZoom          | 0x006d1f74 |                            |
+   +---------------------+------------+----------------------------+
+   | g_menu              | 0x004dc0c4 | page index at +0x3c        |
+   +---------------------+------------+----------------------------+
+
+   ALL OF THEM ARE REBASED at run time against GetModuleHandle(NULL).
+   A 1997 binary carries no DYNAMIC_BASE flag so it will load at
+   0x00400000, but the image has a .reloc section and one subtraction
+   is cheaper than debugging a wild pointer. The capture header prints
+   the delta, so "every float is garbage" has an obvious first thing
+   to check.
+
+2.3.  Why not the Ghidra debugger
+
+   The MCP exposes a full debugger surface - debugger_attach,
+   debugger_set_breakpoint, debugger_read_memory, debugger_registers,
+   debugger_watch_memory, debugger_trace_function, and
+   debugger_dynamic_to_static to map a live address back to the DB. It
+   remains the right tool for an EXPLORATORY question: which branch
+   fires, what a global holds at an arbitrary moment, where a write
+   comes from.
+
+   It is the wrong tool for THIS capture, which is bulk. We want 240
+   vec3s, twelve matrix floats and a handful of scalars, all at one
+   instant, in a form that diffs against our own output offline. That
+   is one file the DLL writes in a millisecond, against hundreds of
+   MCP round trips with the game frozen at a breakpoint the whole
+   time. The DLL also needs no VM: it does not have to survive the
+   game wedging the display, because by then it has already written
+   its file.
+
+   Use the debugger AFTER the dumps, on whatever the dumps make
+   confusing.
+
+3.  What to capture, in priority order
+
+3.1.  Page 10, the immediate blockers
+
+   All but the last row are in the F11 dump already. Everything here
+   is read as a GLOBAL at the moment of the keypress - no breakpoint,
+   no detour - which is why the one row that needs a call intercepted
+   is the one row the harness does not cover.
+
+   +---------------------------------+-------------------------------+
+   | What the dump holds             | Settles                       |
+   +=================================+===============================+
+   | the two wheel instance          | THE WHEEL POSITIONS, as two   |
+   | positions at racer+0x1a8 and    | vec3s, with no inference at   |
+   | racer+0x32c, as PlaceWheels     | all. Currently derived from   |
+   | (0x0045c7c0) left them          | three .rdata constants and an |
+   |                                 | assumed identity matrix.      |
+   +---------------------------------+-------------------------------+
+   | the racer orientation matrix at | WHETHER IT IS THE IDENTITY.   |
+   | racer+0xbc                      | The whole wheel placement     |
+   |                                 | rests on this and nothing on  |
+   |                                 | the page writes it.           |
+   +---------------------------------+-------------------------------+
+   | g_meshSkl[0].vertices, 240      | THE POSE MATH, end to end. A  |
+   | vec3s, after the pose is        | vertex-for-vertex diff        |
+   | applied                         | against ours localises any    |
+   |                                 | Euler order or unit error to  |
+   |                                 | a single bone.                |
+   +---------------------------------+-------------------------------+
+   | the camera record and           | THE FRAMING - why the bike    |
+   | g_projZoom                      | sits lower than retail.       |
+   +---------------------------------+-------------------------------+
+   | ANSWERED, and not by dumping    | WHICH .rot THE PAGE APPLIES:  |
+   | it. The path is an argument,    | NONE. The identity pose       |
+   | not a global, so the harness    | reproduces the capture to     |
+   | never saw it - but the vertex   | 0.0001 units. staticPied, the |
+   | dump settled it anyway, which   | name-based choice we had been |
+   | is why the indirect answer was  | applying, is out by 42.5.     |
+   | worth more than the direct one. | See section 6.2.              |
+   +---------------------------------+-------------------------------+
+
+   THE VERTEX DIFF IS THE BIG ONE. It reduces "the rider is subtly
+   wrong" - which could be the angle unit, the Euler order, the
+   composition order, or the joint convention - to a table of which
+   bones match and which do not. A bone whose children are all wrong
+   but which is itself right localises the error to that joint.
+
+3.2.  The cheap wins everywhere else
+
+   These are NOT in the F11 dump. Each is a few lines to add to
+   capture() when its turn comes, or a debugger session if it needs a
+   moment the hotkey cannot reach.
+
+   o DAT_004ea4e0 and the other write-once globals. Several open
+     questions are of the form "no writer traced, initialiser is 0" -
+     a single read at a known moment confirms or refutes each.
+
+   o THE COLOUR PATH. Skl_Load resolves face colours against bank 0's
+     palette through two branches; dumping a few resolved colours
+     says which branch fires and what it produces.
+
+   o THE BLEND LADDER. subsystems/d3d-textures.txt has several arms
+     chosen by flags whose runtime values were reasoned about rather
+     than observed.
+
+   o THE TRACK LOADER, when it arrives. Reading a loaded .trk's
+     in-memory form beside the file would validate a format that is
+     currently decoded but never exercised.
+
+4.  Rules that still apply
+
+   o THE AGENT DOES NOT LAUNCH IT. The user starts the game, presses
+     F11 and hands back mrcapture.txt. That is the same division rule
+     8 already describes, with a text file in place of a verbal
+     report. The agent builds the DLL (Release|Win32, rule 9) and does
+     not run it.
+
+   o A DUMP IS EVIDENCE, NOT AUTHORITY. It is one run, on one machine,
+     with one set of settings. A value read once is [observed] until
+     it is understood; it becomes [verified] when the code that
+     produces it has been read and agrees.
+
+   o WRITE IT DOWN THE SAME DAY, WITH THE CAPTURE BLOCK IT CAME FROM.
+     A dumped value with no note saying which capture produced it is
+     worse than no value, because the next reader cannot tell what it
+     was measuring. The blocks are numbered and carry the menu page
+     for exactly this reason.
+
+   o THE DB DOES NOT MOVE. Nothing about this touches decomp/MOTO.EXE
+     or the Ghidra project. A dump that contradicts the DB is a
+     finding to write up on both sides (rule 5b), not a licence to
+     edit one of them quietly.
+
+4.0.  The A/B run - tools/mr_ab.py
+
+   python tools/mr_ab.py --spot square-right --frames 48 --step 16
+
+   Places BOTH games at one spot, drives them the same frames with
+   the same input, and prints the two tracks side by side. It works
+   at all because MR_Racer is byte-exact, so one offset table
+   serves both and there is nothing to translate.
+
+   IT FOUND THREE THINGS ON ITS FIRST RUN, none of which a
+   one-sided reading would have shown:
+
+   o THE PORT'S PLACEMENT HAD SILENTLY STOPPED WORKING. mr_place
+     wrote s_race_yawWorld, which was the heading until
+     racer_apply_steering was imported and the MATRIX became the
+     state. The scalar is a cache now, so the write placed nothing
+     and the bike kept its old heading - 0 degrees against MOTO's
+     -90. Fixed: the port path writes matOrientation, same as the
+     MOTO path.
+
+   o segment AND segmentPrev WERE STALE. racer_update_ground_contact
+     maintains segmentStart (+0x31c1); race.c draws and places from
+     segment (+0x31bd), and nothing had updated it since import 1.
+     Placed at segment 3: MOTO read 3/3/3, ours read 9/9/3. Each
+     field looks plausible alone, which is why only a comparison
+     catches it.
+
+   o OUR ACCELERATION IS ABOUT TWO THIRDS OF MOTO'S - 11.48 m/s
+     against 17.32 after the same input - and the distance covered
+     differs by more than the speed explains. That is the
+     drivetrain, and it is what import 6 is for.
+
+   THE FRAME COUNTS ARE NOT THE SAME THING. MOTO's send_input runs
+   N of ITS frames and ours runs N of ours; the two engines do not
+   agree on what a frame is. Compare the SHAPE of the tracks, and
+   treat a constant ratio as a timebase difference rather than a
+   physics one.
+
+4.0.-1.  The stunt bit, and why it was not there
+
+   SEND_INPUT's hold mask carries SEVEN bits, not six:
+
+       0 accelerate   1 brake   2 left   3 right
+       4 higher gear  5 lower gear
+       6 STUNT - the wheelie button
+
+   BIT 6 IS NOT A BIT OF THE INPUT WORD. Bits 0..5 go into
+   racer+0x31e9, the word Input_OnKeyDown fills for actions 0..5.
+   Its case 6, at 0x00431250, does not touch that word at all: it
+   writes stuntHeld (+0x31f9) and stuntPressed (+0x3201)
+   directly, and maybe_Input_OnKeyUp at 0x00432700 clears
+   stuntHeld alone. So the DLL reproduces those two writes -
+   stuntHeld is a LEVEL, stuntPressed an EDGE set only on the
+   0 -> 1 transition. [verified]
+
+   NOT action6Down (+0x31fd). That field belongs to the JOYSTICK
+   path: maybe_Input_ReadDevice at 0x00411b30 derives the same
+   two fields from it, and maybe_Game_ReadInput calls it only for
+   device types 2 and 4. On a keyboard racer nothing reads or
+   writes it - a hardware watchpoint on it recorded zero writes
+   across a whole run - so a first version of this that drove
+   action6Down moved the wheelie not at all.
+
+   THE REQUEST FLAG IS A THIRD FIELD AGAIN. maybe_Racer_Tick at
+   0x0045d6db copies stuntHeld into stuntOrOverspeed (+0x2e85),
+   gated on the countdown being over plus humanPlayer plus
+   soloMode, and maybe_Racer_UpdateWheelie ramps on THAT. Three
+   fields, one button.
+
+   NOTHING ON THE GAME THREAD CLEARS stuntHeld WHILE UPRIGHT, so
+   a bare SET_MEM latches it like a held key and the harness can
+   drive a wheelie without the DLL. ONCE crashLatch IS SET it is
+   a different story: UpdateWheelie's reset branch clears it, the
+   angle and the timer every frame at 0x0046612e. A stunt test
+   that silently does nothing is usually a crashed bike, so read
+   crashLatch (+0x30c1) before believing a flat wheelie column.
+
+   WHY IT MATTERED. Without any of this the wheelie could not be
+   driven from the harness, so the port's wheelie had no retail
+   comparison - and the first attempt at one held bit 4 by
+   mistake, which is the GEAR, shifted MOTO up and quietly
+   invalidated the speed column as well.
+
+   THE DLL MUST BE REBUILT AND MOTO.EXE RESTARTED for the mask
+   bit to exist. Until then a hold of 0x40 is refused as out of
+   range, which is at least a loud failure rather than a silent
+   no-op; tools/mr_ab.py writes stuntHeld itself and so works
+   against either build.
+4.0.0.  MOTO's SEND_INPUT DOES NOT ALWAYS RUN WHAT YOU ASK
+
+   Measured against the frame counter at 0x004e981c, before and
+   after each call:
+
+   +--------+-----------+-----------+
+   | asked  | advanced  | overhead  |
+   +========+===========+===========+
+   |      1 |         2 |        +1 |
+   +--------+-----------+-----------+
+   |      2 |         2 |         0 |
+   +--------+-----------+-----------+
+   |      3 |         3 |         0 |
+   +--------+-----------+-----------+
+   |      8 |         8 |         0 |
+   +--------+-----------+-----------+
+   |     16 |        22 |        +6 |
+   +--------+-----------+-----------+
+
+   SO NEVER STEP AN A/B ONE FRAME AT A TIME. At frames=1 the
+   overhead doubles MOTO's rate, and a side-by-side run drifts to
+   a clean 2:1 - our frame 4 reading MOTO's frame 2, our 6 its 3,
+   our 12 its 6. That looks exactly like our port running at half
+   speed and it is nothing of the sort.
+
+   STEPS OF 2, 3 OR 8 ARE EXACT. Those are what the A/B runs use,
+   which is why their speeds match to four decimals while the
+   one-frame trace appeared to show a 2x error.
+
+   CHECK THE COUNTER RATHER THAN TRUSTING THE REQUEST whenever a
+   new step size is used. It is two GET_MEMs and it has now caught
+   one bogus divergence.
+
+4.0.1.  What the A/B has settled so far
+
+   TURNING TRACKS. Held left from the grid, steer saturates at
+   -600.0 on both sides and the headings stay within about three
+   degrees over thirty frames, with lean matching to a tenth at
+   the peak - -35.36 against -35.44. The offset appears in the
+   first few frames and then holds, so it is an initial-ramp
+   difference rather than a rate error.
+
+   +--------+-------------+-------------+
+   | frame  | MOTO hdg    | ours        |
+   +========+=============+=============+
+   |      6 |     14.72   |     11.67   |
+   +--------+-------------+-------------+
+   |     18 |     51.20   |     48.43   |
+   +--------+-------------+-------------+
+   |     30 |     86.35   |     83.76   |
+   +--------+-------------+-------------+
+
+   THE WALL RECOVERY WAS INVERTED, and only a comparison could
+   have shown it, because the MAGNITUDE was already right. Both
+   games set a pending yaw of -81.09 on the same square hit; MOTO
+   then climbed the heading -90 -> -81 -> -72 -> -63 while ours
+   ran -90 -> -98.9 -> -116.8 -> -134.6. Same number, opposite
+   direction, and on its own each side looks reasonable.
+
+   THE CAUSE IS A CONVENTION SEAM. flLeanTarget is stored in
+   Racer_GetYaw's sign, which runs opposite to ours. The fix
+   negates the composed step rather than the stored value, so the
+   field stays byte-comparable with MOTO - which is what made it
+   findable in the first place.
+
+   DO NOT DERIVE THESE SIGNS, MEASURE THEM. Three separate sign
+   errors in this area were each 'derived' correctly and were each
+   wrong: the compose sense, the recovery's early-out frame, and
+   this one. The convention gap between Racer_GetYaw and
+   atan2(-x, z) makes every derivation a coin toss and every
+   two-sided measurement decisive.
+
+4.1.  Movement tests: rails off, both sides reset
+
+   ANY measurement that involves the bike moving starts with these
+   three steps, in this order, every time:
+
+       1.  python tools/mr_cheats.py --on nowalls
+       2.  python tools/mr_reset.py           (MOTO)
+           2                                  (mracer)
+       3.  drive, then capture
+
+   AND FOR A WALL OR CRASH TEST, STEP 2a IS A PLACEMENT.
+   tools/mr_place.py writes the position and the orientation, so
+   an impact happens at a chosen angle instead of wherever driving
+   happened to end up - which is what makes two captures of the
+   same event comparable:
+
+       python tools/mr_place.py                 report, and the
+                                                two wall distances
+       python tools/mr_place.py --at X Y Z --yaw D
+
+   It writes moveDir along with the matrix, and it has to:
+   racer+0x130 is where the bike POINTS and racer+0x18c is where
+   it is GOING, and only the second one moves it. Turning the
+   matrix alone leaves a bike that faces a wall and drives past
+   it.
+
+   IT ALSO REPORTS THE WALLS, read from the segment record rather
+   than found by driving into them - g_pTrkSegments at 0x0052c108,
+   stride 252, the two wall planes at +0x60 and +0x70 as
+   {nx,ny,nz,d} with the normals facing INWARDS, so the signed
+   distance is the room on that side. Segment 3 of ile01 is a
+   straight 2560 units wide; the grid puts the bike 1152 from one
+   rail and 1408 from the other.
+
+   WHY THE RAILS COME OFF FIRST. A wall push displaces the racer
+   between the wheel contacts being written and the draw reading
+   them, and the result looks exactly like a flaw in whatever
+   formula is being tested. It cost one full round of the placement
+   capture: the anchor reconstructed to 82.65 and 84.93 against a
+   required 84.0, which read as a broken model and was a broken
+   measurement. With the rails off the same numbers are exact.
+
+   WHY BOTH SIDES RESET. Comparing a MOTO parked wherever the last
+   test left it against a freshly loaded mracer compares two
+   different situations. The grid is the only state both sides
+   reach identically without being driven there.
+
+   nowalls IS RUNTIME ONLY - it patches the process, never the
+   file, and a fresh launch reads the .bpt files again. Turn it
+   off with --off nowalls when the measuring is done, so the next
+   session does not inherit a track with no rails and mistake it
+   for the game.
+
+   THE GAME MUST BE RUNNING FOR A HOOK TO FIRE. A hook arms fine
+   against a frozen MOTO and then records nothing. Check the frame
+   counter at 0x004e981c on two reads before concluding that a
+   hook site is wrong; if it does not move, the game is paused and
+   moto_send_input has to step it.
+
+   AND HOOKS REFUSE RELATIVE INSTRUCTIONS. CALL, JMP and Jcc
+   cannot be relocated into a trampoline, so hook_arm rejects
+   opcodes e8, e9, eb, 70..7f and 0f. Site the hook on the LEA or
+   MOV either side of the call instead - which usually reads
+   better anyway, since after the call the register holds the
+   RESULT rather than the argument.
+
+5.  What it would NOT settle
+
+   o ANYTHING ABOUT THE PORT'S OWN CODE. A capture of the original
+     says what the original does; our divergences - the D3D9 back
+     end, the ini, the audio stubs - are still ours to reason about.
+
+   o DESIGN QUESTIONS. Why the eight bikes exist, what a mode means,
+     which page follows which. Those come from reading.
+
+   o THE 3.20 / 3.22 QUESTION. A capture is of whichever build is
+     installed, and docs/releases.txt records that no retail CD
+     examined contains our binary.
+
+6.  The first capture, 2026-09-03
+
+   decomp/mrcapture.txt, 23 blocks, menu page 10, all eight bikes.
+   The image loaded at its preferred base so the rebase delta is zero.
+   Everything in this section is [verified] against that file.
+
+
+6.0.  RETRACTED: the pose finding
+
+   THIS SECTION ORIGINALLY CONCLUDED THAT THE BIKE-SELECT PAGE
+   APPLIES NO POSE, on a vertex diff that scored the identity at
+   0.0001 units over 240 vertices against 13 to 80 for every real
+   pose. The test could not have failed:
+
+       Screen3D_TransformVertsFlat(out,
+           g_meshSkl[lod].vertices + rec->firstVertex * 12,
+           rec->vertexCount, ...)
+
+   maybe_Racer_Draw (0x0045f290) transforms a SLICE of that pool
+   per part and never writes back, so g_meshSkl[lod].vertices holds
+   the bind pose BY CONSTRUCTION. Asking whether it equalled the
+   bind pose had one possible answer.
+
+   A DIFF THAT CLEAN IS THE SIGNATURE OF COMPARING A FILE AGAINST
+   ITSELF, not a measurement of runtime state. The check to apply
+   to any agreement that good is what could have made it come out
+   differently.
+
+   THE POSE IS A MATRIX PER BODY PART, held in the racer at
+   0x640 + (lod*20 + part)*100 - see 7.1 for the record. Which pose
+   the page wears is settled in 9.2.
+
+   tools/skl_pose_diff.py is sound; it was pointed at the wrong
+   reference. Point it at per-part matrices.
+
+6.1.  What it settled
+
+   o THE RACER MATRIX AT +0xbc IS THE IDENTITY, and the racer position
+     and body instance position are both (0,0,0), in all 23 blocks.
+     The whole wheel placement rested on this and nothing on the page
+     writes it, so it was an assumption; it is now a measurement.
+
+   o THE CAMERA ORBITS A STATIONARY BIKE. Camera position is exactly
+     radius 1500.0000 from the world origin and exactly y 240.0000 in
+     every block, with the angle advancing between presses. The bike
+     does not turn at all. g_projZoom is 1.0.
+
+   o THE LOD SLOT IS 0, so the page draws the articulated skeleton.
+     racer+0x638 reads 0 in every block. See 6.2 - this had been
+     reasoned to slot 2.
+
+   o THE WHEEL FORMULA IS EXACT. Measured front (0, -27.8404,
+     83.9753), rear (0, -30.7200, -84.0000), identical for all eight
+     bikes because all eight share RoueAxeDistance 1.75, RayonAv 0.29
+     and RayonAr 0.32. Against
+
+         rear  = (0, -96 * rayonAr, -48 * axeDistance)
+         front = (0, -96 * rayonAv, +48 * axeDistance)
+
+     that is -30.7200 and -84.0000 exactly on the rear, and -27.8400
+     and +84.0000 on the front. THE FRONT IS OUT BY 0.0247 IN Z and
+     0.0004 in Y - small, one-sided, and too large to be float noise
+     at that magnitude. Something adds a little to the front wheel
+     that the formula does not model. Open, and listed in 6.3.
+
+   o THE SCALE IS 96 UNITS PER METRE, falling out of the same numbers:
+     the wheel centres sit one radius below the origin and the axles
+     half a wheelbase either side of it. So the model origin is the
+     wheelbase midpoint horizontally and the top of the rear tyre
+     vertically, and the ground is 61.44 units below it.
+
+   o ALL EIGHT BIKES SHARE ONE MESH. The 240 vertices are
+     byte-identical across all 23 blocks and all eight selections,
+     which independently confirms that a livery is a palette and not
+     a model. See subsystems/texture-banks.txt.
+
+6.2.  What it corrected
+
+   Both of these were reasoned from real evidence and both were wrong,
+   which is the point of taking a capture at all.
+
+   o RETRACTED - "THE PAGE APPLIES NO POSE" WAS WRONG; see 6.0. What
+     survives is that the .SKL parser, the 3.5 load scale and the
+     root-joint re-centring are exact, which the same diff does
+     establish.
+
+   o THE MODEL IS NOT OFFSET. src/menu.c was shifting it by minus its
+     own bounding-box centre, openly labelled a stand-in for a racer
+     record we had not reconstructed. That centre is (0.08, 28.80,
+     -9.60), so the stand-in was pushing the bike 28.8 units down and
+     9.6 back - which is the "bike sits too low" that prompted this
+     whole exercise. The original offsets nothing.
+
+     The premise was about the wrong mesh: medium\corps.3df does have
+     its origin by the rear axle, but this page draws the SKELETON,
+     and skl_load re-centres that on its root joint.
+
+   o AND ONE COMMENT WAS WRONG IN src/. The block above the page-10
+     camera constants argued the medium mesh from SelectLod's
+     distance bands. Every step was true and the conclusion was wrong,
+     because SelectLod is never called on this page. Reading what a
+     function computes is not the same as establishing that it runs.
+
+6.3.  What it did not answer
+
+   All but one are closed elsewhere: the front wheel scalar in
+   racer-draw-audit 55 to 57, the pose in 9.2, and the wheel-frame
+   misalignment with it. THE CAMERA TARGET IS STILL UNMEASURED -
+   only the position at +0x98 is dumped, and a target of the origin
+   is near certain from the orbit radius and height without being
+   observed.
+
+7.  The second capture, 2026-09-03
+
+   Eight blocks, one per bike, taken after mrhook learned to read the
+   per-part records. This is the capture that was worth taking.
+
+   THE POSE IS IDENTICAL IN ALL EIGHT BLOCKS, and the eight were taken
+   at eight different camera angles. So the matrices carry no view
+   component and the pose does not vary with the bike.
+
+7.1.  The per-part record, verified
+
+   rec = racer + 0x63C + (lod * 20 + part) * 100
+
+   +--------+-------+-----------------------------------------------+
+   | Offset | Type  | Field                                         |
+   +========+=======+===============================================+
+   | +0x00  |       | unknown                                       |
+   +--------+-------+-----------------------------------------------+
+   | +0x04  | ptr   | PARENT RECORD, null at the root               |
+   +--------+-------+-----------------------------------------------+
+   | +0x18  | f[12] | the pose matrix, model space                  |
+   +--------+-------+-----------------------------------------------+
+   | +0x48  | f[3]  | a position                                    |
+   +--------+-------+-----------------------------------------------+
+   | +0x54  | int   | firstVertex, into g_meshSkl[lod].vertices     |
+   +--------+-------+-----------------------------------------------+
+   | +0x58  | int   | vertexCount                                   |
+   +--------+-------+-----------------------------------------------+
+   | +0x5c  | int   | faceCount                                     |
+   +--------+-------+-----------------------------------------------+
+   | +0x60  | ptr   | faces                                         |
+   +--------+-------+-----------------------------------------------+
+
+   100 bytes exactly, 20 per LOD slot. Part count is at racer + 0x2d4c
+   + lod*4 and the draw order at racer + 0x2d74 + lod*4.
+
+   THE BASE IS 0x63C, NOT 0x640. Draw reads the parent pointer at
+   (part*100 + 0x640) and writes the matrix at (part*100 + 0x654),
+   which are record +0x04 and +0x18. Getting this off by four would
+   mislabel every field, which is why it is worth stating twice.
+
+   HOW IT WAS VERIFIED. Every non-null parent pointer in the capture
+   resolves to racer + 0x63C + parent*100, and the resulting tree
+   REPRODUCES THE .SKL MEMBER TREE OF SPEED\CORPS.SKL EXACTLY, for all
+   seventeen members. The vertex runs match the file's members too, and
+   the draw order is the file's own remap table. Part 17 carries the
+   file's 91-face trailing group and has no vertices.
+
+   AND THE TRANSFORM FORMULA IS CONFIRMED. For part 4 - member 6, with
+   re-centred origin (0.3, 10.4, -36.6) - the rule
+
+       trn = origin - origin * R
+
+   gives (0, 12.57, 1.39) against a captured (0, 12.5467, 1.3959). So
+   v' = (v - origin) * R + origin is right, which formats/skl-rot.txt
+   had argued from the identity-pose test alone.
+
+7.2.  The pose is not a shipped .rot
+
+   IT MATCHES NONE OF THE 106 .rot FILES the game ships - the 19 in
+   SPEED plus SPEEDPKT, KTMCROSS, KTMPKT and PODIUM. Tested three
+   ways, all negative:
+
+   o Compose each candidate and compare world matrices. Best is 0.799
+     on a rotation entry, where a match is under 0.01.
+
+   o The same across eight variants - composition order, transpose and
+     angle sign. Best 0.588. Nothing near.
+
+   o The same again with the angles indexed by PART number - the .PIV
+     numbering - rather than by member. Best 0.687.
+
+   That is 106 poses x 2 indexings x 2 composition orders x 2
+   transposes x 2 signs = 1696 combinations, best 0.588.
+
+   o Decompose the captured matrices instead and read the angles out
+     directly, then compare per member. Every non-trivial member is
+     off by hundreds to thousands of units.
+
+   THE DECOMPOSITION IS VIEW-INVARIANT, which is what makes the third
+   test trustworthy. If every world matrix carries a common factor on
+   the right - a view matrix, say - then
+
+       W_i * inverse(W_parent) = L_i * V * inverse(V) * inverse(L_...)
+
+   cancels it. So the recovered locals are the true local rotations
+   however the chain is composed and whatever is applied after it.
+
+   THE RECOVERED POSE, in .rot units of 0x4000 to the turn:
+
+   +--------+---------------------------+------------------------+
+   | Member | Local euler x, y, z       | Note                   |
+   +========+===========================+========================+
+   | 0      |      0,      0,      0    | root, frame            |
+   | 1      |      0,      0,      0    | empty helper           |
+   | 2      |      0,     87,      0    | single axis            |
+   | 3      |   -500,      0,      0    | single axis            |
+   | 4, 5   |      0,      0,      0    | empty helpers          |
+   | 6      |   -871,      0,      0    | single axis            |
+   | 7      |   3233,    169,    122    | limb                   |
+   | 8      |  -3562,    983,   -871    | limb                   |
+   | 9      |   1022,    145,   -309    | limb                   |
+   | 10     |   -257,   -681,    639    | limb                   |
+   | 11     |  -1868,      0,      0    | single axis            |
+   | 12     |   1027,   -233,    139    | limb                   |
+   | 13     |    153,    456,   -129    | limb                   |
+   | 14     |   2190,   -314,     69    | limb                   |
+   | 15     |    887,    440,   -676    | limb                   |
+   | 16     |    514,   -186,    547    | limb                   |
+   +--------+---------------------------+------------------------+
+
+   THE SHAPE IS THE INTERESTING PART. The chassis chain - 2, 3, 6, 11
+   - comes out as clean SINGLE-AXIS rotations, while every limb has
+   all three. That is what a computed pose looks like: procedural
+   angles on the chassis, something else driving the limbs. A keyframe
+   read straight out of a file would not sort itself that way.
+
+   SO THE POSE IS COMPUTED, NOT LOADED [inferred - strong, but it
+   rests on the absence of a match rather than on reading the code
+   that builds the matrices]. Finding that code is the next job.
+
+   WHAT IS NOT YET RULED OUT: a blend of two .rot files, a .rot plus
+   procedural chassis terms, or an animation state we have not found.
+   maybe_Racer_Draw computes lean, suspension and a fork angle from
+   FourcheAngleArriere and HauteurCadre, and reads a PersoAnim field
+   out of the carac record - all candidates.
+
+7.3.  The wheels do not close
+
+   The wheel meshes were dumped for the first time:
+
+   +-------+-------+--------------------+---------+----------------+
+   | Wheel | Verts | Mesh radius        | Placed  | Tyre bottom    |
+   +=======+=======+====================+=========+================+
+   | front | 47    | 34.06 y, 34.13 z   | -27.84  | -61.90         |
+   | rear  | 47    | 38.60 y, 38.68 z   | -30.72  | -69.32         |
+   +-------+-------+--------------------+---------+----------------+
+
+   Both meshes are centred on their own origin, so the placement is
+   the axle. THE TWO TYRES THEREFORE TOUCH DIFFERENT GROUND LEVELS,
+   7.4 units apart, which cannot be what the game draws.
+
+   Nor does a scale fix it. Scaling each mesh to its carac radius puts
+   the bottoms at -55.68 and -61.44, still 5.76 apart, and no single
+   scale can equalise them - the equation gives a negative factor.
+
+   FOR REFERENCE the skeleton's lowest vertex is -62.55, which sits
+   just below the rear tyre's -61.44 under the scaled reading. So the
+   REAR wheel appears to define the ground and the front is the odd
+   one out - which is also the wheel whose placement is 0.0247 off the
+   formula (6.1).
+
+   MISSING: whether the wheel instances carry a scale we are not
+   reading, and what the suspension term in Draw contributes -
+
+       RoueRayonAr * k1 * k2 * racer[0x2e91] + RoueRayonAr * k3
+
+   is visible in the decompilation and is not in our formula at all.
+
+7.4.  New: SPEEDPKT, and the .PIV files
+
+   Looking for poses turned up assets we had not attributed. Five
+   archives ship skeletons and poses:
+
+   +--------------+------+------+------+
+   | Archive      | .rot | .skl | .piv |
+   +==============+======+======+======+
+   | KTMCROSS.BKF |   37 |    3 |    3 |
+   | KTMPKT.BKF   |   28 |    4 |    4 |
+   | PODIUM.BKF   |   12 |    1 |    0 |
+   | SPEED.BKF    |   19 |    1 |    1 |
+   | SPEEDPKT.BKF |   10 |    1 |    1 |
+   +--------------+------+------+------+
+
+   SPEEDPKT HAS ITS OWN CORPS.SKL - same 240 vertices, same 17
+   members, same tree and same remap, but DIFFERENT vertices and
+   different member origins. It is the same rider modelled in a
+   different bind pose. "PKT" is plausibly paddock [guess].
+
+   THE MENU DOES NOT LOAD IT, THOUGH. The captured vertex pool matches
+   SPEED\CORPS.SKL to 0.0001 and SPEEDPKT\CORPS.SKL only to 55.8, so
+   the speed skeleton is the one in g_meshSkl[0]. Nor is the SPEEDPKT
+   bind pose the answer to 7.2: applying the captured matrices to the
+   SPEED bind pose does not produce it either (worst 72.0).
+
+   Worth noting anyway, because SPEEDPKT also ships TWO banks and
+   ELEVEN palettes where SPEED ships fewer, and page 10 loads two
+   banks. Which archive the page's other assets come from has not been
+   checked and should be.
+
+   .PIV IS A NEW FILE TYPE - see formats/piv.txt. It is a manifest of
+   named entries pointing at skeleton files, not geometry, and it
+   still carries the authors' absolute paths.
+
+8.  What PilotRot resolves to
+
+   IT DOES NOT RESOLVE TO A POSE. It is a variable-length LIST, every
+   entry of which is loaded at startup. Which one a racer wears is
+   chosen elsewhere - and on the bike-select page, nothing chooses.
+
+8.1.  The list, and where it lands
+
+   maybe_Bike_ReadManifest (0x0042a173) reads the key and then keeps
+   taking 0x40-byte lines UNTIL A LINE CONTAINS NO '.' [verified]. The
+   paths go to 0x005191e4, stride 0x40, count at 0x005191e0.
+
+   An entry beginning '_' followed by a digit is special: the digit is
+   stored as an index, the list position beside it, two more numbers
+   are read, and the path is taken from character 3 onward. THAT IS
+   THE LOADER THAT STRIPS THE _1_ AND _2_ PREFIXES that
+   formats/bpt-content.txt section 4 left open.
+
+   FUN_00410a10 then loads every entry through Rot_Load (0x0045b340)
+   into an array at 0x0051D2A8, STRIDE 0xF4 [verified from the
+   disassembly: MOV EBX,0x51d2a8 / ADD EBX,0xf4 with ECX as the
+   destination]. 0xF4 is 244 = a 4-byte count plus 20 vec3 of float,
+   which is exactly what Rot_Load writes.
+
+8.2.  Nothing on the menu selects from it
+
+   Four functions reference that array. The one that indexes it to
+   pose a racer is FUN_0045d810, and
+
+       FUN_0045d810 has exactly ONE caller, FUN_00467b30
+       FUN_00467b30 is called from maybe_Game_Tick and three
+       racer-update functions - all gameplay
+
+   [verified]. THAT IS THE SAME CHAIN, AND THE SAME ONE CALLER, AS
+   maybe_Racer_SelectLod. So the bike-select page runs neither the LOD
+   selector nor the pose selector, for the same reason: both hang off
+   the gameplay tick, and a menu does not tick gameplay.
+
+   This is the second time that pattern has decided a question on this
+   page, and it is worth naming: A MENU DRAWS A RACER WITHOUT
+   UPDATING ONE. Anything reached only from maybe_Game_Tick is absent,
+   and whatever state it would have written keeps whatever was put
+   there at creation - or is written by the draw path itself.
+
+   SO THE PER-PART MATRICES OF SECTION 7 ARE NOT ANIMATION OUTPUT.
+   That is consistent with their being static across eight captures
+   and identical for all eight bikes, and it is why no shipped .rot
+   reproduces them: on this page no .rot is ever applied. Where they
+   DO come from is still open - maybe_Racer_Draw composes and writes
+   them itself, from per-part angle state whose source has not been
+   read.
+
+8.3.  A real bug: the .ROT header
+
+   Reading Rot_Load to answer the above turned up an error in our own
+   loader, in this document's section on the format, and in
+   tools/skl.py. THE FILE IS
+
+       char magic[4]      "ROT"
+       i16  hdr[3]        NOT an angle triple
+       i16  angle[17][3]
+
+   and we were reading 18 triples starting at offset 4, which put
+   every member's angles on the bone before it.
+
+   IT SURVIVED BECAUSE BOTH READINGS ARE 112 BYTES EXACTLY. 4 + 18*6
+   and 4 + 6 + 17*6 are the same number, so the size check passed, no
+   bytes were left over, and every .rot "decoded cleanly". A
+   self-consistent parse of a fixed-size record is not evidence that
+   the parse is right.
+
+   Fixed in src/skl.c, src/skl.h, tools/skl.py and
+   tools/skl_pose_diff.py. It does NOT change the conclusion in 7.2 -
+   with the corrected reader the best of 106 poses is still 0.529
+   against a 0.01 threshold - but every angle quoted in
+   formats/skl-rot.txt before this correction is off by one member.
+
+9.  Reading the assembly: where the angles come from
+
+   The decompiler loses this path because the angles arrive on the x87
+   stack and Ghidra does not model it. The assembly gives it up
+   readily once you know to search for the field offset.
+
+9.1.  The part record is a tree node
+
+   Skl_BuildPartMatrices (0x00463d90) is a recursive walker, and its
+   two recursion tests name the two unknown fields [verified]:
+
+       if (*this)    recurse      -> +0x00 is the FIRST CHILD
+       if (this[2])  recurse      -> +0x08 is the NEXT SIBLING
+
+   So the record completes as:
+
+   +--------+-------+---------------------------------------------+
+   | Offset | Type  | Field                                       |
+   +========+=======+=============================================+
+   | +0x00  | ptr   | first child                                 |
+   | +0x04  | ptr   | parent, null at a root                      |
+   | +0x08  | ptr   | next sibling                                |
+   | +0x0C  | f[3]  | THE ANGLES, radians                         |
+   | +0x18  | f[12] | the matrix, built from them                 |
+   | +0x48  | f[3]  | the joint pivot                             |
+   | +0x54  | int   | firstVertex                                 |
+   | +0x58  | int   | vertexCount                                 |
+   | +0x5c  | int   | faceCount                                   |
+   | +0x60  | ptr   | faces                                       |
+   +--------+-------+---------------------------------------------+
+
+   THE PIVOT IS OUR RE-CENTRED MEMBER ORIGIN. Part 4 carries
+   (0.2780, 10.4134, -36.5143) against member 6's re-centred origin
+   of (0.3, 10.4, -36.6). So skl_load's root-joint re-centring is
+   confirmed a second time, independently of the vertex diff.
+
+   maybe_Racer_Draw calls the walker TWICE, on two subtree roots:
+
+       0x00460f16   part 0, corps - the bike
+       0x00460f51   part 3, Pilote - the rider
+
+   and part 3's parent pointer is null in every capture, so the rider
+   really is a separate root with its own incoming matrix. THE GAME'S
+   TREE IS NOT THE .SKL PARENT ARRAY - corps.skl gives member 5 a
+   parent of 0.
+
+9.2.  The menu wears staticPied after all
+
+   Rot_ApplyToRacer (0x0045b480) copies a pose into the records:
+
+       count = min(pose->count, racer[0x2d4c + lod*4])
+       src   = pose + 1
+       dst   = racer + lod*2000 + 0x648          (= record + 0x0C)
+       while (count--) { dst[0..2] = src[0..2];
+                         src += 3; dst += 0x19; }
+
+   PART-INDEXED - triple i goes to part i, in part order. And
+   Game_LoadBikeAndBanks calls it once, at load:
+
+       0040a6e8  MOV  ECX,0x51d678
+       0040a6ed  PUSH 0x584421
+       0040a6f2  CALL 0x0045b480
+
+   0x51d678 - g_pilotRot = 0x3D0 = 4 * 0xF4, so the pose is
+   g_pilotRot[4], and index 4 of the PilotRot list is staticPied.
+
+   SO THE ORIGINAL NAME-BASED GUESS WAS RIGHT, and the capture that
+   appeared to refute it (section 6.0) was measuring the bind pool.
+   Two sessions were spent walking away from a correct answer on the
+   strength of a test that could not fail. The lesson is section 6.0's
+   and it is worth restating: a suspiciously clean negative deserves
+   the same scrutiny as a suspiciously clean positive.
+
+9.3.  The transform matches ours exactly
+
+   Skl_BuildPartMatrices computes
+
+       m = ((v - pivot) * euler(angle) + pivot) * parent
+
+   which is src/skl.c's rule. And the nine Euler products at
+   0x00460f94 - traced through the x87 stack instruction by
+   instruction - are IDENTICAL to mat34_from_euler:
+
+       c2*c1,  s2*c0 + c2*s1*s0,  s2*s0 - c2*s1*c0,
+       -s2*c1, c2*c0 - s2*s1*s0,  s2*s1*c0 + c2*s0,
+       s1,     -c1*s0,            c1*c0
+
+   The angle-to-index scale is the double at 0x004d0ed0 =
+   2607.5945876 = 0x4000/(2*pi), our unit, and the cosine table is at
+   0x005fcb80.
+
+   THE TRANSFORM, THE EULER ORDER, THE ANGLE UNIT AND THE PIVOT ARE
+   ALL CONFIRMED. Whatever still differs is in the ANGLES, not the
+   maths that consumes them.
+
+9.4.  What is left, and what the next capture reads
+
+   Applying staticPied part-indexed with the corrected reader still
+   does not reproduce the captured matrices - best 0.61 on a rotation
+   entry. Since 9.3 rules out the transform, the runtime angles must
+   differ from the file's, and the candidates are:
+
+   o something writes the angles after Rot_ApplyToRacer;
+
+   o the incoming matrix for the RIDER subtree (part 3) is not the
+     identity in the way we assume - it is built at 0x00460f25 from a
+     matrix at racer+0x3085 and is where a lean would enter;
+
+   o the part-to-pose-triple mapping is not the identity we assume.
+
+   ALL THREE ARE SETTLED BY READING +0x0C, WHICH THE OLD DUMP MISSED.
+   It based itself at 0x640 - one field past the record start - so it
+   read the parent, the matrix and the pivot and skipped the one field
+   that says which pose the game is wearing.
+
+   mrhook now dumps, per part: the child/parent/sibling pointers, THE
+   ANGLES in radians and in .rot units, the matrix and the pivot; plus
+   the whole of g_pilotRot beside them, so the source poses and the
+   applied angles can be compared in one file. If the angles match
+   staticPied, the difference is in the composition; if they do not,
+   something rewrote them and that something is next.
+
+10.  SOLVED: the third capture
+
+   Dumping the angle field at record +0x0C settled it immediately. The
+   runtime angles are staticPied, exactly, in every part:
+
+   +------+------------------+------------------+-------+
+   | Part | Runtime, 0x4000  | staticPied file  | Ratio |
+   +======+==================+==================+=======+
+   |  2   |             -500 |             -125 |   4   |
+   |  4   |             -872 |             -218 |   4   |
+   |  5   |    3236, 200, 60 |     809, 50, 15  |   4   |
+   |  6   | -3820, 1052, 128 |  -955, 263, 32   |   4   |
+   |  7   |  1016, 36, -340  |   254, 9, -85    |   4   |
+   |  8   | -296, -680, 620  |  -74, -170, 155  |   4   |
+   +------+------------------+------------------+-------+
+
+   Every value, every part, exactly four times. THE MENU WEARS
+   staticPied - the guess this project started from, abandoned in
+   section 6.0 on the strength of a test that could not fail, and now
+   measured.
+
+10.1.  Three bugs, all in skl.c
+
+   o A .ROT TURN IS 0x1000, NOT 0x4000. Rot_Load scales by the double
+     at 0x004d0e68 = 0.0015339807878856412 = 2*pi/0x1000. The engine's
+     own unit is 0x4000, so the two coexist and a .rot angle is four
+     times the index it resembles.
+
+   o A POSE IS INDEXED BY PART. Rot_ApplyToRacer copies triple i to
+     part i, and part = remap[member] - the .skl index table this
+     loader used to read and discard as redundant with the parent
+     list. It is not redundant; it is a different fact.
+
+   o THE COMPOSITION IS parent * local. Ours was local * parent, which
+     is exact at a root and drifts with depth - parts 0 to 4 matched
+     perfectly and part 6 was out by 0.36. A bug that looks like
+     accumulating error rather than a wrong formula.
+
+   WITH ALL THREE FIXED, staticPied reproduces the game's own per-part
+   matrices to 0.0004 over every part but one, which is the precision
+   of the capture. tools/skl_pose_diff.py --parts now names the pose
+   at 0.00043 against 0.539 for the runner-up.
+
+   REMAINING: part 15, RoueAV. maybe_Racer_Draw poses the front wheel
+   separately at 0x00460f94 from the steering, and it is the single
+   outlier at 6.4 units of translation against 0.05 everywhere else.
+
+10.2.  What it cost, and why
+
+   Three sessions, and every one of them turned on ASSERTING SOMETHING
+   INSTEAD OF EVALUATING IT.
+
+   o The vertex-pool test (6.0) was accepted because it gave a clean
+     number, without asking what could have made it come out
+     otherwise. Nothing could.
+
+   o The .rot layout (8.3) survived because both readings total 112
+     bytes, and "it decodes cleanly" was taken as evidence.
+
+   o The angle unit was read off a bit pattern. 0x3f5921fb54442d18
+     shares its mantissa with pi/2 and 2*pi/0x4000 was the expected
+     answer, so it was written down as fact and repeated into a doc,
+     a source comment and a Ghidra plate comment. Computing it takes
+     one line and would have ended the whole detour at the start.
+
+   The pattern is one thing: a number that LOOKS like the number you
+   expect gets waved through, and a test that CANNOT fail gets read as
+   a strong result. Both are cheap to check and neither was.
+
+   The capture harness is what broke the tie every time, and the
+   cheapest field in it - three floats at record +0x0C - was the one
+   that mattered. It was missed because the record base was taken as
+   0x640 rather than 0x63C: one field of skew, and the dump read
+   everything around the answer.
+
+11.  Verified to the vertex, and the two pose paths
+
+   Section 10 checked our MATRICES against the game's. This section
+   checks the thing the screen actually shows - the posed vertex
+   positions - and settles which code builds a pose in each mode.
+
+11.1.  The end-to-end check
+
+   The capture holds, per part, a matrix AND the vertex run it owns.
+   That is enough to build the game's own output without the game:
+   for every part, transform its slice of the bind pool by its matrix.
+   Comparing that against src/skl.c's output is the whole pipeline -
+   .skl parse, float scale, root re-centring, .rot parse, angle unit,
+   remap, Euler order, composition order and the vertex loop - tested
+   in one number.
+
+   +---------------------------+----------+--------------------------+
+   | Vertices                  | Worst    | Verdict                  |
+   +===========================+==========+==========================+
+   | 216 body, rider, swingarm |   0.0444 | exact                    |
+   | 24 front wheel (71..94)   |   6.3743 | wrong - see 11.3         |
+   +---------------------------+----------+--------------------------+
+
+   THE MODEL SPANS ROUGHLY 130 UNITS, so 0.044 is the dump's own
+   print precision rather than an error [verified]. Every rider part -
+   pelvis, both legs, spine, both arms, head - is reproduced.
+
+   THE PARENT LIST IS ALSO SAFE TO WALK IN ORDER. Every member's
+   parent index is strictly less than its own on SPEED\CORPS.SKL -
+
+       -1 0 1 0 3 0 5 6 7 6 9 6 11 12 11 11 15
+
+   - so skl_apply_pose's single forward pass always has world[parent]
+   built before it is read [verified]. A skeleton that violated this
+   would compose against uninitialised stack and fly apart; nothing
+   in the loader enforces it, so a new .skl is worth checking.
+
+11.2.  The two paths that pose a racer
+
+   Only two pieces of code write the ANGLE field at part record +0x0C,
+   and they belong to different modes [verified, by xref].
+
+   +----------+------------------------------+------------------------+
+   | Mode     | Function                     | What it does           |
+   +==========+==============================+========================+
+   | menu     | Rot_ApplyToRacer  0x0045b480 | copies g_pilotRot[4]   |
+   |          | from Game_LoadBikeAndBanks   | once, at load          |
+   +----------+------------------------------+------------------------+
+   | gameplay | maybe_Racer_UpdatePose       | reads g_pilotRot at    |
+   |          |                   0x0045d810 | four sites, per frame  |
+   +----------+------------------------------+------------------------+
+
+   SO THE BIKE-SELECT PAGE HAS NO ANIMATION CODE AT ALL, and that is
+   a finding rather than an omission. The page is one call to
+   Rot_ApplyToRacer and then nothing for as long as it is open; the
+   leaning and weight-shifting seen during a race is built by
+   0x0045d810, which the menu never calls.
+
+   maybe_Racer_UpdatePose IS 2934 BYTES AND HAS NOT BEEN READ. It is
+   called from FUN_00467b30 and reads g_pilotRot (0x0051d2a8) at
+   0x0045da52, 0x0045db7a, 0x0045e070 and 0x0045e2f6. Four reads of a
+   pose table in one function is what a BLEND looks like rather than
+   a copy of one entry [inferred - the reads are verified, what it
+   does with them is not]. Nothing on the menu path depends on it.
+
+   Both paths converge on Skl_BuildPartMatrices (0x00463d90), which
+   turns angles into matrices from maybe_Racer_Draw.
+
+11.3.  What is still wrong: the front wheel
+
+   Part 15 - RoueAV, member 2, vertices 71..94 - is the one part the
+   .rot chain does not reproduce.
+
+       ours    (-2.590,  0.000,  0.135)
+       theirs  (-2.831,  5.293, -3.400)      6.37 units apart
+
+   ITS ROTATION IS RIGHT to 0.0003; only the translation is out, and
+   it is out in Y and Z - the plane a front suspension travels in.
+   maybe_Racer_Draw poses this part separately at 0x00460f94 from the
+   steering and the suspension term
+
+       RoueRayonAr * k1 * k2 * racer[0x2e91] + RoueRayonAr * k3
+
+   which is in the decompilation and is not in our formula at all.
+   That is the next thing to read, and it is very likely the same
+   gap as the standing wheel-placement complaint in 7.3.
+
+11.4.  Comparing the port against the capture
+
+   Section 11.1 was computed OFFLINE, from the capture plus a Python
+   mirror of src/skl.c. It says our maths is right. The screen says
+   the rider is wrong. Both cannot be true, and the offline test
+   cannot tell which of its own assumptions is false - it never sees
+   the built code.
+
+   So the port now dumps the same data the original does:
+
+   +---------------------+--------------------------------------------+
+   | src/posedbg.h       | wrote mrposedbg.txt from our build, in     |
+   |                     | mrhook's layout. TEMPORARY, AND NOW GONE - |
+   |                     | see 13.4.                                  |
+   +---------------------+--------------------------------------------+
+   | tools/pose_cmp.py   | diffs the two and names the FIRST stage    |
+   |                     | that disagrees. KEPT.                      |
+   +---------------------+--------------------------------------------+
+
+       python tools/pose_cmp.py mrcapture.txt mrposedbg.txt
+
+   THE LADDER IS THE POINT. .skl parse -> .rot angles -> matrices ->
+   vertices, each consuming the last. Reporting only the end result
+   says "wrong" without saying where, which is how three sessions
+   went by. Each stage names its own likely cause:
+
+   +-------+---------------------+--------------------------------+
+   | Stage | Compares            | A difference means             |
+   +=======+=====================+================================+
+   | 1     | bind vertices       | .skl parse, scale, re-centring |
+   +-------+---------------------+--------------------------------+
+   | 2     | .rot angles         | wrong file, index or unit      |
+   +-------+---------------------+--------------------------------+
+   | 3     | world matrices      | Euler order or composition     |
+   +-------+---------------------+--------------------------------+
+   | 4     | posed vertices      | the vertex loop or the runs    |
+   +-------+---------------------+--------------------------------+
+
+   RUN AGAINST THE PYTHON MIRROR IT REPORTS 1 AND 2 CLEAN AND ONLY
+   THE FRONT WHEEL OUT AT STAGE 3 [verified]. That validates the tool
+   and pins the expectation: if the real dump from the build disagrees
+   at stage 1, 2 or 3, the built code is not doing what src/skl.c
+   says, and the offline result in 11.1 is measuring a fiction.
+
+   Stage 1 also settles a question that was never asked directly: the
+   game's g_meshSkl[0] matches our RE-CENTRED vertices to 0.0001, so
+   the original re-centres on the root joint too [verified].
+
+12.  The port matches, and the premise was still wrong
+
+12.1.  What the dump proved
+
+   The build ran, wrote mrposedbg.txt, and pose_cmp reported:
+
+   +-------+---------------------+------------+---------------------+
+   | Stage | Compares            | Worst      | Verdict             |
+   +=======+=====================+============+=====================+
+   | 1     | bind vertices       |     0.0000 | exact               |
+   +-------+---------------------+------------+---------------------+
+   | 2     | .rot angles         |     0.0000 | exact               |
+   +-------+---------------------+------------+---------------------+
+   | 3     | world matrices      |     5.2932 | front wheel only    |
+   +-------+---------------------+------------+---------------------+
+   | 4     | posed vertices      |     6.3716 | front wheel only    |
+   +-------+---------------------+------------+---------------------+
+
+   SO THE BUILT CODE IS NOT STALE AND NOT DIVERGENT. It reproduces
+   the offline mirror exactly, which reproduces the original's own
+   part matrices to 0.0004. Every stage the capture can see agrees.
+
+   AND THE SCREEN IS STILL WRONG. That is only possible if the thing
+   being compared is not the thing being drawn - so the fault is in
+   STAGE 4'S GROUND TRUTH, which was not measured but CONSTRUCTED,
+   by assuming maybe_Racer_Draw computes v' = v * mat[12] per part.
+   The capture carries matrices; it has never carried the original's
+   posed output vertices. That assumption was the last unexamined
+   premise in the chain and it is wrong - see 12.2.
+
+   THIS IS THE SAME FAILURE AS 6.0 AND 10.2, for the fourth time: a
+   test built on an unverified premise agrees with itself and is read
+   as agreement with the game. The tell is identical each time - a
+   number that comes out clean while the picture does not.
+
+12.2.  Two things maybe_Racer_Draw actually does
+
+   Both read out of the decompilation at 0x0045f290 [verified].
+
+   THE FACE LOOP RUNS TO count + 1:
+
+       iVar9 = 0;
+       do { ... } while (iVar9 < racer[0x2d4c + lod*4] + 1);
+
+   The part count is 17, so the loop visits parts 0..17 and PART 17
+   IS DRAWN. It has no vertices and a zero matrix, and it carries the
+   .SKL's 91-face trailing group. All 91 of those faces span two or
+   more members - they are the glue that stitches the rigid parts
+   together, drawn against the already-transformed pool. Our loader
+   already keeps them, so this one we happen to match.
+
+   THE RIDER AND THE BIKE ARE POSED FROM DIFFERENT ROOTS:
+
+       if ((part < 3) || (14 < part))   -> one base matrix
+       else                             -> a different base matrix
+
+   +-----------+--------------------------------------+------------+
+   | Parts     | Members                              | Chain      |
+   +===========+======================================+============+
+   | 0,1,2     | corps, FourcheAv, FourcheAr          | bike       |
+   | 15,16     | RoueAV, RoueAr                       | bike       |
+   +-----------+--------------------------------------+------------+
+   | 3..14     | Pilote, Bassin, FemurG/D, TibiaG/D,  | RIDER      |
+   |           | Colonne, BrasG/D, AvbrasG/D, head    |            |
+   +-----------+--------------------------------------+------------+
+
+   THE SPLIT IS EXACTLY THE RIDER. And it is not incidental:
+   Skl_BuildPartMatrices is called TWICE just above the loop, once
+   off a local matrix and once off racer + 0x3085, so the two chains
+   are built from different roots.
+
+   THAT IS THE BUG. src/skl.c composes one chain from one root, so it
+   places the bike correctly and the rider wrongly - which is exactly
+   what is on screen: a bike that looks right carrying a rider whose
+   limbs and neck are stretched away from it.
+
+   Note the per-part transform also builds the TRANSPOSE of the part
+   matrix with a negated translation - an inverse, for an orthonormal
+   matrix - and composes that with the base [inferred; the element
+   shuffle is unambiguous, the operand order is not, and this
+   decompilation is too mangled by x87 and stack aliasing to settle
+   it]. Reading the assembly of the loop is the next job, and it must
+   be the assembly rather than the decompiler output.
+
+   OPEN, AND NOT TO BE ASSUMED AWAY AGAIN: what racer + 0x3085 holds
+   and what writes it, and whether the second Skl_BuildPartMatrices
+   call is what makes the rider chain hang off the bike rather than
+   off the world.
+
+13.  SOLVED: the vertices are drawn with the INVERSE
+
+13.1.  The assembly
+
+   Read at 0x004615c1, inside maybe_Racer_Draw's per-part loop, with
+   EBP = racer + (lod*20 + part)*100 + 0x654 = record +0x18, the pose
+   matrix M that Skl_BuildPartMatrices wrote. It builds a 12-float T:
+
+       T[0..8] = transpose(M)     m0 m3 m6 / m1 m4 m7 / m2 m5 m8
+       T[9]    = -(m0*t0 + m1*t1 + m2*t2)
+       T[10]   = -(m3*t0 + m4*t1 + m5*t2)
+       T[11]   = -(m6*t0 + m7*t1 + m8*t2)
+
+   That is the exact inverse of v' = v*M + t for orthonormal M, and M
+   is orthonormal because it is a product of Euler rotations
+   [verified, element by element].
+
+   T is then copied to [ESP+0x40], its translation offset by
+   (bodyPos - cameraPos), multiplied by the view matrix at
+   camera + 0x68, and handed to Screen3D_TransformVertsFlat as the
+   transform for this part's slice of g_meshSkl[lod].vertices.
+
+   SO THE VERTICES ARE DRAWN WITH inverse(M), NOT WITH M.
+
+   Two helpers were identified on the way [verified]:
+
+   +------------+---------------------+---------------------------+
+   | 0x00403710 | Matrix34_Identity   | was FUN_00403710          |
+   | 0x004039c0 | Matrix34_Copy       | already named             |
+   +------------+---------------------+---------------------------+
+
+   AND THE TWO-ROOT SPLIT IS NOT THE MENU'S PROBLEM. The branch on
+   part < 3 || part > 14 selects which world POSITION is subtracted,
+   bike or rider. On the menu path racer+0x30c1 is zero and the two
+   are the same value, so the split does nothing there. It exists for
+   the crash case, where the rider keeps the last saved bike matrix
+   (racer+0x3085) and position (racer+0x30b5) instead of the current
+   one. Section 12.2 named this as the likely bug; it was not.
+
+13.2.  The proof, without running anything
+
+   The .skl's trailing group is 91 faces and ALL 91 span two or more
+   members - they are the glue stitching the rigid parts together. So
+   their edges must stay about as short as the bind pose's, because
+   that is what stitching means. On SPEED\CORPS.SKL with staticPied:
+
+   +----------------------+---------------+---------------+
+   | Transform            | max glue edge | mean          |
+   +======================+===============+===============+
+   | bind pose            |         45.17 |         18.82 |
+   | forward M  (ours)    |        101.63 |         26.76 |
+   | inverse(M)           |         50.33 |         18.84 |
+   +----------------------+---------------+---------------+
+
+   Forward doubles them; inverse holds the model together. This is a
+   test with a PREDICTED FAILURE MODE and a reason the answer could
+   have come out either way - which is exactly what sections 6.0,
+   10.2 and 12.1 lacked.
+
+13.3.  What was actually wrong, and for how long
+
+   OUR MATRICES WERE RIGHT THE WHOLE TIME. skl.c reproduced record
+   +0x18 to 0.0004 and then applied it FORWARD. Every symptom follows
+   from bending each joint the wrong way:
+
+   +------------------------+------------------------------------+
+   | Reported               | Cause                              |
+   +========================+====================================+
+   | torso leaning back     | Colonne -41 deg applied as +41     |
+   | left leg stretched     | FemurG +71 / TibiaG -84 inverted,  |
+   | down instead of folded | so the knee straightens            |
+   | neck stretched out     | head +48 deg swung off its joint   |
+   | bike looks about right | parts 0 and 2 take fixed matrices, |
+   |                        | not the pose chain, at all         |
+   +------------------------+------------------------------------+
+
+   AND IT EXPLAINS WHY EVERY TEST PASSED. Sections 10, 11 and 12 all
+   compared MATRICES, or compared vertices against a ground truth
+   BUILT from the matrices with the same forward assumption. Nothing
+   in that chain could see the error. The fix in three places:
+
+       src/skl.c              mat34_invert_rigid, applied per member
+       tools/skl_pose_diff.py invert_rigid in apply_pose
+       tools/pose_cmp.py      stage 4's ground truth
+
+   THE FRONT WHEEL IS STILL THE ONLY OUTLIER, unchanged at 6.37 units
+   - see 11.3. Everything else is exact.
+
+13.4.  The scaffolding, and what was kept
+
+   src/posedbg.h IS DELETED, along with its include, its one call in
+   menu.c, and the MR_Skeleton.world[] field that existed only to feed
+   it. src/ builds clean with no trace of it.
+
+   THAT WAS THE DEAL WHEN IT WENT IN. It was written as one
+   self-contained header with a single call site, no ini key, no
+   global and no build-system entry, specifically so that removing it
+   later could not turn into an afternoon of untangling. Removal was
+   four edits and a full rebuild.
+
+   THE RULE IT CAME FROM, worth keeping: diagnostic code earns its
+   place only while a specific question is open. When the question is
+   answered it goes, and what stays behind is the FINDING, written
+   down. A log line kept 'in case' is a line nobody dares delete.
+
+   +----------------------+------------------------------------------+
+   | Kept                 | Why                                      |
+   +======================+==========================================+
+   | tools/pose_cmp.py    | the LADDER is the reusable part.         |
+   |                      | Recreating the dump writer is twenty     |
+   |                      | minutes; rediscovering that a staged     |
+   |                      | comparison was needed cost three         |
+   |                      | sessions. Its docstring carries the      |
+   |                      | dump layout so it can be fed again.      |
+   +----------------------+------------------------------------------+
+   | get_log_dir()        | not scaffolding - a standing decision.   |
+   |                      | The log lands BESIDE THE EXE, with       |
+   |                      | [DEBUG] logpath as an override, so two   |
+   |                      | installs keep separate logs.  The file   |
+   |                      | half is off unless [DEBUG] logfile=1;    |
+   |                      | the console half is never gated.         |
+   +----------------------+------------------------------------------+
+   | tools/mrhook         | the capture harness for MOTO.EXE, which  |
+   |                      | is a separate program from our build.    |
+   +----------------------+------------------------------------------+
+
+14.  The front wheel: structure found, one scalar open
+
+14.1.  What overwrites the front wheel matrix
+
+   Part 15 (RoueAV) is the last part still wrong, at 6.37 units. Its
+   ROTATION is correct to 0.0003 - it comes from the pose like every
+   other part. Only the translation differs, and the reason is that
+   maybe_Racer_Draw THROWS THE POSE MATRIX AWAY for this one part and
+   rebuilds it [verified, 0x00460f5d onward].
+
+   It finds the part through the draw order rather than by number:
+
+       EDI = order[2] = 15
+
+   then builds R from part 15's OWN angle triple at record +0x0C -
+   the same three angles Rot_ApplyToRacer wrote, so R is unchanged -
+   and a new translation:
+
+       d   = part15.pos - part1.pos          ; the fork vector
+       S   = |d| * A / B
+       P   = part1.pos + normalize(d) * S
+       trn = R * (-pos) + P
+
+   and composes the result with part 1's matrix. Part 1 is FourcheAv,
+   the fork pivot, so the wheel is being slid along the fork.
+
+   OUR FORMULA IS THIS WITH P = pos, which is the same thing only when
+   S = |d|. Measured on the menu: |d| = 69.41 and S = 63.03, so the
+   game pulls the wheel 6.38 units back up the fork - and 6.38 is the
+   error we have been carrying.
+
+   The pieces are all verified against the capture: substituting the
+   measured S into the formula above reproduces the captured matrix
+   exactly.
+
+14.2.  The vector helpers, now named
+
+   Six one-line helpers were identified while reading this and are
+   renamed in the DB. They are used all over the binary, so this is
+   worth more than the front wheel:
+
+   +------------+------------------+-------------------------------+
+   | 0x004570d0 | Vec3_Sub         | out = a - b                   |
+   | 0x0040ffc0 | Vec3_Add         | out = a + b                   |
+   | 0x0046d540 | Vec3_Scale       | out = v * s                   |
+   | 0x0040fcb0 | Vec3_Length      | __fastcall, returns in ST0    |
+   | 0x0040fcd0 | Vec3_Normalize   | in place, guards against zero |
+   | 0x0040fc90 | Vec3_Set         | __thiscall, three floats      |
+   | 0x00403710 | Matrix34_Identity| (from section 13)             |
+   +------------+------------------+-------------------------------+
+
+   Two constants also confirmed by reading them out of the image:
+
+       _DAT_004d102c = 96.0f                units per metre
+       0x004d0ed0    = 2607.5945876         = 0x4000 / (2*pi)
+
+14.3.  CLOSED - the two scalars are known
+
+   This section held A and B open, "a length saved from an earlier
+   Vec3_Sub" and another. Both are in racerdraw_fork_scale now:
+   S = |bindTip - bindPivot| * posed / reach, tagged to
+   0x0045fda0. racer-draw-audit 55 to 57 verified the result
+   against MOTO.
+
+14.4.  Reading the two earlier pairs
+
+   THE PART INDEX IS READ FROM THE DRAW ORDER, not hardcoded
+   [verified, 0x0045fb5b]:
+
+       EDI = racer[0x2d74 + lod*4][2] = order[2] = 15
+
+   so the code says "the third part in draw order", which on
+   corps.skl is RoueAV. Any reconstruction should resolve it the same
+   way rather than writing 15.
+
+   The three Vec3_Sub calls that matter, in order:
+
+   +------------+-----------------------------------------------------+
+   | 0x0045fbee | d = record[15].pos - record[1].pos, the fork vector |
+   | 0x0045fc29 | feeds Vec3_Length -> A, stored at 0x0045fc3a to     |
+   |            | [ESP+0x180]. Its operand is the output of           |
+   |            | Vec3_TransformByMatrix34 applied to d.              |
+   | 0x0045fc5b | feeds Vec3_Length -> then B = len - RoueRayonAv*96, |
+   |            | stored at 0x0045fc87.                               |
+   +------------+-----------------------------------------------------+
+
+   THE CARAC FIELD IS CONFIRMED BY ADDRESS. 0x0045fc78 loads
+   [EAX*4 + 0x5092b4] with EAX = bikeIndex*73, and 73 floats is the
+   stride the capture dumps. 0x5092b4 is therefore base + 15*4, and
+   carac[15] is RoueRayonAv = 0.29 in every shipped bike [verified].
+
+   Two more helpers identified and given prototypes:
+
+       0x00410010  Vec3_TransformByMatrix34  out = v*M + t, __stdcall
+       all of the Vec3_* above are __stdcall, RET 0xC
+
+14.5.  RETRACTED: the stack anomaly was a miscount
+
+   COUNT PUSHES ACROSS THE WHOLE SEQUENCE, NOT PER CALL. An
+   argument can be pushed several instructions before the call
+   that consumes it, so a per-call tally reads as a mismatch and
+   invites blaming the database. 14.6 and 14.8 do it properly.
+
+14.6.  CLOSED - the trace that resolved 14.3
+
+   Served its purpose: the product it pinned is now the explicit
+   formula in racerdraw_fork_scale.
+
+14.7.  CLOSED - the numeric constraint on the two matrices
+
+   The constraint was a way to pin the product while the factors
+   were open. They are not open any more - racerdraw_fork_scale
+   and racerdraw_front_wheel_offset carry both, each with an
+   ORIGIN address.
+
+14.8.  Why hand-tracing the stack has to stop here
+
+   ARGUMENTS ARE NOT ALWAYS PUSHED. At 0x0045fa8e:
+
+       0045fa84  PUSH EDX
+       0045fa85  PUSH 0
+       0045fa87  LEA  ECX, [ESP + 0x84]
+       0045fa8e  SUB  ESP, 0x4          <-- reserves an argument slot
+       0045fa91  FMUL ...
+       0045fa97  PUSH 0
+       0045fa9b  FSTP [ESP + 0x4]       <-- fills it
+       0045fa9f  CALL Vec3_Set
+
+   MSVC reserves a slot with SUB ESP and fills it with FSTP, because a
+   float computed on the x87 stack cannot be PUSHed. Three more of
+   these sit in the front wheel block itself, at 0x004610b5, 0x004610b8
+   and 0x004610c0.
+
+   SO COUNTING PUSHES IS STRUCTURALLY WRONG, not merely error-prone,
+   and every ESP displacement in this function has to be resolved
+   against SUB/ADD ESP and FSTP stores as well. That is a mechanical
+   job a debugger does for free and a human does badly.
+
+   THREE REVISIONS IN ONE SESSION IS THE SIGNAL. First a miscount
+   mistaken for a database defect (14.5), then arguments materialised
+   early across an intervening call, now slots reserved without a
+   push. Each was found only because the next step did not add up. The
+   method is at its limit; continuing it here would produce a
+   confident answer with no way to tell whether it is right - which is
+   the exact failure of sections 6.0, 10.2 and 12.1.
+
+   MEASURE INSTEAD, and the measurement is small and precise:
+
+       detour 0x0045fdb3 and dump the two floats at
+       [ESP+0x180] and [ESP+0xac]   -> A and B directly
+
+   No stack theory is needed to read a float out of a slot the
+   instruction itself names. With A and B in hand the formula for S
+   follows, and sampling them during a race - where the suspension
+   actually moves - turns one equation into many, so the result can be
+   falsified rather than fitted (14.3).
+
+14.9.  The suspension term, located
+
+   Section 7.3 recorded a suspension term visible in the
+   decompilation and missing from our wheel formula. It is at
+   0x0045fa6c, with EAX pointing at a carac float:
+
+       [carac] * [0x004d1050] * 96 * racer[0x2e91]
+     + [carac] * [0x004d0e98]
+
+   built into a vec3 (0, that, 0) by Vec3_Set and then transformed and
+   added to a wheel position. 0x004d102c is the 96.0f units-per-metre
+   constant already confirmed. racer[0x2e91] is the suspension state
+   [inferred - it is the only per-frame factor in the product].
+
+   BOTH CONSTANTS READ OUT OF THE IMAGE [verified]:
+
+       0x004d1050 = 0.125f          0x004d0e98 = 48.0f
+
+   which collapses the term to
+
+       radius * (12 * racer[0x2e91] + 48)
+
+   because 0.125 * 96 = 12. So the REST offset is radius * 48 and the
+   travel is radius * 12 per unit of racer[0x2e91]. On the rear wheel,
+   with RoueRayonAr 0.32, that is 15.36 at rest plus 3.84 per unit.
+
+   NOTE THE 48. It is the same half-scale that already appears in the
+   wheel placement - RoueAxeDistance * 48 puts the front axle at
+   z 83.98 - while the radius uses 96. Two scales, both real, and the
+   48 here is a strong sign the placement formula in 6.1 and this
+   suspension term are the same piece of geometry seen twice.
+
+15.  The agent: querying the game instead of inferring
+
+15.1.  What it is
+
+   mrhook now runs a second thread listening on a named pipe,
+   \\.\pipe\mrhook, answering two commands:
+
+       STATUS                  base, rebase delta, menu page,
+                               selected bike, capture count
+       GET_MEM <addr> <size>   up to 1024 bytes, as hex
+
+   The address is a preferred-base VA and is rebased inside the
+   game, so an address is pasted straight out of Ghidra or out of
+   these documents. tools/bridge_mcp_mrhook.py bridges it to MCP,
+   and also runs standalone with --cli, which is the first thing to
+   try when something does not work.
+
+   The pattern is cdino_pc.c's agent thread, minus its mailbox: that
+   exists so a command can run on the emulator thread, and reading
+   memory does not need it. tools/mrhook/README.txt section 8 has
+   the detail.
+
+   WHY IT IS WORTH THE CODE. This document records four occasions
+   where a confident static inference was wrong and stayed wrong
+   for sessions - 6.0, 10.2, 12.1 and 14.5 - and the common factor
+   every time was that nothing could falsify it. A query against
+   the running game is the falsifier. The known-answer test is the
+   shape to keep using: 004d102c must read back 0000c042, because
+   96.0f was already verified from the database, so the test can
+   fail.
+
+15.2.  What it does not solve, and why that is fine
+
+   IT CANNOT READ THE FRONT WHEEL'S SCALARS. A and B live at
+   [ESP+0x180] and [ESP+0xac] inside maybe_Racer_Draw, and a stack
+   slot means nothing once the frame has returned. GET_MEM reads
+   addresses, not frames.
+
+   So section 14.8's plan is unchanged and is still the next step: a
+   detour at 0x0045fdb3 that samples those two floats where they are
+   live. The agent is the prerequisite - it proves the DLL can carry
+   a second thread and a protocol without disturbing the game - not
+   the measurement itself.
+
+   Nothing in section 14 is retracted or confirmed by this. It is
+   tooling.
+
+16.  Trace hooks, and the test that can fail
+
+   Section 15.2 said GET_MEM cannot read a stack slot, and that the
+   front wheel needed a detour. mrhook now has one: four hook
+   slots, each replacing an instruction with a jump to a naked stub
+   that saves the registers, records requested memory, restores,
+   runs the original instruction from a trampoline and jumps back.
+   tools/mrhook/README.txt section 9 has the mechanics and the five
+   ways it could be silently wrong.
+
+   THE MEASUREMENT, which is the whole point:
+
+       SET_HOOK 0 0045fdb3 7 4 ESP+180:4,ESP+ac:4
+       GET_TRACE
+
+   0x0045fdb3 is FDIV [ESP+0xac], seven bytes. [ESP+0x180] is A,
+   written at 0x0045fc3a; [ESP+0xac] is B, written at 0x0045fc87.
+   Both are live at that instruction (14.6).
+
+   AND IT COMES WITH A KNOWN ANSWER. From the capture, on the menu,
+
+       |d| = 69.4052        S = 63.0300
+
+   so whatever A and B come back as, they must satisfy
+
+       |d| * A / B  =  63.03
+
+   to within float precision. If they do, the hook is right AND
+   S = |d| * A / B is confirmed, in one shot. If they do not, one of
+   the two is wrong and it is visible immediately.
+
+   THAT IS THE POINT, AND IT IS THE THING EVERY EARLIER ATTEMPT ON
+   THIS QUESTION LACKED. Sections 6.0, 10.2, 12.1 and 14.5 each
+   record a conclusion that was confidently wrong and stayed wrong
+   because nothing could contradict it. A prediction with a number
+   attached, checked against the machine, is the difference.
+
+16.1.  The measurement
+
+   Taken on the bike-select page, bike 0, four hits [verified]:
+
+       SET_HOOK 0 0045fdb3 7 4 ESP+180:4,ESP+ac:4
+
+   +---------------------+--------------+-----------------------+
+   | Slot                | Raw          | As float              |
+   +=====================+==============+=======================+
+   | A = [ESP+0x180]     | 85cf8a42     |             69.405312 |
+   | B = [ESP+0x0ac]     | 34d69842     |             76.418365 |
+   +---------------------+--------------+-----------------------+
+
+   All four hits were identical, which is what a static menu should
+   give. The game kept running, so the trampoline returned cleanly,
+   the x87 state survived, and the budget disarmed the hook.
+
+16.2.  What it settled
+
+   THE FORMULA. |d| * A / B = 63.0359 against 63.0300 predicted
+   from the F11 capture - 0.009 per cent, which is the four-decimal
+   rounding of the numbers in section 14, not a discrepancy. So
+
+       S = |d| * A / B                                 [verified]
+
+   A IS |d|. 69.405312 measured against 69.4052 computed offline
+   from the two joint positions. Since A = |d * M| (14.6), that
+   means |d * M| = |d|, so M IS ROTATION-ONLY - it carries no
+   translation. That resolves the fork in 14.7, and by elimination
+   base is not record[1].pos and M0 is the matrix with the
+   translation in it.
+
+   B AGREES WITH THE PREDICTION. 76.418365 measured, 76.4252
+   predicted; recomputing the prediction with the measured S gives
+   76.4184, so the residual is entirely S's rounding. Therefore
+
+       |racer[0x1b4] - base| = B + RoueRayonAv * 96 = 104.2584
+
+   TWO REGISTERS, READ BY HAND FROM THE ASSEMBLY, CONFIRMED BY THE
+   MACHINE. EDI came back 0000000f - 15, the front wheel part index,
+   in the register 0x0045fb5b was said to load it into. EBX came
+   back 00584421, which is g_menuRacer. Both were derived by the
+   accounting that section 14.8 had to disown; both were right.
+
+16.3.  What it did not settle
+
+   ONE CONFIGURATION IS STILL ONE EQUATION. This confirms the
+   formula's SHAPE at a single point. It does not say what M0 and
+   base are computed FROM, and it cannot: on a static menu with the
+   suspension at rest there is nothing to vary. That needs the hook
+   firing during a race, which is more samples rather than a
+   different tool.
+
+   SO DO NOT FIT ANYTHING TO 0.908228. A measured ratio agreeing
+   with a derived one is a check passing, not a formula discovered.
+
+   THE INPUTS WERE LATER FOUND rather than fitted:
+   racerdraw_fork_scale computes S from the bind-space fork length
+   and the posed reach, and racer-draw-audit 55 to 57 has the
+   verification.
+17.  Data watchpoints, and the hole they close
+
+   Section 16 added trace hooks, which trap a SITE. This adds
+   watchpoints, which trap an ADDRESS - and the difference is not a
+   convenience.
+
+17.1.  What a displacement search structurally cannot find
+
+   The standard move for "what writes racer+0xNN" has been to search
+   Ghidra for instructions whose operand names that displacement. It
+   works, it is fast, and it has a hole: IT ONLY FINDS STORES THAT
+   NAME THE OFFSET. A store through a pointer names nothing.
+
+   THE PROJECT FELL IN TWICE IN ONE SESSION.
+
+   o racer+0x2ea9, THE SHADOW VERTEX ARRAY, has ZERO instructions
+     referencing it anywhere in the image. Searching for it returns
+     nothing, which reads exactly like "dead space". It was found
+     only because Racer_Ctor happens to construct the array by name,
+     and that was luck rather than method.
+
+   o racer+0x319d TOOK TWO RUNS OF FOUR HOOK SLOTS. Eight candidate
+     writer sites, four hook slots, so two rounds of arm-ride-read
+     with the user driving between them. Six of the eight never
+     fired. A watchpoint would have named the two that did in one
+     run without knowing any of the eight in advance.
+
+   The second case is the cheaper lesson: the answer was reachable,
+   it just cost two sessions of somebody else's time.
+
+17.2.  The mechanism
+
+   x86 debug registers. DR0-DR3 hold four addresses, DR7 says trap on
+   write or on access, and the CPU raises EXCEPTION_SINGLE_STEP. Four
+   is the CPU's limit, not a design choice. mrhook arms them on the
+   game thread from the pipe thread - a thread cannot suspend itself -
+   and catches the trap in a vectored handler.
+
+   Design and every caveat: tools/mrhook/README.txt section 14. The
+   implementation is lifted from
+   N:\DEV\CDINO\cdino_pc\cdino_hooks.c, which had already paid
+   for the failure modes.
+
+17.3.  The three that will cost a session if forgotten
+
+   o THE REPORTED EIP IS AFTER THE STORE. A data #DB is a trap, not
+     a fault - raised once the storing instruction has retired. The
+     write was made by the instruction ENDING at the reported
+     address.
+
+   o THE ADDRESS MUST BE NATURALLY ALIGNED TO THE LENGTH, and the
+     racer tail is byte-misaligned throughout: +0x2e1d, +0x2e55,
+     +0x3085 and +0x319d are all 1 mod 4, so a 4-byte watch on any
+     of them is REFUSED. len=1 works at any address and catches
+     every normal store to the containing dword.
+
+   o mode=rw IS AN ACCESS WATCH. x86 has no read-only encoding, so a
+     read has to be inferred from the value not changing.
+
+17.4.  What this does not replace
+
+   Hooks still win where the question is about a SITE rather than an
+   address - "what were the registers when this branch was taken",
+   which is what settled the hand skeleton in
+   formats/skl-rot.txt 5.1.7. Watchpoints win where the address is
+   known and the writer is not. They are complementary, and both are
+   cheaper than a confident inference nobody can falsify.
+
+17.5.  A mode=rw watch and a hook capture cannot share an address
+
+   Four rw watchpoints and four hooks were armed for one replay. The
+   hooks captured windows of the racer that happened to COVER the
+   watched bytes, and the result was this, sixteen times over
+   [verified, 2026-09-05]:
+
+       d0#1  eip=6f096889  eax=0000001c  esi=005871a9  old=0 new=0
+       d0#2  eip=6f096889  eax=0000001c  esi=005871a9  old=0 new=0
+       ...
+
+   0x6f09xxxx IS INSIDE mrhook.dll, not the game. EAX held 0x1c, 0x18
+   and 0x14 on the three slots - 28, 24 and 20, EXACTLY the capture
+   lengths that had been asked for. The watchpoints were trapping
+   mrhook's own capture reads.
+
+   o SO THE INSTRUMENT MEASURED ITSELF, and on two slots it burned
+     the whole 16-hit cap doing it - eight reads from each of the
+     two hooks, cap reached, slot auto-disarmed, and the game never
+     got a chance to be seen. Those two results are void, not
+     negative.
+
+   o THE TELL IS THE EIP AND THE REGISTERS. A game hit has an eip in
+     0x004xxxxx and ESI holding a racer base; a self-hit has an eip
+     in the DLL, ESI holding THE WATCHED ADDRESS ITSELF, and EAX
+     holding a capture length. Anything above 0x00800000 in the eip
+     of a data hit is not the game.
+
+   o THE RULE: DO NOT LET A HOOK CAPTURE COVER AN ADDRESS A rw WATCH
+     IS ON. mode=w is unaffected, because a capture only reads. If
+     both are wanted on the same bytes, run them in separate passes.
+
+   This is a specific case of a general hazard with mode=rw: it traps
+   ANY access, and the agent's own tooling is an accessor. GET_MEM
+   does not trap - it runs on the pipe thread and only the game
+   thread is watched - but a hook capture runs ON the game thread and
+   does.
+
+18.  FINDING THE REPLAY BUFFER - two instruments that found
+     nothing
+
+   THE FACTS ABOUT THE REPLAY ARE IN subsystems/replay.txt. What
+   is worth keeping from the search is why two reasonable
+   instruments came back empty, because both failure modes
+   recur:
+
+   o A DATA WATCHPOINT ON A BUFFER THAT IS WRITTEN BY memcpy
+     reports the copy helper, not the caller that wanted it.
+
+   o A SWEEP FOR A VALUE THAT IS CONSTANT IN THE CAPTURED STATE
+     finds every address holding that constant and no way to
+     choose between them. Section 19 is the general form, and it
+     is the lesson rather than this section.
+
+19.  WHEN AN INSTRUMENT FINDS NOTHING, VARY THE CONTENT
+
+   Six runs of MR_Racer had been watched for writes and reported
+   none, and the conclusion drawn was "the per-frame path never
+   touches them". One of them, racer+0x305d, turned out to be the
+   running stunt animation - and the reason no writer ever fired is
+   that THE ROAD BIKE HAS NO STUNT ANIMATIONS. Its .rot set contains
+   none of the SAUTDELIRE poses; the cross bike ships ten. See
+   structs/MR_Racer.txt section 18.
+
+   o SO THE NEGATIVE WAS ABOUT THE SESSION, NOT THE FIELD. No better
+     watchpoint, longer window or larger cap would have found it. The
+     variable that mattered was which bike was on the track, and the
+     rider chose it - "this bike is different and can do big jumps so
+     we might find something".
+
+   o WHICH IS THE CHEAPEST EXPERIMENT AVAILABLE AND THE ONE WE KEEP
+     FORGETTING. Every run so far had been the same bike on the same
+     track with better instruments. One change of vehicle named five
+     fields in a single lap.
+
+   o BEFORE RECORDING A NULL RESULT, ASK WHAT WOULD HAVE HAD TO
+     HAPPEN. A field written only when a stunt starts, a lap
+     completes, an AI crashes or the network delivers a packet is
+     silent in a race where none of those occurred, and that is
+     indistinguishable from dead. Say which event was absent, so the
+     next session knows what to arrange rather than what to re-watch.
+

@@ -1,0 +1,189 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                           THE BIKE ASSET SET
+
+
+Abstract
+
+   How a bike's meshes get from its .bpt manifest into memory. Two
+   functions do it: one reads the manifest into a wall of global path
+   buffers, the other loads nine meshes from those paths.
+
+   This is the join between formats/bpt-content.txt, which lists what
+   the manifests contain, and structs/MR_Mesh.txt, which describes what
+   a loaded mesh looks like.
+
+   +---------------------------+------------+
+   | Item                      | Address    |
+   +===========================+============+
+   | maybe_Bike_ReadManifest   | 0x00429e20 |
+   +---------------------------+------------+
+   | maybe_Game_LoadBikeMeshes | 0x00413450 |
+   +---------------------------+------------+
+   | Mesh_Scale                | 0x004204b0 |
+   +---------------------------+------------+
+
+Table of Contents
+
+   1. Reading the manifest
+   2. Loading the meshes
+   3. What this settles elsewhere
+   4. Open questions
+
+1.  Reading the manifest
+
+   maybe_Bike_ReadManifest reads each key with Settings_ReadString and
+   copies it into a fixed global buffer with strncpy at 0x3f bytes. For
+   every mesh it then calls Script_ReadString once more to take the
+   paired .map path off the following line [verified].
+
+   +-----------------+-------------+-------------+--------------------------+
+   | Manifest key    | Path buffer | Paired .map | Holds                    |
+   +=================+=============+=============+==========================+
+   | FileBnk0        | 0x00518b20  | -           | texture bank 0           |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileBnk1        | 0x00518b60  | -           | texture bank 1           |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileSkl         | 0x00518ba0  | -           | skeleton                 |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileSklHand     | 0x00518be0  | -           | hand skeleton            |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileRoueArriere | 0x00518c20  | 0x00518c60  | rear wheel               |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileRoueAvant   | 0x00518ca0  | 0x00518ce0  | front wheel              |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileMotoMed     | 0x00518e60  | 0x00518e20  | body, medium LOD         |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileMotoLow     | 0x00519020  | 0x00518fe0  | body, low LOD            |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileMotoVeryLow | 0x005190a0  | 0x00519060  | body, very low LOD       |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileGuidon      | 0x005190e0  | 0x00519120  | handlebars               |
+   +-----------------+-------------+-------------+--------------------------+
+   | FileCockpit     | 0x00519160  | 0x005191a0  | cockpit                  |
+   +-----------------+-------------+-------------+--------------------------+
+   | PilotRot        | 0x005191e4  | -           | pilot animation list     |
+   +-----------------+-------------+-------------+--------------------------+
+   | MotoCarac       | 0x00519de4  | -           | characteristic file list |
+   +-----------------+-------------+-------------+--------------------------+
+
+   That is the whole bike asset set, and it matches the manifest
+   contents recorded in formats/bpt-content.txt section 4 key for key.
+
+   The PilotRot list is variable-length. It reads 0x40-byte entries
+   until a line contains no '.', which is a slightly alarming terminator
+   - a path without an extension ends the list.
+
+   Entries beginning with '_' followed by a digit get special treatment:
+   the digit is stored as a separate index in a parallel table and the
+   path is taken from character 3 onward. That is the code that strips
+   the _1_, _2_ and _3_ prefixes on the KTM stunt animations, which
+   formats/bpt-content.txt left as an open question [verified].
+
+2.  Loading the meshes
+
+   maybe_Game_LoadBikeMeshes loads nine meshes in a fixed order,
+   returning 0 on the first failure so a missing asset stops the whole
+   set [verified].
+
+   +-------------------------+-----------------+-------+----------------+
+   | Mesh object             | From            | Scale | Vertex normals |
+   +=========================+=================+=======+================+
+   | g_meshGuidon            | FileGuidon      | 8.0   | no             |
+   +-------------------------+-----------------+-------+----------------+
+   | g_meshCockpit           | FileCockpit     | 8.0   | no             |
+   +-------------------------+-----------------+-------+----------------+
+   | g_meshMotoMed           | FileMotoMed     | 0.95  | no             |
+   +-------------------------+-----------------+-------+----------------+
+   | g_meshMotoLow           | FileMotoLow     | 0.95  | no             |
+   +-------------------------+-----------------+-------+----------------+
+   | g_meshMotoVeryLow       | FileMotoVeryLow | 0.95  | no             |
+   +-------------------------+-----------------+-------+----------------+
+   | g_meshRoueArriere[0..1] | FileRoueArriere | 0.95  | YES            |
+   +-------------------------+-----------------+-------+----------------+
+   | g_meshRoueAvant[0..1]   | FileRoueAvant   | 0.95  | YES            |
+   +-------------------------+-----------------+-------+----------------+
+
+   Two details are worth keeping.
+
+   THE SCALE COLUMN ABOVE IS A SECOND SCALE, NOT THE LOADER'S. Every
+   one of the nine goes through Load3dfAndMap, which ALWAYS multiplies
+   by the 96.0 at 0x004d0690; the column is the separate Mesh_Scale
+   call that follows it [verified, 0x00413450]:
+
+   +---------------------+---------------+--------+---------------+
+   | Mesh                | Load3dfAndMap | Scale  | net           |
+   +=====================+===============+========+===============+
+   | Guidon, Cockpit     | 96.0          | 8.0    | 768.0         |
+   +---------------------+---------------+--------+---------------+
+   | the three bodies    | 96.0          | 0.95   | 91.2          |
+   +---------------------+---------------+--------+---------------+
+   | both wheels         | 96.0          | none   | 96.0          |
+   +---------------------+---------------+--------+---------------+
+
+   o A PORT THAT READS THE COLUMN AS THE LOADER SCALE IS 12 TIMES OUT
+     ON THE COCKPIT and 101 times out on the bodies. It is not a
+     visible error either: the mesh transforms, culls and queues
+     perfectly and collapses to a point. mesh.h says the same thing
+     about passing 0, and this is the same trap one column over.
+
+   o THE WHEELS GET Mesh_CenterOnBounds AND Mesh_ComputeVertexNormals
+     INSTEAD, which is why they are the only smooth-shaded part of the
+     bike and the only one whose authored offset is discarded.
+
+   So the handlebars and cockpit were authored at 1/8 of the body's
+   size and the bodies 5 per cent over - asset-pipeline artefacts
+   rather than anything the renderer cares about [inferred].
+
+   Only the wheels get Mesh_ComputeVertexNormals. The body, handlebars
+   and cockpit are left with face normals only, so the wheels are
+   smooth-shaded and the rest of the bike is flat [verified]. That is a
+   defensible choice for 1997: a wheel is the one part of a bike where
+   faceting would be obvious.
+
+   Each wheel is loaded twice, from the same path, into two adjacent
+   MR_Mesh objects. Presumably so each instance can carry its own
+   transform without re-reading the file [inferred].
+
+3.  What this settles elsewhere
+
+   The three LOD meshes here are the three body entries the bike
+   manifests list - medium\corps, kawalow and kawavlow in MOTOSPD.BPT.
+   That confirms the level-of-detail reading of those manifest entries
+   [verified].
+
+   It also CORRECTS a guess made in structs/MR_Mesh.txt, which proposed
+   that the three parallel heap arrays of MR_Mesh were three levels of
+   detail, citing the same manifest evidence. The evidence belongs here:
+   the LODs are three separate static mesh objects from three separate
+   manifest keys.
+
+   The parallel arrays turned out to be something else entirely - the
+   three meshes of a .trk named prop template. See formats/trk.txt
+   section 4.
+
+   The static mesh objects are laid out at a 0x70 stride wherever they
+   are arrays, which is the third independent sighting of that stride
+   and consistent with MR_Mesh's fields ending at +0x6c.
+
+4.  Open questions
+
+   o PARTLY RESOLVED. Racer_Create attaches both g_meshRoueArriere and
+     g_meshRoueAvant to each racer through FUN_0048bce0, so the two
+     copies are attachment sources - one per wheel position. Why that
+     needs two loaded copies rather than one shared mesh is still
+     unclear. See subsystems/racers.txt section 4.
+
+   o The 8.0 against 0.95 scale split is unexplained.
+
+   o FileBnk0, FileBnk1, FileSkl and FileSklHand are read into buffers
+     that maybe_Game_LoadBikeMeshes never touches. Whoever consumes them
+     has not been found.
+
+   o maybe_Bike_ReadManifest takes a parameter it uses as a file handle
+     holder - it throws a C++ exception when +0x8 is null - and that
+     object has not been identified.
+
+   o The PilotRot terminator is a line with no '.' in it. Whether that
+     is deliberate or accidental is unknown.

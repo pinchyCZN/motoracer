@@ -1,0 +1,425 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          ANIMATED DECOR
+
+
+Abstract
+
+   The helicopter beside the dirt arena, its rotor, and the birds on
+   the street tracks.  One translation unit - animDecor.cpp, confirmed
+   by the assert path at 0x0048b370 - holding a small keyframe
+   animator that drives model instances placed by the .trk.
+
+   THE PORT PARSES NONE OF IT.  trk_skip_anim_decor locates the
+   section and steps over it exactly, so the byte-exact load check
+   still passes, and nothing is built, ticked or drawn.  The objects
+   are visible because they are ordinary decor meshes; they do not
+   move because the animator is absent.
+
+Table of Contents
+
+   1. Where it lives
+   2. The per-frame tick
+   3. The record
+   4. The eight types
+   5. What an import needs
+   6. Open questions
+
+1.  Where it lives
+
+   +------------+------------------------------+-------------------+
+   | Address    | Name                         | Role              |
+   +============+==============================+===================+
+   | 0x0048b7e0 | AnimDecor_Load               | parse, from .trk  |
+   +------------+------------------------------+-------------------+
+   | 0x0048b7a0 | the per-frame tick           | from Game_Tick    |
+   |            |                              | at 0x0047d877     |
+   +------------+------------------------------+-------------------+
+   | 0x0048b370 | the animator                 | one object        |
+   +------------+------------------------------+-------------------+
+   | 0x0048b740 | maybe_AnimDecor_FreeAll      | teardown          |
+   +------------+------------------------------+-------------------+
+
+   The TU runs from about 0x0048b070 to 0x0048bbc0 - eleven functions,
+   roughly 2900 bytes.  ModelInstance_Init at 0x0048bce0 begins the
+   next one.
+
+2.  The per-frame tick
+
+   0x0048b7a0 is four lines: if the object list is enabled, call the
+   animator once per object with the frame delta.
+
+       if (this[1] == 0)
+           for (i = 0; i < this[0]; i++)
+               animate(delta)
+
+3.  The record
+
+   Indices are dwords into the object, read as float or int by type.
+
+   +-------+-----------------------------------------------------+
+   | Index | Meaning                                             |
+   +=======+=====================================================+
+   | [0]   | TYPE, 1..8.  0 is an inactive slot                  |
+   +-------+-----------------------------------------------------+
+   | [1]   | which angle to drive: 0, 1 or 2                     |
+   +-------+-----------------------------------------------------+
+   | [3]   | the model instance this object moves                |
+   +-------+-----------------------------------------------------+
+   | [7]   | the running time, advanced by the frame delta       |
+   +-------+-----------------------------------------------------+
+   | [8]   | range low, or the rate on types 3 and 5             |
+   +-------+-----------------------------------------------------+
+   | [9]   | range high                                          |
+   +-------+-----------------------------------------------------+
+   | [10]  | phase, or the base angle                            |
+   +-------+-----------------------------------------------------+
+   | [11]  | the period                                          |
+   +-------+-----------------------------------------------------+
+   | [12]  | position FROM, x y z at [12] [13] [14]              |
+   +-------+-----------------------------------------------------+
+   | [15]  | position TO,   x y z at [15] [16] [17]              |
+   +-------+-----------------------------------------------------+
+   | [18]  | the path step count, type 7                         |
+   +-------+-----------------------------------------------------+
+   | [19]  | the path table itself, type 7                       |
+   +-------+-----------------------------------------------------+
+
+   WHERE IT WRITES.  Angles go to instance +0x14, +0x18 or +0x1c,
+   chosen by [1].  Positions go to instance +0x20, +0x24, +0x28.
+
+4.  The eight types
+
+   +---+---------------------------------------------------------+
+   | 1 | TRIANGLE WAVE between [8] and [9], driving an angle.    |
+   |   | t/period, folded at 1.0 so it runs up then back down    |
+   +---+---------------------------------------------------------+
+   | 2 | SINE between [8] and [9], with [10] as the phase        |
+   +---+---------------------------------------------------------+
+   | 3 | LINEAR RAMP, angle = (t/period) * [8] + [10].  This is  |
+   |   | a continuous spin - the rotor                           |
+   +---+---------------------------------------------------------+
+   | 4 | TRIANGLE WAVE on POSITION, lerping [12..14] to [15..17] |
+   +---+---------------------------------------------------------+
+   | 5 | as 3                                                    |
+   +---+---------------------------------------------------------+
+   | 6 | INVALID - falls into the fatal message box below        |
+   +---+---------------------------------------------------------+
+   | 7 | PATH WALK. The step index picks an entry from the       |
+   |   | table at [19] and stores it into the instance; step     |
+   |   | 0 restores instance+0x54. This is the flight            |
+   +---+---------------------------------------------------------+
+   | 8 | POSITION LERP WITH A HOLD - the period is [10] + [11]   |
+   |   | and the lerp saturates at 1.0 for the [10] part         |
+   +---+---------------------------------------------------------+
+
+   A TYPE OUTSIDE 1..8, AND TYPE 6, ABORT THE GAME - sprintf into a
+   buffer, Cdd_MessageBox, g_fatalError, App_Shutdown, exit(1).  The
+   string is "BAD AnimDecor type" and the assert path is what anchors
+   the TU.
+
+5.  What an import needs
+
+   Four pieces, in order:
+
+   o THE PARSE.  trk_skip_anim_decor already walks the section
+     exactly - the record is 0x20 bytes when the subversion is 1 and
+     0x40 otherwise, and a type-7 object is followed by a path table
+     of paths * frames * 12 bytes.  It discards what it reads; it
+     would keep it.
+
+   o THE INSTANCES ALREADY EXIST - this was the piece that looked
+     hardest and it is not a piece at all.  AnimDecor CREATES
+     NOTHING.  It layers animation onto entries of the DECOR TABLE
+     that Trk_Load already built:
+
+         record[2] = packed & 0xffff              the table index
+         record[3] = DAT_004dc0e4[record[2]]      the entry itself
+
+     and the animator then writes that entry's own angle and
+     position fields.  The helicopter mesh is already loaded and
+     already drawn on our side - which is exactly why it is visible
+     and still - so nothing has to be created, only driven.
+
+     AND THE PORT'S SIDE LINES UP.  MR_TrkInstance carries rot[3]
+     and pos[3], and trk_draw already builds its matrix from them
+     (mat34_from_euler on in->rot, in->pos minus the camera).  The
+     decor entry's +0x20 is its position, which the table's own note
+     records independently, and the animator's +0x20/+0x24/+0x28
+     writes land there.
+
+     THE ORDER IS CONFIRMED.  74 entries on both sides of the dirt
+     arena, names slot for slot, and finish_000, CAMERA_000 and
+     CAMERA_001 agreeing to the digit.  The entries that DISAGREED
+     were exactly agusta_004, helice_004 and the three flash lights -
+     the animated ones, caught mid-animation on MOTO and sitting at
+     the file's values on ours.  The mapping is confirmed from both
+     directions at once.
+
+   o THE TICK - DONE.  trk_anim_decor_tick, called from race_update
+     on a REAL STEP only.  maybe_Game_Tick runs the original at
+     0x0047d877, in the tick, so a rendered frame must not advance it
+     - the periods are real time and a paused game would spin the
+     rotor.
+
+     THE UNIT IS THE SCALED DELTA, dt * 100 in race_update - dt there
+     is SECONDS.  Passing dt ran the whole subsystem at 1/100 speed:
+     the rotor turned 0.0042 rad a frame where its record asks for
+     0.207, and it read as not moving at all rather than as moving
+     slowly.  The loader's 0.1 scaling puts the periods in the scaled
+     delta's unit, not in dt's.
+
+     THE WRAP IS AN fmod WRITTEN LONG.  time - (int)(time/period) *
+     period, which the decompiler renders as an algebraic zero
+     because it drops the truncation - case 7 still shows the __ftol
+     that proves it is there.
+
+     A BAD TYPE DOES NOT ABORT ON OUR SIDE.  The original sprintfs
+     "BAD AnimDecor type", puts up a message box and calls exit(1); a
+     port has no business killing the process over one decoration, so
+     the object is skipped.  The loader's own 63/79 limits already
+     reject the file that could cause it.
+
+   o THE DRAW NEEDED NOTHING.  trk_draw already builds each
+     instance's matrix from rot[] and pos[], which is what the
+     animator writes, so the objects move as soon as the tick runs.
+
+5.1.  The records, read back
+
+   51 objects on the dirt arena.  The helicopter is decor slots 1 and
+   2, and its four records are:
+
+   +----+---+------+--------+--------+---------+------------------+
+   | n  | t | axis | idx    | lo     | period  | what             |
+   +====+===+======+========+========+=========+==================+
+   | 12 | 2 |  1   |   1    |  2.094 |   1500  | body yaw sway    |
+   +----+---+------+--------+--------+---------+------------------+
+   | 13 | 2 |  2   |   1    |  0.087 |   2500  | body roll sway   |
+   +----+---+------+--------+--------+---------+------------------+
+   | 14 | 3 |  1   |   2    | -6.283 |    100  | THE ROTOR - one  |
+   |    |   |      |        |        |         | turn a period    |
+   +----+---+------+--------+--------+---------+------------------+
+   | 15 | 4 |  0   |   2    |        |   5000  | the rotor flies  |
+   |    |   |      |        |        |         | with the body    |
+   +----+---+------+--------+--------+---------+------------------+
+   | 16 | 4 |  0   |   1    |        |   5000  | the body's path, |
+   |    |   |      |        |        |         | 1266 -> 4666 up  |
+   +----+---+------+--------+--------+---------+------------------+
+
+   -6.283 is -2pi, so type 3 with period 100 is one revolution per
+   100 scaled units - about a second.  The body climbs from y 1266 to
+   4666 and back over a period of 5000, about fifty seconds.
+
+   THE TWO POSITION RECORDS SHARE A from AND A to.  Slots 1 and 2 are
+   the body and the rotor and they move together, which is how the
+   rotor stays on the helicopter.
+
+5.2.  Type 7 is the WING FLAP, and the numbers say so
+
+   Every gull on the speed bay carries three records - a roll sway
+   (type 2), a yaw ramp (type 3, one turn per 1200 to 1800 units, the
+   circling) and a TYPE 7 with paths = 19 and frames = 26, period 1.5
+   to 4.
+
+   19 x 26 x 12 BYTES IS 19 SETS OF 26 VEC3s.  The gull mesh has 26
+   vertices and there are 19 alternate vertex arrays: a vertex
+   animation, which is what a flapping wing needs and is why type 7
+   is a POINTER swap rather than a position.
+
+       iVar4 = (int)(time / period)           the step
+       step 0      -> restore *(inst+0x54)+0x1c, the base mesh
+       1..pathCount-> *(inst+0x4c)+4 = path[step-1]
+
+   and the wrap is over (pathCount + 1) * period, so step 0 is a real
+   frame of the cycle rather than just a reset.
+
+   THE PERIOD IS UNDER ONE FRAME - 1.5 to 4 against a 3.3 delta - so
+   the flap advances a frame or two per tick, which is about right
+   for a bird.
+
+   AND THE MESH CONFIRMS IT.  named[10] is Gull05 with 26 vertices at
+   every LOD and 33 primitives - the same 26 the record's frameCount
+   gives.  Each path is a whole replacement vertex set, not an offset
+   and not a bone.
+
+   IMPLEMENTED.  The original stores a pointer into the instance at
+   +0x4c and restores +0x54's on step 0; ours records the step in the
+   record and trk_draw substitutes the array at queue time through
+   trk_queue_mesh_verts.  The frameCount is checked against the
+   mesh's vertexCount before it is used, so a record that does not
+   belong to the mesh it names leaves the mesh alone rather than
+   reading past it.
+
+5.3.  Props are not bounded by distance in the original
+
+   Decor is drawn PER VISIBLE SEGMENT - maybe_Trk_DrawZonesAndList-
+   Segments dispatches it through vtable slot +0xc for each segment
+   in the ring window - so a prop is bounded by how far along the
+   TRACK it is, not by how far it is from the eye.
+
+   THE PORT DRAWS EVERY PROP IN THE TABLE, nearest first.  While the
+   back plane was the manifest's LenBPlane that hid the difference;
+   when drawdistance stopped meaning a clip, it did not.  Reported on
+   the speed bay: a Corsair that should only appear deep into the lap
+   was visible from the grid.  It is decor slot 80 and it has no
+   position animation at all - three records, all rotation - so it
+   was never flying anywhere, only being drawn from too far away.
+
+   THE PER-SEGMENT LISTS WERE ALREADY PARSED, and the note that said
+   otherwise was wrong.  Each segment's indices[] is the decor list.
+   Read live on the speed bay:
+
+       seg  0  count=1  indices=[0]      FINISH_000, the start line
+       seg  1  count=1  indices=[1]
+       seg  2  count=1  indices=[2]
+       seg 23  count=2  indices=[10, 11]
+
+   - consecutive in segment order, which is how the table is
+   authored.  trk_draw now gathers its props from the visible
+   segments' lists and the radial clip is switched off when it does,
+   because the window IS the limit.
+
+   A RADIAL CLIP COULD NEVER HAVE FIXED THIS.  The Corsair is a short
+   distance from the camera and a long way along the track - exactly
+   the case the two rules disagree about.
+
+5.4.  The Corsair does not fly - it ORBITS, on a 17000 radius
+
+   It has no position animation at all: three records, a pitch sway, a
+   roll sway and a type-3 yaw ramp.  Its INSTANCE position is
+   (-28474.1, 3600.4, 13328.7) and it is IDENTICAL on both sides.
+
+   WHAT MAKES IT A FLYBY IS THE MESH.  corsair3's vertices run
+   x 16519..17830, y -385..387, z -881..1074 - the model sits about
+   17000 units out along +X from its own origin.  A yaw ramp about Y
+   therefore sweeps it round a circle of that radius, once per 1000
+   scaled units.  It is a very large, very slow orbit, and from the
+   track it reads as a plane flying past.
+
+   AND THAT RADIUS AMPLIFIES EVERY ORIENTATION ERROR.  The pitch and
+   roll sways are +-0.349 rad, twenty degrees; at a 17000 radius,
+   twenty degrees of tilt moves the far end of the circle by about
+   5800 units vertically.  A small difference in how the three euler
+   angles are composed is invisible on a palm tree and puts this
+   aeroplane through a hill.
+
+   REPORTED: on our side it passes through the terrain.  Position is
+   ruled out - it matches to the digit - so if this is a real
+   difference it is in the rotation, and mat34_from_euler is the only
+   thing between the angles and the matrix.  That function has
+   already been wrong once in exactly this way (rot[0] and rot[1]
+   driving each other's terms, model.c) and was corrected against the
+   x87 block at 0x0048c0fb, so it is a suspect rather than a
+   conclusion.
+
+   NOT ESTABLISHED: whether RETAIL clips the hill too.  Nobody has
+   said it does not - only that the plane is prominent on the third
+   lap.  Settle that before treating it as a port defect.  [open]
+
+5.5.  DECOR IS NOT DRAWN BY ModelInstance_Draw
+
+   The test above was set up and produced ZERO HITS, which is the
+   finding.  Every decor object shares the vtable at 0x004d0110, and
+   its draw slot is
+
+       vtable+0x0c = 0x004022f0
+
+   not ModelInstance_Draw (0x0048c030).  A hook on the euler block
+   inside ModelInstance_Draw never fires for a prop, because props do
+   not go through it.
+
+   WHICH MATTERS BEYOND THE TEST.  The port composes every decor
+   instance's matrix with mat34_from_euler, and that function is
+   transcribed from the x87 block at 0x0048c0fb INSIDE
+   ModelInstance_Draw - the racer path.  If FUN_004022f0 builds its
+   matrix differently, decor has been using the wrong composition all
+   along, and the Corsair is where it shows because a 17000-unit
+   radius multiplies the error.
+
+5.5.1.  And decor has its OWN euler builder - FUN_00403880
+
+   FUN_004022f0 does not compose the matrix itself.  It calls
+
+       FUN_00403880(decor + 0x14, ...)          the rot triple
+       Matrix34_Multiply(m, m, camera + 0x68)
+
+   so FUN_00403880 IS THE DECOR EULER BUILDER, and it is a different
+   function from the x87 block inside ModelInstance_Draw that
+   model.c's mat34_from_euler was transcribed from.
+
+   THE TWO MATRICES ARE STRUCTURALLY DIFFERENT.  Reading FUN_00403880
+   and naming the three angles A, B, C in the order its three __ftol
+   calls consume them:
+
+       m[1] = sinC * f      m[4] = cosC * f      m[7] = -cosB
+
+   The middle column must be unit, so f * f + cosB * cosB = 1 and
+   f = sinB:
+
+       column 1 = ( sinC*sinB,  cosC*sinB,  -cosB )
+       row 2    = ( X*sinB,     -cosB,       Y*sinB )   X*X + Y*Y = 1
+
+   ours has, from model.c:
+
+       out[6] = s1          a bare sine at index 6
+       out[7] = -c1 * s0
+
+   MOTO's decor matrix has a bare COSINE at index 7 and ours has a
+   bare SINE at index 6.  They are not the same composition, and no
+   relabelling of the three angles makes them one.
+
+   SO EVERY DECOR PROP IN THE PORT IS ORIENTED BY THE WRONG MATRIX.
+   It is invisible on a palm - a yaw-only prop looks plausible either
+   way - and it is 5800 units of altitude on a Corsair orbiting at a
+   17000 radius.  That is why this surfaced where it did.
+
+5.5.2.  Pinned: the decor euler is transpose(Ry . Rx . Rz)
+
+   Hooked at 0x00403994 - past the nine stores, before EDI is popped,
+   so ESI still holds the matrix and EDI the angles - with
+   (0.3, 0.7, 1.1) forced onto every decor object.  Captured:
+
+       0.51663  0.85137 -0.09088
+      -0.59532  0.43347  0.67654
+       0.61538 -0.29542  0.73078
+
+   Fitting all 288 combinations of axis order, angle assignment, sign
+   and transpose:
+
+       transpose(Ry(rot[1]) . Rx(rot[0]) . Rz(rot[2]))   err 0.00072
+       mat34_from_euler, what the port was using          err 0.69161
+
+   0.00072 across nine entries is the cosine table's quantisation.
+   The two are not the same matrix and no relabelling makes them one.
+
+       out0 = cb*cr + sb*sp*sr   out1 = cp*sr   out2 = -sb*cr + cb*sp*sr
+       out3 = -cb*sr + sb*sp*cr  out4 = cp*cr   out5 =  sb*sr + cb*sp*cr
+       out6 = sb*cp              out7 = -sp     out8 =  cb*cp
+
+   with p = rot[0], b = rot[1], r = rot[2].
+
+   mat34_from_euler_decor is that, and trk_draw uses it for props.
+   EVERY PROP ON EVERY TRACK was oriented by the racer's matrix
+   before this; it agrees only when pitch and roll are zero, which is
+   every palm tree and no aeroplane.
+
+   HOW TO RUN THE TEST ONCE THE SITE IS KNOWN.  MOTO pauses cleanly
+   and a SET_MEM to a decor object's +0x14 STICKS while it does -
+   verified - so the input can be forced and held.  Write the same
+   triple to every entry of DAT_004dc0e4 and any captured matrix is
+   the answer, with no need to identify which prop drew.
+
+     o AND IT LEAVES THE DECOR ROTATED until the race is reloaded.
+       The animated objects are corrected within a frame or two by
+       the animator; the static ones - palms, trees, boats - keep
+       whatever was written.  Restart the race after testing.
+
+6.  Open questions
+
+   o The record's remaining dwords - [2], [4], [5], [6] are not read
+     by the animator and are unidentified.
+   o Type 7 is implemented as a vertex-array swap, which is what the
+     data is.  The original's +0x4c and +0x54 indirections are not
+     themselves read, so if a prop ever animates something OTHER than
+     its vertices through the same path, this would not cover it.

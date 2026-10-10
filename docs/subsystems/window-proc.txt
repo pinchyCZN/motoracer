@@ -1,0 +1,237 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          THE WINDOW PROCEDURE
+
+
+Abstract
+
+   maybe_Event_WndProc at 0x00432980 is the game's window procedure, in
+   event.cpp. It was found while chasing one question - what re-
+   validates the display mode at runtime - and the answer is
+   WM_DISPLAYCHANGE, which closes the loop on the 16-bit gate.
+
+   Finding it also required repairing a function boundary. Ghidra had
+   the function starting 0x25 bytes late, because a window procedure has
+   no call references at all.
+
+   +---------------------------+-----------------------------+
+   | Item                      | Address                     |
+   +===========================+=============================+
+   | maybe_Event_WndProc       | 0x00432980                  |
+   +---------------------------+-----------------------------+
+   | registered by             | FUN_004157d0, at 0x00415811 |
+   +---------------------------+-----------------------------+
+   | maybe_g_altEnterEnabled   | 0x004e8934                  |
+   +---------------------------+-----------------------------+
+   | maybe_CdAudio_OnMciNotify | 0x004b1340                  |
+   +---------------------------+-----------------------------+
+
+Table of Contents
+
+   1. A boundary repair first
+   2. The message map
+   3. What closes the 16-bit retry loop
+   4. ALT+ENTER and WM_ACTIVATEAPP
+   5. What WM_DESTROY does
+   6. Off-spine edges, noted and not followed
+   7. Open questions
+
+1.  A boundary repair first
+
+   Ghidra had a function at 0x004329a5 of 3463 bytes with NO callers and
+   NO references to its entry. That combination is the signature of a
+   boundary defect, not of dead code.
+
+   The real entry is 0x00432980, twenty-five bytes earlier, and it is a
+   textbook MSVC SEH prologue [verified]:
+
+       00432980  64 a1 00 00 00 00   MOV EAX,FS:[0]
+       00432986  55                  PUSH EBP
+       00432987  8b ec               MOV EBP,ESP
+       00432989  6a ff               PUSH -1
+       0043298b  68 69 38 43 00      PUSH 0x433869
+       00432990  50                  PUSH EAX
+       00432991  64 89 25 ...        MOV FS:[0],ESP
+       ...
+       004329a5  53                  PUSH EBX   <- Ghidra started here
+
+   Those 0x25 bytes were never disassembled because nothing CALLS a
+   window procedure - Windows invokes it through a pointer. The only
+   reference is a DATA reference from 0x00415811, which stores 0x432980
+   into a WNDCLASSA on the stack. That structure sits at ESP+0x14, so
+   [ESP+0x14] = style = 3 = CS_VREDRAW | CS_HREDRAW and [ESP+0x18] =
+   lpfnWndProc. The same function, FUN_004157d0, then calls
+   RegisterClassA and CreateWindowExA [verified].
+
+   This is the third defect class in ghidra-db-repairs.txt - reached
+   only through pointers in data - and it is worth noting that the
+   existing repair scripts did NOT catch this one, because the tail of
+   the function had been defined as a function in its own right, so it
+   did not look like orphaned code.
+
+   Repaired to 3500 bytes and given a proper WNDPROC signature. The
+   Windows types were already in the data type manager, so the
+   decompilation improved considerably.
+
+2.  The message map
+
+   +-------------------+--------+----------------------------------------+
+   | Message           | Value  | What it does                           |
+   +===================+========+========================================+
+   | WM_DESTROY        | 0x0002 | save config and island list, then quit |
+   +-------------------+--------+----------------------------------------+
+   | WM_SYSCOLORCHANGE | 0x0015 | re-validate the display mode           |
+   +-------------------+--------+----------------------------------------+
+   | WM_ACTIVATEAPP    | 0x001c | alt-tab; drops fullscreen              |
+   +-------------------+--------+----------------------------------------+
+   | WM_SETCURSOR      | 0x0020 | FUN_0045a190                           |
+   +-------------------+--------+----------------------------------------+
+   | WM_DISPLAYCHANGE  | 0x007e | re-validate the display mode           |
+   +-------------------+--------+----------------------------------------+
+   | WM_NCMOUSEMOVE    | 0x00a0 | tracks the cursor delta                |
+   +-------------------+--------+----------------------------------------+
+   | WM_KEYDOWN        | 0x0100 | Input_OnKeyDown                        |
+   +-------------------+--------+----------------------------------------+
+   | WM_KEYUP          | 0x0101 | maybe_Input_OnKeyUp                    |
+   +-------------------+--------+----------------------------------------+
+   | WM_CHAR           | 0x0102 | stores the character                   |
+   +-------------------+--------+----------------------------------------+
+   | WM_SYSKEYDOWN     | 0x0104 | ALT+ENTER fullscreen toggle            |
+   +-------------------+--------+----------------------------------------+
+   | WM_SYSKEYUP       | 0x0105 | clears g_menuModifiers                 |
+   +-------------------+--------+----------------------------------------+
+   | WM_COMMAND        | 0x0111 | three menu ids                         |
+   +-------------------+--------+----------------------------------------+
+   | WM_MOUSEMOVE      | 0x0200 | ClientToScreen, wakes the menu         |
+   +-------------------+--------+----------------------------------------+
+   | WM_LBUTTONDOWN    | 0x0201 | SetCapture, menu click                 |
+   +-------------------+--------+----------------------------------------+
+   | WM_LBUTTONUP      | 0x0202 | ReleaseCapture                         |
+   +-------------------+--------+----------------------------------------+
+   | WM_RBUTTONDOWN    | 0x0204 | SetCapture                             |
+   +-------------------+--------+----------------------------------------+
+   | WM_RBUTTONUP      | 0x0205 | ReleaseCapture                         |
+   +-------------------+--------+----------------------------------------+
+   | MM_MCINOTIFY      | 0x03b9 | CD audio, gated on g_cdAudio           |
+   +-------------------+--------+----------------------------------------+
+
+   Everything else falls through to DefWindowProcA. Note there is NO
+   WM_PAINT and no WM_SIZE handler - the game does not render from the
+   message loop at all, which is what one would expect from a DirectDraw
+   title but is worth having confirmed.
+
+   The three WM_COMMAND ids are 0x9c41, 0x9c42 and 0x9c43 - 40001 to
+   40003. The first posts WM_CLOSE, the second calls slot +0x08 on
+   g_pGame, the third opens a modal CDialog. They are almost certainly a
+   debug or system menu.
+
+3.  What closes the 16-bit retry loop
+
+   This was the open question in subsystems/display-mode-gate.txt, and
+   the answer is confirmed rather than guessed [verified]:
+
+       case 0x0015:   /* WM_SYSCOLORCHANGE */
+       case 0x007e:   /* WM_DISPLAYCHANGE  */
+           maybe_Cdd_ValidateDisplayMode(0);
+
+   Both land on the same instruction at 0x0043335f. The argument is 0,
+   meaning depth only - the 640x480 minimum is enforced at startup but
+   not re-enforced at runtime.
+
+   So the design is coherent end to end. The startup gate puts up a
+   modal Abort/Retry/Ignore box telling the user to change colour depth.
+   When they do, Windows broadcasts WM_DISPLAYCHANGE, this procedure re-
+   validates, and the mode is accepted. The retry loop is not the only
+   path out - the message handler is the other.
+
+4.  ALT+ENTER and WM_ACTIVATEAPP
+
+   Two handlers matter to a windowed port because they already do most
+   of what one would want [verified].
+
+   WM_SYSKEYDOWN with wParam == VK_RETURN (0x0d), gated on
+   maybe_g_altEnterEnabled:
+
+       g_videoSettingsDirty = 1;
+       g_fullscreenResolved = !g_fullscreenResolved;
+       if (g_ddUsingEnumeratedDevice) DAT_004f1824 = g_fullscreenResolved;
+
+   It does not change the mode itself - it raises the same dirty flag
+   that subsystems/mode-change.txt describes, and the frame loop applies
+   it. That is exactly the structure a port wants to keep.
+
+   WM_ACTIVATEAPP is the alt-tab path. On deactivate it clears the
+   fullscreen flag and raises the dirty flag; on activate it restores
+   the previous state through DAT_004e8954, a three-state variable
+   holding -1 for 'nothing saved'. This is the machinery that lets an
+   exclusive-mode DirectDraw game survive being switched away from.
+
+5.  What WM_DESTROY does
+
+   More than a port needs, but worth recording because it is the
+   authoritative shutdown order [verified]:
+
+   o saves Data/Config.spt through Settings_SaveAll, and warns with
+     Cdd_WarningCancel on failure rather than aborting
+
+   o saves the island list, Data/list.spt or Data/list_%02d.spt when
+     DAT_004dc048 is non-zero
+
+   o both saves have a curious verify-and-delete pass gated on
+     DAT_004e714c: it reloads what it just wrote, and then deletes the
+     file. That reads like a debug consistency check left enabled
+     [guess]
+
+   o tears down DirectPlay - DestroyPlayer then CloseSession, both with
+     fatal asserts quoting event.cpp lines 3104 and 3107
+
+   o PostQuitMessage(0)
+
+   Before the menu-state save it swaps g_cfgScreenMode,
+   g_cfgWidescreen169 and DAT_004dc028 for their saved copies when a
+   menu is active, then swaps them back. So the settings written to disk
+   are the ones the player chose, not whatever the menu was temporarily
+   previewing.
+
+6.  Off-spine edges, noted and not followed
+
+   event.cpp is translate-list, so per the spine-first rule in CLAUDE.md
+   these were recorded rather than chased:
+
+   +--------------+--------------------------------------------------+
+   | Target       | What it looked like                              |
+   +==============+==================================================+
+   | FUN_00433ec0 | pre-dispatch hook for four modeless windows      |
+   +--------------+--------------------------------------------------+
+   | FUN_0045a190 | cursor selection, WM_SETCURSOR                   |
+   +--------------+--------------------------------------------------+
+   | FUN_004157d0 | RegisterClass + CreateWindowEx, the window setup |
+   +--------------+--------------------------------------------------+
+   | FUN_004354e0 | part of the modeless window teardown             |
+   +--------------+--------------------------------------------------+
+   | FUN_0043362f | post-modal-dialog restore                        |
+   +--------------+--------------------------------------------------+
+
+   The four globals DAT_004e8904, DAT_004e8908, DAT_004e890c and
+   DAT_004e8910 are four modeless windows given identical teardown at
+   the top of the procedure, each freeing a +0x58 pointer, a +0x48 array
+   of objects with a virtual call, and a +0x4c pointer. One of them logs
+   "CloseHelpSubMenu". They are a menu or help overlay system and are
+   not renderer code.
+
+7.  Open questions
+
+   o Whether maybe_g_altEnterEnabled is ever set. If ALT+ENTER works in
+     the shipped game that is a windowed-mode path already present,
+     which would be useful to know before writing one.
+
+   o The three WM_COMMAND menu ids and where that menu comes from. No
+     menu resource has been located.
+
+   o The reload-then-delete pass on both save paths, gated on
+     DAT_004e714c. Deleting a config file after successfully reloading
+     it makes no obvious sense.
+
+   o DAT_004e8954, the saved fullscreen state across alt-tab, uses -1 as
+     'nothing saved'. Where it is initialised was not checked.

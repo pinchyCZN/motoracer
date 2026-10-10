@@ -1,0 +1,570 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                    THE DIRECT3D EXECUTE BUFFER PATH
+
+
+Abstract
+
+   The hardware path is Direct3D Immediate Mode driven by EXECUTE
+   BUFFERS. This note records the direct evidence, since the claim
+   shapes the whole modernization plan: execute buffers have no modern
+   equivalent and cannot be ported mechanically.
+
+   Nothing here is inferred from the era or from the API's reputation.
+   It is the opcodes, the structure layouts and the interface GUIDs in
+   this binary.
+
+Table of Contents
+
+   1. Which interface generation
+   2. The instruction stream
+   3. The geometry opcodes
+      3.1. Vertices are transformed but not lit
+      3.2. Triangles are batched under one header
+   4. Buffer layout, vertices and the viewport
+      4.1. Two buffers, created once
+      4.2. The buffer is vertices then instructions
+      4.3. The vertex format
+      4.4. The viewport is a formality
+      4.5. Submitting
+   5. Closing and submitting a buffer
+   6. Bringing the device up
+      6.1. Choosing a device, and the 16-bit lock
+      6.2. PowerVR is detected by a FourCC surface
+      6.3. The vertex budget
+      6.4. What else it does
+      6.5. The z buffer
+         6.5.1. Two ways to have no z buffer
+   7. Why this cannot be translated
+   8. Open questions
+   9. The emitters now carry MR_Cd3d * on this
+
+1.  Which interface generation
+
+   Every GUID below was found by scanning .rdata and .data for the
+   interface's first dword [verified]:
+
+   +----------------------------+------------+------------+
+   | GUID                       | Address    | Introduced |
+   +============================+============+============+
+   | IID_IDirect3D              | 0x004d1650 | DX2/DX3    |
+   +----------------------------+------------+------------+
+   | IID_IDirect3D2             | 0x004d1660 | DX5        |
+   +----------------------------+------------+------------+
+   | IID_IDirect3D3             | absent     | DX6        |
+   +----------------------------+------------+------------+
+   | IID_IDirect3DDevice        | 0x004d16b0 | DX2/DX3    |
+   +----------------------------+------------+------------+
+   | IID_IDirect3DDevice2       | 0x004d16c0 | DX5        |
+   +----------------------------+------------+------------+
+   | IID_IDirect3DExecuteBuffer | 0x004d16f0 | DX2/DX3    |
+   +----------------------------+------------+------------+
+   | IID_IDirect3DTexture       | 0x004d16d0 | DX2/DX3    |
+   +----------------------------+------------+------------+
+   | IID_IDirect3DTexture2      | 0x004d16e0 | DX5        |
+   +----------------------------+------------+------------+
+   | IID_IDirect3DViewport      | 0x004d1700 | DX2/DX3    |
+   +----------------------------+------------+------------+
+   | IID_IDirect3DViewport2     | 0x004d1740 | DX5        |
+   +----------------------------+------------+------------+
+   | IID_IDirectDraw2           | 0x004d15d8 | DX2        |
+   +----------------------------+------------+------------+
+   | IID_IDirectDraw4           | absent     | DX6        |
+   +----------------------------+------------+------------+
+
+   So the binary carries both the DX2/DX3 interfaces and their DX5
+   successors, and stops there: no IDirect3D3 and no IDirectDraw4, which
+   are the DirectX 6 generation. It probes for whichever is present,
+   which is the usual 1997 arrangement.
+
+   That refines the common description of this game as a DirectX 3
+   title. The rendering STYLE is DirectX 3 era, but the binary is
+   prepared to talk to a DirectX 5 runtime through the ...2 interfaces
+   [verified].
+
+   It matters because DirectX 5 introduced DrawPrimitive as the
+   replacement for execute buffers, and this binary queries
+   IDirect3DDevice2 yet still builds execute buffers. The old path was
+   kept.
+
+2.  The instruction stream
+
+   D3D_EmitRenderStates at 0x0041a0a0 appends instructions to the buffer
+   by hand. Each is a D3DINSTRUCTION header, three fields in four bytes,
+   followed by that many payload records [verified]:
+
+       BYTE  bOpcode      8 = D3DOP_STATERENDER
+       BYTE  bSize        8 = sizeof(D3DSTATE)
+       WORD  wCount       1, then 12 or 13
+       ... wCount records of { DWORD stateType; DWORD value; }
+
+   The state numbers it writes decode cleanly against
+   D3DRENDERSTATETYPE, which is the confirmation that this really is the
+   D3D instruction encoding and not some private format:
+
+   +------+-----+--------------------------------+
+   | Hex  | Dec | D3DRENDERSTATE_                |
+   +======+=====+================================+
+   | 0x02 | 2   | ANTIALIAS                      |
+   +------+-----+--------------------------------+
+   | 0x03 | 3   | TEXTUREADDRESS                 |
+   +------+-----+--------------------------------+
+   | 0x04 | 4   | TEXTUREPERSPECTIVE             |
+   +------+-----+--------------------------------+
+   | 0x07 | 7   | ZENABLE                        |
+   +------+-----+--------------------------------+
+   | 0x08 | 8   | FILLMODE                       |
+   +------+-----+--------------------------------+
+   | 0x09 | 9   | SHADEMODE, 1 flat or 2 gouraud |
+   +------+-----+--------------------------------+
+   | 0x0e | 14  | ZWRITEENABLE                   |
+   +------+-----+--------------------------------+
+   | 0x0f | 15  | ALPHATESTENABLE                |
+   +------+-----+--------------------------------+
+   | 0x15 | 21  | TEXTUREMAPBLEND                |
+   +------+-----+--------------------------------+
+   | 0x17 | 23  | ZFUNC, set to 4 LESSEQUAL      |
+   +------+-----+--------------------------------+
+   | 0x1a | 26  | DITHERENABLE                   |
+   +------+-----+--------------------------------+
+   | 0x1b | 27  | ALPHABLENDENABLE               |
+   +------+-----+--------------------------------+
+   | 0x1d | 29  | SPECULARENABLE                 |
+   +------+-----+--------------------------------+
+   | 0x21 | 33  | STIPPLEDALPHA                  |
+   +------+-----+--------------------------------+
+
+   SHADEMODE taking 1 or 2, and ZFUNC taking 4, are the enum values
+   D3DSHADE_FLAT, D3DSHADE_GOURAUD and D3DCMP_LESSEQUAL. The
+   DITHERENABLE state is set from a global that the command-line
+   documentation at 0x004dc664 exposes as a dithering switch.
+
+   INCOMPLETE. That table was drawn from D3D_EmitRenderStates alone,
+   which is the bulk block written once per execute buffer. Six further
+   emitters append D3DOP_STATERENDER instructions from inside the queue
+   walk, one per primitive, and between them add four more states -
+   0x11 TEXTUREMAG, 0x12 TEXTUREMIN, 0x13 SRCBLEND, 0x14 DESTBLEND
+   [verified]. With those the catalogue is complete: every state number
+   and every value in the stream decodes against a D3D enum.
+
+   The six are D3D_SetBlendMode 0x0041dde0, D3D_SetBlendModeFlatAlpha
+   0x0041e000, D3D_SetBlendModeSrcAlpha 0x0041e1b0,
+   D3D_SetTextureFilter 0x0041e2b0, D3D_SetDither 0x0041e380 and
+   D3D_InvalidateBatch 0x0041e730. See d3d-render-state.txt.
+
+3.  The geometry opcodes
+
+   Four opcodes are emitted in total, from four functions, all in the
+   Dsi_d3d.cpp range [verified]:
+
+   +--------+-----------------------+-------+------------------------------------+
+   | Opcode | Name                  | bSize | Emitted by                         |
+   +========+=======================+=======+====================================+
+   | 0x02   | D3DOP_LINE            | 4     | D3D_EmitLine 0x00419ee0            |
+   +--------+-----------------------+-------+------------------------------------+
+   | 0x03   | D3DOP_TRIANGLE        | 8     | D3D_EmitTriangle 0x00419d60        |
+   +--------+-----------------------+-------+------------------------------------+
+   | 0x08   | D3DOP_STATERENDER     | 8     | D3D_EmitRenderStates 0x0041a0a0    |
+   +--------+-----------------------+-------+------------------------------------+
+   | 0x09   | D3DOP_PROCESSVERTICES | 0x10  | D3D_EmitProcessVertices 0x00419ff0 |
+   +--------+-----------------------+-------+------------------------------------+
+   | 0x0b   | D3DOP_EXIT            | 0     | D3D_CloseExecuteBuffer 0x0041a310  |
+   +--------+-----------------------+-------+------------------------------------+
+   | 0x0c   | D3DOP_BRANCHFORWARD   | 0x10  | D3D_EmitProcessVertices            |
+   +--------+-----------------------+-------+------------------------------------+
+
+   No matrix opcodes, no light opcodes, no D3DOP_SPAN or
+   D3DOP_SETSTATUS. The engine transforms nothing through Direct3D
+   beyond the one PROCESSVERTICES call and issues no matrix state at
+   all, which fits a game that keeps its own camera and its own software
+   rasterizer.
+
+3.1.  Vertices are transformed but not lit
+
+   D3D_EmitProcessVertices writes a D3DPROCESSVERTICES whose dwFlags is
+   2, D3DPROCESSVERTICES_TRANSFORM - not TRANSFORMLIGHT [verified].
+
+       +0x00  dwFlags    = 2
+       +0x04  wStart     = 0
+       +0x06  wDest      = 0
+       +0x08  dwCount    = vertex count
+       +0x0c  dwReserved = 0
+
+   So Direct3D transforms and the engine lights. That is the same
+   lighting the software path carries per vertex at +0x0c and burns into
+   the Full and Half rasterizer chains. Both back ends are fed pre-lit
+   vertices, which is a good sign for a port: a modern pipeline takes
+   pre-lit colours without argument.
+
+3.2.  Triangles are batched under one header
+
+   D3D_EmitTriangle is the most interesting of the four. It does not
+   emit one instruction per triangle [verified].
+
+   When the texture handle differs from the previous triangle it emits a
+   D3DOP_STATERENDER carrying D3DRENDERSTATE_TEXTUREHANDLE, then opens a
+   D3DOP_TRIANGLE header with wCount 0 and remembers that header's
+   address. Every subsequent call increments the wCount in the saved
+   header in place and appends an 8-byte D3DTRIANGLE.
+
+   So a run of triangles sharing a texture costs a single header, and
+   the thing that closes a batch is a texture change. Texture sorting,
+   done inline by the emitter, in 1997.
+
+   The wFlags field distinguishes three cases:
+
+   +-------+-------------+--------+-------------------------------------+
+   | Mode  | Vertices    | wFlags | Meaning                             |
+   +=======+=============+========+=====================================+
+   | 2     | v, v+1, v+2 | 0x300  | EDGEENABLE1 | EDGEENABLE2           |
+   +-------+-------------+--------+-------------------------------------+
+   | 1     | v, v+2, v+3 | 0x1f   | D3DTRIFLAG_EVEN, strip continuation |
+   +-------+-------------+--------+-------------------------------------+
+   | other | v, v+1, v+2 | 0x700  | EDGEENABLETRIANGLE, all three       |
+   +-------+-------------+--------+-------------------------------------+
+
+   Modes 2 and 1 in sequence emit a quad as two triangles sharing an
+   edge, with the shared edge's antialiasing disabled so the seam does
+   not show. The default mode enables all three edges for a standalone
+   triangle.
+
+   D3D_EmitLine is the same machinery for D3DOP_LINE with a 4-byte
+   D3DLINE payload, presumably for wireframe or debug output.
+
+4.  Buffer layout, vertices and the viewport
+
+4.1.  Two buffers, created once
+
+   maybe_D3D_InitDevice creates the execute buffers through
+   IDirect3DDevice::CreateExecuteBuffer, vtable +0x18, passing a
+   D3DEXECUTEBUFFERDESC with dwSize 0x14 = 20 and dwFlags 1 =
+   D3DDEB_BUFSIZE [verified].
+
+   It creates TWO, the second only when a global is set. Every function
+   that touches a buffer takes an index and picks between them, so the
+   engine alternates: while one is executing the other is being filled.
+
+   The size is maxVerts * 64 plus 48 per triangle, rounded down to a 2
+   KB boundary, where maxVerts is clamped against a per-device cap read
+   from the device capability table.
+
+4.2.  The buffer is vertices then instructions
+
+   D3D_BeginExecuteBuffer locks the buffer, vtable +0x10, and splits it
+   in two [verified]:
+
+       lpData                          vertices, D3DTLVERTEX each
+       lpData + maxVerts * 0x20 + 0x28 instructions
+
+   0x20 is sizeof(D3DTLVERTEX). Two independent write pointers advance
+   towards each other's regions, one for vertices and one for
+   instructions, and the instruction emitters bounds-check theirs
+   against the buffer end.
+
+4.3.  The vertex format
+
+   D3D_WriteVertex fills a standard D3DTLVERTEX and advances by 0x20
+   [verified]:
+
+   +-------+----------+------------------------------------------------+
+   | Float | Field    | Source                                         |
+   +=======+==========+================================================+
+   | [0]   | sx       | vertex +0x10, screen X                         |
+   +-------+----------+------------------------------------------------+
+   | [1]   | sy       | vertex +0x14, screen Y                         |
+   +-------+----------+------------------------------------------------+
+   | [2]   | sz       | 1.0 with no z-buffer, else vertex +0x08 scaled |
+   +-------+----------+------------------------------------------------+
+   | [3]   | rhw      | vertex +0x18                                   |
+   +-------+----------+------------------------------------------------+
+   | [4]   | color    | computed by D3D_DrawScene                      |
+   +-------+----------+------------------------------------------------+
+   | [5]   | specular | likewise                                       |
+   +-------+----------+------------------------------------------------+
+   | [6]   | tu       | from the caller                                |
+   +-------+----------+------------------------------------------------+
+   | [7]   | tv       | from the caller                                |
+   +-------+----------+------------------------------------------------+
+
+   rhw taking vertex +0x18 is worth pausing on. Section 6 of
+   subsystems/rasterizer-pipeline.txt verifies that field as 1/z from
+   the software clipper, entirely independently, and rhw is by
+   definition the reciprocal homogeneous w. Both back ends read the same
+   field for the same purpose, which is about as strong a confirmation
+   of a vertex layout as this project can get without running the game.
+
+   Colours are computed in D3D_DrawScene through the shade table at
+   DAT_005d43b0 - now g_d3dShadeRamp - indexed by the vertex's own
+   intensity at +0x0c. That is the same intensity the software path
+   thresholds at 0x3dfff to pick its Full or Half chain. The engine
+   lights; Direct3D does not.
+
+   THE RAMP IS NOW DECODED: it is 32 levels by 256 channel values of
+   table[level][channel] = channel * level / 32, built at run time by a
+   loop at the end of Cdd_ctor2 and empty in the image. See
+   structs/MR_Vertex.txt section 6.4, and note that full brightness
+   comes out 247 rather than 255.
+
+   The SPECULAR at [5] is written with the same shaded RGB and is
+   INERT - SPECULARENABLE is emitted from a global Cd3d_Ctor zeroes and
+   nothing else touches [verified].
+
+4.4.  The viewport is a formality
+
+   D3D_CreateViewport does the expected three calls -
+   IDirect3D::CreateViewport at +0x1c, IDirect3DDevice::AddViewport at
+   +0x24, IDirect3DViewport::SetViewport at +0x14 - and the D3DVIEWPORT
+   it passes is the correct 0x2c = 44 bytes.
+
+   It is also entirely zero apart from dwSize. No x, y, width, height,
+   scale or z range is ever supplied [verified].
+
+   That is consistent, because D3D_ExecuteBuffer calls Execute with flag
+   2, D3DEXECUTE_UNCLIPPED. The engine has already transformed and
+   clipped in its own code, so there is no viewport transform for
+   Direct3D to apply and nothing for it to clip against. The viewport
+   object exists only because Execute requires the parameter.
+
+   For a port this is good news twice over: there is no viewport mapping
+   to reproduce, and the vertices arriving at the API are already in
+   screen space with 1/z attached.
+
+4.5.  Submitting
+
+   D3D_ExecuteBuffer restores the main DirectDraw surface if lost, then
+   [verified]:
+
+       IDirect3DDevice::BeginScene   vtable +0x4c
+       IDirect3DDevice::Execute      vtable +0x20
+             (device, executeBuffer, viewport, D3DEXECUTE_UNCLIPPED)
+       IDirect3DDevice::EndScene     vtable +0x50
+
+5.  Closing and submitting a buffer
+
+   D3D_CloseExecuteBuffer at 0x0041a310 finishes a buffer in four steps
+   [verified]:
+
+       1  append D3DINSTRUCTION { 0x0b D3DOP_EXIT, 0, 0 }
+       2  vtable +0x14  IDirect3DExecuteBuffer::Unlock
+       3  zero 48 bytes and fill a D3DEXECUTEDATA:
+            +0x00  dwSize = 0x30 = sizeof(D3DEXECUTEDATA)
+            +0x08  dwVertexCount
+            +0x0c  dwInstructionOffset
+            +0x10  dwInstructionLength
+       4  vtable +0x18  IDirect3DExecuteBuffer::SetExecuteData
+
+   The dwSize of 0x30 is decisive on its own. 48 bytes is exactly
+   sizeof(D3DEXECUTEDATA) in the DirectX 3 and 5 headers, and the three
+   fields written land at the offsets that structure defines.
+
+   Overflow is caught by comparing the write pointer against a limit and
+   reporting "Error in D3DUnLockExecuteBuffer lpBufEnd OverFlow", which
+   is also where the name in the original source leaks.
+
+6.  Bringing the device up
+
+   D3D_InitDevice at 0x0041e8f0 is the whole hardware bring-up. It has
+   no callers; Direct3D reaches it as a callback [verified].
+
+6.1.  Choosing a device, and the 16-bit lock
+
+   After EnumDevices the selection loop demands three things of a
+   candidate, and the first one matters for any modernization plan
+   [verified]:
+
+   +-------------------------------------------+------------------------------------------+
+   | Test                                      | Meaning                                  |
+   +===========================================+==========================================+
+   | dwDeviceRenderBitDepth & 0x400            | DDBD_16, renders 16 bits per pixel       |
+   +-------------------------------------------+------------------------------------------+
+   | g_devIsHardware                           | not the reference or software rasterizer |
+   +-------------------------------------------+------------------------------------------+
+   | DoesTexturesTransparency or a config flag | colour-keyed textures                    |
+   +-------------------------------------------+------------------------------------------+
+
+   So the 16-bit restriction is not only a display-mode filter. A
+   Direct3D device that cannot render at 16 bits per pixel is rejected
+   during selection, before a surface or a texture is ever created.
+   Anything that removes the depth lock has to address this test as well
+   as the mode enumeration.
+
+   Among qualifying devices the loop prefers one whose desc +0x08 has
+   bit 0 set over the first candidate found; that field is
+   dcmColorModel, so it is preferring one colour model over another
+   [inferred].
+
+6.2.  PowerVR is detected by a FourCC surface
+
+   The PowerVR check is a neat trick. The engine asks DirectDraw to
+   create a surface whose pixel format carries the FourCC 0x43525650,
+   which spells PVRC, and treats success as proof of a PowerVR board
+   [verified]. Setting g_cfgUsePowerVr then forces several other globals
+   on, including the infinite-z-buffer flag.
+
+6.3.  The vertex budget
+
+   The execute buffer is sized from a fixed budget, not from the scene
+   [verified]:
+
+       g_maxVertices = ((budget * 0xf000) / 0x2580) * 3
+       budget = 0x20 normally, 8 when PowerVR is active
+       then clamped to g_devMaxVertexCount
+
+   +---------+----------+-----------------------------------------------+
+   | Case    | Vertices | Buffer bytes                                  |
+   +=========+==========+===============================================+
+   | normal  | 612      | (204+1)*0x30 + 612*0x40, rounded down to 2 KB |
+   +---------+----------+-----------------------------------------------+
+   | PowerVR | 153      | the same formula                              |
+   +---------+----------+-----------------------------------------------+
+
+   0x40 per vertex is twice the 0x20 a D3DTLVERTEX needs; the surplus
+   and the 0x30 per triangle are the instruction stream's share. When
+   the buffer fills mid-scene D3D_DrawScene closes it, executes it and
+   resumes into the next one, so the budget caps latency rather than
+   scene complexity.
+
+6.4.  What else it does
+
+   EnumTextureFormats is issued here, vtable +0x38, with
+   D3D_EnumTextureFormatsCallback at 0x00419980 as the callback. That
+   function fills g_texFormats and is the answer to the open question in
+   subsystems/d3d-textures.txt section 6.5 about where the descriptor
+   array comes from - it has no callers because Direct3D calls it
+   [verified].
+
+   Both execute buffers are created and then primed by a Begin and Close
+   pair before any drawing. Finally the initialiser walks 20 texture
+   banks and preloads every marked sub-texture, choosing the source
+   depth from the bank flags: bit 0 is 8-bit palettised, bit 5 4-bit
+   palettised, bit 1 16-bit and bit 6 8-bit. Exhausting the slots
+   reports "Not enough video memory" exactly once.
+
+6.5.  The z buffer
+
+   D3D_CreateZBuffer at 0x0041e580 is called from the initialiser with
+   the display size when g_cfgUseZBuffer is set. It releases any
+   existing surface, then creates one attached to the main surface
+   [verified]:
+
+   +-------------------------+------------------------------------------------+
+   | Field                   | Value                                          |
+   +=========================+================================================+
+   | +0x04 dwFlags           | 0x47 = CAPS | HEIGHT | WIDTH | ZBUFFERBITDEPTH |
+   +-------------------------+------------------------------------------------+
+   | +0x18 dwZBufferBitDepth | the best the device offers, see below          |
+   +-------------------------+------------------------------------------------+
+   | +0x68 ddsCaps           | 0x24000 ZBUFFER | VIDEOMEMORY                  |
+   +-------------------------+------------------------------------------------+
+   |                         | 0x20800 ZBUFFER | SYSTEMMEMORY if not hardware |
+   +-------------------------+------------------------------------------------+
+
+   The depth is picked from D3DDEVICEDESC.dwDeviceZBufferBitDepth,
+   testing DDBD_32, DDBD_24, DDBD_16 then DDBD_8 in that order and
+   taking the first available - so it asks for the deepest z buffer the
+   hardware has, unlike the colour depth, which is pinned at 16.
+
+   The surface is then attached with
+   IDirectDrawSurface::AddAttachedSurface, and the code records whether
+   the request for video memory was actually honoured.
+
+6.5.1.  Two ways to have no z buffer
+
+   The control flow distinguishes them, and the distinction matters
+   [verified]:
+
+   +-------------------------------+-----------------------------+
+   | Situation                     | Returns                     |
+   +===============================+=============================+
+   | g_cfgUseZBuffer clear         | 0, and nothing is created   |
+   +-------------------------------+-----------------------------+
+   | device reports no z buffer    | 1, SUCCESS, with no surface |
+   +-------------------------------+-----------------------------+
+   | no usable depth bit set       | 0                           |
+   +-------------------------------+-----------------------------+
+   | CreateSurface or attach fails | 0, both surfaces released   |
+   +-------------------------------+-----------------------------+
+
+   So a device with no z buffer is a supported configuration rather than
+   an error. What happens then is visible in D3D_WriteVertex: when
+   g_zBufferEnabled is clear it writes sz = 1.0 into every D3DTLVERTEX
+   rather than a real depth, and the hardware path falls back entirely
+   on draw order.
+
+   That is the same discipline the software path enforces through the
+   span buffer, which also resolves visibility by order rather than by
+   depth. Both back ends are built to work without a z buffer, and the z
+   buffer is an accelerator rather than a requirement [inferred].
+
+7.  Why this cannot be translated
+
+   The shape of the API is visible in the code and it is worth stating
+   plainly, because it decides the porting strategy.
+
+   To change a render state the engine does not call a function. It
+   writes a byte, a byte and a word into a memory buffer, then eight
+   bytes per state, advancing a raw pointer it has to bounds-check
+   itself. Vertices and drawing commands go into the same buffer.
+   Nothing happens until the buffer is unlocked and handed back through
+   SetExecuteData.
+
+   So the driver receives a small program to interpret rather than a
+   sequence of calls. Every error is a buffer-layout error, and the
+   compiler can check none of it.
+
+   There is no modern counterpart to port to. The replacement path,
+   DrawPrimitive, arrived in DirectX 5 and even that is long gone. The
+   conclusion recorded in CLAUDE.md stands: this path must be REPLACED,
+   not translated.
+
+   The good news is that the surface is small. The instruction emission
+   is concentrated in the Dsi_d3d.cpp range 0x00419000 to 0x0041b000,
+   and the game's own software rasterizer already expresses the same
+   scene through a completely different mechanism - see
+   subsystems/rasterizer-pipeline.txt. Two independent renderers means
+   the geometry interface between the engine and its back end is already
+   a real boundary.
+
+8.  Open questions
+
+   o ANSWERED. All six opcodes the engine emits are in section 3.
+
+   o Whether the DX5 interfaces are used for anything beyond being
+     queried is unestablished. Only four calls in the whole binary use
+     vtable +0x74, the DrawPrimitive slot on IDirect3DDevice2, and two
+     of those are in MFC. Neither of the other two has been confirmed to
+     be a device call.
+
+   o The viewport is done; see section 4.4. No material or light state
+     is ever set - there are no D3DOP_STATELIGHT or matrix opcodes at
+     all, which follows from the engine doing its own transform and
+     lighting.
+
+
+9.  The emitters now carry MR_Cd3d * on this
+
+   Every function in this note that writes the execute buffer is a
+   __thiscall method on the Cd3d object, and all of them now declare it
+   [verified]. The cursor arithmetic they perform is written
+
+       this->pInstrCursor
+
+   in the decompiler rather than *(int *)(param_1 + 8), so the opcode
+   layouts described here can be read against the code directly.
+
+   MR_Cd3d is 12 bytes:
+
+       0x00  undefined4  dwUnknown00
+       0x04  void *      pVertexCursor    stepped 0x20 per D3DTLVERTEX
+       0x08  void *      pInstrCursor     stepped 4 for a header, 8 per
+                                          state or triangle record
+
+   The method was a GhidraClass named to match the structure; see
+   the bulk signature pass. The class holds twelve
+   functions - the two geometry emitters, the two execute-buffer
+   bracket calls, the two texture entry points, the five state
+   emitters, and the constructor.
+
+   o dwUnknown00 at +0x00 is still unidentified, and it is now the only
+     unnamed field in the object the entire hardware path runs through.

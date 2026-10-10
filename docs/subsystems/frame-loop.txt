@@ -1,0 +1,913 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       THE FRAME LOOP AND PACING
+
+
+Abstract
+
+   What the original does to pace itself, why the reconstruction does
+   something different, and what that means for input and audio.
+
+   The short version: THE ORIGINAL TARGETS 30 FPS AND ENFORCES IT BY
+   BUSY-WAITING. It is single threaded, its only clock is timeGetTime,
+   and it never raises the timer resolution. None of that survives into
+   the port, and this note records the decisions so they are choices
+   rather than drift.
+
+Table of Contents
+
+   1. What the original does
+      1.1. Frame_LimitAndMeasure
+      1.2. The help text is wrong about the range
+      1.3. The clock is timeGetTime and only timeGetTime
+      1.4. The frame delta, and a ceiling applied one line too late
+      1.5. What may advance on a paused frame
+      1.6. A scripted run must STEP the clock, not free-run it
+   2. Why our loop was choppy
+   3. Pacing on modern Windows
+      3.1. The options, and why not each one
+      3.2. What was chosen
+   4. Fixed simulation, variable render
+   5. Input does not need a thread
+   6. Audio
+   7. Configuration
+   8. The virtual clock: pause and frame-step
+      8.1. Why a pause flag does not work
+      8.2. Two clocks
+      8.3. Stepping
+      8.4. The primitive limit
+      8.5. Keys
+   9. Open questions
+
+
+1.  What the original does
+
+1.1.  Frame_LimitAndMeasure
+
+   0x00459fd0, renamed from FUN_00459fd0. It is the entire pacing
+   mechanism, and it does two jobs [verified].
+
+   THE LIMIT. It reads g_frameRateMax (0x004dc200), whose value in the
+   image is 30, divides 1000 by it to get a millisecond budget, and
+   then spins:
+
+       if (g_frameRateMax != 0) {
+           budget = 1000 / g_frameRateMax;
+           do {
+               now = timeGetTime();
+               g_lastFrameTimeMs = now;
+               if (now - prevFrameStart >= budget) break;
+           } while (now - thisFrameStart < budget);
+       }
+
+   THERE IS NO Sleep ANYWHERE IN MOTO.EXE. A search of the import
+   table and every reference finds timeGetTime with 75 references,
+   SetThreadPriority with 2, and nothing else in this area - no Sleep,
+   no QueryPerformanceCounter, no GetTickCount, no timeBeginPeriod, no
+   timeSetEvent, no WaitForVerticalBlank. So the limiter holds a core
+   at 100 per cent for whatever is left of every frame.
+
+   The second condition is a runaway guard: it also gives up once a
+   full budget has passed since the function was ENTERED, so a frame
+   that already overran cannot spin for a second budget on top.
+
+   THE METER. A 24-entry ring at g_frameDurationRing (0x005809f8) is
+   shifted down one slot per frame with the newest duration written at
+   [0], and the count at g_frameDurationCount saturates at 24. The
+   function returns
+
+       1000 * count / sum(durations)
+
+   the average frame rate over the last 24 frames. Any single frame
+   longer than 1000 ms truncates the history. The constant 1000 is
+   built from three LEAs and a shift rather than an IMUL.
+
+1.2.  The help text is wrong about the range
+
+   The binary documents the flag itself at 0x004dc664:
+
+       -FrameRateMax<XX>   : Limit frame rate of the game to XX frame/sec
+                             (20 to 99, default=30, 0=no limit)
+
+   The parser in Main_InitAndParseCommandLine disagrees [verified]:
+
+       00414c6c  CMP  EAX,0x14
+       00414c6f  JLE  skip
+       00414c71  CMP  EAX,0x63
+       00414c74  JGE  skip
+       00414c76  MOV  [0x004dc200],EAX
+
+   It stores only when 20 < n < 99, so THE ACCEPTED RANGE IS 21 TO 98.
+   A literal -FrameRateMax20 or -FrameRateMax99 is silently ignored and
+   the default stands. Zero is handled separately, further down, and
+   does disable the limit.
+
+   Small, but it is the kind of thing that turns into an afternoon if
+   somebody tests the documented boundary and concludes the flag is
+   broken.
+
+1.3.  The clock is timeGetTime and only timeGetTime
+
+   75 references, spread across the menus, the sprites, the racers and
+   D3D_DrawScene. There is no second clock.
+
+   AND THE GAME NEVER CALLS timeBeginPeriod. Without it, timeGetTime
+   advances at the default system timer resolution - about 15.6 ms.
+   So the original's own notion of time moves in 15.6 ms jumps, and at
+   a 33 ms budget that is half a tick of quantisation per frame.
+
+   At 30 fps that is survivable, and it is probably why 30 was chosen
+   rather than 60: the clock is not good enough to pace a 16 ms frame.
+   At 144 fps it would be absurd - the budget would be smaller than
+   the clock's resolution.
+
+
+1.3.9.  race_update SUBSTEPS, AND WITHOUT IT FAST-FORWARD TUNNELS
+
+   The fixed-timestep pump in timing.h exists and the race never
+   used it: race_update is called once per RENDERED frame and takes
+   the whole frame delta as ONE physics step.
+
+   FOR GEOMETRY, AT NORMAL SPEED, THAT IS HARMLESS.  A 16 ms step
+   moves the bike 53 world units at 90 km/h, and every piece of
+   geometry it tests against is far larger than that.
+
+   BUT IT IS NOT HARMLESS FOR EVERYTHING, and this was found the
+   expensive way.  The AI speed needle integrates as
+
+        speedKmhNeedle += (int)(needleRate * dt * 0.01)
+
+   with needleRate clamped to 40.  At the original's one 33 ms
+   step that is int(1.32) = 1 and the needle climbs; split into
+   two 16 ms steps it is int(0.66) = 0 TWICE, so the needle never
+   moves at all.  HALVING THE STEP DOES NOT HALVE THE RESULT, IT
+   ZEROES IT - the fraction is discarded every sub-step.
+
+   The consequence reached the mixer: a stuck needle feeds
+   Gearbox_AutoSelect a ground speed of 0, so every AI racer sat
+   in gear 1 with tachoRpm on its 800 idle floor, and their
+   engine notes droned at the bottom of the gear-1 band instead
+   of revving.  Measured against MOTO at the same moment: its AI
+   read needle 53, tachoRpm 5811, rpm 0.484; ours read needle 0,
+   tachoRpm 800, rpm 0.0667.  [verified - live, both builds]
+
+   READ THAT COMPARISON WITH 1.4's WARNING IN HAND: MOTO was
+   harness-pinned to a 33 ms step while the port was taking two
+   16 ms ones, so the two were never stepping the same amount.
+   The ARITHMETIC above stands on its own and is the point -
+   int(40 * 1.7 * 0.01) is 0 whatever the other side is doing -
+   but the numbers beside it are not a like-for-like.
+
+   o ANY INTEGRATOR THAT TRUNCATES TO AN INT IS SUSPECT HERE.
+     dt-scaling is not enough on its own; a sub-stepped build
+     needs the remainder carried, or the quantity computed once
+     per FRAME like the camera and the HUD already are.
+
+   AT 10x FAST-FORWARD THE STEP IS 166 ms AND THE BIKE TUNNELS.  It
+   covers 533 units in one step - more than a whole 512-unit
+   segment, and 1.4 times the road half width through ile01's
+   bridge.  Wall clipping, ground contact and the segment walk are
+   each handed a displacement larger than the geometry they test
+   against, so it passes through walls a smaller step would have
+   caught.  Fast-forwarded gameplay was not a valid measurement of
+   anything that touches a wall.
+
+   dt-SCALING IS NECESSARY AND NOT SUFFICIENT, which is the part
+   that misleads: every routine scales by its delta correctly and it
+   still breaks, because one large Euler step is not several small
+   ones once collision is involved.
+
+   So the block is cut into slices of at most RACE_MAX_SUBSTEP:
+
+        1x  @60fps    16.7 ms ->  1 step   (bit-for-bit as before)
+        1x  @30fps    33.3 ms ->  2 steps of 16.7 ms
+       10x  @60fps   166.7 ms ->  9 steps of 18.5 ms
+       stall clamp   250.0 ms -> 13 steps of 19.2 ms
+
+   WHAT IS IN THE LOOP IS WHAT INTEGRATES OR TESTS GEOMETRY - the
+   racer tick, progress, standings, the clock, the decor animation
+   and the bike-to-bike push.  The particles, the camera, the HUD
+   and the draw prep stay per-FRAME: the camera is a first-order
+   filter, so running it N times would pull it in N times as fast.
+
+   THE COUNT IS BOUNDED at RACE_MAX_SUBSTEPS for the reason
+   FRAME_MAX_STEPS is - a slow machine must fall behind in real time
+   rather than demanding more steps that take longer still.
+
+1.4.  The frame delta, and a ceiling applied one line too late
+
+   Game_UpdateFrameTimer @ 0x004120e0 derives every consumer of
+   frame time from that one clock.  [verified]
+
+   +----------------------+------------+----------------------------+
+   | Global               | Address    | Meaning                    |
+   +======================+============+============================+
+   | g_clockMs            | 0x004e9cfc | Clock_Sample @ 0x00459fa0  |
+   |                      |            | stores timeGetTime here;   |
+   |                      |            | Clock_Now @ 0x00459fc0     |
+   |                      |            | returns it. Both are two   |
+   |                      |            | lines long.                |
+   +----------------------+------------+----------------------------+
+   | g_framePrevMs        | 0x0050bbc8 | the previous sample        |
+   +----------------------+------------+----------------------------+
+   | g_frameDeltaMs       | 0x004e980c | raw delta, integer ms      |
+   +----------------------+------------+----------------------------+
+   | g_frameDeltaSmoothed | 0x004dc150 | exponentially smoothed ms  |
+   +----------------------+------------+----------------------------+
+
+   The order of operations is the whole point:
+
+       g_frameDeltaMs = Clock_Now() - g_framePrevMs;
+       if (g_dwReplayMode != 1)
+           g_frameDeltaSmoothed += (raw - g_frameDeltaSmoothed) * a;
+       g_frameDeltaScaled = (float)g_frameDeltaMs;
+       if (raw > ceiling) { g_frameDeltaMs = 200; scaled = 200.0; }
+       else if (scaled < 1) { g_frameDeltaMs = 30; scaled = 30.0; }
+
+   THE LONG-FRAME CEILING IS APPLIED AFTER THE SMOOTHING, so it
+   protects g_frameDeltaMs and not g_frameDeltaSmoothed. A stall of
+   any length is clamped to 200 ms for the physics and folded in at
+   full value for everything reading the smoothed figure. Measured
+   against a frozen game: four seconds took g_frameDeltaSmoothed
+   from 35.159 to 542.293.  [verified]
+
+   That is not academic. maybe_Racer_UpdateLean DIVIDES by it:
+
+       0046ac1b  MOV  EAX,[g_frameDeltaSmoothed]
+       0046ac24  MOV  ECX,[ESI + 0x2e29]     ; nonzero skips the clamp
+       0046ac2e  MOV  EAX,0x41a00000         ; 20.0, a FLOOR
+       0046ac3d  MOV  [ESP+0x10],EAX         ; ...and no ceiling
+       0046ac45  FDIV [ESP+0x10]
+       0046ac4f  FSTP [ESI + 0x2e1d]         ; lean
+
+   so one long frame flattens the bike for exactly one frame. In
+   normal play a stall that big does not happen and the smoothing
+   hides the rest. Under a stepped harness it happens at every
+   resume, which is what made the reconstruction look wrong when
+   the harness was at fault - see racers-convergence.txt 9.61.5.
+
+   THE FIX IS A VIRTUAL CLOCK, NOT A CORRECTION AT THE BOUNDARY.
+   mrhook replaces Clock_Sample with
+
+       g_clockMs += 33 for each frame the counter advances
+
+   so game time is a function of the frame counter and nothing
+   else. It is seeded at engagement so the clock does not jump.
+
+   THE STEP FOLLOWS -FrameRateMax, as an integer 1000/n - the
+   same arithmetic the game's own limiter spends, so 30 buys 33 ms
+   and 60 buys 16.  It is read once at engagement from
+   g_frameRateMax (0x004dc200); the rate is parsed at startup and
+   nothing moves it afterwards.
+
+   o IT WAS A HARDCODED 33 UNTIL THIS WAS FOUND, and at
+     -FrameRateMax60 that ran the game at DOUBLE SPEED: the
+     renderer ticked twice as often and the clock still advanced
+     33 a frame.  It also pinned the physics at 33 ms where an
+     unhooked 60 fps game steps 16, so every driven A/B at 60 was
+     33 against the port's 17 and came back about 1.97x apart -
+     which reads exactly like a port defect.  A long session went
+     through the torque curve, the carac table and the gain block
+     before the clock turned out to be the cause; Engine_TorqueAt
+     hooked on both sides returned 7630.1411 against 7630.1415
+     from identical inputs.  [verified - live, both builds]
+
+   o BOTH SIDES NOW SPEND THE SAME INTEGER 1000/n.  The port
+     rounds an explicit maxfps to that step rather than taking it
+     as a rate, so 60 buys 16 ms on both and an A/B is exact at
+     any setting.  Its DEFAULT always did this - kOriginalStepMs
+     is a step, not a rate - which is why 30 fps matched all
+     along and only an explicit maxfps drifted.
+
+     UNTIL THAT LANDED THE PORT SPENT 1/60 = 16.67 ms, and
+     race_update quantises dt to whole ms, so its step alternated
+     16/17/17 against MOTO's flat 16.  Every drivetrain quantity
+     came back at 0.965 of MOTO's - which is 16.0/16.67 exactly,
+     and no part of it was physics.  [verified - live, both
+     builds]
+
+     THE ROUNDING IS COARSE AT HIGH RATES and that is the game's
+     own arithmetic, not an approximation of it: 144 asks for
+     6.94 ms, gets 6, and runs at 166.7.
+
+   o THE PORT MUST ALSO TAKE ONE STEP PER FRAME for the
+     comparison to hold - see 1.3.9.  At maxfps=30 with
+     RACE_MAX_SUBSTEP at its shipped 0.02 the frame is cut into
+     two 16 ms slices and the mismatch returns by another route.
+
+   IT ACCUMULATES RATHER THAN MULTIPLYING, because THE FRAME
+   COUNTER IS NOT MONOTONIC - a race restart puts it back to zero.
+   Deriving the clock as base + frameCount * 33 therefore ran it
+   backwards across a reset and handed the game a negative delta:
+   g_frameDeltaSmoothed read -159.534 on the first frame after
+   mr_reset and needed some fifty frames to climb back to 33, so a
+   run started from a fresh reset began inside a corrupted window.
+   A backward or absurd jump now counts as one frame.  [verified]
+   The frame limiter is unaffected: it calls timeGetTime directly
+   rather than through Clock_Sample (1.3), and only three sites
+   call Clock_Sample at all.
+
+   CORRECTING g_framePrevMs AT THE BOUNDARY IS NOT ENOUGH. That
+   global has THREE writers - maybe_Game_ReadInput @ 0x00411821,
+   Game_UpdateFrameTimer @ 0x00412125, and the tail of
+   FUN_00410ee0, which sets it to now at the end of every solo
+   frame. A correction applied at one instant is a race against
+   the other two and the last writer before the resumed frame
+   wins. Measured: the boundary fix took the lean lost on the
+   first resumed frame from 63 per cent down to 0.3, and twelve
+   stepped bursts still drifted 22 per cent from one continuous
+   run.  [verified]
+
+   HOLDING g_frameDeltaSmoothed FROM ANOTHER THREAD IS WORSE THAN
+   USELESS. The game writes it at the top of the frame and reads
+   it a few instructions later, so an external write only ever
+   wins before the sample: the value reads as pinned to whoever
+   polls it and the frame that used it is untouched. That is a
+   measurement that lies, not a fix.
+
+   With the virtual clock engaged the raw delta is 33 on every
+   frame including resumed ones, g_frameDeltaSmoothed sits at
+   exactly 33.000, and twelve frames produce the same lean whether
+   taken as one burst, three or six - -0.82303, -0.82292 and
+   -0.82293, agreeing to 0.01 per cent.  [verified]
+
+   THE HARNESS CANNOT STEP A SINGLE FRAME. A resume costs two
+   frames minimum - the game finishes the frame it was frozen in
+   and starts the next before the pause flag lands. Requests of
+   two or more are exact; a request of one advances two and says
+   so in its reply.  [verified]
+
+1.5.  What may advance on a paused frame
+
+   A PAUSED FRAME STILL RENDERS. tm_now stops, so anything reading
+   it takes a zero step - but the frame loop, the draw and the
+   menu tick all still run. Anything that integrates state WITHOUT
+   going through that zero step keeps moving while the game is
+   frozen.
+
+   THAT IS NOT ONLY A COSMETIC BUG. It silently biases every
+   stepped measurement, because a scripted comparison pauses
+   between bursts and the original is genuinely frozen across
+   those gaps. The chase camera did exactly this and it cost a
+   long hunt through constants that were never wrong - see
+   camera.txt.
+
+   SWEPT, and the state as of this pass:
+
+   +---------------------------+------------------------------------+
+   | Site                      | Verdict                            |
+   +===========================+====================================+
+   | race_camera(1)            | WAS BROKEN, now gated on dt > 0.   |
+   |                           | A filter chasing a point fixed to  |
+   |                           | the bike converges for free on a   |
+   |                           | frame the bike did not move.       |
+   +---------------------------+------------------------------------+
+   | race_tick_physics,        | dt-scaled throughout; dt is 0 on a |
+   | s_race_segPos,            | paused frame, so they no-op.       |
+   | s_race_ticks              |                                    |
+   +---------------------------+------------------------------------+
+   | glass.c, menu page 14     | read tm_now deliberately, and say  |
+   |                           | so. The original reads timeGetTime |
+   |                           | for both; the divergence is that a |
+   |                           | paused game is not a state it has. |
+   +---------------------------+------------------------------------+
+   | p10_pan_step              | Fixed per-frame increment with no  |
+   |                           | dt - and FAITHFUL, the original    |
+   |                           | accumulates the same way at        |
+   |                           | 0x0044eeab. Input-driven on a menu |
+   |                           | page, nothing measures it.         |
+   +---------------------------+------------------------------------+
+   | audio.c delayed cues      | FIXED - now tm_now. They used to   |
+   |                           | schedule on tm_real_now and fire   |
+   |                           | while the game was frozen, which   |
+   |                           | announces something that has not   |
+   |                           | happened yet.                      |
+   +---------------------------+------------------------------------+
+   | menu key repeat,          | Real time, and correctly so - both |
+   | agent.c timeouts          | are I/O, not simulation.           |
+   +---------------------------+------------------------------------+
+
+   NOTHING IN THE FRAME LOOP INTEGRATES OUTSIDE THE GATE NOW,
+   except p10_pan_step, which is faithful.
+
+   THE RULE FOR NEW CODE: if it accumulates and it runs in the
+   frame loop, it takes dt or it reads tm_now. Reading the wall
+   clock is a deliberate choice that has to be argued in a comment,
+   as glass.c does.
+
+
+1.6.  A scripted run must STEP the clock, not free-run it
+
+   MOTO's harness integrates a FIXED 33 ms per scripted frame; ours
+   integrated REAL elapsed time, and that was the largest remaining
+   error in every accumulating comparison the project has made.
+
+   agent_run_start called tm_set_paused(0), which puts clock_advance
+   on its unpaused branch - advance = realDt * speed.  So a scripted
+   frame was worth however long that frame happened to cost, and no
+   two runs of the same script integrated the same amount.
+
+   MEASURED.  Sixteen frames of throttle from an identical placement,
+   the same script twice:
+
+       +---------+-----------+-----------+
+       | run     | MOTO      | port      |
+       +=========+===========+===========+
+       | first   |   11.4806 |   11.4516 |
+       | second  |   11.4806 |   11.4555 |
+       +---------+-----------+-----------+
+
+   MOTO to six figures both times; ours differing from itself by more
+   than a third of its difference from MOTO.  That is the signature -
+   a side that cannot reproduce ITSELF is not being compared, it is
+   being sampled.
+
+   THE VIRTUAL CLOCK WAS NOT AT FAULT AND WAS NOT CHANGED.  timing.c
+   is untouched: clock_advance already had both branches and the
+   fixed-step one was correct.  The defect was one line in agent.c -
+   the scripted-run driver reached for tm_set_paused(0) rather than
+   the step path the pause work had already built.  It survived
+   because that work was exercised at the KEYBOARD, where the step
+   key runs the fixed branch; SEND_INPUT was the one caller taking
+   the other road.
+
+   THE FIX IS tm_step_frames, NOT A NEW CLOCK.  The fixed-step branch
+   of clock_advance already existed for the step key, and its step is
+   1/targetFps, which defaults to 1/(1000/33) - the original's 33 ms
+   exactly.  So a scripted run queues one step per frame and the two
+   sides now integrate the same time as well as the same count.
+
+   WHAT THIS INVALIDATES: any figure this project quoted from a
+   multi-frame scripted run, in proportion to how many frames it
+   accumulated over.  Single-frame deltas and per-frame hook traces
+   are unaffected - they never integrated more than one step.
+
+   IT DID NOT EXPLAIN THE ACCELERATION DIFFERENCE, only hide it.
+   With the clock stepped the port reproduces itself exactly -
+   11.4508 three runs running - and the gap to MOTO settles at a
+   stable -0.260 per cent instead of wandering.  A real defect was
+   underneath it (drag applied twice, racers-convergence.txt 9.18.22); the
+   jitter had been large enough to argue about which.
+
+   THE TRAILING TICK CHANGES MEANING.  agent_run_tick holds the keys
+   for one tick after the count runs out, because under free-run that
+   tick still integrated and releasing early ran a frame of centring
+   backwards through the measurement (1.4).  With a stepped clock
+   that trailing tick has no step left, so it integrates nothing and
+   the keys it holds no longer matter.  N queued steps are now N
+   integrating frames rather than N plus a fraction.
+
+2.  Why our loop was choppy
+
+   The reconstruction's loop already presented with
+   D3DPRESENT_INTERVAL_ONE, so every frame was arriving on the vblank
+   and the frame rate was correct. The motion still stuttered, and the
+   reason was not the pacing at all:
+
+       demo3d_draw((float)timeGetTime() * 0.001f);
+
+   THE ANIMATION WAS DRIVEN BY A 15.6 MS CLOCK WHILE THE DISPLAY RAN
+   AT 16.67 MS. The logo's angle advanced in 15.6 ms quanta, the
+   screen refreshed every 16.67 ms, and the two beat against each
+   other: most frames the angle moved one quantum, occasionally two or
+   none. Every frame was on time and the motion was visibly uneven.
+
+   o THAT IS WHY VSYNC ALONE DID NOT FIX IT, and it is worth
+     remembering as a class of bug. Smooth presentation and smooth
+     motion are different properties. A correct frame rate with a
+     coarse animation clock looks exactly like dropped frames.
+
+   The trailing Sleep(1) was a second, smaller problem - it makes the
+   loop miss vblanks under load - but it was not the main one.
+
+
+3.  Pacing on modern Windows
+
+3.1.  The options, and why not each one
+
+   +---------------------------+--------------------------------------+
+   | Approach                  | Verdict                              |
+   +===========================+======================================+
+   | Sleep(1) in a loop        | Granularity is the system timer      |
+   |                           | quantum, ~15.6 ms by default and     |
+   |                           | ~1 ms at best. Cannot hit 16.67 ms   |
+   |                           | reliably, let alone 6.9 ms.          |
+   +---------------------------+--------------------------------------+
+   | Busy-wait on QPC          | Exact, and what the original does    |
+   |                           | with a coarser clock. Burns a whole  |
+   |                           | core, heats the machine, drains a    |
+   |                           | laptop. Correct result, unacceptable |
+   |                           | cost.                                |
+   +---------------------------+--------------------------------------+
+   | A DirectX facility        | THERE ISN'T ONE. D3D9 has no wait    |
+   |                           | primitive beyond Present blocking on |
+   |                           | vsync. D3DKMTWaitForVerticalBlank    |
+   |                           | exists but is a kernel-thunk API not |
+   |                           | intended for applications.           |
+   +---------------------------+--------------------------------------+
+   | Vsync alone               | Genuinely good, and free - Present   |
+   |                           | blocks in the driver, off-CPU. But   |
+   |                           | it locks you to the refresh rate and |
+   |                           | its divisors, so it cannot express   |
+   |                           | "cap at 30 on a 144 Hz panel".       |
+   +---------------------------+--------------------------------------+
+   | High-resolution waitable  | THE ANSWER. Sub-millisecond, and a   |
+   | timer                     | real sleep - the thread is off the   |
+   |                           | CPU. Windows 10 1803 and later.      |
+   +---------------------------+--------------------------------------+
+
+   o SO THE "CLEANER WAY THAN SHORT SLEEPS" IS REAL AND IT IS NOT A
+     DIRECTX THING. It is CreateWaitableTimerEx with
+     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, which Windows 10 1803
+     added for exactly this problem. Before it existed, burning cycles
+     really was the only way to hit a sub-quantum deadline, which is
+     why so much older game code does.
+
+3.2.  What was chosen
+
+   src/timing.c. A hybrid, because no OS wait is exact:
+
+     1  QueryPerformanceCounter is the clock. Sub-microsecond, and it
+        does not wrap in any plausible session.
+
+     2  Wait on a high-resolution waitable timer until a small margin
+        before the deadline - 1.2 ms with the good timer, 3 ms
+        without. This is the part that is genuinely asleep.
+
+     3  Spin out the remaining fraction with YieldProcessor (the PAUSE
+        instruction), which hints the core that this is a spin-wait so
+        a hyperthreaded sibling gets the pipeline and the power draw
+        drops.
+
+   THE SPIN IS BOUNDED BY THE MARGIN, not by the frame. That is the
+   whole difference from the original: under a millisecond of burn per
+   frame instead of the entire remainder of a 33 ms budget.
+
+   timeBeginPeriod(1) is raised as well, and paired with timeEndPeriod
+   at shutdown. It bounds the worst-case overshoot and it is what
+   makes the no-high-resolution-timer fallback tolerable. Leaving it
+   raised on exit is antisocial - it costs power on the whole machine -
+   so the pairing is not optional.
+
+   FALLBACK IS AUTOMATIC. If the high-resolution flag is rejected the
+   code takes a plain waitable timer, and if that fails, Sleep. The
+   startup line says which one it got.
+
+
+4.  Fixed simulation, variable render
+
+   The loop runs the simulation at a FIXED rate and the renderer as
+   fast as the cap allows:
+
+       dt = frame_begin(&pacer);
+       while (frame_next_step(&pacer))
+           game_tick(pacer.fixedStep);      // constant step
+       render();                            // as often as we can
+       frame_end(&pacer);
+
+   WHY, RATHER THAN JUST RUNNING EVERYTHING FASTER. The original ties
+   its physics step to its frame, so its step IS 33 ms. Raising that
+   loop to 144 Hz would quietly change the simulation - a bike's
+   handling would depend on the display rate, and every tuned constant
+   in the physics would mean something different. That is the standard
+   way a port of a game this age breaks, and it breaks subtly enough
+   to survive testing.
+
+   The step defaults to 30 Hz, the rate the original's code was
+   written against. Nothing forces that once the physics is understood
+   well enough to know it is stable at other rates.
+
+   TWO GUARDS, both of which matter:
+
+     o dt IS CLAMPED at 0.25 s. A frame stalled by a window drag or a
+       blocking load would otherwise inject a huge step and teleport
+       everything. Clamping makes the game run slow for one frame,
+       which is the right failure.
+
+     o THE STEP COUNT IS BOUNDED at 8 per frame, and the backlog is
+       dropped rather than carried. Carrying it means the next frame
+       needs the same overrun plus more, which is a spiral that ends
+       at zero frames per second.
+
+   frame_alpha() is provided for interpolating drawn positions between
+   simulation states. Nothing uses it yet. It is there because a
+   renderer faster than the simulation needs it to look smooth, and
+   retrofitting it later means touching every drawable.
+
+
+5.  Input does not need a thread
+
+   THE ORIGINAL HAS NO CreateThread AT ALL [verified] - the whole game
+   is one thread. Input is winmm joyGetPosEx for the joystick and
+   GetKeyState for the keyboard, polled inline.
+
+   Nothing about a modern input API changes that answer:
+
+     o RAW INPUT arrives as window messages, which the loop already
+       pumps. Polling GetRawInputBuffer once a frame is a memory read.
+
+     o XINPUT is a user-mode call into a cached state block. Fast for
+       a CONNECTED pad.
+
+     o DIRECTINPUT GetDeviceState is a buffered read and is fine on
+       the main thread. DirectInput is deprecated for gamepads anyway;
+       it remains the only option for wheels and pedals with more axes
+       than XInput exposes, which for a racing game is not a footnote.
+
+   o ONE REAL CAUTION. XInputGetState against an EMPTY slot is slow -
+     it goes looking for a device. Polling four slots every frame when
+     none are plugged in costs milliseconds. The fix is to rescan
+     disconnected slots on a timer, a few times a second, not to move
+     input to a thread. A thread would hide the cost rather than
+     remove it.
+
+   A thread is only warranted for an input source that BLOCKS. None of
+   the above does. If a wheel's force-feedback effects turn out to
+   block on upload, that upload is what moves off the main thread -
+   not the polling.
+
+
+6.  Audio
+
+   src/audio.h and src/audio.c, currently a silent stub with the full
+   interface in place.
+
+   WHAT THE ORIGINAL DOES [verified from the import table]: music is
+   RED BOOK CD AUDIO through mciSendCommandA - tracks 2..n of the game
+   disc, played by the drive itself, never decoded by the game. Sound
+   effects are DirectSound, with the winmm mixer* API for volume.
+
+   NEITHER SURVIVES. Nobody runs with the disc in the drive, and
+   DirectSound on Windows 10 is emulated with no hardware mixing.
+
+   o AND THIS IS A REAL LIMIT OF CLAUDE.md RULE 10, which deserves
+     recording rather than discovering later. A stock install has NO
+     MUSIC FILES, because the music was never installed - it was on
+     the disc. A drop-in EXE can find every sound effect in the
+     archives and cannot conjure the soundtrack out of a DATA folder.
+     Music will need files the user supplies, most likely ripped from
+     their own disc, in a directory we define.
+
+   The interface therefore addresses music BY TRACK NUMBER, exactly as
+   the original does. A back end resolves track 4 to whatever it finds;
+   game code never learns the difference.
+
+   THE LIKELY BACK END IS XAUDIO2 - it ships in Windows 10 as
+   XAudio2_9.dll with no redistributable, which is the same constraint
+   that chose D3D9. Decoding is the open part: Media Foundation covers
+   MP3 and AAC with nothing extra, but not FLAC or Opus, which would
+   need a small static library. That decision is deferred and does not
+   leak past audio.h.
+
+   audio_update() is called once per frame from the loop so that audio
+   needs no thread in GAME code. XAudio2 runs its own mixing thread,
+   and a streaming worker - so a disk hitch cannot stall a frame -
+   belongs inside the back end, behind that call.
+
+
+7.  Configuration
+
+   [VIDEO] in mracer.ini, read at startup:
+
+   +----------+---------+---------------------------------------------+
+   | Key      | Default | Meaning                                     |
+   +==========+=========+=============================================+
+   | maxfps   | 60      | Render cap.  DEFAULTS TO 60 - see below.    |
+   |          |         | -1 is the ORIGINAL'S 33.0 ms step, 30.303   |
+   |          |         | fps.  0 = uncapped, let vsync pace it.  N   |
+   |          |         | is taken literally, with no clamp.          |
+   +----------+---------+---------------------------------------------+
+   | simhz    | 30      | Fixed simulation rate.  Reaches the race    |
+   |          |         | ONLY when maxfps is 0 - see below.          |
+   +----------+---------+---------------------------------------------+
+
+   THE DEFAULT IS 60, AND IT IS A DELIBERATE DIVERGENCE.  main.cpp
+   initialises cfgMaxFps to 60, which the explicit arm turns into an
+   integer 16 ms step - 62.5 fps - rather than the original's 33.0.
+   A 30 fps default is a 1997 display assumption, and everything
+   below is why it is not free: A/B RUNS AGAINST MOTO.EXE MUST SET
+   maxfps=30 ON BOTH SIDES or a frame stops meaning the same thing.
+
+   AND THE CAP IS LOAD-BEARING.  race_update takes its dt from the
+   REAL frame time and is called once per RENDERED frame, so the
+   scaled delta the physics reads is 3.3 only because a frame is held
+   at 33.0 ms.  Raising maxfps is a change to the simulation, not to
+   presentation.
+
+   WHAT ACTUALLY BREAKS, in three kinds:
+
+   +---------------------+------------------------------------------+
+   | Kind                | Behaviour off 30 fps                     |
+   +=====================+==========================================+
+   | dt-SCALED           | approximately right - only the           |
+   | most things         | integration error differs                |
+   +---------------------+------------------------------------------+
+   | dt-DIVIDED          | changes.  racer_lean_response is the     |
+   | lean                | case, but BOTH sides floor the divisor   |
+   |                     | at 20.0 ms when leanMode is 0, so above  |
+   |                     | ~50 fps it stops getting worse and pins  |
+   |                     | at 33/20 = 1.65x.  With leanMode set the |
+   |                     | floor is skipped and it scales all the   |
+   |                     | way - that is the 2x case.               |
+   +---------------------+------------------------------------------+
+   | NO dt at all        | runs literally N times faster.  The air  |
+   | frame-COUNT         | timer is the known one - racers.txt 7547 |
+   +---------------------+------------------------------------------+
+
+   THE FLOOR IS THE ORIGINAL'S, at 0x0046ac2e: MOV EAX,0x41a00000 is
+   20.0f, reached only when the racer's leanMode field is 0.  The
+   port carries it as LEAN_DT_FLOOR.
+
+   o 33.0 IS THE ORIGINAL'S INTEGER 33, NOT 1000/30.  Its own limiter
+     spends an integer 1000/n ms, so 30 buys 33 ms and 30.303 fps.  At
+     1000/30 the port ran every dt-driven quantity 1.01x hot.
+
+   o RETAIL HAS THE SAME COUPLING.  Frame_LimitAndMeasure caps a loop
+     that also drives the physics, and its tick is variable-timestep
+     too - so 30 fps is load-bearing there as well, and this is not a
+     defect the port introduced.  It is one the port has not yet
+     fixed.
+
+   maxfps 0 with vsync on would be the sane default IF the simulation
+   were decoupled: Present blocks in the driver, off-CPU, at exactly
+   the refresh rate.  The cap is also for when vsync is off, or to
+   hold something BELOW the refresh rate - capping at 30 on a 144 Hz
+   panel is the case vsync cannot express.
+
+   HAVING BOTH ON IS SAFE. Whichever is tighter wins, and frame_end
+   becomes a no-op when Present has already blocked past the deadline.
+
+
+8.  The virtual clock: pause and frame-step
+
+   A debug facility, not game behaviour. None of it exists in the
+   original and none of it changes what the game does when it is not
+   being driven by hand.
+
+8.1.  Why a pause flag does not work
+
+   The obvious implementation - a g_paused flag, and skip the update
+   when it is set - is wrong here, and it is worth writing down why
+   because it fails silently rather than obviously.
+
+   GAME CODE READS THE WALL CLOCK ITSELF. MenuPage14_Title_Tick calls
+   timeGetTime and diffs it against a stamp its own enter handler
+   took; the reconstruction does the same through tm_now. So not
+   calling the tick for two seconds does not pause anything. The
+   moment it is called again it observes that two seconds passed and
+   advances the animation by two seconds in one frame. Skipping the
+   update is not pausing, it is DEFERRING - and the deferred time is
+   all paid back in a single step.
+
+   A flag would therefore have to be checked by every reader of the
+   clock, forever, and the one reader that forgot would resume with a
+   jump. That is a rule nobody can keep.
+
+8.2.  Two clocks
+
+   So the clock pauses rather than the caller.
+
+   +---------------+------------------------------------------------+
+   | tm_real_now() | REAL. QueryPerformanceCounter since tm_init.   |
+   |               | Never pauses. For the pacer's deadlines, the   |
+   |               | fps counter, and measuring the machine.        |
+   +---------------+------------------------------------------------+
+   | tm_now()      | VIRTUAL. What the game reads. Advances only    |
+   |               | when frame_begin advances it, and not at all   |
+   |               | while paused.                                  |
+   +---------------+------------------------------------------------+
+
+   frame_begin is the only place the virtual clock moves. It takes the
+   real elapsed time, decides what the frame is entitled to, adds that
+   to the virtual clock and returns it. Every subsystem reading tm_now
+   then freezes for free, and none of them needs to know a pause
+   exists.
+
+   WHAT KEEPS WORKING, and this is the part that makes the whole
+   approach cheap: the message pump, the game draw, and the present
+   all run every frame exactly as before. So the window keeps
+   repainting, input keeps being delivered, and the last frame stays
+   on screen - not because it is being preserved, but because the game
+   keeps redrawing it identically from a clock that is not moving.
+   There is no "hold the last framebuffer" path to get wrong.
+
+   frame_end still waits against a REAL deadline, so a paused game
+   paces at the cap instead of spinning as fast as it can redraw.
+
+   A USEFUL SIDE EFFECT: anything that keeps animating while paused is
+   reading the wrong clock. That is a bug in the caller, and this is a
+   cheap way to find it.
+
+8.3.  Stepping
+
+   tm_step_frames(n) queues n frames and pauses if not already paused,
+   so one key does both jobs and the caller never has to know which
+   state it was in. Requests accumulate and are consumed ONE PER
+   FRAME, which is what makes holding the key down produce slow motion
+   at the keyboard repeat rate rather than one large jump.
+
+   A step is a FIXED amount - one period of the frame cap, or one
+   simulation step when uncapped. Not the real elapsed time, which
+   would make every step a different size; a single-step that is not
+   reproducible is not much of a debugging tool.
+
+8.4.  The primitive limit
+
+   g_queuePrimLimit in queue.h, negative for none, which is the
+   default.
+
+   The queue is the only point in the pipeline where every primitive
+   of a frame exists at once, in draw order, before any of them has
+   been rasterized. Capping the dispatch there and walking the cap
+   upward draws the frame one primitive at a time, which turns "there
+   is a stray line on the screen" into "primitive 47 is the stray
+   line" - and 47 can then be traced back to its object and its face.
+
+   Two details that are not optional:
+
+   o IT LIMITS DISPATCH, NOT THE WALK. queue_walk clears bucket heads
+     as it passes them, and that IS how the queue is emptied for the
+     next frame. Breaking out early would leave nodes linked and the
+     next frame would draw both frames. This is the same reason the
+     original keeps walking past its own 2000-primitive limit instead
+     of returning.
+
+   o IT ALSO LIMITS BUCKET 7999, which the game's own limit exempts.
+     The exemption is right for an always-on-top HUD and wrong for a
+     bisection tool, since a limit that cannot reach some primitives
+     cannot isolate them. Limit 0 draws nothing, which is the contract
+     worth having. The dispatched STATISTIC is still taken before the
+     top bucket, so it keeps meaning what it meant.
+
+8.5.  Keys
+
+   Handled in WndProc ahead of menu_on_key, so a page cannot swallow
+   them.
+
+   +-------+----------------------------------------------------------+
+   | SPACE | Pause / resume. Auto-repeat ignored - bit 30 of lparam - |
+   |       | because holding a toggle down would flap it.             |
+   +-------+----------------------------------------------------------+
+   | A     | Step one frame, pausing first if running. Auto-repeat    |
+   |       | DELIBERATELY not ignored: each repeat queues another     |
+   |       | frame, so holding A is slow motion.                      |
+   +-------+----------------------------------------------------------+
+   | [ ]   | Lower / raise the primitive limit. The first '[' with no |
+   |       | limit set starts from what was dispatched last frame, so |
+   |       | it removes the last primitive rather than blanking the   |
+   |       | screen.                                                  |
+   +-------+----------------------------------------------------------+
+   | \     | Clear the primitive limit.                               |
+   +-------+----------------------------------------------------------+
+
+   The overlay shows PAUSED and PRIM n/total when either is active.
+   The fps stays real while dt goes to zero, and the two disagreeing
+   is exactly the signal that the clock is being driven by hand.
+
+
+9.  Open questions
+
+   o THE FIXED-STEP LOOP IS A STUB, AND THIS IS THE BIG ONE.  main.cpp
+     runs frame_begin / frame_next_step / frame_end, but its update
+     step only advances s_simTime - game_tick is commented out and was
+     never wired.  The race ticks from page01_tick instead, once per
+     RENDERED frame, taking its dt from the real frame time.
+
+     SO THE DECOUPLING timing.h DESCRIBES IS SCAFFOLDING.  simhz moves
+     only the debug single-step amount; the render cap is what
+     actually holds the physics step steady.  frame_alpha has no
+     callers either, so even a correct fixed-step sim would judder at
+     a high refresh until drawables interpolate.
+
+     Moving race_update into that loop is the fix and it is not small:
+     it would put every physics number measured against MOTO.EXE at
+     risk, and it would not help the frame-COUNT dependencies below.
+
+   o SOME CODE IS FRAME-COUNT DEPENDENT, not delta dependent, so no
+     amount of fixing the timestep would make it rate-independent -
+     the air timer (racers.txt 7547, 3414, 7251) and the page-10 bike
+     pan (menu-pages.txt 3285).  These have to be found and converted
+     one at a time.
+
+   o WHETHER THE GAME LOGIC IS RATE-INDEPENDENT. The pacer runs the
+     simulation at 30 Hz because that is what the original ran at.
+     Whether the reconstructed gameplay would be stable at 60 or 120
+     is untested; the two entries above are the reasons to assume not.
+     Do not raise simhz on the assumption that it is.
+
+   o WHAT SetThreadPriority IS FOR. Two references, both in
+     Main_InitAndParseCommandLine, matching -ThreadHighest and
+     -ThreadTimeCritical in the help text. Raising priority is how a
+     busy-wait limiter stops being descheduled mid-spin; with a real
+     sleep it should be unnecessary. Not reproduced, and not obviously
+     needed.
+
+   o WHETHER ANY GAME CODE DEPENDS ON THE 15.6 MS QUANTISATION. A
+     timer compared for equality rather than for having elapsed would
+     behave differently on a fine clock. Nothing seen so far does, but
+     75 timeGetTime sites have not all been read.
+
+   o VSYNC IS NOT YET RUNTIME-CONFIGURABLE. d3d9rt.cpp hardcodes
+     D3DPRESENT_INTERVAL_ONE. Changing it needs a device reset, which
+     is a bigger change than an ini read, so it was left alone.

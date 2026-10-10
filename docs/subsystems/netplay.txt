@@ -1,0 +1,456 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       NETPLAY - HOW IT WORKS
+
+
+Abstract
+
+   MotoRacer's network play is STATE SYNCHRONISATION WITH DEAD
+   RECKONING, not input lockstep. Every machine broadcasts its own
+   racer's position, speed and aim direction once per tick; every
+   receiver stores that as a target and slides its local copy of that
+   racer toward it. Events that cannot be inferred from state - a
+   crash, a collision - are sent as explicit flags and messages.
+
+   That is the OPPOSITE of how the replay works. A replay records the
+   input word and re-simulates from it; the network sends the answer
+   and interpolates toward it. The two share the integrator and
+   nothing else.
+
+   DirectPlay is imported by ordinal and none of this is
+   reconstructed. This note is what the binary says, so a future
+   implementation starts from the real protocol rather than from a
+   guess about it.
+
+Table of Contents
+
+   1. The Shape
+   2. The Message Dispatcher
+      2.1. The player table
+   3. The State Packet, 0x66
+      3.1. Two Builders, One Packet - and What the Host Relays
+   4. The Flag Word
+   5. How a Remote Racer Moves
+   6. Collisions and Crashes
+   7. Open Questions
+
+1.  The Shape
+
+   A STAR WITH A RELAYING HOST.  maybe_Game_Tick sends 0x66 once per
+   tick at 0x0047d831, and then, if the host flag 0x004dbff8 is set,
+   walks the player table from 0x0050806c with a stride of 0x24 and
+   re-sends 0x66 for every entry whose state is 3, at 0x0047d85b. So
+   a client tells the host where it is and the host forwards that on
+   to the others.  [verified]
+
+   g_nSoloMode selects the whole path. With it clear,
+   maybe_Game_CreateRacers builds the roster from the player table at
+   0x00508054 instead of from g_opponentCount, and
+   Race_TickAllRacers gives every non-local racer
+   maybe_Racer_TickRemote rather than maybe_Racer_TickAI.
+
+2.  The Message Dispatcher
+
+   FUN_00455280(msg, senderId) is the whole receive path - a switch on
+   the u16 at the head of the message. It returns 1 to keep the
+   session and 0 to tear it down.
+
+   The first test is an ECHO GUARD: the id at +0x400 is compared with
+   the sender, and the message is dropped when they match.
+
+   The types seen, by number:
+
+      0x64  join. Finds the sender in the player table, marks the
+            racer active, copies the player name into racer+0x2dd4
+            and bumps the count at 0x00542790. A host answers 0x65
+            and, once the count reaches 0x0050dbd8, broadcasts 0x6a.
+      0x65  join acknowledged
+      0x66  THE RACER STATE UPDATE - section 3
+      0x67  leave. Clears the racer's active flag.
+      0x6a  everyone is here, leave the lobby
+      0x6b  race setup: track, laps and mode, written straight into
+            g_nSelectedTrack, g_nRaceLaps and g_nSelectedMode
+      0x6c  race over, sets g_nRaceOverNet
+      0x6d  writes racer+0x2ddd
+      0x6e  COLLISION - section 6
+      0xc8  player table slot update
+      0xc9  PLACE. Builds an orientation from two angles through
+            g_cosTable, calls maybe_Racer_PlaceWheels and clears the
+            lap fields - a teleport or a respawn.
+      0xca  player ready
+      0xcb  the whole player table, 0x144 bytes of it
+      0xcc  leave acknowledged
+      0xcd  ping
+      0xce  PING ROUND TRIP. The host measures every peer through
+            DirectPlay's vtable +0x4c, qsorts the results, and then
+            BUSY-WAITS on timeGetTime so the slowest peer and the
+            fastest start together.
+      0xcf  bike choice, into racer+0x0078
+      0xd0  track by NAME, matched against g_pTrackList
+      0xd1  mode, pocket flag and difficulty, then a re-parse of the
+            championship script
+      0xd2  lap count
+      0xd3  one keystroke of chat; 8 is backspace and 10 is clear
+      0xd4  go to a menu page
+      0xd5  a flag at 0x00509ba4
+      0xd6  0xf9 bytes into the results table at 0x005d0d58
+
+   THE SPLIT IS GUARANTEED VERSUS NOT, and both ends show it. The
+   receiver answers everything from 0xc8 up with
+   maybe_Net_SendGuaranteed; the builder sends 0x64, 0x65, 0x67, 0x6a
+   and 0x6c through that same function, but puts 0x66, 0x68 and 0x69
+   through FUN_00454330 instead. So the lobby is acknowledged traffic
+   and the per-tick racer state is fire-and-forget - which is why the
+   receiver needs the hard resync in section 3.
+
+   0x68 AND 0x69 ARE SENT AND DISCARDED, and there is NO second
+   dispatcher. [verified]  Settled from the switch's own tables
+   rather than from the decompiler's case list:
+
+      o THE RECEIVE PATH IS SINGULAR. IDirectPlay2::Receive, vtable
+        +0x64, is called from exactly one site in the image -
+        0x00454a49 in FUN_00454a10. That loop sends a message to
+        FUN_00455280 when the sender id is non-zero and to
+        FUN_00454aa0 when it is zero. FUN_00454aa0 is the DirectPlay
+        SYSTEM handler and only tests 3, 5, 0x21 and 0x101, so a game
+        id cannot reach it.
+      o FUN_00455280 DISPATCHES THROUGH TWO TABLES. It computes
+        id - 0x64, rejects anything above 0x72, indexes a BYTE table
+        at 0x00456308 to get a case number and then jumps through the
+        dword table at 0x004562a4.
+      o THE BYTE TABLE SENDS BOTH TO THE DEFAULT. Entries for
+        0x64..0x73 read 00 01 02 03 18 18 04 05 06 07 08 18 18 18 18
+        18, so 0x68 and 0x69 both select case 0x18 - shared with
+        0x6f..0x73, every id with no handler.
+      o AND CASE 0x18 IS THE DEFAULT. 0x004562a4 + 0x18*4 holds
+        0x0045628d, which is the same address the bounds-check JA
+        branches to. The function returns without reading the
+        payload.
+
+   SO THE INPUT MESSAGE IS A VESTIGE. 0x68 is the only message in the
+   protocol that carries an input word, it is still built and still
+   sent every time something calls for it, and the receiver throws it
+   away. The natural reading is that the protocol began input-based
+   and was converted to state sync, with the builder left behind -
+   but that is a story about the development, not something the
+   binary states.  [inferred]
+
+   0x68 is 0xc bytes carrying racer+0x31e9 for g_inputRacerIndex.
+   0x69 loops the racer array sending one 0x30-byte name record per
+   live entry, operator new / delete each.
+
+   THAT 0x68 IS WORTH NOTING: it is the only message in the protocol
+   that carries an INPUT WORD. If it were live, part of the design
+   would be input-based after all - but nothing receives it here.
+
+2.1.  The player table
+
+   g_netPlayers at 0x00508030, NINE SLOTS OF 0x24 [verified]. The
+   count is the protocol's own: 0xcb copies the whole table as 0x144
+   bytes, and 9 * 0x24 is 0x144 exactly.
+
+   +--------+------+--------+---------------------------------------+
+   | Offset | Size | Name   | Notes                                 |
+   +========+======+========+=======================================+
+   | +0x00  |   4  | dpId   | DirectPlay player id; 0 is an empty   |
+   |        |      |        | slot. What every scan compares.       |
+   +--------+------+--------+---------------------------------------+
+   | +0x04  |  20  | name   | copied into racer+0x2dd4 by 0x64      |
+   +--------+------+--------+---------------------------------------+
+   | +0x18  |   4  | state  | 3 = racing, which is what the host    |
+   |        |      |        | relay loop tests; 4 = ready to start  |
+   +--------+------+--------+---------------------------------------+
+   | +0x1c  |   4  | ready  | set to 1 by 0xca, at 0x00455ce1       |
+   +--------+------+--------+---------------------------------------+
+   | +0x20  |   4  |        | unexamined                            |
+   +--------+------+--------+---------------------------------------+
+
+   SLOT 0 IS SKIPPED BY EVERY SCAN.  They all start at 0x00508054,
+   which is slot 1, and the index they hand back is used directly to
+   index g_racers - racer 1 being the local player.  So a slot index
+   IS a racer index.
+
+   o THE DECOMPILER RENDERS THESE ACCESSES AS THREE DIFFERENT
+     ARRAYS, and reading it literally puts two fields at +0x00.  It
+     prints the 0xca store as (&g_netPlayerTable)[slot * 9] = 1,
+     which looks like it writes the id.  The asm at 0x00455ce1 is
+     MOV dword ptr [EAX + EAX*8 + 0x50804c],1 with EAX = slot * 4,
+     so EAX + EAX*8 is slot * 0x24 and the displacement is base +
+     0x1c.  Ghidra had a separate untyped symbol at each field and
+     scaled the index by whichever one it picked.  Read the
+     displacement, not the array name.
+
+   o THE STATE FIELD IS WHY 0x0050806c LOOKS ODD.  Section 1 has the
+     host relay loop walking from there; 0x0050806c is slot 1 plus
+     0x18, which is that slot's state - not a separate array.
+
+3.  The State Packet, 0x66
+
+   Offsets are BYTES from the head of the message. The decompiler
+   shows them halved, because it types the pointer as u16.
+
+   +--------+--------+------------------------------------------------------+
+   | Offset | Type   | Meaning                                              |
+   +========+========+======================================================+
+   | +0x00  | u16    | message type - 0x66 for a racer state update         |
+   +--------+--------+------------------------------------------------------+
+   | +0x02  | u16    | BYTE COUNT of the message, and it is what            |
+   |        |        | IDirectPlay2::Send is given as dwDataSize            |
+   +--------+--------+------------------------------------------------------+
+   | +0x04  | int    | owner id, tested against the id at +0x400            |
+   +--------+--------+------------------------------------------------------+
+   | +0x08  | float  | speed. Stored to BOTH racer+0x0124 speed and         |
+   |        |        | racer+0x00ec engineSpeed                             |
+   +--------+--------+------------------------------------------------------+
+   | +0x0c  | float  | aimDir[0] -> racer+0x0198                            |
+   +--------+--------+------------------------------------------------------+
+   | +0x10  | float  | aimDir[1] -> racer+0x019c                            |
+   +--------+--------+------------------------------------------------------+
+   | +0x14  | float  | aimDir[2] -> racer+0x01a0                            |
+   +--------+--------+------------------------------------------------------+
+   | +0x18  | float  | position[0] -> racer+0x2df5                          |
+   +--------+--------+------------------------------------------------------+
+   | +0x1c  | float  | position[1] -> racer+0x2df9                          |
+   +--------+--------+------------------------------------------------------+
+   | +0x20  | float  | position[2] -> racer+0x2dfd                          |
+   +--------+--------+------------------------------------------------------+
+   | +0x24  | int    | -> racer+0x2ddd, the elapsed race time               |
+   +--------+--------+------------------------------------------------------+
+   | +0x28  | int    | -> racer+0x2de1, the best lap                        |
+   +--------+--------+------------------------------------------------------+
+   | +0x2c  | u32    | the flag word, unpacked in section 4                 |
+   +--------+--------+------------------------------------------------------+
+   | +0x30  | float3 | the crash launch direction, read only when flag      |
+   |        |        | bit 3 is set                                         |
+   +--------+--------+------------------------------------------------------+
+   | +0x400 | int    | sender id. A message whose id equals the sender is   |
+   |        |        | dropped as an echo                                   |
+   +--------+--------+------------------------------------------------------+
+
+   ONE FLOAT CARRIES BOTH SPEEDS. The value at +0x08 is written to
+   racer+0x0124 and racer+0x00ec, so a remote racer's engine speed IS
+   its road speed and no drivetrain runs for it.
+
+   AND THE PACKET IS VARIABLE LENGTH WITHIN ONE ID. The builder sets
+   the byte count to 0x3c and then SUBTRACTS 0xc when the crash bit is
+   clear, so a 0x66 is 60 bytes with a crash vector and 48 without.
+   A reader that assumes a fixed size is wrong half the time.
+
+   THREE OF THE FIELDS ARE DERIVED AT SEND TIME rather than copied,
+   which matters because the racer field of the same name is NOT what
+   goes on the wire:
+
+      +0x08  speed is |positionPrev - position| / g_frameDeltaScaled,
+             measured from the last frame's travel. racer+0x0124 is
+             never read by the builder.
+      +0x0c  aimDir is (0,0,1) put through matOrientation at
+             racer+0x00bc - the bike's forward vector - not
+             racer+0x0198, which is where the RECEIVER stores it.
+      +0x04  the owner id comes from racer+0x2dcc.
+
+   The crash vector at +0x30 is copied from racer+0x31a1, and
+   racer+0x31ad is the crash-pending flag: the builder packs it into
+   bit 3 and then ZEROES IT, so a crash is sent exactly once. It is a
+   send-once latch, the same shape as the replay's stuntPressed.
+
+   THE PREVIOUS TARGET IS KEPT. Before the new position is stored,
+   racer+0x2df5 is copied to racer+0x2e01 - so the racer holds the
+   last TWO received positions, and section 5 uses the pair as a
+   direction.
+
+   SO INPUT IS TRANSMITTED AFTER ALL - but as presentation, not as
+   the simulation. tickInputWord is racer+0x2dc8, the synthesised
+   button word that racer_emit_wheel_fx and the pose code read, and
+   eight bits of it ride in the flag word. The receiver gets the
+   POSITION to place the bike and the INPUT to decide whether it is
+   throwing dust. The dead 0x68 message is not the only input path;
+   it is the only one that tried to be authoritative.
+
+   AND THERE IS A HARD RESYNC. The distance between the racer's
+   CURRENT position at racer+0x0030 and the received one is compared
+   against 0x004d0d70; past that, racer+0x2e11 is snapped to the
+   received position and racer+0x2e01 to the current one, which
+   restarts the interpolation instead of sliding a long way across
+   the track.
+
+3.1.  Two Builders, One Packet - and What the Host Relays
+
+   0x66 is built in two places and they produce THE SAME 60/48-byte
+   packet, field for field: the same offsets, the same eight flag
+   positions, the same racer+0x31ad latch clear, the same byte count
+   dropping by 0xc when the crash bit is clear.  [verified]
+
+      inline in maybe_Net_SendGameMessage, when playerIndex is 0.
+      It finds the racer by scanning the player table at 0x00508054
+      for the session id, so it can only build for THE LOCAL RACER.
+
+      FUN_004567e0(buffer, racer), when playerIndex is non-zero.
+      It takes the racer POINTER and so can build for ANY racer -
+      which is what maybe_Game_Tick's relay loop uses, passing the
+      racer index it is walking.
+
+   SO THE HOST DOES NOT FORWARD THE BYTES IT RECEIVED. It
+   re-serialises each peer from ITS OWN copy of that racer, including
+   re-measuring the speed from its own position history for that
+   racer. A relayed packet is the host's view of the peer, not the
+   peer's own report of itself.
+
+   THE AIM VECTOR IS COMPUTED TWO WAYS THAT ARE THE SAME VALUE. The
+   inline builder puts (0,0,1) through matOrientation; FUN_004567e0
+   adds matOrientation row 2 to row 3 inline. For a 3x4 transform
+   those are identical, and row 3 is zeroed, so both yield the unit
+   forward vector.
+
+   NO, THE RELAY BUFFER IS NOT OVERFLOWED - a decompiler artefact,
+   settled from the disassembly. maybe_Net_SendGameMessage's prologue
+   pushes the SEH triple to [EBP-0x04], [EBP-0x08] and [EBP-0x0c] and
+   then SUB ESP, 0x88, so the locals run [EBP-0x94]..[EBP-0x0d]. The
+   buffer is [EBP-0x4c], and 60 bytes from there ends at [EBP-0x11] -
+   four bytes clear of the SEH record. Ghidra sized the array from
+   the 48-byte non-crash path only.
+
+4.  The Flag Word
+
+   The u32 at +0x2c packs the small per-racer state. The slot index
+   is in it, and that is what tells the receiver WHICH racer the
+   packet is about.
+
+   +----------+----------------+-----------------------------------------+
+   | Bits     | Destination    | Meaning                                 |
+   +==========+================+=========================================+
+   | 0..1     | racer+0x2de5   | raceState                               |
+   +----------+----------------+-----------------------------------------+
+   | 2        | racer+0x2e85   | stuntOrOverspeed                        |
+   +----------+----------------+-----------------------------------------+
+   | 3        | -              | CRASH. Calls maybe_Racer_BeginCrash     |
+   |          |                | with the vector at +0x30                |
+   +----------+----------------+-----------------------------------------+
+   | 4..7     | -              | THE RACER SLOT this packet is about     |
+   +----------+----------------+-----------------------------------------+
+   | 8..11    | racer+0x2f7b   | lapCounter                              |
+   +----------+----------------+-----------------------------------------+
+   | 12..14   | racer+0x2f79   | checkpoint index                        |
+   +----------+----------------+-----------------------------------------+
+   | 15..19   | racer+0x2f85   | finishPosition                          |
+   +----------+----------------+-----------------------------------------+
+   | 20..27   | racer+0x2dc8   | tickInputWord                           |
+   +----------+----------------+-----------------------------------------+
+
+5.  How a Remote Racer Moves
+
+   THIS PATH IS PORTED AND RUNNING, and not because of netplay: the
+   TIME-ATTACK GHOST uses it.  maybe_Racer_TickRemote has exactly
+   two callers in Race_TickAllRacers - a network game's non-local
+   racers, and the ghost in racer slot 2 - so the ghost exercises
+   the same integrator, the same decision layer and the same data
+   model a peer does.  See formats/timatak.txt, whose 0x34-byte
+   frame carries the same fields as the 0x66 packet.
+
+   What that bought, all of it owed to netplay as much as to the
+   ghost:
+
+   o racer_tick_remote and racer_remote_apply_state are imported
+     whole, and the Math_InvertRigidMatrix omission that made a
+     remote bike steer toward the MIRROR of its reported heading
+     was found and fixed there.  It would have hit every network
+     peer identically.
+   o the aim vector, the send-once event latch, the flag word and
+     the wall clip are all exercised once a lap.
+   o Hud_DrawRacerCallouts, which in a network game labels every
+     peer, is ported and verified - hud-race.txt 7.2.
+
+
+   maybe_Racer_TickRemote (0x0045e940) is nearly maybe_Racer_TickAI -
+   the same integrator with the AI's decision layer swapped for
+   FUN_0045e560, which is where the received state is consumed.
+
+   THE ORIENTATION IS STEERED, NOT ASSIGNED. FUN_0045e560 builds a
+   LookAt from the origin to aimDir, INVERTS IT, takes the yaw
+   difference against the racer's own matOrientation and composes
+   that in as a delta, then zeroes steering.  The bike TURNS toward
+   the direction the packet reported rather than snapping to it.
+
+   THE INVERSION IS LOAD-BEARING.  Math_InvertRigidMatrix
+   (0x0040fe80) sits between the LookAt and Matrix34_YawOf at
+   0x0045e5a1, and it is not housekeeping: a LookAt is a VIEW matrix,
+   so its 3x3 is the transpose of the orientation it describes and
+   yaw(R^T) = -yaw(R).  Reading the yaw off the un-inverted matrix
+   steers a remote bike toward the MIRROR of its reported heading,
+   which is correct on a straight - yaw 0 negates to itself - and
+   wrong through every corner until the bike travels sideways.  In
+   mode 0 the position is still assigned outright, so the symptom is
+   a bike on the right line pointing the wrong way rather than one
+   that leaves the track.  racer_ai_follow_line runs the same
+   LookAt/invert pair at 0x0046b24d.
+
+   THE POSITION IS DEAD RECKONED, in three steps:
+
+      o racer+0x2e11 chases the received position at
+        engineSpeed * dt * 0x004d1010, and snaps to it when the dot
+        of the remaining offset goes negative - an overshoot test.
+      o racer+0x0030 then lerps toward racer+0x2e11 by 0x004d1018,
+        which is 0.5.
+      o Trk_FindSegmentForPoint re-derives the segment from the
+        result.
+
+   EXCEPT IN MODE 0, where the position is assigned from the received
+   value outright and neither the chase nor the lerp runs. That arm
+   is also what the time-attack ghost takes, which is why the ghost
+   reads as a network peer.
+
+   moveDir is blended from the last two received positions whenever
+   they differ by more than 0x004d0e50, weighted by flImpactBlend -
+   so a peer's travel direction comes from where it has BEEN, not
+   from what it claims to be doing.
+
+6.  Collisions and Crashes
+
+   NEITHER IS INFERRED. Both arrive as explicit traffic:
+
+      o A CRASH rides in the state packet as flag bit 3, with the
+        launch direction at +0x30, and the receiver calls
+        maybe_Racer_BeginCrash directly.
+      o A COLLISION is its own message, 0x6e, sent by FUN_00456bf0
+        from maybe_Game_CollideRacers. It carries a direction, a
+        speed and a flag, and has two arms: one writes the push
+        direction and magnitude into racer+0x038c..0x0398, the other
+        rebuilds them from the racer's own travel and zeroes its
+        speed through Racer_SetLongSpeed and Gearbox_SyncRoadSpeed. A
+        non-zero word at +0x18 makes it a crash rather than a shove.
+
+   So the authority for an impact is the machine that detected it,
+   and the result is pushed to the other rather than recomputed
+   there.
+
+7.  Open Questions
+
+   o WHAT 0x004dbff8 IS, beyond "non-zero on the host". It gates the
+     relay, the ping round trip and the lobby's authority.
+
+   o THE FLAG WORD IS FULLY MAPPED - this bullet used to say bits
+     15..19 and 20..27 were unidentified. They are finishPosition
+     and tickInputWord, both named in racer.h and both in section
+     4's table. Every bit of it now lands on a named field of the
+     byte-exact MR_Racer, so the 0x66 contract needs no further
+     reading to be reimplemented.
+
+   o THE TRANSPORT IS NOT RECONSTRUCTED.  DirectPlay is imported by
+     ordinal and nothing below the message layer has been read: no
+     session enumeration, no lobby, no send or receive path.  That
+     is the whole of what stands between the decoded protocol and a
+     working game.  A replacement is DESIGNED, not built, in
+     netplay-relay.txt: one dumb relay, outbound connections only,
+     and the session page that drives it.
+
+   o THE CHASE ARM HAS NEVER RUN.  Section 5's dead reckoning -
+     racer+0x2e11 walking toward the received position and the half
+     lerp onto it - is transcribed in racer_remote_apply_state but
+     only reachable with g_nSelectedMode != 0.  The ghost takes the
+     mode-0 arm, which assigns the position outright, so the two
+     smoothing stages are the one part of remote movement that is
+     ported and unexercised.
+
+   o WHETHER THE PORT SHOULD FOLLOW THIS AT ALL. It is a 1997 star
+     topology with a busy-wait barrier for latency matching. The
+     protocol is worth knowing; copying it is a separate decision.

@@ -1,0 +1,863 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                        THE IN-RACE MENUS
+
+
+Abstract
+
+   ESCAPE during a race raises a small menu - RESTART, QUIT RACE,
+   CONTINUE RACE - over the running track.  It is not a menu page.
+   It belongs to a second, smaller menu framework the game uses only
+   in-race, with its own object, its own widgets, its own mouse
+   cursors and its own per-frame service.  Four such menus exist at
+   once, each in its own global.
+
+   This note covers that framework, the escape menu specifically,
+   and what the three rows do.
+
+Table of Contents
+
+   1. The four slots
+   2. The menu object
+   3. The per-frame service
+   4. Widgets
+   5. Buttons
+   6. The escape menu and its siblings
+      6.1. The rows
+      6.2. Geometry and entry
+         6.2.1. The two fonts
+         6.2.2. The accelerator is marked in the label
+         6.2.3. How the entry is stepped
+         6.2.4. What Widget_Init stores, and every number the
+                two menus pass
+      6.3. What the rows do
+      6.4. The continue menu
+   7. The localised string table
+   8. Open questions
+   9. The panel
+      9.1. What the fade actually does
+
+1.  The four slots
+
+   Four globals, each holding one in-race menu or NULL.  All four
+   are serviced by the same function in the same order [verified]:
+
+   +--------------+-----------------------+-------------------------+
+   | Global       | Menu                  | Opened by               |
+   +==============+=======================+=========================+
+   | 0x004e8910   | the mode picker       | Shift+F12               |
+   +--------------+-----------------------+-------------------------+
+   | 0x004e890c   | the help menu         | F1, solo only           |
+   +--------------+-----------------------+-------------------------+
+   | 0x004e8904   | THE ESCAPE MENU       | ESCAPE, when not paused |
+   +--------------+-----------------------+-------------------------+
+   | 0x004e8908   | the debug menus       | F11 and F12             |
+   +--------------+-----------------------+-------------------------+
+
+   Opening one FREES whatever that slot held first, so a slot holds
+   at most one menu and re-pressing the key rebuilds it.
+
+2.  The menu object
+
+   0x78 bytes, built by InGameMenu_Ctor (0x004338b0) [verified].
+   Only the fields the escape menu touches are listed.
+
+   +--------+------+----------------------------------------------+
+   | Offset | Type | Notes                                        |
+   +========+======+==============================================+
+   | +0x00  | int  | kind. 6 is the escape menu, 7 the help menu  |
+   +--------+------+----------------------------------------------+
+   | +0x10  | int  | BLOCKS THE GAME TICK while non-zero          |
+   +--------+------+----------------------------------------------+
+   | +0x18  | int  | passed to the frame draw. -10 here           |
+   +--------+------+----------------------------------------------+
+   | +0x20  | int  | CLOSE REQUEST. Every row callback sets it    |
+   +--------+------+----------------------------------------------+
+   | +0x24  | int  | buttons allocated; also gates the cursors    |
+   +--------+------+----------------------------------------------+
+   | +0x28  | int  | 1 from the ctor - service me every frame     |
+   +--------+------+----------------------------------------------+
+   | +0x30  | fn   | optional tick. NULL on the escape menu       |
+   +--------+------+----------------------------------------------+
+   | +0x38  | fn   | optional accept                              |
+   +--------+------+----------------------------------------------+
+   | +0x48  | ptr  | widget array, one pointer each               |
+   +--------+------+----------------------------------------------+
+   | +0x50  | int  | widget count                                 |
+   +--------+------+----------------------------------------------+
+   | +0x54  | ptr  | the CURRENT button                           |
+   +--------+------+----------------------------------------------+
+   | +0x58  | ptr  | button array, stride 0x6c                    |
+   +--------+------+----------------------------------------------+
+   | +0x5c  | int  | button count                                 |
+   +--------+------+----------------------------------------------+
+   | +0x64  | int  | g_framePrevMs at construction                |
+   +--------+------+----------------------------------------------+
+
+   THE ESCAPE MENU HAS NO TICK FUNCTION.  +0x30 is left NULL by the
+   ctor and never set, so it never closes itself - it closes only
+   when a row callback sets +0x20.
+
+3.  The per-frame service
+
+   InGameMenu_ServiceAll (0x004126a0) walks the four slots twice
+   [verified].  For each non-NULL menu:
+
+       if (menu+0x28)  InGameMenu_BuildAccelerators(menu)
+       if (menu+0x30)  { r = menu->tick()
+                         if (r) { menu+0x38 ? menu->accept(0)
+                                            : menu+0x20 = 1
+                                  if (menu+0x20 || !menu+0x24)
+                                      destroy the slot } }
+
+   and then, in slot order, returns 0 as soon as a menu with +0x10
+   set is found.  THAT RETURN IS HOW THE MENU PAUSES THE RACE: the
+   caller reads 0 as "do not step the game this frame".
+
+   +0x10 is 1 on the escape menu, so the race is frozen while it is
+   up without any pause flag being involved.
+
+4.  Widgets
+
+   Three classes, cloned from a stack template by
+   InGameMenu_AddWidget (0x00433a30) according to template +0x0c
+   [verified]:
+
+   +------+-------+--------------------+------------------+
+   | Kind | Bytes | Constructor        | What             |
+   +======+=======+====================+==================+
+   | 0    | 0xac  | 0x00415cd0         | the base         |
+   +------+-------+--------------------+------------------+
+   | 1    | 0xc2  | 0x00415dd0         | TEXT             |
+   +------+-------+--------------------+------------------+
+   | 2    | 0x178 | 0x00415e80         | a third class    |
+   +------+-------+--------------------+------------------+
+
+   Widget_Init (0x00416170) fills one in.  Its fields, as far as
+   the escape menu uses them [verified]:
+
+   +--------+--------+--------------------------------------------+
+   | Offset | Type   | Notes                                      |
+   +========+========+============================================+
+   | +0x08  | int    | alignment mode. 0x62 rows, 0xc2 the title  |
+   +--------+--------+--------------------------------------------+
+   | +0x10  | int    | VISIBILITY MODE, see below                 |
+   +--------+--------+--------------------------------------------+
+   | +0x14  | int    | 1 or 3 means ANIMATED                      |
+   +--------+--------+--------------------------------------------+
+   | +0x18  | double | destination x                              |
+   +--------+--------+--------------------------------------------+
+   | +0x20  | double | destination y                              |
+   +--------+--------+--------------------------------------------+
+   | +0x28  | double | start x                                    |
+   +--------+--------+--------------------------------------------+
+   | +0x30  | double | start y, as g_mainHeight - y               |
+   +--------+--------+--------------------------------------------+
+   | +0x58  | int    | destination x, integer                     |
+   +--------+--------+--------------------------------------------+
+   | +0x5c  | int    | destination y, integer                     |
+   +--------+--------+--------------------------------------------+
+   | +0x60  | int    | HOME x, scaled to the screen mode          |
+   +--------+--------+--------------------------------------------+
+   | +0x64  | int    | HOME y, scaled                             |
+   +--------+--------+--------------------------------------------+
+   | +0x68  | int    | home x as authored                         |
+   +--------+--------+--------------------------------------------+
+   | +0x6c  | int    | home y as authored                         |
+   +--------+--------+--------------------------------------------+
+   | +0x70  | int    | CURRENT x, what the draw uses              |
+   +--------+--------+--------------------------------------------+
+   | +0x74  | int    | CURRENT y                                  |
+   +--------+--------+--------------------------------------------+
+   | +0x78  | int    | x as authored                              |
+   +--------+--------+--------------------------------------------+
+   | +0x7c  | int    | y as authored                              |
+   +--------+--------+--------------------------------------------+
+   | +0x88  | uint   | the clock when it was built                |
+   +--------+--------+--------------------------------------------+
+   | +0x90  | int    | period, from a NEGATIVE delay argument     |
+   +--------+--------+--------------------------------------------+
+   | +0x98  | int    | period, from a positive one                |
+   +--------+--------+--------------------------------------------+
+   | +0xac  | char*  | the text                                   |
+   +--------+--------+--------------------------------------------+
+   | +0xb4  | int    | font id                                    |
+   +--------+--------+--------------------------------------------+
+
+   COORDINATES ARE AUTHORED FOR 640x480 and scaled in
+   TextWidget_Layout (0x004165c0) [verified]: halved at 320x240,
+   times 0x200/0x280 and 0x180/0x1e0 at 512x384, untouched at
+   640x480.  So an authored 22 is 22 pixels only in the largest
+   mode.
+
+   THE VISIBILITY MODE AT +0x10 is a fade/blink selector read by
+   TextWidget_Draw (0x00416da0), and the value it produces is an
+   ALPHA 0..100 handed to the text blitter [verified].
+
+   0 IS OPAQUE AND RISING MEANS MORE TRANSPARENT, so the names below
+   describe the VALUE and the visible effect is the opposite way
+   round: mode 2's rising alpha fades the text OUT.
+
+   The evidence is that GO has to go away.  Hud_DrawInRace puts it
+   up as mode 2 over 500 ms and nothing ever destroys the widget, so
+   the other reading would fade it up and leave it on screen for the
+   rest of the race.  Modes 5, 6 and 7 - fixed 75, 50, 25 - are a
+   strange order to number under this reading, and nothing uses
+   them. [open]
+
+   +------+-------------------------------------------------+
+   | Mode | Effect                                          |
+   +======+=================================================+
+   | 0    | always drawn, default intensity                 |
+   +------+-------------------------------------------------+
+   | 1    | fade OUT over +0x8c ms                          |
+   +------+-------------------------------------------------+
+   | 2    | fade IN over +0x8c ms                           |
+   +------+-------------------------------------------------+
+   | 3    | BLINK. With +0x90 zero it counts frames and     |
+   |      | masks with +0x98 - the fast flicker the         |
+   |      | selected row uses                               |
+   +------+-------------------------------------------------+
+   | 4    | ping-pong intensity                             |
+   +------+-------------------------------------------------+
+   | 5    | fixed 75                                        |
+   +------+-------------------------------------------------+
+   | 6    | fixed 50                                        |
+   +------+-------------------------------------------------+
+   | 7    | fixed 25                                        |
+   +------+-------------------------------------------------+
+
+5.  Buttons
+
+   InGameMenu_AllocButtons (0x00433990) allocates n x 0x6c and sets
+   +0x24 to 1.  InGameMenu_MakeButton (0x00433c90) ties widget
+   indices to a button.  Within a button [verified]:
+
+       +0x14  enter          +0x1c  a third handler
+       +0x18  leave          +0x20  ACTIVATE
+       +0x34  HCURSOR        +0x38  cursor id
+       +0x68  accelerator letter
+
+   THE ACCELERATOR IS DERIVED FROM THE LABEL.
+   InGameMenu_BuildAccelerators (0x00434960) walks each button's
+   text, takes the first alphabetic character not already claimed
+   in g_keyScanTable, upper-cases it and claims it.  So the hotkeys
+   are a property of the TRANSLATION, not of the menu.
+
+6.  The escape menu and its siblings
+
+   InGameMenu_OpenEscape (0x00436420), called with 1 from
+   Input_OnKeyDown case 0x1b.
+
+   IT IS GATED ON THE PAUSE FLAG.  DAT_004dc038 is the pause
+   toggle, shared by VK_PAUSE and P, and ESCAPE tests it first - so
+   escape does nothing at all while the game is paused.
+
+6.1.  The rows
+
+   Four buttons in a solo race; a fifth appears in a championship
+   replay or a network game.  EACH ROW IS TWO WIDGETS, the plain
+   text and a blinking copy, which is what makes the selected row
+   flash.
+
+   +--------+------------------+-----------+------------------------+
+   | Button | Label            | String id | Callback               |
+   +========+==================+===========+========================+
+   | 0      | "MOTO RACER"     | literal   | none, it is the title  |
+   +--------+------------------+-----------+------------------------+
+   | 1      | [RESTART]        | 104       | InGameMenu_OnRestart   |
+   +--------+------------------+-----------+------------------------+
+   | 2      | [QUIT RACE]      | 105       | InGameMenu_OnQuitRace  |
+   +--------+------------------+-----------+------------------------+
+   | 3      | [CONTINUE RACE]  | 110       | ..._OnContinueRace     |
+   +--------+------------------+-----------+------------------------+
+
+   In DEMO mode rows 1 and 2 become [NEXT DEMO] (107) and
+   [QUIT DEMO] (106) with their own callbacks, and row 3 becomes
+   [CONTINUE DEMO] (108).  In a replay row 3 is [CONTINUE REPLAY]
+   (109).  The optional fifth row is [QUIT REPLAY] (111) or the
+   three-line [ABANDON RACE] / [AND WAIT FOR] / [NEXT RESTART]
+   (112) in a network game.
+
+6.2.  Geometry and entry
+
+   Authored at 640x480.  Every row is animated (widget +0x14 == 1)
+   and each enters from a different place after its own delay
+   [verified, read off the Widget_Init arguments]:
+
+   +------------------+-------------+---------+-------+-------+
+   | Row              | Enters from | Home xy | Delay | Font  |
+   +==================+=============+=========+=======+=======+
+   | MOTO RACER       |    0, 200   |   0, 5  |     0 |     9 |
+   +------------------+-------------+---------+-------+-------+
+   | [RESTART]        |  300,   0   |   0, 0  |   400 |    32 |
+   +------------------+-------------+---------+-------+-------+
+   | [QUIT RACE]      | -300,  22   |   0, 22 |   500 |    32 |
+   +------------------+-------------+---------+-------+-------+
+   | [CONTINUE RACE]  |    0, 200   |   0, 44 |   600 |    32 |
+   +------------------+-------------+---------+-------+-------+
+
+   So the first row flies in from the right, the second from the
+   left and the third from below, 100 ms apart.
+
+   THE HOME COORDINATES ARE OFFSETS, and Text_ApplyAlignment
+   (0x00417900) resolves them against the flags word at widget
+   +0x08 [verified]:
+
+       0x62  rows    x += (W - textW) / 2
+                     y += H / 2
+
+       0xc2  title   x += (W - textW) / 2
+                     y  = (H / 2 - y) - textH
+
+   so the rows hang DOWN from the middle of the screen and the
+   title is stacked UP off the same line by its own height.
+
+   READ LIVE OFF MOTO with the menu up at 640x480, which is where
+   every number above was checked rather than assumed:
+
+   +------------------+-------+--------+-----------+------------+
+   | Widget           | flags | home   | measured  | drawn at   |
+   +==================+=======+========+===========+============+
+   | MOTO RACER       | 0xc2  | 0,  5  | 136 x 22  | 252, 213   |
+   +------------------+-------+--------+-----------+------------+
+   | [RESTART]        | 0x62  | 0,  0  |  65 x  9  | 287, 240   |
+   +------------------+-------+--------+-----------+------------+
+   | [QUIT RACE]      | 0x62  | 0, 22  |  81 x  9  | 279, 251   |
+   +------------------+-------+--------+-----------+------------+
+   | [CONTINUE RACE]  | 0x62  | 0, 44  | 113 x  9  | 263, 262   |
+   +------------------+-------+--------+-----------+------------+
+
+   Widget +0x80 and +0x84 are the MEASURED TEXT SIZE, which is what
+   Text_ApplyAlignment is given - not a second position.
+
+   THE ROWS CAME OUT 11 APART, NOT 22, and that is a SETTING rather
+   than a correction to the table.  That MOTO has g_cfgSmallFonts
+   (0x004f0e08) set to 1, which sends TextWidget_Layout down its
+   halving branch.
+
+   THE TITLE IS NOT HALVED, AND THE RULE IS NOW KNOWN.  The branch
+   is chosen PER FONT by Font_Get's second out-parameter, and that
+   parameter is 1 exactly when the requested id is NOT one of the
+   twelve LowRes/HiRes pairs - it is set on Font_Get's `default:`
+   arm [verified, 0x00490470 and 0x004904f0].  So:
+
+       halve when  SmallFonts is on AND the font HAS a twin
+
+   Font 9, MenuLink, is unpaired, so the title keeps its authored
+   coordinates.  Font 32, GameMenuHiRes, is paired with 33, so the
+   rows halve.  A font with no LowRes form is not drawn any smaller,
+   so moving its position would be wrong.
+
+   o THIS BITES ANY UNPAIRED FONT, not just the title.  The grid
+     countdown draws GET READY in font 12, Messages, which is also
+     unpaired: halving its authored y of 0x1e drops it on top of the
+     countdown number, which is font 14 and does halve.
+
+6.2.1.  The two fonts
+
+   Read live off the widgets at +0xb4: the title asks Font_Get for
+   id 9 and the rows for id 32.  DATA\FONTS.BPT names them
+   [verified]:
+
+   +----+---------------+------------------+------------------------+
+   | Id | Name          | Class            | Face                   |
+   +====+===============+==================+========================+
+   | 9  | MenuLink      | AntiAlias8Transp | HiRes\MenuLink.Raw     |
+   |    |               |                  | HiRes\MenuLin2.Raw     |
+   |    |               |                  | 32..95 and 192..211    |
+   +----+---------------+------------------+------------------------+
+   | 32 | GameMenuHiRes | Pal              | HiRes\GameMenu.Raw     |
+   +----+---------------+------------------+------------------------+
+
+   Id 33, GameMenuLowRes, is its LowRes twin; Font_Get swaps the
+   pair on the small-fonts rule.  The config names .Raw and the
+   archive ships .FNT - the config names the source art, the bank
+   holds the packed font.
+
+   *** THE ROW FONT IS A PALETTED BITMAP FONT, AND EVERY GLYPH CELL
+   CARRIES ITS OWN PLATE. *** Read out of HIRES\GAMEMENU.FNT
+   [verified]:
+
+   +-----+--------+---------------+----------------------------+
+   | idx | pixels | RGB           | What                       |
+   +=====+========+===============+============================+
+   |   8 |  17299 | 255,   0,   0 | THE PLATE - 60 per cent    |
+   +-----+--------+---------------+----------------------------+
+   |  15 |   3614 | 255, 255, 255 | the letterforms            |
+   +-----+--------+---------------+----------------------------+
+   |   2 |   3054 |  36,   0,   0 | the bottom edge, 2 rows    |
+   +-----+--------+---------------+----------------------------+
+   |   0 |   1722 |   0,   0, 255 | padding, brackets only     |
+   +-----+--------+---------------+----------------------------+
+   |   1 |   1572 |   0,   0,   0 |                            |
+   +-----+--------+---------------+----------------------------+
+
+   with nine more making an anti-alias ramp of pale reds, 16 used
+   out of 256.
+
+   THE SPACE CHARACTER IS 16 PIXELS OF SOLID RED, not blank, and a
+   letter is the same slab with white strokes cut into it.  So a row
+   of this font draws as a CONTINUOUS RED BAR with white lettering
+   and a dark bottom edge - the embossing is the font, not a sprite
+   per word and not a background the menu draws.  The same glyphs
+   serve every language.
+
+   Index 0, the only blue, appears only in the bracket glyphs where
+   the cell is wider than the art.
+
+   FONT 32 HAS NO CONFIGURED COLOURS and must not be given any.  It
+   appears in neither FontForeColors nor FontBackColors, because a
+   Pal face resolves through its own palette.
+
+   FONT 9 IS THE OPPOSITE.  MENULINK.FNT has paletteEntries 0 - it
+   is coverage, not colour - so DATA\FONTS.BPT supplies both
+   [verified]:
+
+       font 9   fore (200, 200, 0)   back (150, 150, 0)
+
+   dark yellow on a darker yellow.  A port that never calls
+   font_set_colors draws it white.
+
+   THE FACE HEIGHTS: MENULINK 29, HIRES\GAMEMENU 18,
+   LOWRES\GAMEMENU 9.  The 9 measured off a running MOTO is
+   therefore the LowRes face, which independently confirms that its
+   g_cfgSmallFonts made Font_Get swap id 32 for id 33.
+
+6.2.2.  The accelerator is marked in the label
+
+   The two widgets of a row hold the same text with ONE LETTER
+   DIFFERENT.  Read live:
+
+       steady copy   "[rESTART]"   "[qUIT RACE]"   "[CoNTINUE RACE]"
+       blink  copy   "[RESTART]"   "[QUIT RACE]"   "[CONTINUE RACE]"
+
+   so the steady copy carries the button's accelerator letter
+   lower-cased and the blinking one does not.
+   InGameMenu_BuildAccelerators picks that letter - the first
+   alphabetic character not already claimed in g_keyScanTable - so
+   R, Q and O here, O because C was taken.
+
+   THE LOWER-CASE RANGE IS THE HIGHLIGHT VARIANT, not lower case.
+   Read out of the face, 'r' against 'R' [verified]:
+
+       R   the red plate, letterforms in index 15, WHITE
+       r   the same plate, the SAME letterforms, index 1, BLACK
+
+   pixel for pixel the same shape at the same width.  So the font
+   carries two colourways of every capital and the menu selects the
+   second by lower-casing one character - which is what makes the
+   hotkey letter appear black on a retail screen.
+
+   THE MOUSE WORKS HERE AND NOWHERE ELSE IN THE RACE.  Each button
+   loads its own cursor with LoadCursorA(0xe4), falling back to
+   IDC_ARROW when the resource is missing.
+
+6.2.3.  How the entry is stepped
+
+   Widget_StepAnimation (0x00416b40), called first thing by
+   TextWidget_Draw.  TextWidget_Layout only sets the endpoints up and
+   TextWidget_Draw only computes alpha; THIS is what moves +0x70 and
+   +0x74.
+
+   It switches on +0x14, and ONLY 1 AND 2 MOVE - every other value,
+   0 included, returns at once and the widget stays where the layout
+   put it.
+
+   THE ROWS ARE STYLE 1, AND IT IS A POLAR SEEK RATHER THAN A LERP
+   [verified, 0x00416b5e]:
+
+       d       = target(+0x60,+0x64) - pos(+0x28,+0x30)
+       dist    = |d|
+       if dist <= 1.5            snap to target and stop
+       aim     = atan2(d.y, d.x)
+       heading = atan2(vel.y(+0x20), vel.x(+0x18))
+       wrap (aim - heading) into range
+       ang     = heading + (aim - heading) * accel(+0x38) * 0.05
+       speed   = (dist - |vel|) * accel(+0x38) * 0.05
+       vel     = (cos ang, sin ang) * speed
+       pos    += vel
+
+   The six constants, read out of .rdata as doubles:
+
+       0x004d0508   1.5      the snap radius, in pixels
+       0x004d0510   pi/2     )
+       0x004d0518   pi       )  an ordinary angle wrap
+       0x004d0520   2*pi     )
+       0x004d0528   -pi/2    )
+       0x004d0530   0.05     the gain
+
+   o THERE IS NO dt.  The gain is accel * 0.05 PER FRAME, so a
+     slide completes in a fixed number of frames rather than in
+     a fixed time - faster on a faster machine.  A port has to
+     decide between a fixed-rate accumulator and matching the
+     original exactly; the same question the frame-counting
+     blink masks ask.  See hud-race.txt 8.1.1.
+
+   o Y IS MEASURED UPWARD here: +0x30 holds g_mainHeight - y, so the
+     atan2 works in a bottom-left frame.
+
+   o SO A STRAIGHT INTERPOLATION IS THE WRONG SHAPE.  The row turns
+     toward its target and closes on it, which overshoots and settles
+     rather than easing.  Do not approximate it.
+
+   STYLE 2 IS A CONSTANT ACCELERATION along a fixed direction
+   [verified, 0x00416d5d, read from the FPU ops - the decompiler
+   loses which doubles the two __ftol calls consume]:
+
+       vel(+0x40) += accel(+0x38)
+       curX(+0x70) = (int)(curX + dirX(+0x58) * vel)
+       curY(+0x74) = (int)(curY + dirY(+0x5c) * vel)
+
+   o +0x58/+0x5c ARE A DIRECTION HERE AND A DESTINATION IN STYLE 1.
+     The same pair means different things depending on +0x14, and
+     there is no arrival test in style 2 - it accelerates away until
+     the widget is destroyed.
+
+
+6.2.4.  What Widget_Init stores, and every number the two menus
+        pass
+
+   The argument-to-offset map is in Widget_Init's plate comment
+   at 0x00416170 and is not repeated here.  Two things about it
+   decide how the entry reads:
+
+   o param_10/param_11 ARE AN INITIAL VELOCITY IN STYLE 1 AND A
+     DIRECTION IN STYLE 2, and param_12/param_13 are a TARGET in
+     style 1 and ignored in style 2.  Same two pairs, two
+     meanings, chosen by +0x14.
+
+   o STYLE 1 AND 3 SEED THE SEEK AND NOTHING ELSE DOES.  For any
+     other style Widget_Init sets the target to the widget's own
+     home, so it has nowhere to go.
+
+   Every animated widget in the two menus, decoded from the
+   builders at 0x00436420 and 0x004358b0.  y is authored for
+   640x480 and scaled by TextWidget_Layout:
+
+   +----------------------+----------+---------+--------+-----+------+
+   | Widget               | Start    | Init.   | Target | Gain| Delay|
+   |                      |          | vel     |        |     |      |
+   +======================+==========+=========+========+=====+======+
+   | escape MOTO RACER    | 0, 200   |  0, -1  | 0,  5  | 5.0 |    0 |
+   +----------------------+----------+---------+--------+-----+------+
+   | escape [RESTART]     | 300, 0   | -1,  0  | 0,  0  | 6.0 |  400 |
+   +----------------------+----------+---------+--------+-----+------+
+   | escape [QUIT RACE]   | -300, 22 |  1,  0  | 0, 22  | 6.0 |  500 |
+   +----------------------+----------+---------+--------+-----+------+
+   | escape [CONTINUE R.] | 0, 200   |  0,  1  | 0, 44  | 6.0 |  600 |
+   +----------------------+----------+---------+--------+-----+------+
+   | escape 5th row       | 0, -200  |  0,  1  | 0, 66  | 6.0 |  700 |
+   +----------------------+----------+---------+--------+-----+------+
+   | continue [CONTINUE]  | -300, 5  |  1,  0  | 0,  5  | 4.0 |    0 |
+   +----------------------+----------+---------+--------+-----+------+
+
+   BOTH TITLES HAVE NO DELAY, and the continue menu's YES and NO
+   rows are animation style 0 - they do not move at all.  So the
+   two TITLE slides need none of the delay machinery the escape
+   menu's rows do.
+
+   The continue title's numbers are the whole of the effect the
+   player sees: it starts 300 px left of its home already moving
+   right at 1 px/frame and seeks (0, 5).
+
+   WHAT THE PORT WOULD NEED, sized rather than done:
+
+   o hud_widget_step gains the style-1 branch - about thirty
+     lines, a straight transcription of 6.2.3 now that the
+     constants are read;
+
+   o HUD_Widget gains posX/posY and velX/velY as doubles and
+     targetX/targetY as ints.  dirX/dirY already carry the
+     initial velocity, because the original overloads the same
+     pair;
+
+   o the TITLE has to become a widget.  hud_draw_items
+     recomputes its position from hud_item_rect every frame, so
+     there is nowhere to keep one between frames; the draw would
+     read curX/curY instead, and the three openers would each
+     build it with their own row of the table above.
+
+   The surrounding machinery is already the right shape -
+   hud_widget_tick steps once per frame OUTSIDE the two overlay
+   passes, which is what a stepper needs.
+
+   THREE THINGS TO SETTLE BEFORE WRITING ANY OF IT:
+
+   o TextWidget_Layout (0x004165c0) IS UNREAD.  The starts and
+     targets above are raw authored numbers; flags 0xc2 on a
+     title and 0x62 on a row decide where they land.  Taken at
+     face value the escape title starts at screen y 200 heading
+     DOWNWARD and seeks up to y 5, which is a swing-and-settle
+     rather than the fall it looks like in play - so either the
+     alignment reframes it or what is visible is the tail of that
+     arc.  Do not implement on the raw numbers alone.
+
+   o THE PER-ROW DELAY MECHANISM IS UNREAD.  It arrives as a
+     negative param_8 and lands in +0x90, and Widget_StepAnimation
+     never tests +0x90.  Not needed for either title.
+
+   o curY's EXACT FORM.  The decompiler drops the __ftol
+     operands.  The snap branch implies
+     curY = (int)(g_mainHeight - pos.y), which wants confirming
+     from the disassembly rather than assuming.
+
+6.3.  What the rows do
+
+   All three set menu+0x20, which is what dismisses the menu.
+
+   RESTART (0x00437610)
+
+       stop the replay if one is recording
+       stop the race
+       g_menuPendingRequest |= 0xb
+
+   QUIT RACE (0x00437890)
+
+       g_menuPendingRequest = 0, then |= 0x20c solo, 0x100c network
+       in a championship, set the local racer's state to 3
+       then draw menu resource 0xb1 as a loading screen and present
+       it, so the transition is covered
+
+   CONTINUE RACE (0x00437ae0)
+
+       FUN_00470fc0(), clear the shift and control flags, and
+       release whatever FUN_00424090(1) took on open
+
+   g_menuPendingRequest IS THE ROUTE BACK TO THE MENU.  The frame
+   loop reads it and acts; the row callbacks only post it.
+
+
+6.4.  The continue menu
+
+   FUN_004358b0 at 0x004358b0.  Raised when the CLOCK has run
+   out and the GAME OVER sequence has finished, not by a key:
+   the dispatcher at 0x004587e0 calls it for bit 0x40 of
+   g_menuPendingRequest, where 0x80 opens the escape menu.
+
+   It is the SAME framework with a different header word and
+   different rows, so nothing in 6.1 to 6.3 changes:
+
+   +------------------+-----------------------------------+
+   | Field            | Value                             |
+   +==================+===================================+
+   | *menu            | 5, where the escape menu is 1     |
+   | menu[3,4,5]      | 1, 1, 1                           |
+   | menu[6]          | -10                               |
+   | menu[0xf]        | 1                                 |
+   | rows             | 3 - a title row plus YES and NO   |
+   | widget slots     | 5                                 |
+   +------------------+-----------------------------------+
+
+   ROW 0 CARRIES NO WIDGETS - FUN_00433c90(menu,0,0,0,0,0,0) -
+   and is the title.  Rows 1 and 2 each take TWO widgets, a
+   steady one and a blinking copy, exactly as 6.2 describes.
+
+   The five widgets, off their Widget_Init calls:
+
+   +---+--------+------+-------+------+-----+------+---------+
+   | # | x, y   | flag | vMode | anim | blk | font | colours |
+   +===+========+======+=======+======+=====+======+=========+
+   | 0 | -300,5 | 0xc2 |   7   |   1  |  0  |   9  | df8/de8 |
+   +---+--------+------+-------+------+-----+------+---------+
+   | 1 |  10,0  | 0x6a |   0   |   0  |-500 |  32  | de8/de8 |
+   +---+--------+------+-------+------+-----+------+---------+
+   | 2 |  10,0  | 0x6a |   3   |   0  |  2  |  32  | dec/dec |
+   +---+--------+------+-------+------+-----+------+---------+
+   | 3 |  10,0  | 0x63 |   0   |   0  |-500 |  32  | de8/de8 |
+   +---+--------+------+-------+------+-----+------+---------+
+   | 4 |  10,0  | 0x63 |   3   |   0  |  2  |  32  | dec/dec |
+   +---+--------+------+-------+------+-----+------+---------+
+
+   THE TITLE IS THE ONLY THING THAT MOVES.  Widget 0 starts at
+   x = -300 with animation style 1, velocity 4.0 and
+   acceleration 4.0 - the polar seek of 6.2.3 - so it flies in
+   from off the LEFT edge.  Its visibility mode is 7, a fixed
+   intensity of 25, so it is drawn partly transparent.
+
+   THE BLINK MASK IS 2 on both highlight copies, which is the
+   framework default of two frames on and two off.
+
+   THE DEFAULT SELECTION IS YES, and it is read rather than
+   assumed: the builder stores rowBase + 0x6c - one 0x6c row
+   stride in, so row 1 - and then calls that row's enter
+   handler, which is what plays the second cue.
+
+   TWO CUES ON OPEN, and neither is the escape menu's 0x03:
+   Snd_StopAll (FUN_00424020) and then Snd_PlayCue(0x44, 0),
+   TRY AGAIN, at the top of the builder; then 0x29 from the
+   default row landing.  The Snd_StopAll is why TRY AGAIN is
+   played DIRECT - a queued line would be discarded by it.
+
+   What the rows do:
+
+   YES (FUN_00436210)
+
+       g_menuPendingRequest = 0xb in solo, 9 otherwise
+
+   and 0xb is the SAME request RESTART posts - bits 0, 1 and 3
+   of the dispatcher, which reload the race, tick it and clear
+   the replay mode.  No page bit, so the menu chain does not
+   move and the race simply starts again.
+
+   NO (FUN_00436250)
+
+       g_menuPendingRequest = 0x20c in championship or
+       practice, 0x40c in a single race, 8 outside solo
+
+   then the same loading-screen cover QUIT RACE draws - reset
+   the viewport and projection, load menu resource 0xb1, draw
+   and present it.
+
+   THE DISPATCHER'S PAGE BITS, which is what makes those two
+   numbers readable [verified, 0x004587e0]:
+
+   +--------+------+   +--------+------+
+   | Bit    | Page |   | Bit    | Page |
+   +========+======+   +========+======+
+   | 0x0100 |   5  |   | 0x1000 |   7  |
+   +--------+------+   +--------+------+
+   | 0x0200 |   9  |   | 0x2000 |  14  |
+   +--------+------+   +--------+------+
+   | 0x0400 |   6  |   | 0x4000 |   8  |
+   +--------+------+   +--------+------+
+   | 0x0800 |   1  |   |        |      |
+   +--------+------+   +--------+------+
+
+   with the shared low nibble 0xc being bit 2, stop the race,
+   plus bit 3, clear the replay mode.  So NO in a championship
+   goes exactly where QUIT RACE goes - page 9, the TOP 5 screen
+   - and NO in a single race goes back to page 6, RACE SELECT.
+
+   0x200 AND 0x8000000 BOTH DIVERT IN A CHAMPIONSHIP: the
+   dispatcher calls FUN_004580f0 instead of Menu_GotoPage when
+   g_nSelectedMode is 2, so the championship has its own route
+   back and does not land on page 9 at all.  [open] what
+   FUN_004580f0 chooses.
+
+   Reconstructed as hud_continue_open in src/hud.c, as a third
+   mode on the same flattened rows.  The slide and the mode-7
+   transparency are not reproduced - the same gap 6.2.3 already
+   records for every escape-menu row.
+
+7.  The localised string table
+
+   g_localizedStrings at 0x004e28e8, 28 bytes per record, ending at
+   0x004e3e04 with an id of -1 [verified]:
+
+       struct { int id; const char *byLang[6]; }
+
+   The language order is the same as everywhere else - Us, Fr, Gr,
+   It, Sp, Sw - see menu-resources.txt section 5.2.1.
+
+   Lang_SetLanguage expands the table into the runtime slots at
+   0x0053b780 and up, which is where InGameMenu_OpenEscape reads
+   its labels from.  A record may hold NULLs for languages that
+   were never translated.
+
+   NON-ASCII BYTES ARE PRESENT - the German and Swedish rows carry
+   0xc4, the Spanish 0xd3 - so these are 8-bit strings in the .FNT
+   code page, not ASCII.
+
+   A RECORD MAY HOLD FEWER THAN SIX, and the four words the
+   in-race menus ask for show it.  Read byte for byte over
+   0x004e0350..0x004e0420:
+
+   +-----------+------------------------------------------+
+   | Word      | What is present                          |
+   +===========+==========================================+
+   | NO        | all six                                  |
+   +-----------+------------------------------------------+
+   | YES       | all six                                  |
+   +-----------+------------------------------------------+
+   | [REPLAY]  | FOUR - Sw, Sp, Gr, Us.  The Italian and  |
+   |           | French slots are three and five bytes of |
+   |           | alignment padding, not strings.          |
+   +-----------+------------------------------------------+
+   | [CONTINUE]| all six                                  |
+   +-----------+------------------------------------------+
+
+   [REPRIS] AT 0x004e039c IS SWEDISH, NOT FRENCH.  It is the
+   Swedish word for a replay and the rest of that language's
+   replay strings say so - REPRIS LADDAD, AVSLUTA REPRIS, FEL
+   VERSION AV REPRISFIL.  There is no [REPRISE] in the image at
+   all, so a French [REPLAY] title cannot be recovered; it
+   falls back to the English.
+
+8.  Open questions
+
+   o THE EASING IS READ - Widget_StepAnimation, 6.2.3, and the
+     constants with it.  What is still missing is what applies
+     the per-row DELAY at +0x90; nothing in the stepper reads
+     that field.  See 6.2.4.
+
+   o THE FIVE-PIXEL SOFT BORDER of the panel is not reproduced.  See
+     section 9; the interior is.
+   o Font_Get's SECOND OUT-PARAMETER decides the per-font half
+     scaling and has not been read.  It is what makes a small-fonts
+     MOTO halve the rows and not the title.
+
+   o FUN_00424090(int) is taken on open and released by every row.
+     Its body is a forward to FUN_00441e80 gated on this+4.
+
+   o FUN_00470fc0, called only by CONTINUE RACE, is unidentified.
+
+   o The network variant FUN_0043b700 and FUN_00438f70 /
+     FUN_0043a400 are the same framework and are not covered
+     here.  FUN_004358b0 is the CONTINUE menu, section 6.4, and
+     FUN_00437b70 the post-race [REPLAY] prompt; neither is a
+     debug menu.
+
+9.  The panel
+
+   THE DARK RECTANGLE IS THE MENU'S OWN DRAW, and it is found.
+   InGameMenu_DrawAll (0x00434ae0) is called once per live slot from
+   maybe_Game_RenderFrame, and its second block is the panel
+   [verified]:
+
+       if (menu+0x08) {
+           InGameMenu_ComputeBounds(menu)
+           ...animate for the first 15 frames...
+           menu+0x68 -= 5;  menu+0x6c -= 5
+           menu+0x70 += 5;  menu+0x74 += 5
+           software -> maybe_Screen3D_FadeRect(menu+0x68) now
+           hardware -> the same call, AFTER the widgets
+       }
+
+   menu+0x08 is set to 1 by InGameMenu_Ctor, so every in-race menu
+   has one.
+
+   THE BOX IS THE UNION OF THE WIDGETS.  InGameMenu_ComputeBounds
+   (0x00434860) walks the buttons, seeds (0xffff, 0xffff, 0, 0) and
+   takes the min and max of each widget's own rectangle into
+   menu+0x68..+0x74 as left, top, right, bottom.  So the panel is
+   whatever the menu happens to be showing, plus five pixels, every
+   frame.
+
+   IT ANIMATES OPEN.  For the first 15 frames - menu+0x60 is a frame
+   counter the draw increments - the corners are moved halfway toward
+   the box each frame, so the panel grows out of its own centre while
+   the rows are still sliding in.
+
+9.1.  What the fade actually does
+
+   maybe_Screen3D_FadeRect (0x0049a5a0) halves the brightness of the
+   rectangle [verified].  Its software interior is
+
+       *p = v >> 1;
+       *p &= ~((1 << (shlR - 1)) | (1 << (shlG - 1)));
+
+   an exact halving with the two borrowed low bits cleared, and its
+   hardware path queues a screen quad of kind 0x2c instead.
+
+   FIVE PIXELS IN FROM EVERY EDGE IT IS A RAMP, not a hard edge: the
+   scale runs from full brightness at the outer edge to a half at the
+   inner one, per channel through the surface masks.  The five comes
+   from g_bitsR, which is the RED CHANNEL BIT WIDTH being read as a
+   pixel distance - a bug with no symptom, because red is 5 bits in
+   every mode the game supports.  See the plate comment.
+
+   The reconstruction draws the interior as a multiply blend against
+   50 per cent grey, which is the same arithmetic in the same place.
+   The ramp is not reproduced.

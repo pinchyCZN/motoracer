@@ -1,0 +1,229 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       CDD::CREATEPRIMARYSURFACE
+
+
+Abstract
+
+   Step 2 of the DirectDraw init chain. Creates the primary surface, and
+   in fullscreen mode the flip chain behind it. This is where page
+   flipping is established, so it is directly load-bearing for any
+   replacement renderer.
+
+   Address 0x00475c90. Named from its own error string "in Create
+   Primary surface" at 0x004eeda0 [verified].
+
+Table of Contents
+
+   1. A function boundary defect, found and repaired
+   2. Original variable names recovered
+   3. Two paths
+      3.1. Windowed
+      3.2. Fullscreen
+   4. The fallback ladder
+   5. Correction to dd-init.txt
+   6. The flip chain decision
+   7. Types created
+   8. Open questions
+
+
+1.  A function boundary defect, found and repaired
+
+   Ghidra had split this single function into two. FUN_00475c90 covered
+   only 0x00475c90 to 0x00475cae (31 bytes) and a bogus FUN_00475caf
+   held the entire body.
+
+   The 31 bytes are a textbook MSVC SEH prologue:
+
+   MOV  EAX, FS:[0]        ; current SEH chain head
+   PUSH EBP
+   MOV  EBP, ESP
+   PUSH -1                 ; scope index
+   PUSH 0x475f62           ; handler
+   PUSH EAX                ; link previous
+   MOV  FS:[0], ESP        ; install
+   SUB  ESP, 0x70          ; 112 bytes of locals
+   LEA  ECX, [EBP-0x10]
+   NOP
+
+   Ghidra split at the trailing NOP. The function is now recreated at
+   0x00475c90 with the correct body [0x00475c90, 0x00475f61] and the
+   bogus entry is gone.
+
+   Note SUB ESP,0x70 is 112 bytes, which accommodates the 108-byte
+   DDSURFACEDESC plus alignment. That independently corroborates the
+   struct size.
+
+   This matters beyond one function. A later sweep found the same shape
+   71 times across game code, in two prologue variants, and repaired all
+   of them. See ghidra-db-repairs.txt; this note is where the pattern
+   was first recognised.
+
+   Still separately open: the menu/pageProtocol.cpp assert anchors at
+   0x0048713c and 0x004888bf are not inside any defined function. That
+   is a different defect, missing functions rather than split ones, and
+   has not been addressed.
+
+2.  Original variable names recovered
+
+   The error strings name the variables as the original programmers did
+   [verified]:
+
+   +----------------+---------------------------+----------------+
+   | String address | Text                      | Recovered name |
+   +================+===========================+================+
+   | 0x004eedbc     | lpDDSPrimary->SetClipper  | lpDDSPrimary   |
+   +----------------+---------------------------+----------------+
+   | 0x004eedd8     | lpDDClipper->SetHWnd      | lpDDClipper    |
+   +----------------+---------------------------+----------------+
+   | 0x004eedf0     | CreateClipper             | -              |
+   +----------------+---------------------------+----------------+
+   | 0x004eeda0     | in Create Primary surface | -              |
+   +----------------+---------------------------+----------------+
+
+   Labelled g_lpDDSPrimary and g_lpDDClipper, keeping the g_ convention
+   while preserving the original identifiers.
+
+3.  Two paths
+
+   The function branches on g_ddFullscreen exactly as step 1 did.
+
+3.1.  Windowed
+
+   Creates a plain primary surface, then a clipper bound to the main
+   window, then attaches the clipper to the surface:
+
+   dwFlags        = DDSD_CAPS
+   ddsCaps.dwCaps = DDSCAPS_PRIMARYSURFACE
+
+   CreateSurface -> GetSurfaceDesc -> CreateClipper
+                 -> SetHWnd(g_hwndMain) -> SetClipper
+
+   No flip chain and no back buffer. A windowed DirectDraw application
+   draws into the primary surface and the clipper keeps it inside the
+   window.
+
+3.2.  Fullscreen
+
+   No clipper. Either a simple primary, or a flip chain, decided by
+   g_ddUseFlipChain:
+
+   dwFlags        = DDSD_CAPS | DDSD_BACKBUFFERCOUNT   (0x21)
+   dwBackBufferCount = g_ddBackBufferCount
+   ddsCaps.dwCaps = 0x4210
+
+   0x4210 decodes as DDSCAPS_VIDEOMEMORY | DDSCAPS_PRIMARYSURFACE |
+   DDSCAPS_FLIP. When DAT_004dc030 is set it becomes 0x6218, which adds
+   DDSCAPS_3DDEVICE and DDSCAPS_COMPLEX.
+
+   An anomaly worth checking: 0x4210 does not include DDSCAPS_COMPLEX,
+   which DirectDraw normally requires when creating a flip chain with
+   back buffers. Only the 3D variant sets it. Either DirectDraw infers
+   it from DDSD_BACKBUFFERCOUNT, or this is a latent bug in the non-3D
+   path [guess]. Verify against a real DirectDraw before copying the
+   behaviour.
+
+4.  The fallback ladder
+
+   The fullscreen flip path degrades in three steps rather than failing
+   outright. This is worth preserving in any reimplementation because it
+   documents what the game considers acceptable:
+
+   +---------+-----------------------+-------------------------------------------------+
+   | Attempt | Change                | Meaning                                         |
+   +=========+=======================+=================================================+
+   | 1       | as configured         | requested back buffers, video memory            |
+   +---------+-----------------------+-------------------------------------------------+
+   | 2       | dwBackBufferCount = 1 | fall back to a single back buffer               |
+   +---------+-----------------------+-------------------------------------------------+
+   | 3       | caps and= 0xffffbfff  | clears DDSCAPS_VIDEOMEMORY; allow system memory |
+   +---------+-----------------------+-------------------------------------------------+
+
+   If the third attempt fails the error is reported and the function
+   returns
+
+   0. Note that reaching attempt 3 also clears g_ddUseFlipChain, so the
+      rest
+
+   of the engine learns that flipping is unavailable.
+
+5.  Correction to dd-init.txt
+
+   dd-init.txt described DAT_005d93b0 and DAT_005d93c4 as "device
+   capability inputs", specifically max texture width and height. That
+   was wrong.
+
+   They are assigned here from GetSurfaceDesc on the primary surface:
+
+   g_primaryWidth  = local_80.dwWidth;
+   g_primaryHeight = local_80.dwHeight;
+
+   They are the primary surface dimensions. The texture size limit
+   defaults to the screen size rather than to any hardware capability,
+   and is then clamped by g_cfgMaxTextureWidth / g_cfgMaxTextureHeight
+   or by the 256 clamp. Renamed g_primaryWidth and g_primaryHeight.
+
+6.  The flip chain decision
+
+   g_ddUseFlipChain is computed from four config globals before the
+   surface is created:
+
+   +-----------------------------------------+-------------------------------------------------------+
+   | Condition                               | Result                                                |
+   +=========================================+=======================================================+
+   | DAT_004eea10 == 1                       | set to (DAT_004dc1a0 == 0), then DAT_004eea10 cleared |
+   +-----------------------------------------+-------------------------------------------------------+
+   | DAT_0053c524 != 0                       | 1                                                     |
+   +-----------------------------------------+-------------------------------------------------------+
+   | DAT_004dc0d4 != 0                       | 0                                                     |
+   +-----------------------------------------+-------------------------------------------------------+
+   | DAT_004dc06c != 0 and DAT_004dc070 == 0 | 1                                                     |
+   +-----------------------------------------+-------------------------------------------------------+
+
+   DAT_004dc1a0 is the -OnlyPrimaryDisplay flag, so that switch disables
+   the flip chain. DAT_004eea10 is a one-shot: it is cleared after first
+   use, so the first call decides and later calls take a different
+   branch.
+
+7.  Types created
+
+   +------------------------+--------------------------------------------------------------------------------------+
+   | Type                   | Contents                                                                             |
+   +========================+======================================================================================+
+   | IDirectDrawSurfaceVtbl | 36 methods, QueryInterface through UpdateOverlayZOrder                               |
+   +------------------------+--------------------------------------------------------------------------------------+
+   | IDirectDrawSurface     | lpVtbl                                                                               |
+   +------------------------+--------------------------------------------------------------------------------------+
+   | IDirectDrawClipperVtbl | 9 methods, QueryInterface through SetHWnd                                            |
+   +------------------------+--------------------------------------------------------------------------------------+
+   | IDirectDrawClipper     | lpVtbl                                                                               |
+   +------------------------+--------------------------------------------------------------------------------------+
+   | DDSURFACEDESC          | 108 bytes; dwSize, dwFlags, dwHeight, dwWidth, lPitch, dwBackBufferCount, filler,    |
+   |                        | ddsCaps_dwCaps                                                                       |
+   +------------------------+--------------------------------------------------------------------------------------+
+
+   Applying DDSURFACEDESC to the stack local turned every local_80[n]
+   into a named field. Vtable offsets 0x58 and 0x70 on the surface
+   resolve to GetSurfaceDesc and SetClipper, and 0x20 on the clipper
+   resolves to SetHWnd, all matching the documented layouts and the
+   error strings.
+
+8.  Open questions
+
+   o RESOLVED. DAT_004dc030 is g_use3DHardware: set to 1 by -D3D and
+     -3DFX, cleared by -NoD3D, and seeded from the stored DetectD3DCard
+     setting. It gates DDSCAPS_3DDEVICE and the DirectDraw device
+     enumeration. See renderer-mode.txt.
+   o RESOLVED. DAT_004dc06c is g_rendererReady (3D init succeeded) and
+     DAT_004dc070 is g_rendererMode (0 hardware, 1 software, 2 unknown).
+     DAT_004dc0d4 and DAT_0053c524 are still open; DAT_0053c524 is now
+     g_ddUsingEnumeratedDevice but what sets the enumeration path is not
+     fully traced. See renderer-mode.txt.
+   o DAT_004eea10 is a one-shot latch. What sets it back to 1, and when
+     is the primary surface recreated?
+   o Is the missing DDSCAPS_COMPLEX in the 0x4210 path a real bug?
+   o FUN_00475f6c and FUN_00475f4a are the SEH unwind helpers; confirm
+     and name them.
+   o g_ddBackBufferCount (0x004ee94c) is read but never seen written.
+     Find the writer.

@@ -1,0 +1,448 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                              THE REPLAY
+
+
+Abstract
+
+   MotoRacer records every race and offers to play it back. IT
+   RECORDS INPUTS, NOT POSITIONS, and replays them through the real
+   physics - which is why the playback lands on the same lap times
+   to the millisecond.
+
+   The whole format is eight bytes a frame in a static array. It was
+   decoded in one sitting by watching the game replay a race that
+   had just been ridden, which is the only way it could have been:
+   the buffer is indistinguishable from any other array until
+   something is seen to write it.
+
+Table of Contents
+
+   1. The buffer
+   2. The record
+      2.1. The top two bits are the stunt, and they are synthesised
+   3. How playback works
+   4. Why it stays in sync
+   5. Saving, and -saverecord
+   6. Determinism, proven bit for bit
+      6.1. The AI are re-simulated too
+      6.2. The replay uses the trackside cameras
+      6.3. A race recorded under mr_freeze cannot be played back
+   7. Open questions
+
+1.  The buffer
+
+   +--------------+----------------------------------------------+
+   | 0x00558aa8   | g_abReplayBuffer - the records, 8 bytes each |
+   +--------------+----------------------------------------------+
+   | 0x004e9838   | g_dwReplayCount - how many records exist,    |
+   |              | and the WRITE index                          |
+   +--------------+----------------------------------------------+
+   | 0x004e983c   | g_replayFrame - the PLAYBACK position        |
+   +--------------+----------------------------------------------+
+   | 0x004e9834   | g_dwReplayMode - 0 live, 1 playback, 2 demo  |
+   +--------------+----------------------------------------------+
+   | 0x004e9814   | g_dwReplayTotalMs - accumulated recorded ms  |
+   +--------------+----------------------------------------------+
+
+   THE COUNT AND THE FRAME ARE DIFFERENT THINGS and they read the
+   same only when a playback has run to the end. Reading 0x004e9838
+   as "where the replay is up to" would be wrong every other time.
+
+   IT IS A STATIC ARRAY, NOT A HEAP ALLOCATION. Capacity is 0x4fb0 =
+   20,400 records, tested in maybe_Replay_WriteInput and nowhere
+   else. At the ~30 frames a second the deltas show that is about
+   eleven minutes twenty of racing, and a longer race records only
+   its first 20,400 frames - no wrap, no error, the rest of the
+   replay is simply missing.
+
+   o THE CAP IS SMALLER THAN THE SPACE. 20,400 * 8 = 0x27d00 ends at
+     0x005807a8 and g_racers is at 0x00581218, so 0xa70 bytes lie
+     between the buffer's real end and the next known global and
+     belong to something not yet identified. [open]
+
+   o WHICH IS WHY IT COULD NOT BE FOUND BY LOOKING FOR ONE. A sweep
+     for heap pointers by megabyte bucket returned hundreds of
+     candidates and none was this, because this is not on the heap.
+     A sweep for an index near the frame count missed it too: the
+     replay frame index counts REPLAY frames, not game frames, and
+     the two had drifted far apart.
+
+2.  The record
+
+   Eight bytes, read live out of a replay in progress [verified]:
+
+   +--------+------+----------------------------------------------+
+   | +0x00  | 3    | THE INPUT WORD, the low 24 bits. Bits 0..5   |
+   |        |      | are the bindable actions: 1 accel, 2 brake,  |
+   |        |      | 4 left, 8 right, 0x10 gear up, 0x20 gear     |
+   |        |      | down. Bits 6 and 7 are NOT keys - see 2.1    |
+   +--------+------+----------------------------------------------+
+   | +0x03  | 1    | THE FRAME DELTA in milliseconds. Observed    |
+   |        |      | 0x1c, 0x21, 0x22, 0x23, 0x24 - 28 to 36 ms   |
+   +--------+------+----------------------------------------------+
+   | +0x04  | 2    | a joystick axis, 0x8000 centred              |
+   +--------+------+----------------------------------------------+
+   | +0x06  | 2    | the other axis, 0x8000 centred               |
+   +--------+------+----------------------------------------------+
+
+   maybe_Replay_ReadInput (0x004578a0) does the unpacking:
+
+       EDX = g_replayFrame;
+       EAX = g_abReplayBuffer[EDX];    the 8-byte record
+       EAX &= 0xffffff;                mask off the frame delta
+       *inputOut = EAX;
+
+   o THE TWO AXES ARE THE JOYSTICK. maybe_Input_ReadDevice writes
+     0x8000 into DAT_0051bcf4 and DAT_0051bcf8 as the centred value
+     for exactly these, so a keyboard race records 0x80008000 in
+     every frame - which is what a keyboard race reads back.
+
+2.1.  The top two bits are the stunt, and they are synthesised
+
+   maybe_Replay_WriteInput (0x004577f0) folds two racer fields into
+   the button word on its way into the buffer [verified]:
+
+       racer[+0x31f9] ? (w | 0x80) : (w & ~0x80)    STUNT HELD
+       racer[+0x3201] ? (w | 0x40) : (w & ~0x40)    STUNT PRESSED
+
+   WHICH IS NECESSARY, because Turbo/Stunts is the ONE action that
+   sets no input bit. Input_OnKeyDown's seven bindable actions are
+   indices 0..6, and cases 0 to 5 OR bits 1, 2, 4, 8, 0x10 and 0x20
+   into racer+0x31e9 - but case 6 writes racer+0x31f9 and +0x3201
+   directly and touches the word not at all. Without this fold-in a
+   recording could not reproduce a wheelie.
+
+   o SO BIT 7 IS A LEVEL AND BIT 6 IS AN EDGE, not two keys. Bit 7
+     stays up for the whole wheelie; bit 6 marks the press and is
+     cleared by maybe_Racer_UpdatePose. A decoder that lists them
+     alongside accel and brake is describing the wrong thing.
+
+   MEASURED OVER ONE 5,956-FRAME RACE [verified], read straight out
+   of the buffer with tools/mr_replay.py:
+
+   +-------------+---------+-------+--------------------------------+
+   | bit         | frames  | pct   |                                |
+   +=============+=========+=======+================================+
+   | 0x01 accel  |   5037  | 84.6% | held almost throughout         |
+   +-------------+---------+-------+--------------------------------+
+   | 0x08 right  |   1359  | 22.8% |                                |
+   +-------------+---------+-------+--------------------------------+
+   | 0x04 left   |    900  | 15.1% |                                |
+   +-------------+---------+-------+--------------------------------+
+   | 0x80 STUNT  |    330  |  5.5% | 32 bursts, longest 87 frames   |
+   |             |         |       | = 2.9 s                        |
+   +-------------+---------+-------+--------------------------------+
+   | 0x02 brake  |    252  |  4.2% |                                |
+   +-------------+---------+-------+--------------------------------+
+   | 0x40 edge   |     67  |  1.1% |                                |
+   +-------------+---------+-------+--------------------------------+
+
+   o THE TWO GEAR BITS NEVER FIRED. 0x10 and 0x20 are Higher Gear
+     and Lower Gear, bound to Z and A, and this rider used neither
+     across three and a half minutes - which is consistent with the
+     gearbox running automatically for a human in solo.
+
+   o AND ONE OF THE THREE CRASHES WAS A WHEELIE. The crash at
+     140218 ms has bit 7 up - accel+left+STUNT - while the crashes
+     at 112963 and 123367 read plain accel. That is the first
+     evidence in this project for the stunt costing stability, and
+     it came out of the recording rather than out of the physics.
+
+3.  How playback works
+
+   The replay feeds the recorded input into the racer's own input
+   word at racer+0x31e9 and lets the ordinary physics run. Watched
+   live [verified]:
+
+   +--------+---------------------------------------------------+
+   | racer  | written by maybe_Replay_ReadInput at 0x004578e0   |
+   | +0x31e9| - eight hits, all from that one site              |
+   +--------+---------------------------------------------------+
+   | racer  | written by the ordinary physics integrator at     |
+   | +0x30  | 0x0048dc3d, with ESI = racer+0x24 - the same      |
+   |        | writer as during a real race                      |
+   +--------+---------------------------------------------------+
+
+   THAT IS THE WHOLE ANSWER. The input word is driven by the replay
+   and the position is not driven at all - it falls out of the
+   physics, exactly as it does when a human is riding. Sampled
+   across four seconds of playback the input word read 9, 8, 1, 0, 5
+   - accel+right, right, accel, nothing, accel+left - while the gear
+   shifted 3, 5, 5, 6, 4 and the speed moved with it.
+
+   o AND THE PLAYER IS LOCKED OUT. g_dwReplayMode reads 1 during
+     a replay, which is the same gate mrhook's SEND_INPUT refuses
+     to drive through. The game is not merging the two input
+     sources; it is switching between them.
+
+   o MODE 2 IS NEITHER. Racers_Init forces two racers when
+     g_opponentCount is 0 and the mode is 2 - most likely the
+     attract demo, which would need racers without a player
+     [inferred]. See subsystems/racers.txt.
+
+4.  Why it stays in sync
+
+   Because the frame delta is recorded alongside the input. A
+   replay does not re-time the race, it re-runs it with the same
+   dt sequence, so an integration that was done in 33 ms steps is
+   redone in 33 ms steps whatever the machine is doing now.
+
+   PROVEN BY A CHECKPOINT [verified]. A watchpoint on the split
+   table caught the replay writing 0x00004d90 - 19856 ms - into
+   entry 0. That is the SAME first checkpoint time, to the
+   millisecond, that the original ride recorded. The physics was
+   re-run from inputs and arrived at the identical answer.
+
+   o SO A PORT CANNOT REPLAY OLD FILES WITHOUT BIT-EXACT PHYSICS.
+     That is the real cost of this design and it is worth knowing
+     before any of the physics is rewritten: a reconstruction whose
+     integrator differs in the last bit will drift, and a .Sav from
+     the retail game will not play back. Positions would have been
+     forgiving; inputs are not.
+
+5.  Saving, and -saverecord
+
+   +----------------+-------------------------------------------+
+   | -saverecord    | an undocumented command-line flag at      |
+   |                | 0x004dc4c0. Main_InitAndParseCommandLine  |
+   |                | sets 0x004e8924 to 1 for it               |
+   +----------------+-------------------------------------------+
+   | *.Sav          | the file type - the dialog filter reads   |
+   |                | "Record Files (*.Sav)|*.Sav|All Files..." |
+   +----------------+-------------------------------------------+
+
+   THE FLAG ONLY GATES WRITING TO A FILE. The game offered a replay
+   after a race with 0x004e8924 reading 0, so recording into
+   g_abReplayBuffer happens always and -saverecord is about
+   persisting it.
+
+   THE RECORDER ITSELF IS maybe_Replay_WriteInput (0x004577f0), and
+   it is nine lines: clamp the delta to 0xff, fold in the two stunt
+   bits, pack dt<<24 | buttons and axis0<<16 | axis1, bump
+   g_dwReplayCount. g_dwReplayTotalMs accumulates the UNCLAMPED
+   delta, so a frame longer than 255 ms makes that global and the
+   sum of the recorded deltas disagree - and the replay plays that
+   frame back short.
+
+   A version check exists - REPLAY VERSION ERROR and REPLAY
+   COMPATIBILITY ERROR, in six languages - so the file carries a
+   header. FUN_00437b70 reads the flag four times and holds one
+   malloc against four frees; it is the save/load path and it has
+   not been read.
+
+6.  DETERMINISM, PROVEN BIT FOR BIT
+
+   Section 4 argued from the recorded frame delta that the replay
+   must re-simulate exactly, and offered one checkpoint time as
+   evidence. Letting a whole replay run with a hook on
+   maybe_Racer_BeginCrash settles it much harder.
+
+   The live race recorded three player crashes. The replay of that
+   race produced [verified]:
+
+   +--------+-----------+------------+---------+
+   | racer  | speed     | race clock | segment |
+   +========+===========+============+=========+
+   |   1    |  94.896   |   25086 ms |   423   |
+   |   4    |  22.222   |   27507 ms |   426   |
+   |   2    |   0.916   |   27507 ms |   426   |
+   |   1    | 109.567   |  112963 ms |   427   |
+   |   1    | 109.559   |  123367 ms |   534   |
+   |   1    | 108.486   |  140218 ms |     8   |
+   |   7    |  22.222   |  186887 ms |    38   |
+   +--------+-----------+------------+---------+
+
+   THE THREE PLAYER CRASHES THE LIVE RUN CAPTURED - 109.567 at
+   112963, 109.559 at 123367, 108.486 at 140218 - CAME BACK
+   IDENTICAL. Not close: the same IEEE bit patterns, 4e22db42,
+   671edb42 and e0f8d842, at the same millisecond.
+
+   o A CRASH IS THE HARSHEST TEST AVAILABLE. It is the end of a
+     long chain of integration, collision and grip, and any
+     divergence anywhere upstream moves it. Three of them landing
+     on identical bits says the re-simulation is exact, not merely
+     close.
+
+6.1.  The AI are re-simulated too
+
+   Racers 4, 2 and 7 crashed during the playback. So the field is
+   not a recording of twelve bikes - the replay re-runs ALL of them
+   from the same starting state and they crash where they crashed.
+
+   o WHICH ANSWERS AN OPEN QUESTION FROM SECTION 6 and raises the
+     cost of the port again. It is not enough for the PLAYER's
+     physics to be bit-exact; the AI's decisions have to be too,
+     and the RNG at FUN_00458ce0 has to produce the same sequence
+     from the same seed.
+
+   o AND IT CAUGHT A PILE-UP. Racer 1 went down at 25086 ms in
+     segment 423; racers 4 AND 2 went down together at 27507 ms in
+     segment 426, two and a half seconds later and three segments
+     on. The rider described exactly that from memory - "it was me
+     that crashed and the rider crashed when it hit my bike" -
+     without knowing the trace would show two of them.
+
+6.2.  The replay uses the trackside cameras
+
+   Watched rather than measured [observed]: the replay camera
+   orbits the player, then cuts to a fixed position and pans as the
+   bike goes past, like a broadcast camera.
+
+   THOSE FIXED POSITIONS ARE ALREADY IN THE DATA. The decor table
+   at DAT_004dc0e4 carries entries named CAMERA_000 and
+   maybe_Trk_CountCameras (0x00473240) reads the same table - see
+   subsystems/decor.txt section 3. So the trackside cameras a
+   replay cuts between are placed by the track file as decor, not
+   hardcoded.
+
+   o THAT IS WHY CAMERA IS A DECOR CLASS WITH NO MESH. It exists to
+     be a position, and this is what reads it. Neither half was
+     worth much alone.
+
+   THE PORT DOES IT NOW.  Camera_SelectView lists five flags that
+   switch the director on and g_dwReplayMode == 1 is one of them, so
+   a playback takes the trackside shots rather than the chase - the
+   single condition that makes a replay look like the attract demo
+   rather than like a race.  race.c's camera block tests
+   race_replay_mode() beside race_auto_ride().
+
+   o AND IT CUTS ON THE FIRST FRAME.  camera_reset leaves the shot
+     timer at zero, which is not yet EXPIRED, so the director would
+     hold a stale eye for one frame before choosing anything.
+     Starting a playback arms it at -1.
+
+6.3.  A race recorded under mr_freeze cannot be played back
+
+   A race was ridden with tools/mr_freeze.py holding the checkpoint
+   clock, so the rider could take his time; he finished last. The
+   freeze was then stopped and the recording played back, and the
+   replay ABORTED PART WAY THROUGH - the checkpoint timeout expired
+   at a checkpoint the original race had passed. [verified,
+   2026-09-05]
+
+   THAT IS NOT A BUG, IT IS THE STRONGEST EVIDENCE YET FOR SECTION 3.
+   If the buffer held positions, or matrices, or anything about where
+   the bike WAS, freezing a clock during recording could not change
+   what plays back. The playback diverged because it RE-SIMULATES
+   from the inputs, and the input stream says nothing about the race
+   clock.
+
+   +---------------------------+--------------------------------+
+   | in the buffer             | NOT in the buffer              |
+   +===========================+================================+
+   | the button word           | the checkpoint countdown at    |
+   | the frame delta           | 0x004dc0a8                     |
+   |                           | anything a debug tool wrote    |
+   +---------------------------+--------------------------------+
+
+   o SO AN OVERRIDE APPLIED WHILE RECORDING MUST BE APPLIED WHILE
+     PLAYING BACK. mr_freeze is a loop over GET_MEM and SET_MEM
+     against 0x004dc0a8; it is not part of the game state the replay
+     restores. Run it during playback too, or record without it.
+
+   o AND THE PHYSICS DID NOT DIVERGE. The bike followed the same
+     path from the same inputs - section 6 proved that bit for bit,
+     twice. What ran out was an external gate the replay does not
+     restore, so the race was cut short rather than played wrong.
+
+   o WHICH GENERALISES TO EVERY DIAGNOSTIC OVERRIDE WE HAVE. A
+     SET_MEM poke, a frozen value, a hook that alters state - none
+     of them are recorded, so any replay taken while one was active
+     is only reproducible with it active again. Worth stating
+     because the symptom is a replay that "stops early" rather than
+     an error.
+
+7.  The port
+
+   race.c carries it: the buffer, the recorder, the reader and the
+   dt override.  It is small because this document had already
+   decoded the format - the work was wiring, not discovery.
+
+   +-------------------------+--------------------------------+
+   | race_replay_write       | maybe_Replay_WriteInput        |
+   +-------------------------+--------------------------------+
+   | race_replay_begin_frame | maybe_Replay_ReadInput, plus   |
+   |                         | handing back the recorded dt   |
+   +-------------------------+--------------------------------+
+   | race_replay_apply       | the input switch in            |
+   |                         | race_poll_input                |
+   +-------------------------+--------------------------------+
+   | race_replay_start       | arms it; the caller restarts   |
+   +-------------------------+--------------------------------+
+
+   THE RECORD IS BYTE-FOR-BYTE THE ORIGINAL'S, deliberately:
+   tools/mr_replay.py decodes MOTO's buffer and reads ours unchanged
+   because of it.
+
+   THREE THINGS WORTH KNOWING:
+
+   o RECORDING IS ONCE A FRAME, NOT ONCE A TICK.  race_poll_input
+     runs per SUBSTEP in this port (frame-loop.txt 1.3.9), so
+     recording there would write several records for one frame and
+     the playback would run long.  The write happens after the
+     substep loop, off the racer's own input word.
+
+   o A REPLAY IS THE RACE RUN AGAIN, from the grid.  YES arms the
+     playback and restarts; the arm survives race_load's reset,
+     which is the one thing that would otherwise wipe the recording
+     on its way to playing it.
+
+   o AND THE dt COMES FROM THE RECORD.  race_update takes its step
+     from the recorded millisecond delta instead of the clock while
+     a playback runs.  Without that the race is re-TIMED rather than
+     re-run and drifts - section 4.
+
+   o THE LIVE STEP IS QUANTISED TO WHOLE MILLISECONDS, and that is
+     not tidiness - it is what makes the record EXACT.  At 60fps the
+     frame is 16.667 ms; recording (int)(dt * 1000) stores 16 while
+     the physics integrates 16.667, so a playback runs about four
+     per cent short.  That looks like nothing for the first seconds
+     and has the bike turning early by the end of a lap, which reads
+     as a frame-rate problem and is not one.  The remainder is
+     CARRIED, so the sequence runs 17, 17, 16, 17 ... and averages
+     the true frame time - truncating without the carry would make
+     the race itself run four per cent slow.
+
+     The original never faces this: its frame delta IS an integer
+     millisecond count, and the replay records that very value.
+
+   o ONE RECORD IS ONE SUBSTEP, NOT ONE FRAME, and that is what
+     makes fast-forward work.  The physics already integrates in
+     slices of at most 20 ms whatever the frame rate or the clock
+     scale (frame-loop.txt 1.3.9), so recording at that level makes
+     the recording paced in SIMULATED time: about fifty records a
+     simulated second, from a 17 ms frame or from a 640 ms one.
+
+     A 40x frame is 32 substeps of 20 ms - which fit the record's
+     one byte, where the 640 did not.  And a playback then spends
+     whatever the wall clock is really worth: race_replay_peek_steps
+     counts how many recorded steps fit in the frame that actually
+     elapsed, so a race recorded under TAB plays back at NORMAL
+     speed.  Recording at frame level could not do either.
+
+     The buffer holds about 5.8 minutes of racing at 60fps on this
+     pacing, against eleven at the original's frame-level ~30fps.
+
+   o EVERY STEP IS A WHOLE NUMBER OF MILLISECONDS.  The frame's
+     millisecond budget is shared out across its substeps with the
+     remainder going one each to the first few, so the record can
+     express exactly the step the simulation took.  A substep of
+     dt/steps generally cannot be written down in the record, and a
+     record that disagrees with the simulation is a playback that
+     drifts.
+
+   NOT PORTED: the .Sav file, so a replay lives only as long as the
+   process.  Retail files could not be played back anyway without
+   bit-exact physics (section 4).
+
+7.1.  Open questions
+
+   o THE FILE FORMAT. Only the in-memory record is decoded. What a
+     .Sav wraps around it - the header, the version, the track and
+     bike identifiers - is unread.
+
+   o ANSWERED, BOTH OF THEM - see section 6. The AI are
+     re-simulated and they crash where they crashed, and the
+     player's crashes come back bit-identical.

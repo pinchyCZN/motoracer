@@ -1,0 +1,46 @@
+; MotoRacer reconstruction - editor settings.
+;
+; The rule is TABS FOR INDENTATION, SPACES FOR ALIGNMENT, one tab per
+; indent level, displayed as four columns. tools/retab.py enforces it
+; and can convert a file that has drifted:
+;
+;     python tools/retab.py --check      report, exit 1 if anything drifted
+;     python tools/retab.py --fix        convert in place
+;
+; Alignment - a continuation line under an open paren, the ' * ' of a
+; block comment, an ASCII diagram - stays spaces, so the source renders
+; correctly whatever tab width the reader has set.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+
+; The reconstruction. C and C++ only.
+[*.{c,h,cpp,hpp,inc}]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+max_line_length = 80
+
+; The tools stay on spaces - PEP 8, and asciify.py has to keep passing
+; its own check.
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 80
+
+; The RFC documents in docs/ are SPECIFIED in spaces: three-space bodies
+; wrapped at 72, four-or-more-space preformatted blocks, tables drawn to
+; a column. Tabs would break the layout and asciify.py's column count.
+; See CLAUDE.md rule 7.
+[*.txt]
+indent_style = space
+indent_size = 4
+max_line_length = 80
+
+[*.md]
+indent_style = space
+indent_size = 2

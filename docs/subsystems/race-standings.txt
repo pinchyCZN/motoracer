@@ -1,0 +1,192 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          RACE STANDINGS
+
+
+Abstract
+
+   The "pos 6/12" on the HUD. One function rebuilds the whole race
+   order into a flat array of racer indices, and it does it with a
+   single 32-bit sort by packing the racer index into the top five
+   bits of the sort key.
+
+   The mechanism was read out of the binary and then checked against
+   live memory at the end of a twelve-racer race, where the computed
+   order matched the racers' finish times exactly.
+
+Table of Contents
+
+   1. The pieces
+   2. racer+0x2de5 is the race state
+   3. Race_ComputeStandings
+      3.1. The packed key
+         3.1.1. The comparator MASKS the index off
+      3.2. Verified against a finished race
+   4. Open questions
+
+1.  The pieces
+
+   +---------------+--------------------------------------------+
+   | 0x0047e1e0    | Race_ComputeStandings                      |
+   +---------------+--------------------------------------------+
+   | 0x00516ab8    | g_anStandings - racer indices, best first  |
+   +---------------+--------------------------------------------+
+   | 0x004dc154    | g_nStandingsCount - how many               |
+   +---------------+--------------------------------------------+
+   | racer +0x2de5 | the race state this sorts on               |
+   +---------------+--------------------------------------------+
+   | racer +0x2ddd | the race clock, the finisher's sort key    |
+   +---------------+--------------------------------------------+
+   | racer +0x31b5 | progress high-water, the racer's sort key  |
+   +---------------+--------------------------------------------+
+
+2.  racer+0x2de5 is the race state
+
+   It had never been identified. It is read in twenty-four places
+   and written literally in only two - both to 3, in FUN_00437890
+   at 0x0043791f and FUN_0047dae0 at 0x0047deec - which is why a
+   displacement search never explained it. Race_ComputeStandings
+   loads it as a BASE (MOV ESI, 0x583ffd at 0x0047e210) and walks
+   the array, so the reads do not name the offset either.
+
+   The values, from how the sorter buckets them [verified] and
+   from live memory [verified]:
+
+   +-------+-------------------------------------------------------+
+   | Value | Meaning                                               |
+   +=======+=======================================================+
+   |   2   | FINISHED. Ranked ABOVE everyone still on track and    |
+   |       | ordered by finish time, soonest first.                |
+   +-------+-------------------------------------------------------+
+   |   1   | RACING. Ranked by progress along the track.           |
+   +-------+-------------------------------------------------------+
+   | 3, 0  | OUT, or never started. Ranked last.                   |
+   +-------+-------------------------------------------------------+
+
+   o AND IT GATES SPECTATING. Input_OnKeyDown's F5 case reads this
+     field for the local racer and only lets the view cycle to
+     another racer when it is 2 or 3 - that is, once you have
+     finished or are out. That is a second, independent reading of
+     the same three values and it agrees.
+
+3.  Race_ComputeStandings
+
+   It walks every racer at stride 0x3209, terminating at
+   &DAT_005d22de, and skips any slot whose +0x68 active flag is 0.
+   Each surviving racer goes into one of three buckets with a
+   different sort key:
+
+   +----------+-----------------------------------------+
+   | state 2  | key = ~racer[+0x2ddd] & 0x7ffffff - the |
+   |          | INVERTED race clock, so the descending  |
+   |          | comparator yields ascending finish time |
+   +----------+-----------------------------------------+
+   | racing   | key = racer[+0x31b5] << 12  OR  the     |
+   |          | sub-segment fraction, 0..0xfff.         |
+   |          | Progress high-water mark, most first    |
+   +----------+-----------------------------------------+
+   | 3 or 0   | key = racer[+0x2ddd] plain              |
+   +----------+-----------------------------------------+
+
+   Each bucket is qsorted with FUN_00457730, then they are
+   concatenated FINISHED, RACING, OUT into g_anStandings.
+
+3.1.  The packed key
+
+   EVERY KEY CARRIES ITS RACER INDEX IN THE TOP FIVE BITS -
+   local_d8 << 0x1b, where local_d8 is the loop counter. After the
+   three sorted buckets are concatenated, one final pass shifts
+   every entry right by 0x1b in place, and what is left is the
+   racer index.
+
+   So one 32-bit sort produces the entire standings, with no
+   parallel array and no comparator that has to dereference a
+   racer. It is a neat trick and it has two consequences worth
+   writing down:
+
+   o IT CAPS THE DESIGN AT 27 BITS OF CLOCK - about 37 hours - AND
+     31 RACERS. Neither is reachable in this game, but a port that
+     widens either has to abandon the packing.
+
+   o A READER THAT CATCHES g_anStandings MID-REBUILD SEES PACKED
+     KEYS, NOT INDICES. They are enormous numbers, not racer
+     numbers. Anything sampling this array asynchronously - a HUD
+     hook, a debug tool - has to tolerate that.
+
+3.1.1.  The comparator MASKS the index off
+
+   Race_SortStandingsKey (0x00457730), read [verified]:
+
+       if ((*a & 0x7ffffff) < (*b & 0x7ffffff)) return 1;
+       return ((*a & 0x7ffffff) <= (*b & 0x7ffffff)) - 1;
+
+   DESCENDING on the low 27 bits, which closes both of the questions
+   3.1 left open - the direction and what the comparator does.
+
+   AND THE MASK IS WHAT MAKES THE PACKING WORK.  The index sits in
+   bits 27..31, ABOVE the payload, so a comparator that compared the
+   whole word would sort by INDEX and by nothing else.  Masking
+   compares only the payload and carries the index along for free.
+
+   o A PORT THAT WRITES THE OBVIOUS COMPARATOR GETS A PLAUSIBLE
+     WRONG ANSWER.  Comparing the full word put the local racer,
+     index 1, last in a field of twelve on every frame - a number
+     that looks like a real position and never changes.
+
+3.2.  Verified against a finished race
+
+   Read live at the end of a twelve-racer race, after the replay of
+   it had also run [verified]:
+
+   +-------+-------+-----------+--------------------------------+
+   | Racer | State | Clock, ms |                                |
+   +=======+=======+===========+================================+
+   |   6   |   2   |   169374  | 1st                            |
+   +-------+-------+-----------+--------------------------------+
+   |  10   |   2   |   175171  | 2nd                            |
+   +-------+-------+-----------+--------------------------------+
+   |   3   |   2   |   175704  | 3rd                            |
+   +-------+-------+-----------+--------------------------------+
+   |   9   |   2   |   176202  | 4th                            |
+   +-------+-------+-----------+--------------------------------+
+   |   2   |   2   |   176537  | 5th                            |
+   +-------+-------+-----------+--------------------------------+
+   |   4   |   2   |   179350  | 6th                            |
+   +-------+-------+-----------+--------------------------------+
+   |   5   |   2   |   180012  | 7th                            |
+   +-------+-------+-----------+--------------------------------+
+   |   1   |   2   |   186852  | 8th - THE PLAYER               |
+   +-------+-------+-----------+--------------------------------+
+   |   7   |   2   |   186887  | 9th                            |
+   +-------+-------+-----------+--------------------------------+
+   |  12   |   2   |   191749  | 10th                           |
+   +-------+-------+-----------+--------------------------------+
+   |  11   |   1   |   193934  | still racing                   |
+   +-------+-------+-----------+--------------------------------+
+   |   8   |   1   |   193934  | still racing                   |
+   +-------+-------+-----------+--------------------------------+
+
+   g_anStandings held 6, 10, 3, 9, 2, 4, 5, 1, 7, 12, 11, 8 and
+   g_nStandingsCount held 12. That is the ten finishers in exact
+   ascending clock order followed by the two who had not finished,
+   which is what section 3 predicts down to the tie-break.
+
+   o THE RIDER REMEMBERED FINISHING SIXTH; this says eighth. The
+     capture is of the state AFTER a replay of the race had also
+     run, so it is not proof about the original ride, and the
+     on-screen position during a race counts something that may
+     not be this array. Not resolved. [open]
+
+4.  Open questions
+
+   o WHAT STATE 3 IS, exactly. Two functions write it and both are
+     unread: FUN_00437890 and FUN_0047dae0. "Out" is inferred from
+     where the sorter ranks it and from F5 letting you spectate.
+
+
+   o WHERE THE HUD READS IT. The "pos N/M" string is not yet tied
+     to g_anStandings by a direct read.
+
+   o THE EXTENT OF g_anStandings. Typed as 13 to match the racer
+     slots; nothing has confirmed the real size.

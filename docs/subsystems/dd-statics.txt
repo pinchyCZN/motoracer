@@ -1,0 +1,1272 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                 STATIC OBJECTS AND TEARDOWN IN DD.CPP
+
+
+Abstract
+
+   screen3d\dd.cpp builds two static C++ arrays at startup and tears its
+   DirectDraw objects down in two modes. Reading the constructors
+   settled the exact base, stride and count of both arrays - and
+   corrected a four-byte error this project had been carrying in
+   MR_DisplayMode.
+
+Table of Contents
+
+   1. Two static arrays
+   2. Why the constructor is the authority
+   3. Two teardown modes
+   4. The texture bank record
+      4.1. What the constructor initialises
+         4.1.1. +0x1c is constructed; the name buffer is 0x101
+   5. The bank accessors
+      5.1. +0x34 is a bank INDEX, and it links the two arrays
+         5.1.1. It does not release the DirectDraw surface
+         5.1.2. Nothing releases the texture surface
+      5.2. The creator, and what it does not do
+         5.2.1. It overwrites +0x30 without releasing it
+   6. The sprite record, 0x4e bytes
+      6.1. Three details of the draw
+         6.1.1. It confirms bank+0x40 and +0x44
+         6.1.2. The interlace rule is a parity match
+         6.1.3. +0x3e is the last REQUESTED frame
+      6.2. Three details of the allocator
+      6.3. AddSprite, and a field it never sets
+         6.3.1. A null colour key means black
+         6.3.2. +0x4a is set for exactly one sprite
+         6.3.3. +0x4a is not the scale
+   7. Banks are resolution-variant
+      7.1. Banks 4, 5 and 6 are the horizon, one per resolution
+      7.2. The horizon is a SCROLLING 2D PANORAMA, not geometry
+         7.2.1. The scroll arithmetic, and the six scalars behind it
+         7.2.2. Reconstructed, and transcribed rather than substituted
+         7.2.3. Confirmed against the running game
+         7.2.4. The camera record stores its basis in COLUMNS, and
+                reading it as rows scrolled the sky backwards
+         7.2.5. The damp and the Y bias come from the TRACK
+         7.2.6. The period divisor is a MODE SELECTOR, not a width
+         7.2.7. The panorama anchors to x = 0, the world to its centre
+   8. Open questions
+
+1.  Two static arrays
+
+   Both are built with _eh_vector_constructor_iterator_ and registered
+   for destruction with _atexit, which gives base, element size, count
+   and both element functions in one instruction each [verified]:
+
+   +----------------+------------+--------+-------+-------------------------------+
+   | Array          | Base       | Stride | Count | Ctor / Dtor                   |
+   +================+============+========+=======+===============================+
+   | g_displayModes | 0x005d8950 | 0x24   | 50    | maybe_DisplayMode_Ctor / Dtor |
+   +----------------+------------+--------+-------+-------------------------------+
+   | texture banks  | 0x005d3a20 | 0x149  | 7     | maybe_DdCaps_Ctor / Dtor      |
+   +----------------+------------+--------+-------+-------------------------------+
+
+   +-------------------------+------------+-----------------------+
+   | Function                | Address    | Role                  |
+   +=========================+============+=======================+
+   | DisplayModes_StaticCtor | 0x004737a0 | builds the mode array |
+   +-------------------------+------------+-----------------------+
+   | DisplayModes_StaticDtor | 0x004737d0 | its atexit handler    |
+   +-------------------------+------------+-----------------------+
+   | maybe_DdCaps_StaticCtor | 0x004738a0 | builds the bank array |
+   +-------------------------+------------+-----------------------+
+   | maybe_DdCaps_StaticDtor | 0x004738d0 | its atexit handler    |
+   +-------------------------+------------+-----------------------+
+
+   The bank array settles an open question in subsystems/dd-init.txt,
+   which had recorded 'two struct arrays with a 329-byte stride' and
+   asked for the loops to be checked against the disassembly. 0x149 is
+   329, and the count is 7.
+
+2.  Why the constructor is the authority
+
+   MR_DisplayMode had its base taken from the first field
+   Cdd_EnumModesCallback writes, 0x005d8954. The constructor says
+   0x005d8950. Every offset in that note was four bytes low and the
+   record's first member was invisible, because the enumeration callback
+   never touches it [verified].
+
+   That member is constructed and destroyed per element, both wrapping a
+   call to 0x004c4e12 - the helper the Cdd error reporters use before
+   CString::Format - so it is very likely a CString holding the mode
+   name [inferred].
+
+   The general lesson, and it is worth applying before the next struct:
+   A RECORD DOES NOT NECESSARILY START WHERE ITS FIRST WRITE LANDS. For
+   a C++ codebase the static-constructor cluster gives base, stride and
+   count exactly, and costs one function read. Look there before
+   deriving a base from a write site.
+
+   A second tell was available and missed: a 0x24 stride with only 0x20
+   of writes should have prompted the question, and the answer was not
+   'a dead field at the end' but 'a live field at the front'.
+
+3.  Two teardown modes
+
+   maybe_Cdd_ReleaseSurfaces at 0x004742f0 takes one argument that
+   chooses how far to unwind [verified]:
+
+   +----------+---------------------------------+-------------------------------+
+   | Argument | Releases                        | Keeps                         |
+   +==========+=================================+===============================+
+   | non-zero | the six surface objects         | primary, clipper, IDirectDraw |
+   +----------+---------------------------------+-------------------------------+
+   | zero     | those, plus primary and clipper | nothing, if DAT_004e8948      |
+   +----------+---------------------------------+-------------------------------+
+
+   The partial mode is the interesting one. It drops the drawing
+   surfaces while keeping the device and the primary alive, which is
+   exactly what a resolution change needs - and it is how
+   maybe_Screen3D_UpdateScreen can rebuild surfaces at a new size
+   without dropping DirectDraw. See subsystems/mode-change.txt.
+
+   Every release nulls its global immediately, so calling it twice is
+   safe. maybe_Cdd_Dtor uses the full form.
+
+4.  The texture bank record
+
+   Before releasing anything, maybe_Cdd_ReleaseSurfaces frees texture
+   banks by walking the 0x149 array BACKWARDS, twice - pass 0 for
+   entries whose +0x0c is zero, pass 1 for the rest [verified]:
+
+   +--------+------------------------------+--------------------------------+
+   | Offset | Holds                        | From                           |
+   +========+==============================+================================+
+   | +0x00  | screen-mode selector         | maybe_DdCaps_ShouldLoad        |
+   +--------+------------------------------+--------------------------------+
+   | +0x04  | enable flag                  | maybe_DdCaps_ShouldLoad        |
+   +--------+------------------------------+--------------------------------+
+   | +0x08  | in-video-memory flag         | maybe_Cdd_CreateTextureSurface |
+   +--------+------------------------------+--------------------------------+
+   | +0x10  | a predicate callback         | maybe_DdCaps_ShouldLoad        |
+   +--------+------------------------------+--------------------------------+
+   | +0x1c  | a name or path string        | maybe_Cdd_CreateTextureSurface |
+   +--------+------------------------------+--------------------------------+
+   | +0x20  | surface size, pitch * height | same, summed by TotalSize      |
+   +--------+------------------------------+--------------------------------+
+   | +0x24  | a flag gating video memory   | maybe_Cdd_CreateTextureSurface |
+   +--------+------------------------------+--------------------------------+
+   | +0x2c  | set to 1 on reset            | maybe_DdCaps_Reset             |
+   +--------+------------------------------+--------------------------------+
+   | +0x30  | the DirectDraw surface       | maybe_Cdd_CreateTextureSurface |
+   +--------+------------------------------+--------------------------------+
+   | +0x34  | texture handle, reset to -1  | maybe_DdCaps_FreeTexture       |
+   +--------+------------------------------+--------------------------------+
+   | +0x38  | entry count, max 0x80        | maybe_DdBank_AllocSprites      |
+   +--------+------------------------------+--------------------------------+
+   | +0x3c  | entry array, 0x4e each       | maybe_DdBank_AllocSprites      |
+   +--------+------------------------------+--------------------------------+
+   | +0x40  | requested width              | maybe_Cdd_CreateTextureSurface |
+   +--------+------------------------------+--------------------------------+
+   | +0x44  | requested height             | maybe_Cdd_CreateTextureSurface |
+   +--------+------------------------------+--------------------------------+
+   | +0x48  | name buffer, 0x101 bytes     | maybe_DdCaps_SetName           |
+   +--------+------------------------------+--------------------------------+
+
+   CORRECTION. The offsets first recorded here - +0x0c, +0x18, +0x1c -
+   were wrong. They came from assuming the backward walk's pointer was
+   element+0x0c, which required the element base to be 0x005d41ee. It is
+   0x005d41d6, so the walk pointer is element+0x24 and every offset was
+   0x18 too low. The element bases follow from the constructor:
+   0x005d3a20 plus i * 0x149.
+
+   The record's shape is now bounded at both ends. The name buffer at
+   +0x48 is 0x101 bytes, and 0x48 + 0x101 = 0x149 exactly, which
+   accounts for the whole record and confirms the stride independently
+   [verified].
+
+   The handle at +0x34 goes to the same releaser D3D_FreeBankTextures
+   uses, which ties this array to subsystems/d3d-textures.txt. Seven
+   banks.
+
+   Why two passes in that order has not been established. Freeing one
+   group before the other suggests a dependency - system-memory copies
+   before video-memory ones, or shared banks last [guess].
+
+   CORRECTION. +0x30 was recorded here as a loaded flag, from
+   maybe_DdCaps_FreeTexture's test of it before freeing the handle at
+   +0x34. It is the DirectDraw SURFACE POINTER.
+   maybe_Cdd_CreateTextureSurface passes bank+0x30 straight to
+   CreateSurface as the output slot, so the free path was reading 'do I
+   have a surface' rather than a separate flag [verified].
+
+   The same function confirms +0x20 as the surface's byte size, pitch
+   times height - which is exactly the field maybe_DdCaps_TotalSize adds
+   up, so the two readings agree from opposite ends.
+
+4.1.  What the constructor initialises
+
+   maybe_DdCaps_Ctor at 0x00477550 is the ctor argument to the vector
+   iterator, and it touches every dword from +0x00 to +0x44 plus the
+   name buffer. That accounts for the whole record and closes the first
+   open question of section 8 [verified]:
+
+   +----------------+-------------+-----------------------------------------+
+   | Offset         | Ctor leaves | Note                                    |
+   +================+=============+=========================================+
+   | +0x00 .. +0x14 | 0           | six dwords, cleared                     |
+   +----------------+-------------+-----------------------------------------+
+   | +0x18          | 1           | a non-zero default                      |
+   +----------------+-------------+-----------------------------------------+
+   | +0x1c          | CONSTRUCTED | not cleared - see below                 |
+   +----------------+-------------+-----------------------------------------+
+   | +0x20 .. +0x28 | 0           | three dwords, cleared                   |
+   +----------------+-------------+-----------------------------------------+
+   | +0x2c          | 1           | matches 'set to 1 on reset'             |
+   +----------------+-------------+-----------------------------------------+
+   | +0x30          | 0           | the surface pointer, null               |
+   +----------------+-------------+-----------------------------------------+
+   | +0x34          | -1          | the texture handle, matches FreeTexture |
+   +----------------+-------------+-----------------------------------------+
+   | +0x38 .. +0x44 | 0           | four dwords, cleared                    |
+   +----------------+-------------+-----------------------------------------+
+   | +0x48          | 0           | 0x101 bytes, cleared                    |
+   +----------------+-------------+-----------------------------------------+
+
+   Only two fields get a non-zero default, +0x18 and +0x2c, and both get
+   1. +0x34 starting at -1 agrees with maybe_DdCaps_FreeTexture
+   resetting it to -1, so -1 is 'no texture' at both ends of the
+   lifetime.
+
+4.1.1.  +0x1c is a constructed object, and the name buffer is exactly 0x101
+
+   The ctor does not clear +0x1c. It constructs it [verified]:
+
+       0047756d  MOV  [EBP-0x10], ECX
+       00477570  MOV  ESI, ECX
+       00477572  LEA  ECX, [ECX + 0x1c]
+       00477575  CALL 0x004c4e12
+
+   0x004c4e12 is the same helper section 2 found wrapped around
+   MR_DisplayMode's first member and identified as very likely a CString
+   constructor. Section 4's table already had +0x1c as 'a name or path
+   string' from maybe_Cdd_CreateTextureSurface. The two readings agree:
+   it is a CString, constructed here and used there.
+
+   The tail is settled by construction rather than inference:
+
+       004775b2  LEA    EDI, [ESI + 0x48]
+       004775be  MOV    ECX, 0x40
+       004775c3  REP    STOSD          ; 0x40 dwords = 256 bytes
+       004775c5  STOSB                 ; one more byte
+
+   256 + 1 = 0x101, cleared explicitly, so the name buffer really is
+   char[257] and not char[256] with a stray byte after it. That also
+   explains why maybe_DdCaps_SetName can strncpy 0x100 bytes without
+   terminating: the 257th byte is zeroed at construction and never
+   written again, so the buffer is permanently NUL-terminated
+   [verified].
+
+   o For the reconstruction this is the field that must be declared
+     char[257]. Declaring char[256] lets the compiler pad the record to
+     332 and silently breaks the pointer arithmetic in every loop that
+     walks the array by 0x149.
+
+
+5.  The bank accessors
+
+   Six small functions operate on one bank record or on the whole array.
+   None self-identifies; all were named from what they touch [verified]:
+
+   +------------------------------+------------+------------------------------+
+   | Function                     | Address    | Does                         |
+   +==============================+============+==============================+
+   | maybe_DdCaps_SetName         | 0x004776b0 | copy 0x100 bytes to +0x48    |
+   +------------------------------+------------+------------------------------+
+   | maybe_DdCaps_FreeTexture     | 0x00477b00 | free one bank's texture      |
+   +------------------------------+------------+------------------------------+
+   | maybe_DdCaps_FreeAllTextures | 0x00474de0 | the two-pass walk            |
+   +------------------------------+------------+------------------------------+
+   | maybe_DdCaps_Reset           | 0x00477930 | free +0x3c, clear the record |
+   +------------------------------+------------+------------------------------+
+   | maybe_DdCaps_TotalSize       | 0x00474fe0 | sum +0x20 across banks       |
+   +------------------------------+------------+------------------------------+
+   | maybe_DdCaps_Ctor / Dtor     | 0x00477550 | the element pair             |
+   +------------------------------+------------+------------------------------+
+
+   maybe_DdCaps_FreeAllTextures and the opening of
+   maybe_Cdd_ReleaseSurfaces are the same two-pass walk, one written out
+   and one called. Whether the compiler inlined it or the source repeats
+   it cannot be told from here.
+
+   Two more general helpers came out of the same batch and belong to
+   dd.cpp rather than to the banks: maybe_GetSurfaceDesc at 0x00474fb0,
+   which zeroes a DDSURFACEDESC, sets dwSize to 0x6c and calls
+   GetSurfaceDesc; and Cdd_MessageBoxF at 0x00472bf0, a printf-style
+   wrapper over Cdd_MessageBox using a 0x800-byte stack buffer.
+
+
+5.1.  +0x34 is a bank INDEX, and it links the two arrays
+
+   maybe_DdCaps_FreeTexture at 0x00477b00 is fourteen instructions
+   [verified]:
+
+       if (this->surface /* +0x30 */) {
+           D3D_FreeBankTextures(this->f34);
+           this->f34 = -1;
+           this->surface = 0;
+       }
+       return 1;
+
+   Section 4 records +0x34 as a 'texture handle'. It is more specific
+   than that, and the callee settles it. D3D_FreeBankTextures indexes
+   its argument by 0x338 [verified]:
+
+       piVar3 = &g_bankPaletteSlots + param_1 * 0x338;
+       if (*(int *)(&DAT_004f95d4 + param_1 * 0x338) != 0) ...
+
+   0x338 is 824, the stride of g_bankRecords - the array based at
+   0x004f92f8 that holds a DirectDraw surface at +0x2e0 and its locked
+   bits at +0x330, indexed by face+0x36. So +0x34 of a texture bank is
+   an INDEX INTO g_bankRecords, not an opaque handle.
+
+   +--------------------------+--------+-------+----------------------------------+
+   | Array                    | Stride | Count | Reached by                       |
+   +==========================+========+=======+==================================+
+   | texture banks, this note | 0x149  | 7     | screen-mode selection            |
+   +--------------------------+--------+-------+----------------------------------+
+   | g_bankRecords            | 0x338  | many  | index in bank+0x34, or face+0x36 |
+   +--------------------------+--------+-------+----------------------------------+
+
+   That is a real ownership relation between two arrays that are easy to
+   confuse. A texture bank is the resolution-variant DESCRIPTOR - name,
+   screen mode, predicate, size - and it points at the g_bankRecords
+   slot that holds the actual surface and its sixteen sub-textures.
+   Reading them as two names for one thing, which the shared word 'bank'
+   invites, is wrong in both directions.
+
+   o -1 in +0x34 therefore means 'owns no g_bankRecords slot', which is
+     consistent with the constructor starting it at -1 and with
+     FreeTexture returning it to -1.
+
+5.1.1.  It does not release the DirectDraw surface
+
+   FreeTexture nulls +0x30 without calling Release on it. Its callee
+   does not release it either - D3D_FreeBankTextures walks the bank's
+   sixteen sub-textures, freeing D3D texture slots and releasing
+   IDirectDrawPalette objects, and never touches the surface at
+   bank+0x30 [verified].
+
+   RESOLVED in section 5.1.2, and the answer is the second one.
+
+   o Worth checking against the -DoRealLock family too. If a surface can
+     be dropped while a page's bits pointer is still cached at
+     g_bankRecords+0x330, that is the stale-pointer case section 47.3 of
+     rasterizer-pipeline.txt warns about.
+
+
+5.1.2.  Nothing releases the texture surface
+
+   maybe_Cdd_ReleaseSurfaces at 0x004742f0 frees texture banks before
+   any COM release, and its loop is maybe_DdCaps_FreeTexture written out
+   inline. The walk pointer is entry+0x24, so its piVar1[3] and
+   piVar1[4] are entry+0x30 and entry+0x34 [verified]:
+
+       if (entry->f30 != 0) {
+           D3D_FreeBankTextures(entry->f34);
+           entry->f34 = -1;
+           entry->f30 = 0;
+       }
+
+   Identical to the standalone function, including nulling +0x30 without
+   calling Release on it. So both teardown paths drop the pointer the
+   same way, and D3D_FreeBankTextures does not release it either - it
+   frees D3D texture slots and IDirectDrawPalette objects and never
+   touches +0x30.
+
+   The creator settles ownership. maybe_Cdd_CreateTextureSurface passes
+   &bank->f30 to IDirectDraw::CreateSurface as the output slot, twice -
+   the second is a retry after DDERR_OUTOFVIDEOMEMORY (0x8876017c),
+   falling back to system memory [verified]:
+
+       00477a10  LEA  EAX, [ESI + 0x30]
+       00477a22  CALL [EAX + 0x18]        ; CreateSurface
+       00477a2b  CMP  EBX, 0x8876017c     ; DDERR_OUTOFVIDEOMEMORY
+       00477a35  LEA  EAX, [ESI + 0x30]   ; retry
+
+   So the bank owns a surface it created, and every path that stops
+   using it nulls the pointer without releasing. On the evidence
+   available that is a LEAK [inferred - two independent teardown paths
+   and the creator have been read, but the field is reached by computed
+   addressing throughout, so no cross-reference can prove that nothing
+   anywhere releases it].
+
+   If it is a leak, the cost is not confined to shutdown:
+
+   +---------------------+-------------------------------+------------------+
+   | Trigger             | Path                          | Surfaces dropped |
+   +=====================+===============================+==================+
+   | a race load         | maybe_Track_SetHorizonBanks   | up to 3          |
+   +---------------------+-------------------------------+------------------+
+   | a resolution change | ReleaseSurfaces, partial mode | up to 7          |
+   +---------------------+-------------------------------+------------------+
+   | shutdown            | ReleaseSurfaces, full mode    | up to 7          |
+   +---------------------+-------------------------------+------------------+
+
+   Only the last is harmless. The partial mode exists precisely so a
+   resolution change need not tear down the device, and the horizon
+   banks are refreshed on every race load, so both of the repeatable
+   paths run often.
+
+   o Worth one more check before treating it as fact: a scan for any
+     Release reached from a pointer loaded out of a bank's +0x30. That
+     cannot be done by cross-reference and needs a small dataflow pass.
+
+   o For the port it hardly matters whether the original leaked - the
+     reimplementation must release the surface either way. It matters
+     for FIDELITY testing: a port that correctly releases will show
+     different video-memory behaviour from the original, and that is a
+     difference to expect rather than to chase.
+
+
+5.2.  The creator, and what it does not do
+
+   maybe_Cdd_CreateTextureSurface at 0x00477980 is __thiscall(bank,
+   width, height). The two arguments go into a DDSURFACEDESC with
+   dwFlags 7 - CAPS, HEIGHT, WIDTH - at +0x08 and +0x0c, which is what
+   identifies them [verified]. On success both are stored back into the
+   bank, and on failure both are zeroed:
+
+       if (hr == 0) { bank->f40 = width; bank->f44 = height; }
+       else         { bank->f40 = 0;     bank->f44 = 0;      }
+
+   Section 4 had +0x40 as 'set on success' without saying what it was
+   set to. It is the requested width, and +0x44 the requested height -
+   the dimensions the bank was created at, which is why the failure path
+   clears them rather than leaving a stale size.
+
+   The rest of the function is already described in section 4: video
+   memory first with a system-memory retry after DDERR_OUTOFVIDEOMEMORY,
+   then GetSurfaceDesc to confirm which memory class was really granted,
+   setting +0x08 and accumulating maybe_g_texVidMemTotal.
+
+5.2.1.  It overwrites +0x30 without releasing it
+
+   One detail matters for section 5.1.2. CreateSurface receives
+   bank+0x30 as its output slot directly, and nothing in this function
+   reads or releases whatever was there before [verified]. So the create
+   path does not release either.
+
+   That is the third independent path over the same field, and all three
+   treat it the same way:
+
+   +--------------------------------+-------------------------------+
+   | Path                           | What it does to +0x30         |
+   +================================+===============================+
+   | maybe_Cdd_CreateTextureSurface | overwrites with a new surface |
+   +--------------------------------+-------------------------------+
+   | maybe_DdCaps_FreeTexture       | nulls it                      |
+   +--------------------------------+-------------------------------+
+   | maybe_Cdd_ReleaseSurfaces      | nulls it, inlined             |
+   +--------------------------------+-------------------------------+
+
+   None of them calls Release. Callers do pair them -
+   maybe_Track_SetHorizonBanks frees three banks before loading one - so
+   the sequence in practice is null, then overwrite, and the interface
+   pointer is simply dropped at each step. That strengthens the reading
+   in section 5.1.2 without proving it, since the same caveat applies:
+   computed addressing means no cross-reference can close it.
+
+   o DAT_004ee9ec appears here as an alternative to bank+0x24 in
+     choosing video memory, and again in maybe_DdCaps_TotalSize as an
+     alternative to bank+0x24 in deciding whether an entry counts. The
+     same global overriding the same field in two places reads as a
+     global 'video memory is available' or 'use video memory' switch.
+     Unnamed, and worth one lookup when its writer is found.
+
+
+6.  The sprite record, 0x4e bytes
+
+   Each texture bank owns an array of these, at bank+0x3c with the count
+   at bank+0x38. maybe_DdBank_AllocSprites builds it: operator new of n
+   * 0x4e + 4, the count in the leading dword, then
+   _eh_vector_constructor_iterator_ over the elements. The count is
+   CLAMPED TO 0x80, so a bank holds at most 128 entries [verified].
+
+   +----------------+-------------------------------------------+
+   | Offset         | Holds                                     |
+   +================+===========================================+
+   | +0x00          | frame count                               |
+   +----------------+-------------------------------------------+
+   | +0x04, +0x08   | hotspot, subtracted from the destination  |
+   +----------------+-------------------------------------------+
+   | +0x0c, +0x10   | origin, added to the destination          |
+   +----------------+-------------------------------------------+
+   | +0x14, +0x18   | per-frame step in x and y                 |
+   +----------------+-------------------------------------------+
+   | +0x1c .. +0x28 | the source rect: left, top, right, bottom |
+   +----------------+-------------------------------------------+
+   | +0x2c          | unique id; 0 means the slot is free       |
+   +----------------+-------------------------------------------+
+   | +0x30          | back-pointer to the owning bank           |
+   +----------------+-------------------------------------------+
+   | +0x34          | colour key low, 3 bytes                   |
+   +----------------+-------------------------------------------+
+   | +0x37          | colour key high, 3 bytes                  |
+   +----------------+-------------------------------------------+
+   | +0x3a          | flags passed through to the blit          |
+   +----------------+-------------------------------------------+
+   | +0x3e          | the current frame                         |
+   +----------------+-------------------------------------------+
+   | +0x42          | an embedded CString name                  |
+   +----------------+-------------------------------------------+
+   | +0x4a          | CLIP MODE bitfield; see dd-blit.txt 2.1   |
+   +----------------+-------------------------------------------+
+
+   The two 3-byte fields at +0x34 and +0x37 both receive the same three
+   bytes from 0x004f0df4, which are 00 ff 00. CONFIRMED as a colour-key
+   low and high pair: maybe_Cdd_DrawSurface takes exactly such a pair,
+   packs each through the runtime pixel-format globals and sets
+   DDBLT_KEYSRCOVERRIDE. See subsystems/dd-blit.txt section 3
+   [verified].
+
+   maybe_DdBank_FindSprite searches all seven banks for an entry whose
+   +0x2c matches its argument, walking from base+0x2c and subtracting
+   0x2c on a hit. Its bank loop bound of 0x005d431f admits exactly seven
+   banks, which independently confirms the count that
+   maybe_DdCaps_StaticCtor gives [verified].
+
+   +---------------------------+------------+--------------------+
+   | Function                  | Address    | Does               |
+   +===========================+============+====================+
+   | maybe_DdSprite_Ctor       | 0x004772f0 | one sprite         |
+   +---------------------------+------------+--------------------+
+   | maybe_DdSprite_Dtor       | 0x004773b0 | one sprite         |
+   +---------------------------+------------+--------------------+
+   | maybe_DdBank_AllocSprites | 0x004776d0 | the array, max 128 |
+   +---------------------------+------------+--------------------+
+   | maybe_DdBank_FindSprite   | 0x00477270 | search all banks   |
+   +---------------------------+------------+--------------------+
+
+
+   IDENTIFIED. The 0x4e record is a SPRITE. maybe_DdSprite_Draw reads a
+   source rectangle out of it, steps that rectangle by a fixed stride
+   per frame, offsets the destination by an origin and a hotspot, and
+   hands both colour keys to the blit. maybe_DdBank_AddSprite fills the
+   same fields from its arguments and returns a unique id [verified].
+
+   The family was renamed accordingly - maybe_DdSprite_Ctor,
+   maybe_DdSprite_Dtor, maybe_DdBank_AllocSprites,
+   maybe_DdBank_FindSprite. The earlier names described where the record
+   lived rather than what it is.
+
+   Ids come from maybe_g_nextSpriteId, a monotonic counter, so they are
+   unique across every bank. That is what makes
+   maybe_DdBank_FindSprite's search of all seven banks meaningful: a
+   sprite handle identifies a sprite anywhere, not a slot within a bank.
+
+   A slot with +0x2c == 0 is free, which is both how
+   maybe_DdBank_AddSprite finds space and why the counter must never
+   issue 0.
+
+   One detail worth keeping for the port: maybe_DdSprite_Draw has an
+   interlace adjustment. When DAT_00624b14 is set it nudges the
+   destination y by one to correct parity, which pairs with the scanline
+   fill in subsystems/dd-present.txt section 3. Both would be dropped
+   together.
+
+6.1.  Three details of the draw
+
+   maybe_DdSprite_Draw at 0x00477400 is 327 bytes and its plate comment
+   covers the shape. Three details are worth pinning [verified].
+
+6.1.1.  It confirms bank+0x40 and +0x44 from a second consumer
+
+   The source rectangle is clamped against the owning bank before the
+   blit:
+
+       if (bank->f40 <= right)  right  = bank->f40 - 1;
+       if (bank->f44 <= bottom) bottom = bank->f44 - 1;
+
+   Right is clamped against +0x40 and bottom against +0x44, which is
+   only meaningful if those are the surface width and height. Section
+   5.2 established that from the producing side -
+   maybe_Cdd_CreateTextureSurface stores the requested width and height
+   there - and this is the same reading from a consumer that never sees
+   the creation. Two independent directions, so the identification no
+   longer rests on one function.
+
+   Note the clamp is to size MINUS ONE, so the rectangle's right and
+   bottom are treated as inclusive coordinates rather than as the
+   exclusive bounds a RECT normally carries. Worth keeping for the port;
+   an off-by-one here is a column of missing pixels.
+
+6.1.2.  The interlace rule is a parity match, not a nudge
+
+   Section 6 describes the adjustment as nudging y by one on the wrong
+   parity. The test is more specific than that:
+
+       if (DAT_00624b14 && ((srcTop + dstY) & 1)) dstY++;
+
+   It forces srcTop + dstY to be EVEN - that is, it makes the
+   destination row parity agree with the source row parity. That is what
+   a field-based or alternate-scanline blit needs: a sprite row that
+   came from an even source line must land on an even destination line,
+   or the interlace pattern breaks up. Pairs with the scanline fill in
+   dd-present.txt section 3, and both would be dropped together.
+
+6.1.3.  +0x3e is the last REQUESTED frame
+
+   The frame is stored before it is validated:
+
+       sprite->f3e = frame;
+       if (0 < frame && frame < sprite->frameCount) ...step the rect...
+
+   So an out-of-range frame is recorded in +0x3e and then ignored for
+   the stepping, leaving the rectangle at frame zero. The field is the
+   last frame asked for, not the frame actually drawn, and a reader
+   cannot use it to tell what is on screen.
+
+
+6.2.  Three details of the allocator
+
+   Section 6 records that the family was renamed to the sprite
+   vocabulary. Four references had not been updated with it - two field-
+   table cells, the accessor table and the paragraph above - and have
+   been reconciled against the database.
+
+   Three behaviours are worth recording beyond the allocation itself
+   [verified]:
+
+   o A COUNT OF ZERO IS A NO-OP. The whole body is inside if (n != 0),
+     so calling it with zero leaves +0x38 and +0x3c untouched rather
+     than clearing them. It cannot be used to empty a bank.
+
+   o THE CLAMP IS SILENT. n > 0x80 is truncated to 0x80 with no error
+     and no report, so a caller asking for more entries than a bank can
+     hold gets 128 and no indication that the rest were dropped.
+
+   o IT DOES NOT FREE AN EXISTING ARRAY. +0x3c is overwritten directly.
+     If a bank is allocated twice, the previous operator new block is
+     dropped.
+
+   That last one is the fourth field in this subsystem handled the same
+   way, after the three paths over +0x30 in section 5.2.1. The pattern
+   is consistent enough to be a house style rather than an oversight:
+   resources are dropped by overwriting the pointer, and the pairing
+   with a free is left to the caller.
+
+   o maybe_DdCaps_Reset is what frees +0x3c, per section 4. Whether
+     every allocation path is preceded by a Reset has not been checked,
+     and that is the same open question as section 5.1.2 in a second
+     place.
+
+   On failure it is careful in the other direction: if operator new
+   returns null, +0x3c is set to null AND +0x38 is reset to 0, so the
+   count never describes an array that does not exist. The success and
+   failure paths are not equally defensive.
+
+
+6.3.  AddSprite, and a field it never sets
+
+   maybe_DdBank_AddSprite at 0x00477790 takes sixteen arguments and
+   every one lands in a named field, so the record's layout and the call
+   signature confirm each other [verified]:
+
+       int DdBank_AddSprite(bank, CString name,
+                            left, top, right, bottom,   /* +0x1c.. */
+                            hotspotX, hotspotY,         /* +0x04, +0x08 */
+                            originX,  originY,          /* +0x0c, +0x10 */
+                            stepX,    stepY,            /* +0x14, +0x18 */
+                            frameCount,                 /* +0x00 */
+                            flags,                      /* +0x3a */
+                            keyLow, keyHigh);           /* +0x34, +0x37 */
+
+   It scans bank+0x3c for the first entry whose +0x2c is zero, stamps it
+   with maybe_g_nextSpriteId post-incremented, writes the back-pointer
+   at +0x30, and returns the id - or 0 if the bank is full, which
+   section 6 already records.
+
+6.3.1.  A null colour key means black, not 'no key'
+
+   Either key argument may be null, and both fall back to the same blob
+   [verified]:
+
+       if (keyLow  == NULL) keyLow  = &DAT_004ee938;
+       if (keyHigh == NULL) keyHigh = &DAT_004ee938;
+
+   DAT_004ee938 is eight zero bytes. So omitting a key does not disable
+   keying - it installs the key 00 00 00, and black becomes transparent
+   for that sprite. Distinct from the 00 ff 00 at 0x004f0df4 that
+   section 6 cites, which is what one particular caller passes.
+
+   o For the port that is a behavioural default worth preserving
+     exactly. A reimplementation that treats a null key as 'no colour
+     key' would draw black pixels the original drops.
+
+6.3.2.  +0x4a is set for exactly one sprite
+
+   AddSprite does not write +0x4a, and maybe_DdSprite_Ctor zeroes it.
+   Across the whole binary the field has exactly two instructions
+   touching it [verified]:
+
+   +---------------------------------+--------+-----------------------+
+   | Site                            | Access | What                  |
+   +=================================+========+=======================+
+   | FUN_004121e0 @0x00412508        | write  | MOV [EAX + 0x4a], ESI |
+   +---------------------------------+--------+-----------------------+
+   | maybe_DdSprite_Draw @0x00477517 | read   | MOV EBX, [EDX + 0x4a] |
+   +---------------------------------+--------+-----------------------+
+
+   The writer reaches its sprite through maybe_DdBank_FindSprite and
+   stores 1, 4 or 6 depending on g_cfgScreenMode, g_cfgWidescreen169 and
+   g_fullscreenResolved - then a few lines later tests the same value
+   with & 4. A quantity written as 1, 4 or 6 and then bit-tested is a
+   flags word, not a scale.
+
+   The reader is Draw's fallback, if (scale == 0) scale = sprite->f4a,
+   feeding maybe_Cdd_DrawScaled. So for every sprite except the one
+   FUN_004121e0 patches, +0x4a stays 0 and the fallback substitutes 0
+   for 0 - a no-op. The field is not a general default; it is a special
+   case for a single sprite.
+
+   o RESOLVED in section 6.3.3 by reading maybe_Cdd_DrawScaled: +0x4a is
+     not a scale.
+
+
+6.3.3.  +0x4a is not the scale, and the argument map proves it
+
+   maybe_Cdd_DrawScaled at 0x004788b0 does take a scale, and it is a
+   FLOAT - the fast path tests it against 0x3f800000, the bit pattern of
+   1.0f, and otherwise runs both dimensions through __ftol [verified].
+   The question is whether +0x4a is the argument that lands there. It is
+   not.
+
+   Mapping maybe_DdSprite_Draw's push sequence at 0x0047750f onto
+   DrawScaled's prologue settles it. Pushes are in reverse order, so the
+   last push is the first argument [verified]:
+
+   +------+--------------------+-----------------------------+
+   | Arg  | Pushed from        | Used by DrawScaled as       |
+   +======+====================+=============================+
+   | 1, 2 | ESI, EDI           | destination x and y         |
+   +------+--------------------+-----------------------------+
+   | 3    | LEA [ESP+0x24]     | the source rect             |
+   +------+--------------------+-----------------------------+
+   | 4    | [ESP+0x48]         | THE SCALE, compared to 1.0f |
+   +------+--------------------+-----------------------------+
+   | 5    | sprite+0x3a        | flags                       |
+   +------+--------------------+-----------------------------+
+   | 6    | the +0x4a value    | passed through untouched    |
+   +------+--------------------+-----------------------------+
+   | 7, 8 | sprite+0x34, +0x37 | the colour key pair         |
+   +------+--------------------+-----------------------------+
+
+   DrawScaled's prologue confirms the alignment: it loads [ESP+0x24] and
+   [ESP+0x2c] into the destination x and y, [ESP+0x30] as the rect and
+   [ESP+0x34] as the value it compares against 1.0f. The +0x4a value is
+   one slot further along and is handed straight to
+   maybe_Cdd_DrawSurface without being read.
+
+   So the scale reaching DrawScaled is a separate caller-supplied
+   argument to maybe_DdSprite_Draw, and +0x4a defaults a DIFFERENT
+   parameter - one that only the blit core interprets. That agrees with
+   the writer in FUN_004121e0 storing 1, 4 and 6 and bit-testing with &
+   4, and it removes the contradiction: a float scale could never hold
+   those values meaningfully, because as float bit patterns 1, 4 and 6
+   are denormals indistinguishable from zero.
+
+   o Two places carried the wrong reading and are corrected: the field
+     table above, and the plate comment on maybe_DdSprite_Draw, which
+     said 'scale defaults to entry+0x4a when the caller passes 0'. The
+     defaulting is real; calling the defaulted parameter a scale is not.
+
+   o RESOLVED. It is a CLIP MODE bitfield, arriving as
+     maybe_Cdd_DrawSurface's param_5 and choosing what bounds the draw.
+     See dd-blit.txt section 2.1.
+
+
+7.  Banks are resolution-variant
+
+   maybe_DdCaps_ShouldLoad at 0x00474e40 decides whether a given bank is
+   wanted, and the answer depends on the display mode [verified]:
+
+       if (a menu is up)                       return 0
+       banks 4, 5, 6: load only when bank+0x00 == g_cfgScreenMode
+       the others:    bank+0x00 against 2, together with
+                      g_cfgSmallFonts and g_cfgScreenMode
+       then the predicate at bank+0x10, if present
+       finally the name at bank+0x48 must be non-empty
+
+   So the engine keeps texture banks in per-resolution variants and
+   loads only the matching set. The deciding pair is g_cfgScreenMode and
+   g_cfgSmallFonts - exactly the pair that picks between the LowRes and
+   HiRes halves of every font id in structs/MR_Font.txt. The same idea
+   runs through both subsystems.
+
+   maybe_DdCaps_ReloadAll at 0x00474f10 is the operation that follows
+   from it: free every bank's texture in a two-pass backward walk, then
+   walk forward and reload each bank that ShouldLoad accepts.
+
+   ON THE SPINE. That is the second half of what a resolution change
+   costs. maybe_Cdd_ReleaseSurfaces' partial mode re-creates the
+   surfaces; this re-uploads every texture bank, re-selected against the
+   new g_cfgScreenMode. A port that changes resolution without tearing
+   down the device needs both halves, and both already exist.
+
+   One detail worth keeping: the free walk runs backwards and the load
+   walk forwards, and their two-pass group order is inverted as well, so
+   the group freed last is loaded first. Whether that matters or is
+   incidental has not been established [verified as to the order,
+   unexplained as to the reason].
+
+
+7.1.  Banks 4, 5 and 6 are the horizon, one per resolution
+
+   Section 7 established that banks are resolution-variant without
+   saying which banks or what they hold. FUN_00410350, called from
+   maybe_Game_LoadRace with a track index, answers both [verified]:
+
+       off = track * 0x130;
+       sprintf(scratch, "%sBank\HorizHi.raw",  path(off));
+       DdCaps_SetName(&bank[6], scratch);
+       sprintf(scratch, "%sBank\HorizMed.raw", path(off));
+       DdCaps_SetName(&bank[5], scratch);
+       sprintf(scratch, "%sBank\HorizLow.raw", path(off));
+       DdCaps_SetName(&bank[4], scratch);
+       DdCaps_FreeTexture() x3;
+       switch (g_cfgScreenMode) { 0, 1, 2 -> one LoadRawToSurface }
+
+   The three addresses are 0x005d3f44, 0x005d408d and 0x005d41d6, which
+   are exactly base + 4, 5 and 6 times 0x149. So the reserved trio of
+   section 7 is the HORIZON backdrop, held per track and per resolution,
+   renamed on every race load and reloaded for whichever screen mode is
+   current.
+
+   +-----------------+-------------------+-------+
+   | g_cfgScreenMode | Bank loaded       | Index |
+   +=================+===================+=======+
+   | 0               | Bank\HorizLow.raw | 4     |
+   +-----------------+-------------------+-------+
+   | 1               | Bank\HorizMed.raw | 5     |
+   +-----------------+-------------------+-------+
+   | 2               | Bank\HorizHi.raw  | 6     |
+   +-----------------+-------------------+-------+
+
+   That is independent corroboration of the mode numbering.
+   structs/MR_DisplayMode.txt derives g_cfgScreenMode as a size class
+   from the mode dimensions and records that 2 is 640x480 rather than
+   320x240; the filenames agree from a completely different direction,
+   with 2 taking the Hi variant and 0 the Low.
+
+   The path prefix comes from a per-track record array based at
+   DAT_004dc088 with a stride of 0x130, the string sitting at +0x24 of
+   each record. That array is read by a dozen functions outside dd.cpp
+   and is not part of this subsystem; noted as an edge, not followed.
+
+   o Only ONE of the three is ever resident. The other two are named but
+     freed, so a resolution change costs a reload of the horizon exactly
+     as section 7 describes for banks generally.
+
+
+7.2.  The horizon is a SCROLLING 2D PANORAMA, not geometry
+
+   FUN_00480930 registers the sprites and Dd_DrawHorizon
+   Between them they are the whole sky: there is no dome, no
+   skybox and no 3D at all.
+
+   THE ART IS ONE 256x256 PAGE CUT IN HALF. FUN_00480930 allocates
+   two sprites on bank 6 and names them from rectangles:
+
+   +--------------------+-----------------------+------------------+
+   | Sprite             | Rect (x0,y0,x1,y1)    | Mode             |
+   +====================+=======================+==================+
+   | Horizon 1 HiRes    | 0, 0, 255, 127        | 2, 640x480       |
+   | Horizon 2 HiRes    | 0, 128, 255, 255      | 2                |
+   | Horizon 1 MedRes   | 0, 0, 203, 101        | 1                |
+   | Horizon 2 MedRes   | 0, 102, 203, 203      | 1                |
+   | Horizon 1 LowRes   | 0, 0, 255, 63         | 0, one only      |
+   +--------------------+-----------------------+------------------+
+
+   so the high and medium modes get a PAIR of half-height strips and
+   the low one a single short strip.  [verified]
+
+   THE DRAW TILES THEM ALTERNATELY ACROSS THE SCREEN. The camera's
+   yaw comes out of the view matrix with fpatan, becomes a pixel
+   offset, and the two strips are laid side by side until the
+   viewport is covered:
+
+       for (; x + w < 0; x += w)  parity ^= 1;   /* wrap left */
+       if (parity) swap(A, B);
+       do {
+           DdSprite_Draw(A, x,     y);
+           DdSprite_Draw(B, x + w, y);
+           x += 2 * w;
+       } while (x <= g_viewMaxX);
+
+   THE PARITY FLIP IS THE INTERESTING PART. Wrapping the offset back
+   onto the screen can land on either strip, so the loop counts how
+   many strip-widths it wrapped and swaps A and B when that count is
+   odd. Without it the two halves would change places whenever the
+   camera passed a multiple of the strip width and the seam would
+   jump.  [verified]
+
+   ABOVE AND BELOW ARE FLAT FILLS. Once the band is drawn, two
+   Screen3D_QueueScreenQuad calls cover the rest of the viewport -
+   one from the top of the screen down to the band, one from the
+   band to the bottom. Their uv is a SINGLE TEXEL taken from the
+   sprite's own corners: piVar4[7]/[8], the top-left, for the sky
+   above, and piVar4[9]/[10], the bottom-right, for the ground
+   below. So the sky colour and the ground colour are whatever the
+   horizon strip's corner pixels happen to be, and no separate
+   colour is stored anywhere.
+
+   o WHICH EXPLAINS A SYMPTOM WORTH RECORDING. On a build where the
+     band does not draw, the two fills still do - and they present
+     as a pair of flat rectangles with nothing between them. That is
+     exactly what MOTO.EXE shows on this machine under the 16-bit
+     colour problem: "2 small skybox squares and all the geometry
+     missing" [observed]. The fills are the last thing standing.
+
+   o AND THE SCALE IS RESOLUTION-DERIVED, not stored:
+     (g_viewMaxX * 6) / 640.
+
+7.2.1.  The scroll arithmetic, and the six scalars behind it
+
+   Every constant Dd_DrawHorizon uses is now read rather than
+   inferred. The .rdata four came out of the Ghidra database and the
+   .data four out of a running race through the mrhook agent, so the
+   two halves corroborate each other rather than sharing a source.
+
+   +--------------+-------------+------------------------------------+
+   | Address      | Value       | Role                               |
+   +==============+=============+====================================+
+   | 0x004d00d8   | 100*pi      | added until a negative heading     |
+   |              |             | goes positive                      |
+   +--------------+-------------+------------------------------------+
+   | 0x004d00e0   | 2*pi        | the fmod modulus, and the heading  |
+   |              |             | span of one period once over S     |
+   +--------------+-------------+------------------------------------+
+   | 0x004d00e8   | pi/2        | the quarter turn the strip index   |
+   |              |             | is offset by                       |
+   +--------------+-------------+------------------------------------+
+   | 0x004d00d0   | 2607.5947   | 0x4000/(2*pi), the trig table      |
+   |              |             | scale - the project's usual one    |
+   +--------------+-------------+------------------------------------+
+   | 0x004d00f0   | 50000.0     | how far out the horizon point sits |
+   +--------------+-------------+------------------------------------+
+   | 0x004db2b4   | 0.25        | g_horizonPitchScale, the scale on  |
+   |              |             | the projected offset               |
+   +--------------+-------------+------------------------------------+
+   | 0x004db2b0   | 5           | g_nHorizonYBias, subtracted from   |
+   |              |             | the band's y                       |
+   +--------------+-------------+------------------------------------+
+   | 0x004e4f94   | 0           | -CorrectRatioTextures; subtracted  |
+   |              |             | from 256 to give the uv divisor    |
+   +--------------+-------------+------------------------------------+
+   | 0x006d20c4   | 394.0       | g_projScaleX, the live projection  |
+   |              |             | scale - see below                  |
+   +--------------+-------------+------------------------------------+
+
+   THE HORIZONTAL SCROLL, with w = 256 the strip width:
+
+       Y    = fmod(heading, 2*pi)
+       S    = (g_viewMaxX * 6) / 640          /* integer */
+       kS   = 2*pi / S
+       r    = Y - trunc(Y / kS) * kS
+       x    = -(2w + trunc(r / kS * 2w))
+
+   so one 512-px panorama period spans 2*pi/S radians of heading.
+   S is INTEGER and therefore coarse: 2 at 320 wide, 4 at 512, 5 at
+   640. At 640x480 that gives the sky a 90-degree horizontal field
+   against the 3D pass's 78, and the mismatch is the binary's rather
+   than a transcription error - worth knowing before it gets
+   "fixed".
+
+   THE VERTICAL IS A PROJECTED POINT, not a stored horizon line. A
+   point 50000 away along the pitched view direction goes through
+   the lens and lands the band's bottom edge on the horizon:
+
+       yp   = -50000 * sin(pitch)
+       zp   =  50000 * cos(pitch)
+       y    = trunc(lens/zp * yp * 0.25) - h - 5 + vpA + vpB
+
+   o THE LENS IS g_projScaleX, ALREADY NAMED. projection.txt has it
+     as g_projBaseX * g_projZoom, so the horizon does not carry its
+     own lens - it reads whatever the 3D pass is currently set to,
+     which is why the two stay consistent when the camera zooms.
+
+   o IT READ 394.0 LIVE, which is the number src/menu.c's
+     P1_VIEW_LENS was calibrated to by hand from a single
+     paused-frame measurement. Two independent derivations agreeing
+     on 394 promotes the debug camera's lens from a fitted constant
+     to a corroborated one. projection.txt records 480.0 for the
+     same global from a different moment, which is consistent -
+     it is derived and therefore varies.
+
+
+7.2.2.  Reconstructed, and transcribed rather than substituted
+
+   src/horizon.c draws it. The art resolves as
+   "<track>BANK\HORIZHI.RAW" through track_asset_name and loads
+   with bank_load mode 1 - the mode-0 skip of texture-banks.txt 4.2
+   does NOT apply, because maybe_Track_SetHorizonBanks reaches the
+   file through Cdd_LoadRawToSurface and not through
+   Bankw_LoadRawTexture [verified, 0x00410350].
+
+   Only the HiRes variant is built, because the port is 640x480,
+   which is screen mode 2, which is HorizHi.
+
+   NOTHING IN IT IS A SUBSTITUTION ANY MORE. Two were flagged when
+   this was first written, and BOTH TURNED OUT TO BE MY ERROR rather
+   than gaps in the binary. Recorded because the mistake is
+   instructive:
+
+   o THE HEADING LOOKED IMPOSSIBLE AND WAS NOT. 0x00402990 adds the
+     camera record's translation at +0x8c to the third matrix row at
+     +0x80 and takes atan2 of that z and x. Read cold, that is
+     dominated by where the camera STANDS rather than where it
+     POINTS, so it was called "not a heading at all" and replaced.
+
+     It is a heading. MR_ModelInstance.txt 3.4 already recorded that
+     Camera_LookAt writes the view matrix with TRANSLATION ZERO, so
+     the addition contributes nothing and the atan2 is of a pure
+     direction - the third row, the camera's forward vector. The
+     answer was in docs/ before the objection was written.
+
+   o THE VERTICAL WAS FOLDED AND SHOULD NOT HAVE BEEN. vpA and vpB
+     were called unread and collapsed into "the viewport centre
+     row". Screen3D_GetViewportRows (0x0049a010) is FOUR LINES and
+     hands back g_viewTopMargin and g_viewCentreY unmodified - 0 and
+     240 live. The -5 does not cancel, so the fold left the band
+     five pixels low and it showed [observed].
+
+   THE LESSON, since it has now cost time twice in this document: a
+   formula that looks wrong is a reason to go and read the record it
+   operates on, not a licence to replace it. Both "impossible"
+   readings were resolved by four lines of a callee and one sentence
+   of an existing struct note.
+
+7.2.3.  Confirmed against the running game
+
+   A hook at 0x00402d62 - the 10-byte MOV [0x005f1310],1, where EDI
+   already holds the finished band y - caught four identical frames
+   of a live race on ile01:
+
+       EDI  0x62        band top y = 98, so the horizon line is 226
+       EBP  0x100       strip width 256, as the sprite rects say
+       EBX  0xfffffd80  start x -640 = -(2w + 128)
+       [ESP+0x4c]       pitch +0.10322 rad = 5.914 degrees
+
+   THE PITCH SIGN IS OPPOSITE OURS. The game reports +0.1032 where
+   the port's asin of the view direction gives -0.104 for the same
+   camera. The magnitudes agree, and because the port also negates
+   in -50000*sin(pitch), the two flips cancel and the arithmetic
+   matches. Worth knowing before someone "fixes" one of them.
+
+   THAT SAMPLE SETTLED THE DAMP. Against y = proj - h - 5 + 0 + 240
+   the two candidates are
+
+       with 0.25     proj = -10.2  ->  y = 97
+       without       proj = -40.8  ->  y = 67
+
+   and the game says 98. So the damp is applied and is not a
+   misreading; it is ile01's own value rather than a fixed fourfold
+   softening - 7.2.5.
+
+   AND F IS THE CAMERA'S HEIGHT, which closed the last pixel. The
+   binary multiplies two terms by the float at camera+0x9c, and
+   MR_ModelInstance.txt 3.3 puts the record's position at +0x98, so
+   +0x9c is position.Y. The point is therefore HZ_DIST out along the
+   pitched view direction LIFTED TO THE EYE, which is the true
+   horizon. With F = 256.23 at the trace's pitch:
+
+       y' = 256.23*cos - 50000*sin = -4897.8
+       z' = 256.23*sin + 50000*cos =  49760.3
+       proj = 394/49760.3 * -4897.8 * 0.25 = -9.695  ->  -9
+       y    = -9 - 128 - 5 + 0 + 240 = 98
+
+   exact. Dropping F gives -10 and so 97, which is precisely the
+   one-pixel residual that stood before the record was read.
+
+7.2.4.  The camera record stores its basis in COLUMNS, and reading
+        it as rows scrolled the sky backwards
+
+   Reported symptom: the panorama slides the wrong way round a
+   corner - turn left and the sky goes further left.
+
+   THE SCROLL ARITHMETIC WAS NEVER AT FAULT.  7.2.1's formula is
+   transcribed correctly and 7.2.3's trace confirms it - but that
+   trace caught the band's Y.  Nothing had checked which way the
+   panorama moved, and the heading feeding it was wrong.
+
+   0x00402990 reads +0x80..0x88, adds the translation at +0x8c
+   (zero, LookAt writes it so) and takes atan2 of that z against
+   that x.  This document and horizon.c both read +0x80..0x88 as the
+   camera's FORWARD row.  It is not; it is the third row of a matrix
+   whose COLUMNS are the basis:
+
+   +---------+------------------------------+------------------+
+   | reading | forward vector               | dot with         |
+   |         |                              | (bike - camera)  |
+   +=========+==============================+==================+
+   | columns | (m[2], m[5], m[8])           |          +0.935  |
+   +---------+------------------------------+------------------+
+   | rows    | (m[6], m[7], m[8])           |          -0.662  |
+   +---------+------------------------------+------------------+
+
+   The column reading points at the bike; the row reading points
+   away.  [verified]
+
+   WHY THE ROW READING LOOKED RIGHT: row1 comes out (0, +0.995,
+   -0.099), near world up, and that fits EITHER layout - as
+   (right.y, up.y, fwd.y) or as the up row.  It is not a
+   discriminator, and it was the only check made.
+
+   SO +0x80 IS right.z AND +0x88 IS fwd.z.  With right = (fwd.z, *,
+   -fwd.x), checked against the measured basis, the binary computes
+
+       atan2(m[8], m[6]) = atan2(fwd.z, right.z)
+                         = atan2(d.z, -d.x)
+
+   which is pi minus the heading horizon.c had - a REFLECTION, so it
+   runs the opposite way as the camera turns.
+
+   MEASURED on MOTO turning right, eight steps [verified]:
+
+   +----------+-------------+---------------+
+   | step     | bike yaw    | horizon yaw   |
+   +==========+=============+===============+
+   | settled  |     +90.000 |       +90.458 |
+   +----------+-------------+---------------+
+   | 1        |      82.046 |        94.792 |
+   +----------+-------------+---------------+
+   | 4        |      64.556 |       109.841 |
+   +----------+-------------+---------------+
+   | 7        |      47.153 |       126.452 |
+   +----------+-------------+---------------+
+
+   The two run in opposite directions at the same rate, and pi minus
+   the bike's heading tracks the horizon's to within the camera's
+   own lag.  horizon.c now takes atan2(d[2], -d[0]).
+
+   THE VERTICAL IS UNAFFECTED - it uses the pitch, which comes from
+   the same third row's y and is a different component.  7.2.3's
+   pixel result stands.
+
+7.2.5.  The damp and the Y bias come from the TRACK, not the code
+
+   Both are read by Trk_Load, four bytes each, under a version > 2
+   gate [verified]:
+
+   +------------+-------------------+-------+------------------------+
+   | Read at    | Global            | Type  | Used by Dd_DrawHorizon |
+   +============+===================+=======+========================+
+   | 0x0040e0a5 | 0x004db2b0        | int   | the Y bias, 0x00402d37 |
+   +------------+-------------------+-------+------------------------+
+   | 0x0040e0b9 | 0x004db2b4        | float | the damp, 0x00402d2a   |
+   +------------+-------------------+-------+------------------------+
+
+   Both globals are ZERO in the image, so a version 2 track leaves
+   them at zero rather than at any built-in default.
+
+   THE DAMP MULTIPLIES THE PROJECTION, so it is not a fixed fourfold
+   softening of the pitch response - it is whatever the track says.
+   Read live, with the band top each binary draws at race start:
+
+   +------------+-------+-------+----------+---------------------+
+   | Track      | bias  | damp  | band top | with ile01's pair   |
+   +============+=======+=======+==========+=====================+
+   | ile01      |     5 | 0.25  |       98 | 98, exact           |
+   +------------+-------+-------+----------+---------------------+
+   | Red City   |   -25 | 1.0   |      100 | 98, two pixels high |
+   +------------+-------+-------+----------+---------------------+
+
+   So a reconstruction that hardcodes one track's pair is pixel-exact
+   on that track and wrong everywhere else, by an amount that looks
+   like a camera fault rather than a data one.  That is the trap this
+   section exists to mark.
+
+7.2.6.  The period divisor is a MODE SELECTOR, not a width
+
+   The scroll period comes from
+
+       s  = (viewMaxX * 6) / 640
+       kS = 2pi / s
+
+   and the original has exactly three screen modes, so that integer
+   divide is picking one of three answers: s is 2 at 320 wide, 4 at
+   512 and 5 at 640.  One 512-pixel period spans 2pi/s radians of
+   heading.
+
+   WIDESCREEN IS OURS AND BREAKS THE ASSUMPTION.  Fed an 854-wide
+   frame the same expression returns 7, where 640 returns 5 - so kS
+   falls from 1.2566 to 0.8976 and the whole panorama re-phases.  On
+   screen that reads as the sky sliding sideways by roughly the width
+   the frame gained, which looks like the band being anchored to the
+   right edge rather than like a period change.
+
+   One period is 512 AUTHORED pixels at any aspect.  A wider frame
+   shows more of it; it does not stretch it.  So the divisor is taken
+   from the design width and the draw extent from the real one -
+   horizon.c.
+
+7.2.7.  The panorama anchors to x = 0; the world anchors to its centre
+
+   The phase above places the panorama's origin column at screen
+   x = 0.  The 3D pass projects about g_viewCentreX.  At the design
+   width those agree - 320 is half of 640 - and the original, which
+   has no frame wider than its design, never has to care.
+
+   OUR 16:9 IS 854 WIDE AND Hor+ (options.h), so g_viewCentreX
+   becomes 427 while the sky's anchor stays at 0.  A world ray
+   straight ahead moves from x 320 to x 427; the sky column that was
+   ahead stays at 320.  The two part by 107, which is half the width
+   gained, and reads on screen as the sky sliding sideways when the
+   aspect is toggled.
+
+   So horizon.c adds g_viewCentreX - FB_DESIGN_W / 2 after the parity
+   wrap and renormalises, which is zero at 4:3 and leaves that path
+   byte-identical.
+
+   o THE SCROLL RATES ALREADY AGREE and are not the problem.  The
+     sky runs 512 px per 2pi/5 of heading, 7.111 px per degree; the
+     world runs g_projScaleX * pi/180, 6.876 at a 394 lens.  The 3.4
+     per cent mismatch is the binary's own - 7.2.6 - and it is the
+     same in both aspects, so what the widening breaks is the ANCHOR
+     and nothing else.
+
+8.  Open questions
+
+   o ANSWERED - the record is g_cameraRecords (0x005161c0), stride
+     0x238, indexed by DAT_004dc0f8: view matrix float[12] at +0x68
+     with translation at +0x8c, position float[3] at +0x98. So the
+     horizon's F at +0x9c is the CAMERA'S HEIGHT, and including it
+     reproduces the traced band y exactly. Callers are FUN_00403180
+     and maybe_Game_RenderFrame (0x0047ff90).
+
+   o ANSWERED - vpA and vpB are g_viewTopMargin (0x006d1040) and
+     g_viewCentreY (0x00624f88), 0 and 240 in a live 640x480 race.
+
+   o WHY 0.25? g_horizonPitchScale damps the sky's pitch response
+     fourfold against a true projection through g_projScaleX. A
+     hook on 0x00402d30 reading the projected value against the
+     camera's real pitch would settle whether the sky is meant to
+     lag the world or whether the 0.25 cancels a factor of four
+     that lives elsewhere in the projection.
+
+   o RESOLVED in section 4.1. maybe_DdCaps_Ctor touches every dword from
+     +0x00 to +0x44 and clears the 0x101-byte name buffer, which
+     accounts for the whole 0x149.
+
+   o Whether field +0x00 of MR_DisplayMode really is a CString. Reading
+     maybe_DisplayMode_Ctor's callee at 0x004c4e12 would settle it, and
+     would also confirm whether the mode name is ever populated -
+     Cdd_EnumModesCallback does not write it.
+
+   o DAT_004e8948 gates whether the full teardown releases IDirectDraw
+     itself. What sets it is unknown.
+
+   o The two-pass order in the texture bank free.
+
+   o What the 0x4e entry's key at +0x2c identifies. It is the only field
+     anything searches on, so naming it would name the entry.
+
+   o RESOLVED. +0x34 and +0x37 are a colour-key low/high pair.
+     maybe_Cdd_DrawSurface packs both and sets DDBLT_KEYSRCOVERRIDE. See
+     subsystems/dd-blit.txt section 3.
+
+   o What the predicate at bank+0x10 tests. It is a per-bank callback
+     that can veto loading, and none of the seven have been followed.

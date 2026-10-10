@@ -1,0 +1,1572 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      WHOLE-FUNCTION IMPORT
+
+
+Abstract
+
+   How gameplay code is brought over from Ghidra from now on: one C
+   function per original function, carrying the original's name, so
+   that the same breakpoint can be set on both sides and the two
+   compared directly.
+
+   This replaces the slice-per-task habit that produced the current
+   racer and physics code. It is a change of METHOD, not of the
+   project's rules - rule 5 already asks for the original's shape
+   including the ugly parts, and this is what following it looks
+   like.
+
+Table of Contents
+
+   1. Why
+   2. What changes
+   3. The byte-exact racer - DONE
+   4. Importing one function
+   5. Where imported functions live
+   6. The verification loop
+   7. Import order
+   8. Retiring the slices
+   9. Open questions
+
+1.  Why
+
+   THE SLICES LOSE THE BRANCHES NOBODY KNEW TO LOOK FOR. A slice is
+   written from the part of a function someone had a reason to read.
+   Everything else in that function is silently dropped, and nothing
+   records that it was dropped.
+
+   Four separate defects in the wall response were traced in one
+   session, and ALL FOUR were already present in
+   maybe_Racer_UpdateGroundContact:
+
+   +-----------------------------------+----------------------------+
+   | What was missing                  | Where it already was       |
+   +===================================+============================+
+   | the bounce/scrape gate is 3D      | 0x004692e4                 |
+   +-----------------------------------+----------------------------+
+   | the 0.75 damping precedes the     | 0x004692b3 store at        |
+   | branch                            | 0x004692d3                 |
+   +-----------------------------------+----------------------------+
+   | the clip runs TWICE, against two  | 0x00468fe9 and 0x0046909f  |
+   | segments                          |                            |
+   +-----------------------------------+----------------------------+
+   | a pending yaw turns the bike off  | 0x00469111 set,            |
+   | the wall                          | 0x00469bb0 drained         |
+   +-----------------------------------+----------------------------+
+
+   Importing that one function whole would have brought all four
+   across for free. Instead they were re-derived from disassembly one
+   at a time, and two were got wrong on the way.
+
+   THE SECOND COST IS NAMING. racer+0x2e31 is a pending heading
+   correction in radians. src/racer.h calls it leanTarget, because
+   the slice that first touched it was read next to the lean code. A
+   field named from a fragment is named from its neighbours rather
+   than from its use.
+
+   THE THIRD COST IS THE ONE THAT MATTERS MOST. The debug agent, the
+   hooks, the watchpoints and mr_place.py exist so that the same
+   event can be produced on both sides and compared. That only works
+   if there is something on our side corresponding to the thing being
+   hooked in MOTO.EXE. A slice has no counterpart, so the comparison
+   has nowhere to attach and the infrastructure goes unused.
+
+2.  What changes
+
+   +------------------+---------------------+----------------------+
+   | Aspect           | Was                 | Now                  |
+   +==================+=====================+======================+
+   | granularity      | a slice per task    | one C function per   |
+   |                  |                     | Ghidra function      |
+   +------------------+---------------------+----------------------+
+   | name             | invented, by role   | the Ghidra name,     |
+   |                  |                     | lowercased           |
+   +------------------+---------------------+----------------------+
+   | ORIGIN tag       | function + site     | function + entry     |
+   |                  | address             | address only         |
+   +------------------+---------------------+----------------------+
+   | starting point   | disassembly, read   | the decompiler's C,  |
+   |                  | by hand             | fixed up             |
+   +------------------+---------------------+----------------------+
+   | unread branches  | dropped in silence  | carried over, marked |
+   +------------------+---------------------+----------------------+
+
+   WHAT DOES NOT CHANGE: rule 13's five gameplay files, the ASCII
+   rule, the tab rule, and the evidence tags. This changes how much
+   of a function comes across at a time, not where it lives or how it
+   is written down.
+
+   A SINGLE-ADDRESS ORIGIN IS THE TELL. When a tag needs two
+   addresses - "at 0x...", naming a site inside a larger function -
+   that is a slice, and from now on it is a thing to justify rather
+   than the default.
+
+3.  The byte-exact racer - DONE
+
+   THIS IS THE ENABLER AND IT COMES FIRST. Imported code addresses
+   fields at the original's offsets. If MR_Racer does not carry those
+   offsets, every import needs its field references translated by
+   hand, which is exactly the error-prone step the whole method
+   exists to remove.
+
+   +---------------+------------------+------------------+
+   | Field         | MOTO.EXE         | ours today       |
+   +===============+==================+==================+
+   | sizeof        | 0x3209  (12809)  | 0x1a8    (424)   |
+   +---------------+------------------+------------------+
+   | pos           | +0x0030          | +0x003c          |
+   +---------------+------------------+------------------+
+   | moveDir       | +0x018c          | +0x00c8          |
+   +---------------+------------------+------------------+
+   | curSegment    | +0x31bd          | +0x0138          |
+   +---------------+------------------+------------------+
+
+   So the target is an MR_Racer whose first 0x3209 bytes carry every
+   known field at its true offset, with named padding everywhere else.
+
+   IT IS THE PREFIX THAT IS EXACT, NOT THE SIZE. racer.h appends two
+   fields of our own past the boundary - isLocal and moveDirClipped -
+   so sizeof(MR_Racer) is 0x3219, and the assertion that guards the
+   layout is offsetof(isLocal) == 0x3209 rather than a size check.
+
+   THAT MATTERS THE MOMENT ANYTHING STRIDES AN ARRAY. Reading a field
+   through a pointer into MOTO is correct, which is the whole point.
+   Computing &racers[i] with our sizeof is 16 bytes per element wrong.
+   Use the literal 0x3209, as tools/mr_place.py already does.
+
+   IT MUST BE #pragma pack(1). The original's tail is byte-misaligned
+   throughout - lean at +0x2e1d, curSegment at +0x31bd, the wall
+   normal at +0x31c5 - and 0x3209 is itself odd. Natural alignment
+   cannot reproduce it. Unaligned float access is fine on x86 and
+   this build is Win32 only.
+
+   VERIFY IT AT COMPILE TIME, not by inspection. Every named field
+   gets an offset assertion and the struct gets a size assertion, so
+   a mistake is a build error rather than a wrong number in a
+   capture.
+
+   THE PAYOFF IS IMMEDIATE AND SEPARATE FROM THE IMPORTS. Once the
+   layouts agree, mracer_get_mem and moto_get_mem read the same field
+   at the same offset, so any racer field can be diffed between the
+   two games without a translation table. mr_place.py collapses to
+   one set of offsets instead of two.
+
+   DONE. MR_Racer is 0x3209 bytes under #pragma pack(1), 56 fields
+   sit at their original offsets, and every one carries a
+   compile-time offset assertion. Four fields have no established
+   offset and live past the prefix, where they claim nothing:
+   isLocal, lane, moveDirClipped, and the MR_Crash grouping.
+
+   IT PAID FOR ITSELF BEFORE A SINGLE FUNCTION WAS IMPORTED. Two
+   defects fell out of simply laying the fields on one line:
+
+   o velocity AND moveDir WERE THE SAME FIELD. Both were declared
+     at +0x018c and the byte-exact layout cannot hold them twice.
+     Our struct had them as two independent vectors, so gravity
+     integrated a private vertical velocity while the position
+     advanced along a separate, permanently horizontal moveDir.
+     The original has ONE vector: ModelInstance_Integrate tilts it
+     downwards and the position step travels along it. Merged, and
+     it is the most likely cause of 2.13's 12x vertical-step gap.
+
+   o pitch AND forkDive WERE ALSO ONE FIELD, both at +0x2e39.
+     pitch had no readers at all - dead on arrival - so forkDive
+     survived and pitch is gone.
+
+   Neither could be seen while the two names lived at two
+   different offsets in a struct of our own design. That is the
+   argument for byte-exactness in one paragraph.
+
+   THEN IT WAS REPLACED BY THE DB'S OWN LAYOUT, which is the
+   version that stands. Building the struct from offsets scraped
+   out of our field comments could only place what we had already
+   named - 56 fields - and it inherited an outright error nobody
+   had noticed:
+
+   o OUR speed WAS AT THE WRONG OFFSET. We had it at +0x2da8; the
+     DB says +0x2da8 is speedTail and the real speed is +0x124.
+     The MEANING we recorded was right - m/s, fed from
+     speedKmhNeedle / 3.6 - so the field simply sat 0x2c84 bytes
+     from where the original keeps it. Any imported function
+     reading r->speed would have read a different number than the
+     rest of our code writes.
+
+   get_struct_layout(MR_Racer) returns 161 fields, CONTIGUOUS -
+   every byte from 0 to 0x3209 accounted for, so no padding has to
+   be computed at all. racer.h now carries that layout verbatim,
+   under the DB's own field names, with 34 offset assertions and a
+   prefix-boundary assertion. Three fields of ours follow it:
+   isLocal, crash and moveDirClipped.
+
+   NINETEEN OF OUR NAMES MOVED to the DB's, matched BY OFFSET
+   rather than by name - pos to position, matrix to matOrientation,
+   curSegment to segment, steer to steering, unk31d1 to
+   flImpactBlend, and so on. Matching by offset is what caught the
+   speed error; matching by name would have preserved it.
+
+   THE RENAME WAS DRIVEN BY THE COMPILER, and that is the part
+   worth reusing. MR_Script, MR_Crash, SKL_Reader and
+   MR_ModelInstance all have their own pos, so a textual rename of
+   ->pos hits them too, and a receiver-name whitelist is guesswork
+   - the receivers are r, s, a, b, g, in, seg, slots and more.
+   Instead: rename everything, build, and put back exactly the
+   lines the compiler rejects with "X is not a member of Y" where
+   Y is not MR_Racer. Two rounds took 102 errors to 17.
+
+   ITS ONE FLAW IS WORTH KNOWING: the revert is LINE granular, so
+   a line touching a racer AND another struct gets both names put
+   back. That left thirteen sites, all of the shape
+   "r->pos[0] = slots[i].pos[0]", and they were fixed by hand.
+
+   THE GENERATOR WAS SCAFFOLDING AND IS NOT CHECKED IN. It read
+   the offsets out of the existing field comments, sorted, and
+   padded the gaps; run against its own output it would treat the
+   padding as unplaced fields and destroy the layout. The
+   assertions are the durable mechanism - the struct is edited by
+   hand from here and the build catches a mistake.
+
+   CLAUDE.md 5b PERMITS OUR STRUCT TO DIVERGE, and it still does -
+   this is a decision to stop exercising that permission for
+   MR_Racer, because the cost of the divergence now exceeds its
+   convenience. The permission remains for genuinely different things
+   like MR_ModelInstance.
+
+4.  Importing one function
+
+   NEVER TRANSCRIBE FROM A PROSE DESCRIPTION, plate comment
+   included.  A first pass at maybe_Math_TurnRadius3Pt written from
+   its own plate got three things wrong, and they are exactly the
+   three prose cannot pin down: the determinant's operand order, so
+   the radius came out NEGATED; the numerator formula; and which
+   component the second degeneracy guard tests.  PROSE IS ENOUGH TO
+   RECOGNISE AN ALGORITHM AND NOT ENOUGH TO REPRODUCE IT.
+
+   That holds even when the prose is ours and correct.  A summary
+   records what a reader needed; a transcription needs what the
+   machine does, and the gap between the two is where sign errors
+   live.
+
+   1.  Check the DB defects first. A decompilation showing in_ZF,
+       in_EAX or a body too short for the function is a symptom of
+       one of the four known defects, not of a hard function. Run the
+       repair scripts before reading. See ghidra-db-repairs.txt.
+
+   2.  Take the decompiler's C as the starting text. Do not
+       transcribe from disassembly; the point is to keep the control
+       flow the decompiler already recovered.
+
+   3.  Apply the mechanical fixups:
+
+       +---------------------------+----------------------------+
+       | Ghidra emits              | Write                      |
+       +===========================+============================+
+       | __thiscall, implicit this | MR_Racer *r as the first   |
+       |                           | parameter                  |
+       +---------------------------+----------------------------+
+       | float10                   | double                     |
+       +---------------------------+----------------------------+
+       | undefined4 / undefined    | the real type              |
+       +---------------------------+----------------------------+
+       | DAT_004d1208              | the named constant, value  |
+       |                           | and address in a comment   |
+       +---------------------------+----------------------------+
+       | *(float *)(this + 0x2e31) | r->pendingYaw              |
+       +---------------------------+----------------------------+
+       | CONCAT44 / SUB84          | rewrite by hand; these are |
+       |                           | decompiler artefacts       |
+       +---------------------------+----------------------------+
+
+   4.  Keep the shape. Gotos, early returns, repeated subexpressions
+       and odd branch order all stay. Rule 5 already says this; it
+       matters more here, because a tidied function no longer lines
+       up with the original instruction for instruction.
+
+   5.  Mark what is not understood IN PLACE, with the address, rather
+       than dropping it. A branch nobody has explained is still
+       transcribed and still runs.
+
+   6.  Feed the discoveries back. A field whose real use becomes
+       clear gets renamed in the Ghidra DB as well - rule 5b.
+
+5.  Where imported functions live
+
+   RULE 13 IS UNCHANGED. The five gameplay files keep their
+   ownership, and an imported function goes to the file that owns its
+   concern:
+
+       maybe_Racer_UpdateGroundContact   racer.c   one racer
+       maybe_Physics_TickDrivetrain      physics.c a force
+       Race_TickAllRacers                race.c    many racers
+
+   The original's own translation units are NOT reproduced for
+   gameplay code, for the reason src/README.txt 11.1 already gives:
+   the original spread this logic across player.cpp, event.cpp and
+   frame3d.cpp according to a structure we cannot see, and guessing
+   at it would be worse than a flat set.
+
+   Section 11's mirror-the-original-tree plan still applies to the
+   subsystems on the replace-list, which is a separate question.
+
+6.  The verification loop
+
+   PLACE BOTH BIKES IMMEDIATELY BEFORE EVERY MEASUREMENT, not
+   once at the top of a script.  A run that ends early - a
+   mistyped key string, a command that errors on one side only -
+   leaves ONE game moved and the other where it was, and the next
+   measurement then reads a difference that is entirely the
+   harness.  It cost a session here: a cornering comparison came
+   back 19.76 against 17.80 on the STRAIGHT phase, which read
+   exactly like a physics divergence and was a stale MOTO.
+
+   o THE TELL IS A SPLIT THAT PREDATES THE MANOEUVRE.  If the
+     two disagree before the interesting input starts, suspect
+     the setup, not the code.
+
+   o BURST LENGTH CHANGES THE ANSWER ON BOTH SIDES EQUALLY.
+     72 frames sent as one SEND_INPUT gives 17.81266; sent as
+     nine of eight it gives 17.86220 - and both games agree to
+     the digit either way.  Compare like with like and do not
+     read the difference between methods as a defect.
+
+   o MOTO TAKES BOTH SEND_INPUT ARGUMENTS IN HEX - strtoul base
+     16 on the mask AND the frame count - while the port's
+     frames= is decimal.  Its keys= list is COMMA separated;
+     spaces silently select nothing and the bike does not move.
+
+
+   THIS IS WHAT THE METHOD BUYS, and all of it works today:
+
+   1.  python tools/mr_cheats.py --on nowalls        if walls are noise
+   2.  python tools/mr_place.py --to both --spot NAME
+   3.  moto_set_hook   by ADDRESS   - MOTO has no symbols
+       mracer_set_hook by NAME      - ours has a .map
+   4.  drive both the same number of frames
+   5.  diff the traces
+
+   Both halves are confirmed working in Release|Win32: the .map gives
+   2643 symbols, and a hook on race_tick_physics arms and records.
+
+6.1.  The second loop - run our function INSIDE MOTO
+
+   THE LOOP ABOVE COMPARES TWO PROCESSES AND THAT IS ITS CEILING.
+   tools/mr_ab.py says so itself: MOTO frames and ours are not the
+   same thing, so only the SHAPE of a track can be compared. Every
+   difference is also the sum of every divergence upstream, and once
+   the two worlds differ they drift.
+
+   HOOK_FUNC REMOVES ALL OF THAT by replacing a MOTO function with an
+   export of tools/mrmod, built from our own src/. There is one world,
+   so a function either matches on that call or it does not:
+
+       LOAD_MOD  mrmod.dll
+       python tools/mr_reset.py                 identical start
+       SEND_INPUT <mask> <frames>               control run
+       ...read the racer fields as HEX...
+       HOOK_FUNC <addr> <export> 1
+       python tools/mr_reset.py                 same start again
+       SEND_INPUT <mask> <frames>               same input
+       ...read the same fields, diff the HEX...
+
+   FIRST RESULT, Plane_Distance (0x004b10c0) against our
+   plane_distance: after 60 frames of throttle from an identical
+   grid start, position, speed and the field at racer+0x190 came back
+   BYTE-IDENTICAL, with the replacement called 33,561 times in that
+   run. [verified]
+
+   COMPARE THE HEX, NOT A PRINTOUT. A first pass compared decoded
+   floats against values already rounded to three decimals and
+   reported a difference of 3e-4 that was entirely the rounding. Read
+   the bytes and diff the bytes.
+
+   A COUNTER INSIDE THE REPLACEMENT IS THE ONLY HONEST PROOF IT RAN.
+   MOTO ships call counters - Plane_Distance opens with
+   INC [0x00709378] - but that one is SHARED with
+   Plane_IntersectSegment, so it climbs whether the hook works or
+   not. mrmod exports mrmod_call_count as DATA for this; its address
+   is the LOAD_MOD base plus the RVA dumpbin reports.
+
+   PICK THE PERTURBATION TO CROSS A BOUNDARY. Biasing
+   plane_distance by +64 changed NOTHING on screen, because almost
+   every consumer uses only the SIGN - Trk_GroundHeightAt picks
+   between two nearly coplanar ground triangles, and the frustum
+   tests compare against radius * -4, which is -2048 for a bike.
+   Negating it instead inverts every test at once and threw the bike
+   2141 units into the air in 60 frames with no input at all. A
+   perturbation that does not cross a boundary proves nothing.
+   The tool descriptions saying a Debug build is required are stale.
+
+   A FUNCTION THAT EXISTS ON BOTH SIDES UNDER THE SAME NAME is the
+   only thing this needs that slicing failed to provide.
+
+
+6.2.  Ways an A/B lies
+
+   Each of these makes a WORKING port look broken, or a working
+   ORIGINAL look inert, and none of them touches game code.  Check
+   them before believing a divergence.
+
+   THE HEADING CARRIES NO COUNT ON PURPOSE.  It said "three" and
+   gained a fourth; a number in a title is a claim about the rows
+   underneath and has to be re-counted whenever either changes.
+   See comment-defects.txt section 3.
+
+   A WATCHPOINT CAN MISS THE WRITES.  One on racer+0x18 saw nothing
+   through sixteen frames of cornering, which read as "MOTO never
+   writes this field".  Read directly, the same field holds 43.63,
+   55.00 and 104.21 in three separate corners -
+   maybe_Racer_ApplyCornering fits it every frame the bike moves.
+   When a watchpoint says a field is dead, read the field.
+
+   THE TWO SIDES DO NOT TAKE THE SAME KEY STRING.  MOTO gets a raw
+   input word from its DLL; the port gets key NAMES and agent.c
+   splits keys= on COMMAS.  So keys=zb is one unknown token and the
+   whole SEND_INPUT is rejected - silently, because nothing reads
+   the reply.  A single key works, which is why this survived every
+   one-key test ever run.  mr_ab.py now builds the port's list with
+   keylist() and sends z,b.
+
+   THE PLACEMENT DOES NOT RESET THE GEARBOX.  mr_ab zeroes speed
+   and gearboxRoadSpeed - it always has - but the GEAR survives,
+   and in manual nothing downshifts on its own, so the gears only
+   ratchet upward across runs.  Two sides in different gears
+   produce two different curves from the same throttle.  Now reset
+   to gear 1, timer 0, state 0, pending 0 on both.
+
+   THE PORT KEEPS THE SHIFT TIMER SOMEWHERE ELSE.  MR_Gearbox is
+   ours; the racer's +0x80 and +0x84 are mirrored for the GEAR
+   only, so a port-side read of the timer and state returns a flat
+   0/0 however the shift is going.  A perfectly good shift reads as
+   a dead gearbox.  mr_ab reads s_race_gearbox for those.
+
+   o AND A STALE PLACEMENT IS THE FOURTH.  If one side starts a
+     sample mid-run - a position that does not change, or a speed
+     that begins at the previous run's plateau - the run is void.
+     Read frame 0 before reading anything else.
+
+6.3.  What the manual gearbox A/B actually showed
+
+   Both sides in manual, same bike, placed on the straight, 60
+   frames of throttle and then the upshift button held:
+
+   +-------+-------------------+------------------+---------------+
+   | frame | speed MOTO / port | timer MOTO/port  | gear          |
+   +=======+===================+==================+===============+
+   |   0   | 18.291 / 18.291   |    0 /   0       | 1 / 1         |
+   +-------+-------------------+------------------+---------------+
+   |   3   | 18.274 / 18.274   |  102 / 118       | 1 / 1         |
+   +-------+-------------------+------------------+---------------+
+   |   6   | 18.248 / 18.248   |   54 /  70       | 1 / 1         |
+   +-------+-------------------+------------------+---------------+
+   |   9   | 18.223 / 18.223   |    6 /  22       | 1 / 1         |
+   +-------+-------------------+------------------+---------------+
+   |  12   | 18.652 / 18.424   |  -10 / -10       | 2 / 2         |
+   +-------+-------------------+------------------+---------------+
+
+   o THE SPEEDS ARE IDENTICAL to three decimals for the whole
+     clutch-out, and a 150 ms manual timer decrements 16 ms a
+     frame on BOTH.  Gear 1 also plateaus at exactly 18.291 on
+     both over 150 frames with no auto-shift, which is manual
+     doing its job on both sides.
+
+   o racer+0x88 READS 0 AND racer+0xb4 READS 82.00 ON BOTH - the
+     manual mode and the carac's 80.0 plus the 2.0 bonus.
+
+   o THE ONE DIFFERENCE IS A CONSTANT 16 ms, one frame, in when
+     the request ARMS - 118 against 102 and the same gap at every
+     later sample.  The frame-12 speed follows from it: the port
+     spent one more frame with the clutch out.  It is NOT tick
+     order - race_poll_input already runs before
+     racer_update_airborne - so the likeliest cause is the
+     harness injection point, the port's agent setting the word
+     at a different moment in the frame than MOTO's DLL does.
+     [open] not isolated; do not read it as a physics difference
+     until it is.
+
+
+6.4.  The steady-state probe, and what the gearbox mode is worth
+
+   mr_ab cannot settle a question that needs a button PULSED on one
+   frame (6.3).  tools/mr_steady_ab.py sidesteps that entirely:
+   WRITE the gear rather than shifting into it, set a speed, hold
+   the throttle for six frames and read how much the speed moved.
+   The throttle is held from the first frame of the block to the
+   last, so there is no pulse to land; the delta is the
+   acceleration at that speed, and where it crosses zero is the
+   terminal speed.
+
+   GEAR 3, ile01 bike 0, delta over six frames.  MOTO and the port
+   agree to four decimals at every row - only each sweep's FIRST
+   row disagrees, which is the placement settling and not a
+   result:
+
+   +--------+-----------+-------------+------------------+
+   | from   | manual    | automatic   | manual advantage |
+   +========+===========+=============+==================+
+   |  40.0  |  +0.925   |   +0.824    |     +12.3%       |
+   +--------+-----------+-------------+------------------+
+   |  44.0  |  +0.961   |   +0.852    |     +12.8%       |
+   +--------+-----------+-------------+------------------+
+   |  48.0  |  +0.929   |   +0.827    |     +12.3%       |
+   +--------+-----------+-------------+------------------+
+   |  52.0  |  +0.342   |   -0.169    |  automatic       |
+   |        |           |             |  upshifted       |
+   +--------+-----------+-------------+------------------+
+
+   o TWELVE PER CENT IS THE 1.1x TORQUE.  Net acceleration is
+     (drive force - drag) / mass, so a ten per cent torque gain
+     buys MORE than ten per cent of acceleration wherever drag is
+     non-zero.  The figure is steady across the mid-range, which
+     is what a clean multiplier looks like.
+
+   o THE 52.0 ROW IS THE GEARBOXES PARTING COMPANY, not noise.
+     T[3] is 50.9, so automatic upshifts during the block and
+     loses speed to the clutch while manual holds the gear and
+     pulls to the limiter.  Both sides agree on it exactly.
+
+   o GEAR 6 IS THE WRONG GEAR FOR THIS MEASUREMENT.  Near the
+     terminal speed drag nearly cancels drive, so the same 1.1x
+     reads as 2.8x and the number says more about how close the
+     probe sat to the crossing than about the multiplier.  Probe
+     mid-range.
+
+   o AND THE TOP-SPEED GAIN IS THE TORQUE, NOT THE CAP.  Gear 6
+     terminal speed is 79.5 manual against 78.6 automatic - both
+     BELOW realSpeedMax either way, 80 or 82, so the +2.0 bonus
+     is not what raises it.  Drag binds first.  The cap is
+     reachable only transiently, on gearboxRoadSpeed.
+
+
+6.5.  The clutch delays, measured on both sides
+
+   tools/mr_clutch_ab.py.  All four values confirmed IDENTICAL on
+   MOTO and the port [verified]:
+
+   +-------------+-----------+-------------+
+   |             | manual    | automatic   |
+   +=============+===========+=============+
+   | upshift     |  150 ms   |   200 ms    |
+   +-------------+-----------+-------------+
+   | downshift   |  200 ms   |   300 ms    |
+   +-------------+-----------+-------------+
+
+   The timer decrements 16 ms per GAME frame on both.  The port
+   catches the start value exactly - 150 and 200 at the first
+   sample after the request - and MOTO is always one or two ticks
+   in, so its first reading is 150-32=118, 200-32=168, 200-16=184
+   or 300-16=284.  Every MOTO reading is a member of the port's
+   own countdown sequence.
+
+   THE AUTOMATIC PAIR NEEDS NO INPUT AT ALL, which is what makes
+   it the cleanest measurement here: Gearbox_RequestAutoShift
+   fires when roadSpeed crosses T[gear], and that crossing is
+   internal to each game.  Nothing is timed by the harness, so no
+   injection offset is possible.  Coast through T[gear-1]-2 for
+   the downshift.
+
+6.5.1.  MOTO RUNS ABOUT TWO GAME FRAMES PER SEND_INPUT FRAME
+
+   And that single fact explains every 'one frame apart' result in
+   6.3.  Coasting from a matched state, MOTO's road speeds were
+
+       51.467  51.173  50.881  50.592
+
+   and the port's were
+
+       51.615  51.467  51.320  51.173  51.027  50.881  50.736
+               ^^^^^^          ^^^^^^          ^^^^^^
+
+   - the same numbers, sampled at half the rate.  The physics is
+   identical; the harnesses are not.  At --step 3 the two agree
+   one for one, so USE A STEP OF 3 OR MORE and never read a
+   per-frame trace as a divergence.
+
+6.5.2.  Three more ways the rig lied, all fixed
+
+   SETTING A SPEED WITHOUT SETTING THE ENGINE DOES NOTHING.  The
+   drivetrain re-derives roadSpeed from engineSpeed through the
+   gear ratio on the next tick, so a written speed survives zero
+   frames - and each side jumps to its OWN number, 52.8 against
+   57.6 from a common 49.2.  engineSpeed is the independent
+   variable; set it and let the speed follow.
+
+   THE PORT KEEPS THE SPEED IN TWO PLACES.  MR_Drivetrain is
+   loaded from the racer at the top of race_tick_physics and
+   stored back at the end, so a write that lands after that
+   tick's drive_load is overwritten by the stale drivetrain.
+   Write BOTH homes - mr_steady_ab.port_set_speed does.  This is
+   also why a placement can appear to do nothing.
+
+   THE MANUAL SHIFT LATCH SURVIVES A RUN.  0x004ea4c8 clears only
+   when NEITHER gear button is held, so a run that ends with the
+   button down leaves it set and the next run refuses to shift.
+   Two identical manual runs, the first shifting and the second
+   inert.  Cleared on both sides at setup now.
+
+
+6.6.  The automatic regression check, and the residual floor
+
+   Both games at 30 fps, automatic, each gear probed INSIDE ITS OWN
+   BAND so the requester does not shift out of it, four frames:
+
+   +------+--------+----------+----------+-----------+
+   | gear | from   | MOTO d   | port d   | residual  |
+   +======+========+==========+==========+===========+
+   |  1   |  14.0  |  +3.615  |  +3.562  |  +0.052   |
+   +------+--------+----------+----------+-----------+
+   |  3   |  44.0  |  +1.096  |  +1.149  |  -0.053   |
+   +------+--------+----------+----------+-----------+
+   |  5   |  68.0  |  +0.265  |  +0.306  |  -0.042   |
+   +------+--------+----------+----------+-----------+
+
+   NO REGRESSION.  The manual work changed nothing automatic can
+   reach: the torque gate is off at mode 1, and the racer's
+   realSpeedMax equals the carac field unless the manual bonus
+   applies, so the rewired clamps read the same number they
+   always did.  cap reads 80.00 on both here, as it should.
+
+   THE RESIDUAL IS A TIME-INTEGRATION FLOOR, NOT PHYSICS, and
+   three things say so:
+
+   o IT DOES NOT SCALE WITH THE DELTA.  About 0.05 whether the
+     block moved the bike 3.6 or 0.27.  A physics difference
+     would be a fraction of the change, not a constant.
+
+   o ITS SIGN FLIPS between gears.  A real divergence does not.
+
+   o A CLAMPED ROW MATCHES EXACTLY.  Gear 1 probed at 20.0 is
+     above the limiter, so the result is decided by the clamp
+     rather than by integrating: both read -1.771 and the
+     residual is -0.0000.  Where the answer does not depend on
+     how much time was integrated, the two agree perfectly.
+
+   o AND IT IS THE SAME IN BOTH MODES - -0.055 automatic against
+     -0.061 manual on the same probe - which is what rules the
+     manual work out as its cause.
+
+6.6.1.  30 fps did not make long runs comparable
+
+   It helped short blocks: at 60 fps MOTO ran about two game
+   frames per requested frame (6.5.1) and at 30 fps a four or six
+   frame block runs one for one.  LONG blocks still diverge, and
+   badly:
+
+       frames=3    residual -0.052
+       frames=6    residual -0.055
+       frames=12   residual +1.669   MOTO 5.253, port 3.585
+
+   A 96-frame standing start reads MOTO 51.0 against the port
+   41.1 at the last sample - which is not a physics result, it is
+   MOTO gaining time across a long call.
+
+   SO KEEP BLOCKS AT SIX FRAMES OR FEWER.  mr_steady_ab is built
+   that way; a long mr_ab drive is for SHAPE - does it shift, in
+   what order, does it plateau - and never for a speed
+   comparison.
+
+7.  Import order
+
+   +---+-----------------------------------+---------------------------+
+   | # | Function                          | Why here                  |
+   +===+===================================+===========================+
+   | 1 | maybe_Racer_UpdateGroundContact   | the wall response; the    |
+   |   | 0x00468ca0                        | live problem, and the     |
+   |   |                                   | proof of the method       |
+   +---+-----------------------------------+---------------------------+
+   | 2 | FUN_0046ad10                      | picks the recovery        |
+   |   | 0x0046ad10                        | heading; unread, and 1    |
+   |   |                                   | needs it                  |
+   +---+-----------------------------------+---------------------------+
+   | 3 | maybe_Racer_BeginCrash            | the crash set, which      |
+   |   | Racer_ResetCrash                  | replaces the speed = 0    |
+   |   | maybe_Racer_UpdateCrash           | stand-in                  |
+   +---+-----------------------------------+---------------------------+
+   | 4 | maybe_Racer_ApplySteering         | replaces the sliced       |
+   |   | 0x00466240                        | steering                  |
+   +---+-----------------------------------+---------------------------+
+   | 5 | ModelInstance_Integrate           | the vertical step, port-  |
+   |   | 0x0048d620                        | divergences 2.13          |
+   +---+-----------------------------------+---------------------------+
+   | 6 | maybe_Physics_TickDrivetrain      | the six slices of it in   |
+   |   | 0x0048ef30                        | physics.c become one      |
+   +---+-----------------------------------+---------------------------+
+
+   IMPORT 1 IS UNDER WAY. Step 1 of section 4 - check the DB first
+   - turned out to be the whole difficulty, and it is worth
+   recording what it cost and what it bought.
+
+   THE DECOMPILATION WAS UNUSABLE AND THE PLATE COMMENT SAID SO:
+   "READ IT FROM THE DISASSEMBLY. The decompiler loses the stack
+   frame - the four Trk_FindSegmentForPoint and five
+   Trk_GroundHeightAt calls render with EMPTY argument lists, and
+   which point is sampled where is the whole algorithm."
+
+   THAT WAS A MISSING-PROTOTYPE PROBLEM, NOT A HARD FUNCTION. Six
+   helpers had no signature, so Ghidra could not recover their
+   arguments:
+
+       Trk_GroundHeightAt  0040c8b0  float __thiscall(MR_Trk*, int, float*)
+       Vec3_Normalize      0040fcd0  float* __thiscall(float*)
+       Vec3_Copy           0040ff80  float* __thiscall(float*, float*)
+       Vec3_Cross          0046d610  float* __cdecl(float*, float*, float*)
+       Vec3_Sub            004570d0  float* __cdecl(float*, float*, float*)
+       Racer_GetYaw        00490220  float __thiscall(float* mat)
+
+   Six prototypes later the ground probes, the cross products and
+   the whole pending-yaw chain read directly out of the
+   decompiler. The plate comment has been corrected in place.
+
+   THE LESSON GENERALISES. "The decompiler cannot handle this" is
+   usually "the callees have no prototypes", and the fix is six
+   API calls that improve EVERY function calling those helpers -
+   not just this one. Do it before concluding a function must be
+   read by hand.
+
+   IMPORT 1 HAS LANDED. racer_update_ground_contact in racer.c is
+   maybe_Racer_UpdateGroundContact whole, in the original's order:
+   the contact history shift, the segment resolve, the two-pass
+   wall clip, the crash decision, the damping, the bounce/scrape
+   gate, the ground snap, the frame rebuild from two probes, both
+   wheel contacts, and the pending-yaw drain.
+
+   FOUR HOLES ARE MARKED IN PLACE, each with its address, and the
+   control flow around them is the original's:
+
+       0x00469010  the championship protection block - ours by
+                   choice, not by omission
+       0x0046ad10  racer_wall_recovery_yaw, UNREAD. Returns 0, so
+                   the drain has nothing to pay out and the bike
+                   still will not turn off a rail. NEXT TO READ.
+       0x0040cd90  rail containment
+       0x004693aa  the drivetrain resync after an impact
+
+   THREE SLICES WENT WITH IT, as section 8 requires - racer_ground_
+   land, racer_wall_crash and racer_wall_hit in racer.c, plus
+   race_clip_walls, race_fall_step and race_land in race.c.
+   racer_wall_impact_cos and racer_wheel_ground survive because
+   the import calls them.
+
+   THE CONSTANTS CAME OUT AS ROUND km/h, which is the sort of
+   confirmation a slice cannot give because it never sees them
+   together: 100, 80, 20, 5, 2 and 1 km/h, each divided by 3.6.
+   The crash rule reads:
+
+       |cos| > 0.98 AND over 100 km/h        always down
+       else 1-in-4, |cos| > 0.5, over 80     down
+       or wheelie above 20 km/h, any angle   down
+
+   AND THE DRAIN CONSTANT CONFIRMED THE MEASUREMENT. 0x004d1208 is
+   0.0235619 rad; times a frameDelta of 3.3 that is 4.455 degrees
+   a frame, against 4.43 to 4.45 measured live off MOTO.EXE.
+
+   ONE DIVERGENCE IS KNOWN AND WRITTEN DOWN. At 0x0046960d the
+   original gates the per-probe segment lookups on PersoAnim;
+   racer_orient_grounded always resolves each probe in its own
+   segment, so we match for PersoAnim == 0 and differ otherwise.
+   PersoAnim is carac index 72, an int, and the loader now reads
+   it - bikes.c walks the floats to 71 and takes 72 as an integer.
+
+   IMPORT 2 HAS LANDED TOO. racer_wall_recovery_yaw is
+   maybe_Racer_WallRecoveryYaw, and it is much shorter than its
+   1024 bytes because one block reduces:
+
+       forward . normal > 0        already heading away, return 0
+       left . normal < 0           negate the normal - this is what
+                                   picks WHICH WAY along the wall
+       aTarget = pi/2 - aNormal    the along-wall direction
+       return shortest arc from the bike's heading to it
+
+   THE REDUCTION IS THE INTERESTING PART. Step three builds a
+   vector out of the 0x4000-entry cosine table:
+   g_cosTable[i] is cos, g_cosTable[i - 0x1000] is sin,
+   g_cosTable[0] is 1 and g_cosTable[0x3000] is 0, so the three
+   components collapse to (-K cos aN, 0, K sin aN). Under
+   yaw(v) = atan2(-v.x, v.z) that is exactly pi/2 - aN, and the
+   magnitude K falls out of the atan2 entirely.
+
+   AND A TRAP WORTH THE PARAGRAPH. K is the float at 0x004d12a8,
+   -100.0. Read as a DOUBLE it is 0.0, which would make the whole
+   block dead code and the function a constant zero - the high
+   dword beside it happens to be zero, so the wrong width looks
+   entirely plausible. Check the width before believing a constant
+   that would delete the code around it.
+
+   PREDICTION, NOT YET CONFIRMED: on the captured square hit the
+   normal was (-1, 0, 0), so aNormal is pi/2, aTarget is 0, and a
+   bike at -90 degrees gets a pending 90 degrees - about 20 frames
+   at the drain's 4.455 a frame. MOTO.EXE was measured settling on
+   3.43 degrees, the segment's own heading, over a comparable span.
+   The few degrees between 0 and 3.43 are NOT explained and want a
+   live A/B run. [open]
+
+   IMPORT 3, THE CRASH SET, HAS LANDED. Three functions that only
+   make sense together, so they came over together:
+
+       racer_begin_crash    0x00467e30  rewritten to the real fields
+       racer_update_crash   0x004683e0  NEW - the port had none
+       Racer_ResetCrash     0x004681d0  already split correctly
+                                        as race_reset_crashes plus
+                                        racer_reset_crash; only the
+                                        timer field moved
+
+   MR_Crash IS GONE, and with it physics_crash_begin, _tick,
+   _decays and _speed_decay. The rider's state lives in the racer's
+   own fields at the original's offsets - crashLaunchDir +0x30c9,
+   flRiderSpeed +0x30d5, flRiderSpeedRef +0x30d9, crashFallSide
+   +0x30dd - which is what made the grouping redundant.
+
+   AND IT KILLS THE speed = 0 STAND-IN. A crash used to stop the
+   bike dead because the port had no UpdateCrash at all. Now the
+   rider flies: moved along the launch, clipped against the rails,
+   bounced once off the ground at 0.01 restitution, dragged down at
+   15 km/h a second sliding or 2 in the air, with the bike's own
+   speed decaying 0.9 a frame meanwhile.
+
+   TWO NAMES WERE THE WRONG WAY ROUND and the import fixes them:
+   +0x30d5 is the rider's SPEED, not a timer, and +0x30c5 is the
+   countdown. flRiderSpeed / flRiderSpeedRef is the progress
+   fraction that drives the tumble - 1.0 at the throw, 0 when he
+   stops sliding.
+
+   ONE STRUCTURAL CHANGE. The original's UpdateCrash calls
+   Racer_ResetCrash itself, but that walks the whole field, so rule
+   13 keeps it in race.c. racer_update_crash returns
+   RACER_CRASH_DONE instead and the caller runs the cascade.
+
+   AND ONE INTEGRATION BUG THE IMPORT EXPOSED. r->speed was copied
+   INTO the racer once a frame and never back, while the advance
+   used s_race_drive.speed - so everything import 1 did to the
+   speed on a wall hit was overwritten before it could be felt,
+   and the bike kept its throttle through the rail. The loop is
+   closed in race_tick_physics now. The original has ONE speed,
+   racer+0x124, which is why it cannot have this bug.
+
+   IMPORT 4 HAS LANDED, and it was smaller than expected because
+   racer_apply_steering already carried the three steering paths
+   and the turnBrakeFlag block. What was missing was the TORQUE
+   TAIL at 0x0046658f - the euler (0, yaw, 0), the matrix, and the
+   ComposeOrientation - which the port had as a separate
+   racer_steer_torque called from race.c.
+
+   THE REAL CHANGE IS WHO OWNS matOrientation, and it is the one
+   that makes imports 1 and 4 mean anything. race.c used to
+   overwrite the matrix with the SEGMENT matrix and then rotate it
+   by the heading - so the terrain fit racer_update_ground_contact
+   had just built from two ground probes was discarded every
+   frame, and the bike's attitude was the segment's rather than
+   the ground's.
+
+   THE COMMENT SITTING OVER THAT CODE SAID the real matrix "is
+   built from the two ground probes in UpdateGroundContact and is
+   not transcribed". It had been transcribed since import 1 and
+   nothing had gone back to check. That is the slice habit's other
+   cost: scaffolding outlives the thing it stood in for, because
+   nobody owns the job of removing it.
+
+   THE ORIGINAL'S DIVISION OF LABOUR, now ours: ApplySteering yaws
+   the matrix, UpdateGroundContact re-fits it to the terrain, and
+   the yaw survives that fit because the ground probes are laid
+   out along the previous forward axis. s_race_yawWorld is READ
+   BACK from the matrix afterwards - a cache, not the state.
+
+   TWO MORE PIECES OF SCAFFOLDING WENT WITH IT: yawRel, which was
+   computed and then discarded, and racer_matrix_rotate_y, which
+   had no callers left.
+
+   IMPORT 5 HAS LANDED and it closes 2.13 outright. The grounded
+   branch adds dt * -1255.68 straight to the displacement, and
+   -1255.68 is -128 * 9.81 - gravity in units per metre rather
+   than integrated into the velocity. 0.033 * -1255.68 = -41.437,
+   against -41.4374 measured. Our port ran the AIRBORNE formula on
+   the grounded path and got -3.4.
+
+   IT ALSO BROUGHT THE WALL SLIDE PUSH, which nothing in the port
+   had: racer+0x174 is the direction the wall clip writes and
+   f_0180 its speed, and BOTH branches add slideDir * f_0180 * 128
+   * dt to the displacement, fading it at dt * 33.333 a frame. So
+   a bike that scrapes a rail is carried along it rather than
+   stopping against it.
+
+   AND THE SLIP BLEND IS THE INTEGRATOR'S, not race.c's: moveDir
+   eases towards the matrix's forward at a weight clamped to
+   [0.85, 0.9], with Y put back unblended at 0x0048da8f.
+
+   check_physics.py still passes, which was the thing to watch.
+
+   IMPORT 6 SURVEYED, NOT YET DONE. maybe_Physics_TickDrivetrain
+   is 4770 bytes, 0x0048ef30..0x004901d2, __thiscall on the
+   instance with SIX stack args (RET 0x18). The prototype is set
+   in the DB now; it had none at all.
+
+   ABOUT HALF OF IT HAS NEVER BEEN TRANSCRIBED. physics.c's ten
+   slices span roughly 0x0048f7ef..0x0049003e - the middle. The
+   front, 0x0048ef30..0x0048f7ef, is some 2240 bytes nothing
+   covers, and its callee list says what lives there:
+   Math_InvertRigidMatrix, Matrix34_Copy, Matrix34_Identity,
+   Vec3_TransformByMatrix34, maybe_Racer_SlipSpeed - the
+   world-to-body-space transform and the slip derivation.
+
+   THREE THINGS MAKE THIS THE RISKIEST OF THE SIX:
+
+   o It is the ONLY subsystem with a measured regression test.
+     tools/check_physics.py holds the slices to numbers read off
+     the running game, and it passes. Replacing them risks losing
+     that for a transcription nothing yet checks.
+
+   o The six argument types are unknown. The call site at
+     0x00465eea pushes 0x8000, 0x8000 - EBX and four stack
+     locals; typing them needs maybe_Racer_ApplyDrive read first.
+
+   o The uncovered front half feeds physics_slip_speed, which the
+     port already computes by another route. Whether that route
+     agrees with the original is exactly what a live A/B would
+     settle - and settling it first would say how much of this
+     import is actually needed.
+
+   AND THE A/B SETTLED IT: THE GAP IS NOT THERE. Both games reset,
+   placed alike and driven the same input in eight-frame steps:
+
+     +--------+---------------+---------------+-------+
+     | frame  | MOTO speed    | ours          | ratio |
+     +========+===============+===============+=======+
+     |      8 |        5.245  |        5.246  | 1.000 |
+     +--------+---------------+---------------+-------+
+     |     16 |       11.481  |       11.481  | 1.000 |
+     +--------+---------------+---------------+-------+
+     |     24 |       17.887  |       17.888  | 1.000 |
+     +--------+---------------+---------------+-------+
+     |     32 |       19.023  |       19.023  | 1.000 |
+     +--------+---------------+---------------+-------+
+     |     48 |       26.232  |       26.233  | 1.000 |
+     +--------+---------------+---------------+-------+
+
+   Three decimals at every sample, through the upshift. The ten
+   slices reproduce the drivetrain's speed curve exactly, and the
+   earlier two-thirds reading was an artefact of unequal starting
+   states in the first A/B - not physics.
+
+   SO IMPORT 6 IS NOT NEEDED FOR THE SPEED, and rewriting 4770
+   bytes of code that matches to three decimals would be a large
+   risk for nothing. What the comparison DID find is two fields
+   the port never writes: gear (racer+0x7c, read 1 against our 0
+   through a whole upshift) and one RPM wobble at the shift point.
+
+   WHAT IMPORT 6 IS ACTUALLY FOR, then: the untranscribed front
+   half is the world-to-body-space transform and the slip
+   derivation, and the thing to measure before touching it is
+   whether physics_slip_speed agrees with maybe_Racer_SlipSpeed.
+   Scope it from THAT, not from the speed curve.
+
+   THE LESSON IS ABOUT MEASUREMENT, not about the drivetrain. A
+   one-sided reading said half the function was missing and
+   assumed the behaviour must be missing with it. It is not: the
+   port reaches the same numbers by a shorter route. Untranscribed
+   is not the same as wrong, and only the comparison can tell them
+   apart.
+   1 and 2 together are the whole wall response. 5 settles a measured
+   divergence that has no other explanation.
+
+   IMPORT 7 HAS LANDED: maybe_Racer_UpdateWheelie, whole, as
+   racer_update_wheelie in physics.c. It takes MR_Racer rather
+   than the MR_Wheelie state the slice carried, so the angle, the
+   timer, the torque scale and the landing thump all reach the
+   racer fields the seven consumers read; the crash reset at
+   0x004660fb comes across with it and closes racers.txt 9.23.
+
+   IT WAS THE FOURTH INSTANCE OF SCAFFOLDING OUTLIVING WHAT IT
+   REPLACED, and the most exactly measured. The slice ramped the
+   angle correctly - matched to MOTO frame for frame,
+   0.6220/0.6221 then 1.2441/1.2441 then 1.5708 - and race.c
+   copied only that one value back. The timer therefore sat at 0
+   on our side while MOTO's climbed 13.2 a frame, so the 200 cap
+   could never fire and the wheelie could never end; the 2.0
+   torque scale never reached the drivetrain either.
+
+   A CORRECT VALUE IN A STRUCT NOBODY READS LOOKS EXACTLY LIKE A
+   CORRECT IMPLEMENTATION from one side. Only the A/B showed it,
+   and only because the timer and the scale were sampled next to
+   the angle rather than the angle alone.
+
+   racer_latch_stunt_request came with it - two instructions of
+   maybe_Racer_Tick at 0x0045d6db, and the only bridge from the
+   button (stuntHeld, +0x31f9) to the request the ramp reads
+   (stuntOrOverspeed, +0x2e85). Without it the button does
+   nothing whatever, which reads as a broken wheelie rather than
+   as missing wiring.
+
+   IMPORT 8 HAS LANDED: Racer_UpdateSuspension @ 0x00466a80, whole,
+   with its two helpers - Math_WrapAnglePi (0x00458da0) and
+   maybe_Racer_ChassisAttitude (0x0045ca00), both named this session.
+   Five carac fields came with it: RetardCadre, AngleSuspension and
+   the three Ressor values, indices 8, 12, 23, 24 and 25.
+
+   IT IS THE CONSUMER OF springCompression. A watchpoint on
+   racer+0x2e95 shows three writers a frame:
+
+       0045d5b1   maybe_Racer_Tick zeroes it at the top
+       00466aed   Racer_UpdateSuspension forces it non-positive
+       00466b01   and stores the relaxed value back
+
+   Other code kicks the field negative - the wheelie touchdown
+   writes -32 - and this walks it back toward zero at 5.184 per
+   clamped frame. Without it the value latches: measured against
+   MOTO, ours sat at -32 for the rest of the race where MOTO showed
+   0 every frame and the kick on the touchdown frame alone.
+
+   THE FRAME DELTA IS CLAMPED TO [3, 5] inside the function, so a
+   stalled frame cannot throw the spring.
+
+   THE WHEELIE PIVOT CAME OUT OF THE SAME SESSION and is a bigger
+   correction than the import. maybe_Racer_UpdateLean does NOT
+   rotate the bike matrix for a wheelie: at 0x0046a343 it swings the
+   FRONT WHEEL CONTACT about the REAR one and rebuilds matBikeRoot
+   from the wheel-to-wheel line, so the frame, the fork, the
+   swingarm and the draw placement all inherit the pitch from the
+   geometry.
+
+   Measured on MOTO through a full wheelie, ile01, local racer:
+
+   +---------+-----------+----------+-------------+----------+
+   | angle   | front.y   | rear.y   | wheelbase   | pitch    |
+   +=========+===========+==========+=============+==========+
+   | 0.0000  |      0.00 |     0.00 |      168.00 |    0.000 |
+   +---------+-----------+----------+-------------+----------+
+   | 0.9331  |     99.09 |     0.00 |      168.00 |   36.145 |
+   +---------+-----------+----------+-------------+----------+
+   | 1.5708  |    118.79 |     0.00 |      168.00 |   45.000 |
+   +---------+-----------+----------+-------------+----------+
+
+   The rear stays pinned on the ground, the separation is preserved
+   exactly, and the pitch reaches 45 degrees at pi/2 - which is
+   sin(angle) * pi/4, the magnitude of the double at 0x004d1218.
+   [verified]
+
+   OURS COMPOSED THAT PITCH ONTO THE DRAW MATRIX, which gives the
+   right angle about the wrong point - the bike rotated about its
+   own middle and the rear wheel sank into the road. It is now
+   racer_wheelie_swing_contact, applied to the contacts after the
+   ground snap exactly as the original does, and the draw-time
+   rotation is gone.
+
+   THE STATE MACHINE MATCHING IS NOT THE POSE MATCHING. The wheelie
+   A/B compared wheelieAngle, wheelieTimer, wheelieScale and the
+   springCompression kick, all to four decimals, and every one of
+   them was right while the bike still pivoted on its engine. A
+   field-by-field comparison says the simulation agrees; it says
+   nothing about how the number reaches the screen.
+   AND THE TILT ARRIVES IN TWO STAGES, which is what import 8 was
+   quietly needed for. The contact swing is only half of a retail
+   wheelie: maybe_Racer_Draw also composes the euler
+   (-suspensionAngle, 0, 0) at 0x0045f6ab, and again at 0x0045f799
+   for its second pass. Traced on MOTO from a standing start,
+   holding stunt:
+
+   +---------+------------+--------------+---------------------+
+   | frame   | geometry   | suspension   | what is happening   |
+   +=========+============+==============+=====================+
+   | 0       |      0.000 |       -0.988 |                     |
+   +---------+------------+--------------+---------------------+
+   | 4       |     26.213 |      -11.247 | at the clamp        |
+   +---------+------------+--------------+---------------------+
+   | 12      |     45.000 |      -11.247 | geometry done       |
+   +---------+------------+--------------+---------------------+
+   | 28      |     45.000 |       -9.998 | unwinding           |
+   +---------+------------+--------------+---------------------+
+   | 30      |     45.000 |       -8.662 |                     |
+   +---------+------------+--------------+---------------------+
+
+   The geometry reaches 45 degrees in twelve frames and the
+   suspension takes 11.25 of them straight back off, pinned at its
+   AngleSuspension clamp. Then the RetardCadre lag - one sixteenth
+   of the gap a frame - lets headingSmoothed catch up and the bike
+   settles further back over the following second. [verified]
+
+   OURS WENT TO THE FULL 45 AT ONCE because nothing drew the second
+   term. The state machine matched, the contact geometry matched to
+   three decimals, and the motion was still visibly wrong - which is
+   the same lesson as the timer and the torque scale, one layer
+   further out. THE FIELDS AGREEING IS NOT THE PICTURE AGREEING.
+
+   THE DRAWN BODY IS VERIFIED, and matRiderRoot is how. Both games
+   copy the matrix they draw the bike on into racer+0x3085 whenever
+   crashLatch is clear - the original at 0x00460db7 - so the draw's
+   own output is readable at the same offset on both sides without
+   any new scaffolding. Nose-up angle of its forward row:
+
+   +---------+----------+----------+----------+
+   | frame   | MOTO     | ours     | diff     |
+   +=========+==========+==========+==========+
+   | 6       |   24.917 |   24.910 |   -0.007 |
+   +---------+----------+----------+----------+
+   | 9       |   33.113 |   33.096 |   -0.017 |
+   +---------+----------+----------+----------+
+   | 12-24   |   33.772 |   33.753 |   -0.019 |
+   +---------+----------+----------+----------+
+   | 30      |   37.947 |   36.699 |   -1.248 |
+   +---------+----------+----------+----------+
+
+   The plateau at 33.77 is the two stages resolved: 45 degrees of
+   contact geometry less the 11.25 the suspension takes back. [verified]
+
+   THE UNWIND IS THREE FRAMES LATE ON OUR SIDE. MOTO comes off the
+   AngleSuspension clamp at frame 27 and we hold it to frame 30, so
+   the second stage starts late and the tilt trails by about a
+   degree before converging. headingSmoothed reaches the clamp
+   boundary at a slightly different time; the lag itself matches.
+   [open]
+
+   WHETHER THE FORK AND SWINGARM PIVOTS CARRY THE PITCH is still
+   not settled, and matRiderRoot cannot answer it - it is the body
+   matrix, not the pivot one. maybe_Racer_Draw composes the
+   suspension rotation into a different stack slot from the one the
+   placement comes off, but tracing stack offsets through a function
+   that size is not worth the error rate when looking at the wheels
+   settles it in a second. The prediction if it IS missing: the
+   wheels sit in the right PLACE - they are solved against contact
+   points that do carry the swing - while the forks lean at the
+   wrong angle relative to the body. [open]
+
+   IMPORT 9, UNDER WAY: maybe_Racer_Draw @ 0x0045f290..0x00461a96.
+   6.5 KB, and the largest thing attempted here. It is where the
+   fork, the swingarm, the steering yaw, the rider placement and the
+   whole part-matrix walk actually live, and every one of those is
+   currently a slice in src/skl.c or src/race.c.
+
+   STEP 1 IS THE DATABASE, NOT THE FUNCTION - rule 15.1, and it is
+   emphatically the case here. The decompilation opens with
+
+       uStack_440 = 0x45f722;
+
+   which is a RETURN ADDRESS stored into a local. Ghidra had lost
+   the stack frame, and once it does that every call in the function
+   renders with an EMPTY ARGUMENT LIST - Matrix34_Copy(),
+   Matrix34_Multiply(), Vec3_Set(), Skl_BuildPartMatrices() - and
+   eleven extraout_ phantoms appear. None of that is the function
+   being hard; it is the callees being undeclared.
+
+   THE CULPRIT IS ALWAYS A WRONG PURGE. Every one of these helpers
+   ends in RET n and Ghidra had param_count 0 for them, so it could
+   not know how much the call removed from the stack and lost track
+   from the first one onwards. Fixed so far:
+
+   +----------------------+--------+-------------------------------+
+   | function             | at     | now                           |
+   +======================+========+===============================+
+   | Vec3_Set             |40fc90  | thiscall(out,x,y,z) RET c     |
+   +----------------------+--------+-------------------------------+
+   | Vec3_Set             |40fd20  | the same, a second copy       |
+   +----------------------+--------+-------------------------------+
+   | Matrix34_Copy        |4039c0  | thiscall(dst,src) RET 4       |
+   +----------------------+--------+-------------------------------+
+   | Matrix34_Copy2       |403a20  | thiscall(dst,src) RET 4       |
+   +----------------------+--------+-------------------------------+
+   | Matrix34_Identity    |403710  | thiscall(out) RET 0           |
+   +----------------------+--------+-------------------------------+
+   | maybe_Mat34_FromEuler|40fd40  | thiscall(out,euler) RET 4     |
+   +----------------------+--------+-------------------------------+
+   | Skl_BuildPartMatrices|463d90  | thiscall + 12 args, RET 30    |
+   +----------------------+--------+-------------------------------+
+
+   Skl_BuildPartMatrices was declared "(void)" against a RET 0x30 -
+   twelve stack arguments unaccounted for. That one alone would
+   desynchronise every caller.
+
+   ALL ELEVEN REMAINING CALLEES ARE NOW DECLARED AND NAMED:
+
+   +-------------------------------+--------+---------------------+
+   | name given                    | at     | what it is          |
+   +===============================+========+=====================+
+   | Mat34_FromEulerPos            |403740  | euler + translation |
+   +-------------------------------+--------+---------------------+
+   | Mat34_ToEuler                 |46d270  | matrix -> euler     |
+   +-------------------------------+--------+---------------------+
+   | Mat34_ToEuler2                |46bd00  | the same, args      |
+   |                               |        | the other way round |
+   +-------------------------------+--------+---------------------+
+   | Mat34_SetTranslation          |46d490  | writes rows 9..11   |
+   +-------------------------------+--------+---------------------+
+   | Vec3_Copy3                    |46d4f0  | three dwords        |
+   +-------------------------------+--------+---------------------+
+   | maybe_Racer_ShadeLevel        |465d60  | 0x10 or 0x1f from   |
+   |                               |        | the segment         |
+   +-------------------------------+--------+---------------------+
+   | maybe_Inst_DrawWithMatrix     |48c6d0  | instance draw, the  |
+   |                               |        | live branch         |
+   +-------------------------------+--------+---------------------+
+   | maybe_Inst_DrawWithMatrixNoFx |48c400  | its twin, no shade  |
+   +-------------------------------+--------+---------------------+
+   | maybe_Mesh_SetPrimVariant     |4221d0  | swaps prim kinds    |
+   |                               |        | 0x15<->0x10 etc     |
+   +-------------------------------+--------+---------------------+
+   | maybe_Mesh_ShadeVertices      |422540  | per-vertex shade    |
+   +-------------------------------+--------+---------------------+
+   | maybe_Racer_ShadeParts        |462a40  | the same over all   |
+   |                               |        | parts, RET 0x48     |
+   +-------------------------------+--------+---------------------+
+
+   maybe_Racer_ShadeParts was also declared "(void)" against a
+   RET 0x48 - eighteen stack arguments.
+
+   Matrix34_Multiply WAS THE LAST ONE, and it hid well: the
+   decompiler INFERRED a clean (out, a, b) signature and printed it
+   at the top of its own listing, while the stored signature was
+   still "undefined Matrix34_Multiply(void)" against a RET 0xc. It
+   is __stdcall with three arguments and is called ten times in the
+   draw. Reading the decompiler's header as if it were the database
+   is a trap worth naming.
+
+   __ftol IS NOT FIXABLE THE SAME WAY, and it has to be handled at
+   transcription instead. It takes its argument on the FPU STACK,
+   and this build of Ghidra offers only __stdcall, __cdecl,
+   __fastcall and __thiscall - none of which can name ST0. So the
+   FLD/FMUL feeding each call is invisible, the calls render as bare
+   __ftol() with no arguments, and where several run together only
+   the last return is bound to anything:
+
+       __ftol();
+       iVar5 = __ftol();
+
+   Both do the same work; the first result is simply dropped by the
+   listing. The leftover FPU values surface as the extraout_ST0 and
+   extraout_ST1 phantoms.
+
+   THE PATTERN IS STEREOTYPED, so it decodes on sight. Every one of
+   these is an angle turned into a cosine-table index:
+
+       FLD   a
+       FMUL  [0x004d0300]        2607.5945876 = 0x4000 / (2*pi)
+       CALL  __ftol              i = (int)(a * that)
+       MOV ECX,EAX / SUB EAX,0x1000
+       AND ECX,0x3fff / AND EAX,0x3fff
+       FLD [ECX*4 + 0x5fcb80]    cos = g_cosTable[i & 0x3fff]
+       FLD [EAX*4 + 0x5fcb80]    sin = g_cosTable[(i-0x1000) & 0x3fff]
+
+   so a RUN OF THREE __ftol calls followed by cos-table loads is an
+   inline euler-to-matrix build - the same thing
+   maybe_Mat34_FromEuler does out of line, spelled out for speed.
+   Transcribe it as cos/sin of the three euler angles and the
+   dropped return is no loss. 0x004d00d0 is the same constant for
+   the Mat34_FromEulerPos copy.
+
+   DO NOT HAND-DECODE THE PUSHES around these. The compiler
+   interleaves argument pushes across neighbouring calls - a PUSH
+   EAX sitting between a Vec3_Set and its call belongs to the
+   FOLLOWING Matrix34_Multiply - and reading them in source order
+   gets the arguments wrong. That is how the existing slices were
+   built. With the prototypes above in place the decompiler
+   untangles it correctly; use its output.
+
+   THE FRAME IS RECOVERED. No uStack_ phantoms remain and every call
+   now carries its arguments. What that immediately exposes:
+
+   o THE STEERING ANGLE IS STORED AFTER ALL, and the old plate
+     comment saying it never is was only true of the wheel matrix.
+     It also goes into THE POSE:
+
+         Vec3_Copy3(pose[slot*20 + 1].pAngle,
+                    (0, steering * factor * 0x004d1058, 0))
+
+     so part 1 - the fork - is turned by the bars through the pose
+     array, with a DIFFERENT constant from the wheel matrix's
+     0x004d1048. Two scale factors, two consumers.
+
+   o THE FORK SCALE, and it is a ratio not a length:
+
+         A = |pivot[k] - pivot[1]|   after transform
+         B = |frontContact - pivot1World| - RoueRayonAv * 96
+         S = |pivot[k] - pivot[1]| bind-space * A / B
+
+     which is what stretches the fork as the wheel moves away from
+     its pivot. Our skl_refork_front has the walk but not this.
+
+   o TWO EULER TRIPLES IN THE RACER FEED THE BIKE MATRIX, and the
+     port uses NEITHER: racer+0x2e3d (rearWheelSpin) and racer+0x2e49
+     (frontWheelSpin), both passed to maybe_Mat34_FromEuler and multiplied
+     into the chain alongside the lean, the suspension pitch and the
+     steering yaw. Four matrices are composed, not two. [open - what
+     writes them]
+
+   o THE REAR OFFSET CARRIES springBounce:
+
+         RoueRayonAr * 0x004d1050 * 96 * springBounce
+             + RoueRayonAr * 48
+
+     so the suspension bounce reaches the rear wheel placement.
+     race_bike_place has the term and racers.txt records it as never
+     having been observed non-zero - it is non-zero here.
+
+   o THE ARM ANGLE USES FourcheAngleArriere, carac 27 - the same
+     value the port calls swingarmRest.
+
+   o Skl_BuildPartMatrices IS CALLED TWICE, once on
+     pose[slot*20] with the bike matrix and once on
+     pose[slot*20 + 3] with matRiderRoot. Bike and rider are two
+     separate skeleton walks off two different matrices.
+   WHAT THE FUNCTION ALREADY GIVES UP, even half-decompiled, and it
+   is worth reading before transcribing anything:
+
+   o THE STEERING YAW IS steering * a per-frame factor * pi/4096,
+     built as a pure Y euler and multiplied into the front wheel
+     matrix. The angle is never stored - both the triple and the
+     matrix are stack temporaries.
+
+   o THE PER-FRAME FACTOR is 1 - speed/RealSpeedMax scaled, clamped
+     to [0,1] for PersoAnim 0 and unclamped otherwise, so steering
+     authority falls off with speed before it reaches the wheel.
+
+   o THE FORK SCALE is |d| * A / B at 0x0045fda5, and the front
+     wheel is placed by walking that distance down the fork axis
+     from the part-1 pivot.
+
+   o DAT_004dc130 PICKS BETWEEN TWO NEARLY IDENTICAL DRAW BRANCHES
+     for each wheel, FUN_0048c6d0 and FUN_0048c400. It reads 1 live,
+     so the 0048c6d0 side is the one that runs.
+
+   o THE RIDER PLACEMENT IS HERE, not in the tick, and the crash
+     branch adds a constant to riderPosition.y - 32 or 64 on
+     PersoAnim.
+
+   IMPORT 9 IS TRANSCRIBED. Every block of maybe_Racer_Draw is in
+   src/racerdraw.c, in the original's order, 24 ORIGIN tags over
+   1300 lines. Two remain documented stubs - the two
+   Skl_BuildPartMatrices walks and the face queue walk - because both
+   index MR_RacerPart and only three of its fields have been read.
+
+   IT IS NOT WIRED INTO race.c and must not be until those two close.
+   When it is, skl_swingarm, skl_refork_front and race_bike_place all
+   die with it.
+
+   THE METHOD THAT WORKED, and it is the reusable part: transcribe a
+   block, and when a LATER block shows what a stack slot actually
+   held, go back and correct the earlier one. THREE BLOCKS NEEDED
+   THAT:
+
+   +--------------------+------------------------+------------------+
+   | block              | first written as       | actually         |
+   +====================+========================+==================+
+   | build_matrices     | two chains             | THREE - the rear |
+   |                    |                        | was mislabelled  |
+   |                    |                        | as the body      |
+   +--------------------+------------------------+------------------+
+   | offsets            | rear on body, front    | rear on the      |
+   |                    | on wheel               | ROLL-ONLY, front |
+   |                    |                        | on the body      |
+   +--------------------+------------------------+------------------+
+   | steer constants    | one scale              | +pi/4096 and     |
+   |                    |                        | -pi/4096         |
+   +--------------------+------------------------+------------------+
+
+   THE CAUSE IS THE ORIGINAL REUSING STACK SLOTS. local_1bc holds
+   three different matrices in turn and local_18c holds both an
+   intermediate and a result. Reading any one block in isolation gets
+   the wrong matrix, which is exactly how the old slices were built
+   and exactly why they never matched.
+
+   WHAT THE FUNCTION TURNED OUT TO CONTAIN, none of which was in the
+   port:
+
+   o THREE MATRICES off matBikeRoot - rear, body, front - differing
+     by which of rearWheelSpin, the suspension pitch, the bars and
+     frontWheelSpin are composed on.
+
+   o THE FORK SCALE IS A RATIO, |bindTip-bindPivot| * posed / reach,
+     and the tip is re-pointed along the BIND direction at that
+     length. That is what extends the fork.
+
+   o THE BARS REACH THE FORK THROUGH THE POSE ARRAY, part 1's angle
+     triple, on the NEGATED scale - so the fork counter-rotates
+     against the wheel mesh.
+
+   o THE ARM CARRIES THE REAR WHEEL. Nothing places that wheel
+     directly; it goes wherever the arm tip lands.
+
+   o THE ARM MATRIX IS A PURE X ROTATION. The inline cosine-table
+     build collapses once g_cosTable[0]=1 and g_cosTable[0x3000]=0
+     are substituted - two of its three euler angles are constant.
+
+   o PARTS 3..14 ARE THE RIDER. No flag; the range is the test.
+
+   o THE QUEUE WALK RUNS ONE PART FURTHER than the transform loop and
+     does not remap the index. Possibly a defect in the original.
+     [open]
+
+   o THE FAR LOD IS A DIFFERENT PROGRAM - one mesh, no pitch, no
+     steering, no crashFallSide, and placed from the REAR CONTACT
+     rather than the midpoint. The two LODs disagree about where the
+     bike is, in the original.
+
+7.10.  Imports 10 to 14 - the draw closes
+
+   maybe_Racer_Draw had been imported block by block and NONE OF IT
+   RAN: nineteen of its twenty-four blocks had no caller, because the
+   port had no function corresponding to it. These five imports give
+   it one and put the whole tree behind it.
+
+   +----+-------------------------------+------------------------+
+   | #  | Function                      | Lands as               |
+   +====+===============================+========================+
+   | 10 | maybe_Racer_Draw              | racerdraw_racer        |
+   |    | 0x0045f290..0x00461a96        | the single entry point |
+   +----+-------------------------------+------------------------+
+   | 11 | maybe_Race_DrawRacers         | race_draw_racers,      |
+   |    | 0x00458b80                    | reshaped on it         |
+   +----+-------------------------------+------------------------+
+   | 12 | maybe_Racer_CullSphere        | racerdraw_visible      |
+   |    | 0x0046e8b0                    | distance half only     |
+   +----+-------------------------------+------------------------+
+   | 13 | maybe_Racer_SelectLod         | racerdraw_select_lod   |
+   |    | 0x0045f1c0                    |                        |
+   +----+-------------------------------+------------------------+
+   | 14 | maybe_Racer_BuildShadow       | racerdraw_build_shadow |
+   |    | maybe_Racer_DrawShadow        | racerdraw_shadow       |
+   |    | 0x00461aa0 / 0x00461f70       | racerdraw_init_shadow  |
+   +----+-------------------------------+------------------------+
+
+   THE ONE THING THAT HAD TO BE RIGHT was the part loop, and two
+   readings of it in this project were wrong. racerdraw.h said
+   "i == 3 transform with an IDENTITY" and racers.txt 9.64 said "a
+   copy of the bike matrix". Neither is true:
+
+       counter 0 -> member 0 -> part 0, corps     ESP+0x3cc
+       counter 3 -> member 3 -> part 2, SWINGARM  ESP+0x240
+
+   Both are prebuilt and go in UNINVERTED. The remap is what settles
+   it - member 3 is part 2 (9.59.4) - and the port had the same fact
+   from the other end all along: model.c had measured mat[3] as
+   needing a pre-inversion to survive its own unconditional inverse.
+   Same member, opposite route.  [verified, 0x004614cf]
+
+   THE RIDER IS NOT A SPECIAL CASE. He arrives through the second
+   walk root and through a TRANSLATION substitution inside the
+   general path. A port that gives him his own placement matrix - as
+   bike_draw did, with riderOrient - has invented a concept.
+
+   AND THE RIDER ROOT HAS TO BE SEVERED. CORPS.SKL gives member 5 a
+   parent of member 0, so the file describes ONE tree; the racer
+   holds TWO, with a null parent at parts 0 and 3. Since the walk
+   recurses siblings with the parent matrix, leaving part 3 on part
+   0 child chain makes the rider walk rewrite the fork and the
+   swingarm with matRiderRoot - silently, after the bike walk got
+   them right.
+
+   Superseded by imports 10 and 11:
+
+       bike_draw                model.c - and it had no original
+       bike_draw_body_parts     model.c
+       bike_draw_piece          model.c
+       MR_BikeDraw              model.h - the struct itself
+       skl_build_anim           skl.c
+       skl_apply_anim           skl.c
+       skl_refork_front         skl.c
+       skl_swingarm             skl.c
+       racerdraw_publish_matrices   racerdraw.c - a bridge to a
+                                    layer that no longer exists
+       s_race_wheelOffset       race.c
+       racer_matrix_roll_z      racer.c
+       racer_matrix_pitch_x     racer.c
+
+   MenuPage10 went with them. Retail draws a real MR_Racer there -
+   g_menuRacer, racer 1 - through the same maybe_Racer_Draw, so the
+   port now does too and the three separate paths are one.
+
+
+7.11.  Import 6 - maybe_Physics_TickDrivetrain - STARTED, NOT DONE
+
+   WHY IT MOVED UP THE ORDER. It was scheduled last because
+   check_physics.py holds its six slices to measured numbers. It is
+   now the blocking item instead, because the SLICING ITSELF is a bug:
+
+       the original  maybe_Racer_ApplyDrive calls the drivetrain on
+                     ALL FOUR paths, coast included, as (num=0, den=1)
+       ours          race.c calls physics_tick_drivetrain only when
+                     dm.num > 0; the coast branch does drag ONLY
+
+   physics_tick_drivetrain is "one frame of the ACCELERATE path" by
+   its own header - it has no drive-fraction parameter at all. So the
+   coast branch lost the engine idle floor, our engine reads 0.0 where
+   MOTO idles at 0.7, torque follows engine speed, and our whole
+   acceleration runs about half. That chain is measured in
+   docs/racer-draw-audit.txt 9.
+
+   IT IS racers-convergence.txt 9.32.2 AGAIN, IN A DIFFERENT
+   BRANCH: "the stand-in
+   was worse than the thing it stood in for - a guard that skips work
+   is not a neutral placeholder."
+
+   DONE SO FAR:
+
+     o maybe_Gearbox_SpeedToEngine (0x0048deb0) prototyped
+       float __thiscall(void*, float *speed, int gear, float engine)
+     o FUN_0048dd90 identified as its INVERSE, named
+       maybe_Gearbox_EngineToSpeed and prototyped. The pair bracket
+       the drive step: speed -> engine, cap, engine -> speed.
+     o a fifth copy-protection payload found in that inverse - see
+       subsystems/copy-protection.txt. Does NOT affect our captures.
+
+   THE SHAPE TO IMPORT. 1205 instructions, 166 basic blocks,
+   cyclomatic complexity 98, 60 calls. This does not land in one pass.
+   Import a SKELETON under the original name taking the real
+   (num, den) pair, every branch transcribed and running, unknown
+   parts marked in place with their addresses rather than dropped -
+   15.1. Then retire the six slices in physics.c and the four branches
+   in race.c together.
+
+   TWO THINGS THAT MUST STILL HOLD AFTERWARDS:
+
+     o tools/check_physics.py, currently 0 failures.
+     o maybe_Racer_ApplyDrive (0x00465e60) comes with it - it computes
+       (num, den) and applies the input overrides we do not model:
+       g_bPreRace forces BRAKE, wheelieAngle forces THROTTLE.
+
+   DO NOT TUNE AGAINST THE GEAR-TOP PLATEAU. The plate on 0x0048ef30
+   records that the original settles at 17.85 in gear 1 where the
+   arithmetic predicts 18.30, unexplained. The 9 m/s protection
+   subtraction was checked as a candidate and ELIMINATED - it is
+   twenty times too large and the flag passes. Still open.
+
+
+8.  Retiring the slices
+
+   A slice is deleted WHEN THE FUNCTION THAT SUBSUMES IT LANDS, not
+   before and not in a separate pass. Leaving both is how two
+   implementations of one behaviour end up fighting.
+
+   Superseded by import 1:
+
+       race_clip_walls          race.c
+       race_fall_step           race.c
+       race_land                race.c
+       racer_wall_impact_cos    racer.c
+       racer_wall_crash         racer.c
+       racer_wheel_ground       racer.c
+
+   The no-walls switch survives the change - it is ours, it is off at
+   load, and it is what lets the two games be put in the same state.
+   It is THE '3' KEY now rather than a [DEBUG] ini setting, and it
+   gates trk_contain_point as well as the clip; see
+   port-divergences.txt.
+
+   Superseded by import 7:
+
+       physics_wheelie_tick     physics.c
+       MR_Wheelie               physics.h - the struct itself
+       s_race_wheelie           race.c
+
+9.  Open questions
+
+   o  HOW MUCH OF MR_Racer IS KNOWN? The byte-exact struct needs
+      every named field verified at its offset. Unknown spans become
+      named padding, which is honest, but a field asserted at the
+      wrong offset is worse than one left as padding.
+
+   o  DOES A 12809-BYTE RACER COST ANYTHING? RACER_MAX racers at
+      0x3209 each. Almost certainly irrelevant, but it is a change of
+      two orders of magnitude and worth one measurement rather than
+      an assumption.
+
+   o  WHAT ABOUT THE FUNCTIONS ALREADY WRITTEN WELL? physics.c's
+      six slices of maybe_Physics_TickDrivetrain are checked against
+      measured numbers by tools/check_physics.py. Re-importing them
+      whole risks a regression against a test that currently passes.
+      Import 6 is last for that reason, and the check must still pass
+      afterwards.

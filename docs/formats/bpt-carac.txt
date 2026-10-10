@@ -1,0 +1,338 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                 CARAC: THE BIKE CHARACTERISTIC TABLES
+
+
+Abstract
+
+   CARAC1.BPT through CARAC8.BPT, present in each of the four bike
+   banks, are the vehicle parameter tables. All 32 decode completely
+   [verified]: 73 values each, one leading integer and the rest IEEE
+   floats.
+
+   These are the numbers a faithful reimplementation of the handling
+   model would need.
+
+Table of Contents
+
+   1. Decoding them
+   2. Layout
+      2.1. The gearbox is the anchor
+      2.2. Values that look interpretable
+   3. What varies
+   4. Every field, by name
+   5. Open questions
+
+
+1.  Decoding them
+
+   The mask is the one described in formats/bpt.txt: a byte-wise XOR
+   against the Park-Miller generator seeded with 0x1a2b3c4d.
+
+   The stream starts at byte 0 for these files, not after a leading
+   count. That differs from CONFIG.BPT, which only decodes when the
+   stream starts at byte 4. Scoring both alignments over a sample of
+   .bpt files makes the split obvious: CARAC1 scores 1.00 from offset 0
+   and 0.08 from offset 4, while CONFIG scores 0.96 from offset 4 and
+   0.12 from offset 0.
+
+   Why the two differ is not established. CONFIG.BPT and LIST.BPT are
+   the two files the game chmods and rewrites at run time, so a
+   plausible guess is that the runtime writer emits a plain header word
+   while the build-time compiler does not [guess]. Do not rely on it;
+   test both alignments.
+
+   Every other .bpt sampled scores about 0.1 at both alignments, because
+   those files contain strings and the stream desynchronises at the
+   first one. CARAC files contain no strings, which is why they decode
+   end to end.
+
+   python tools/bpt.py --dump decomp/DATA/extracted/SPEED/CARAC1.BPT
+
+2.  Layout
+
+   73 values. Index 0 is an integer; treat the rest as floats.
+
+   +----------+-----------------------+--------------------------------------------+
+   | Index    | Value in SPEED/CARAC1 | Reading                                    |
+   +==========+=======================+============================================+
+   | 0        | 2                     | version or record count                    |
+   +----------+-----------------------+--------------------------------------------+
+   | 1 to 4   | 75, 75, 75, 75        | the four bike-select stat bars; see below  |
+   +----------+-----------------------+--------------------------------------------+
+   | 5 to 27  | assorted              | body and handling constants, see below     |
+   +----------+-----------------------+--------------------------------------------+
+   | 28       | 6                     | number of gears in use                     |
+   +----------+-----------------------+--------------------------------------------+
+   | 29       | 12000                 | rev limit                                  |
+   +----------+-----------------------+--------------------------------------------+
+   | 30 to 35 | 0.3 .. 1.45           | gear ratio array, six slots                |
+   +----------+-----------------------+--------------------------------------------+
+   | 36       | 10500                 | a second, lower rev figure                 |
+   +----------+-----------------------+--------------------------------------------+
+   | 37 to 71 | assorted              | grouped in threes, see below               |
+   +----------+-----------------------+--------------------------------------------+
+   | 72       | 0                     | terminator                                 |
+   +----------+-----------------------+--------------------------------------------+
+
+2.1.  The gearbox is the anchor
+
+   Index 28 gives the gear count and indices 30 to 35 hold the ratios.
+   The array is fixed at six slots and index 28 says how many are live
+   [verified]:
+
+   +----------+-------+------------------------------+
+   | Bike     | Gears | Slots 1 to 6                 |
+   +==========+=======+==============================+
+   | SPEED    | 6     | 0.3 0.6 0.9 1.2 1.34 1.45    |
+   +----------+-------+------------------------------+
+   | KTMCROSS | 5     | 0.35 0.65 0.95 1.1 1.3 (1.5) |
+   +----------+-------+------------------------------+
+   | SPEEDPKT | 4     | 0.24 0.44 0.64 1.0 (0.6 1.1) |
+   +----------+-------+------------------------------+
+   | KTMPKT   | 4     | 0.2 0.4 0.7 1.4 (1.0 2.0)    |
+   +----------+-------+------------------------------+
+
+   The two pocket bikes are what settle it. Their ratios climb cleanly
+   for exactly four slots and then break the ramp, so the trailing slots
+   are leftover rather than part of the sequence. Values in brackets are
+   those unused slots.
+
+   This also confirms the gearbox is real rather than decorative, which
+   matches the Higher Gear and Lower Gear actions catalogued in
+   subsystems/input-bindings.txt.
+
+   Index 29 is above index 36 in every file, and both are ordered by
+   bike class: 12000 and 10500 for the road bike, down to 9000 and 7000
+   for the KTM pocket bike. A rev limit and a power or shift point
+   [inferred].
+
+2.2.  Values that look interpretable
+
+   From SPEED/CARAC1, with the caveat that these readings are [guess]
+   unless marked otherwise:
+
+   [ 7] 280      plausibly top speed
+   [12] 0.1963   very close to pi/16, so an angle in radians
+   [20] 0.0028   small coefficient, drag or rolling resistance
+   [24] -10      paired with
+   [25] 10       a symmetric range, plausibly a lean or steering limit
+   [26] -0.65    paired with
+   [27] -0.55    a second, narrower symmetric pair
+
+   From index 37 to 71 the values fall into descending groups of three,
+   for example 6, 5.5, 4 then 10, 9, 8 then 3, 2.5, 2. Groups of three
+   recur throughout. The game has three difficulty settings and
+   CurrentDifficulty is a stored setting, so per-difficulty tuning is
+   the obvious reading [guess]. It is equally consistent with three
+   surface types.
+
+3.  What varies
+
+   Comparing the eight CARAC files within one bike, 18 of the 73 values
+   differ. Comparing the four bikes at CARAC1, 60 of 73 differ.
+
+   So the eight files per bike are variants of one machine rather than
+   eight different machines: most of the table is shared and only the
+   tuning moves.
+
+   RESOLVED - THE EIGHT VARIANTS ARE THE EIGHT SELECTABLE BIKES.
+   MenuPage10_BikeSelect indexes g_bikeCarac with 0..7 and refuses to
+   step past either end, and the bike manifest names exactly eight
+   carac scripts under the key "MotoCarac" [verified]. The gear
+   ratios differing between them is then expected rather than
+   suggestive: they are eight different machines.
+
+   INDICES 1 TO 4 ARE THE FOUR STAT BARS page 10 draws -
+   acceleration, speed, grip and braking - and they are NOT
+   constant.  Only CARAC1 is 75/75/75/75, and it is that in every
+   bank.  The other seven vary.  All four banks, stock:
+
+   +--------+-----------------+-----------------+-----------------+-----------------+
+   | File   | SPEED           | KTMCROSS        | SPEEDPKT        | KTMPKT          |
+   +========+=================+=================+=================+=================+
+   | CARAC1 |  75  75  75  75 |  75  75  75  75 |  75  75  75  75 |  75  75  75  75 |
+   | CARAC2 |  50  75 100 100 |  50  75 100  75 |  50  75 100 100 |  50  75  75 100 |
+   | CARAC3 | 100  50  75 100 | 100  50  75  75 | 100  50 100  75 | 100  50  75  75 |
+   | CARAC4 |  50 100  75  75 |  50 100 100  50 |  50 100  75  75 |  75 100  50  75 |
+   | CARAC5 | 100  75  75  50 | 100  75  75  50 | 100  75  75  50 |  50 100 100  75 |
+   | CARAC6 | 100  85  45  70 | 100  75  50  75 | 100  75  50  75 | 100  75  50  75 |
+   | CARAC7 |  75 100  50  75 |  75 100  50  75 |  75 100  50  75 | 100  75  75  50 |
+   | CARAC8 | 100  75  50 100 |  50 100  75  75 | 100  75  50 100 |  50  75 100  50 |
+   +--------+-----------------+-----------------+-----------------+-----------------+
+
+   o AND IT LOCATES PART OF THE SPEED.BKF TAMPERING. CLAUDE.md records
+     that our CARAC2.BPT has eight edited values, seven raised and one
+     lowered. Two of them are here - SPEED CARAC2 reads 50/75/100/100
+     on the stock disc and 100/100/100/100 in decomp/DATA, so the
+     cheat pumped bike 2's acceleration and speed to maximum. Read
+     these from a stock copy or the page draws somebody's cheat.
+
+4.  Every field, by name
+
+   Carac_Load at 0x0042a580 reads all 73 values by setting key, so it is
+   an authoritative field map rather than an inference from the data. It
+   fills g_bikeCarac at 0x00509278, an array of eight records of 0x124
+   bytes - the eight carac files each bike manifest names under
+   MotoCarac [verified].
+
+   +-------+----------+------------------------------+
+   | Idx   | Type     | Setting key                  |
+   +=======+==========+==============================+
+   | 0     | int      | MotoType                     |
+   +-------+----------+------------------------------+
+   | 1     | int      | Gfx_acc                      |
+   +-------+----------+------------------------------+
+   | 2     | int      | Gfx_spe                      |
+   +-------+----------+------------------------------+
+   | 3     | int      | Gfx_gri                      |
+   +-------+----------+------------------------------+
+   | 4     | int      | Gfx_bra                      |
+   +-------+----------+------------------------------+
+   | 5     | float    | Frein                        |
+   +-------+----------+------------------------------+
+   | 6     | float    | MoteurVitesseMax             |
+   +-------+----------+------------------------------+
+   | 7     | float    | MotoMasse                    |
+   +-------+----------+------------------------------+
+   | 8     | float    | RetardCadre                  |
+   +-------+----------+------------------------------+
+   | 9     | float    | RoueAccelerationAngulaire    |
+   +-------+----------+------------------------------+
+   | 10    | float    | RoueMaxAccelerationAngulaire |
+   +-------+----------+------------------------------+
+   | 11    | float    | RoueVitesseRetour            |
+   +-------+----------+------------------------------+
+   | 12    | float    | AngleSuspension              |
+   +-------+----------+------------------------------+
+   | 13    | float    | RoueLimiteAngulaire          |
+   +-------+----------+------------------------------+
+   | 14    | float    | RoueAxeDistance              |
+   +-------+----------+------------------------------+
+   | 15    | float    | RoueRayonAv                  |
+   +-------+----------+------------------------------+
+   | 16    | float    | RoueRayonAr                  |
+   +-------+----------+------------------------------+
+   | 17    | float    | RoueRayon                    |
+   +-------+----------+------------------------------+
+   | 18    | float    | RealSpeedMax                 |
+   +-------+----------+------------------------------+
+   | 19    | float    | VitesseMaxBoite              |
+   +-------+----------+------------------------------+
+   | 20    | float    | RotationTransfert            |
+   +-------+----------+------------------------------+
+   | 21    | float    | DivTransfert                 |
+   +-------+----------+------------------------------+
+   | 22    | float    | HauteurCadre                 |
+   +-------+----------+------------------------------+
+   | 23    | float    | RessorAmplitudeDec           |
+   +-------+----------+------------------------------+
+   | 24    | float    | RessorAmplitudeMin           |
+   +-------+----------+------------------------------+
+   | 25    | float    | RessorAmplitudeFactor        |
+   +-------+----------+------------------------------+
+   | 26    | float    | FourcheAngleAvant            |
+   +-------+----------+------------------------------+
+   | 27    | float    | FourcheAngleArriere          |
+   +-------+----------+------------------------------+
+   | 28    | float    | NbSpeed                      |
+   +-------+----------+------------------------------+
+   | 29    | float    | RegimeMax                    |
+   +-------+----------+------------------------------+
+   | 30    | float    | RapportDeBoite1              |
+   +-------+----------+------------------------------+
+   | 31    | float    | RapportDeBoite2              |
+   +-------+----------+------------------------------+
+   | 32    | float    | RapportDeBoite3              |
+   +-------+----------+------------------------------+
+   | 33    | float    | RapportDeBoite4              |
+   +-------+----------+------------------------------+
+   | 34    | float    | RapportDeBoite5              |
+   +-------+----------+------------------------------+
+   | 35    | float    | RapportDeBoite6              |
+   +-------+----------+------------------------------+
+   | 36    | float    | RegimeCoupleMax              |
+   +-------+----------+------------------------------+
+   | 37    | float    | CoupleMax                    |
+   +-------+----------+------------------------------+
+   | 38    | float    | Couple1000                   |
+   +-------+----------+------------------------------+
+   | 39    | float    | CoupleRegimeMax              |
+   +-------+----------+------------------------------+
+   | 40    | float    | ZoneRouge                    |
+   +-------+----------+------------------------------+
+   | 41    | float    | MinAdherenceWheel            |
+   +-------+----------+------------------------------+
+   | 42-44 | float[3] | MinAdherenceDerap            |
+   +-------+----------+------------------------------+
+   | 45-47 | float[3] | MaterialNeutre               |
+   +-------+----------+------------------------------+
+   | 48-50 | float[3] | MaterialEauProfonde          |
+   +-------+----------+------------------------------+
+   | 51-53 | float[3] | MaterialEau                  |
+   +-------+----------+------------------------------+
+   | 54-56 | float[3] | MaterialSable                |
+   +-------+----------+------------------------------+
+   | 57-59 | float[3] | MaterialHerbe                |
+   +-------+----------+------------------------------+
+   | 60-62 | float[3] | MaterialTerre                |
+   +-------+----------+------------------------------+
+   | 63-65 | float[3] | MaterialGoudron              |
+   +-------+----------+------------------------------+
+   | 66-68 | float[3] | MaterialHuile                |
+   +-------+----------+------------------------------+
+   | 69-71 | float[3] | MaterialBordRoute            |
+   +-------+----------+------------------------------+
+   | 72    | int      | PersoAnim                    |
+   +-------+----------+------------------------------+
+
+   Note the type column. This note previously recorded that index 0 is
+   an integer and the rest are floats. That is nearly right: indices 0
+   to 4 are integers and so is index 72, PersoAnim. The remaining 67 are
+   floats [verified].
+
+   The ten triples are read as one named key followed by two bare
+   Script_ReadFloat calls, so the file stores three numbers under each
+   of those names. Nine of the ten are surfaces - neutral, deep water,
+   water, sand, grass, earth, tarmac, oil and roadside - which makes
+   that block a per-surface grip table. The tenth, MinAdherenceDerap, is
+   the slide threshold and is stored the same way.
+
+   Two values are adjusted after reading, which is worth knowing before
+   comparing a file against memory [verified]:
+
+       MotoType == 1     clamps RoueAccelerationAngulaire to
+                         the range 3.0 to 6.0
+       DAT_004dc1f4 == 0 subtracts a constant from NbSpeed
+
+   IDENTIFIED. DAT_004dc1f4 is g_protectionPassed, the copy-protection
+   verdict, and the constant is 1.0 - one gear fewer on every bike when
+   the registry PId check fails. It is a silent anti-tamper penalty, not
+   a parameter of the bpt format, and should not be reconstructed as
+   one. This binary is cracked so the flag is always 1 and the penalty
+   never applies. See subsystems/copy-protection.txt [verified].
+
+   The vocabulary is French and mechanical throughout: Frein is brake,
+   MotoMasse mass, Fourche the fork, RapportDeBoite a gearbox ratio,
+   RegimeMax maximum engine speed, CoupleMax maximum torque, ZoneRouge
+   the red line. So the model is a real engine and suspension
+   simulation, not a set of arcade constants.
+
+   Three fields are already known to be read elsewhere: 12, 13 and 14 as
+   floats by maybe_Game_CollideRacers; 18, RealSpeedMax, copied to
+   racer+0xb4 by Racer_Create at 0x0045c572; and 72, PersoAnim, used as
+   a boolean by maybe_Game_LoadBikeMeshes and as the three-way lean and
+   wheelbase gate in maybe_Racer_UpdateLean. See subsystems/racers.txt
+   sections 4, 5 and 9.71.
+
+
+5.  Open questions
+
+   o Confirm whether the groups of three from index 37 are per-
+     difficulty by locating a consumer indexed by CurrentDifficulty.
+   o Index 12 being close to pi/16 is suggestive but unconfirmed; check
+     whether the code treats it as an angle.
+   o The reading of individual physics constants needs a consumer traced
+     in the handling code before any of it can be trusted. Right now the
+     gearbox is the only part backed by structural evidence.

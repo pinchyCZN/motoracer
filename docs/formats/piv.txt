@@ -1,0 +1,169 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      THE .PIV FILES, AND THE
+                    SKELETON PART NAMES THEY CARRY
+
+
+Abstract
+
+   A .PIV is an AUTHORING MANIFEST, not geometry. It names the parts
+   of a skeleton and points at the .skl files they were built from,
+   and it still carries the original developers' absolute paths.
+
+   Its value to this project is one table: it NAMES ALL SEVENTEEN
+   MEMBERS of corps.skl, in the game's own part order. Those names
+   turn an anonymous bone tree into a readable one - FourcheAr is the
+   swingarm, Colonne the spine, FemurG the left thigh - and they made
+   an otherwise opaque runtime pose interpretable at a glance.
+
+   Nine files exist, across four archives. The format is only
+   partially decoded and nothing in the game has been shown to read
+   one; see section 4.
+
+Table of Contents
+
+   1. Where they are
+   2. What is decoded
+   3. The part names
+   4. Open questions
+
+
+1.  Where they are
+
+   +--------------+------+------+------+
+   | Archive      | .piv | .skl | .rot |
+   +==============+======+======+======+
+   | KTMCROSS.BKF |    3 |    3 |   37 |
+   | KTMPKT.BKF   |    4 |    4 |   28 |
+   | PODIUM.BKF   |    0 |    1 |   12 |
+   | SPEED.BKF    |    1 |    1 |   19 |
+   | SPEEDPKT.BKF |    1 |    1 |   10 |
+   +--------------+------+------+------+
+
+   SPEED\CORPS.PIV and SPEEDPKT\CORPS.PIV are both 5656 bytes and
+   carry the same sixteen names in the same order, so the file
+   describes the SKELETON RATHER THAN THE POSE [inferred - the two
+   archives' corps.skl differ in every vertex and every member origin,
+   yet their .piv agree].
+
+2.  What is decoded
+
+   Little, and only what was needed to read the names.
+
+   o A u32 at +0 holding 1 - a version or a count [guess].
+
+   o A sequence of records, each carrying a NUL-padded name and a
+     path. Record boundaries are marked by short "&N " tags - "&4 ",
+     "&5 ", up to at least "&9 " - which appear immediately before
+     paths.
+
+   o The paths are the authors' own and are worth recording as
+     evidence about the build, alongside the thirteen assert paths in
+     docs/code-map.txt:
+
+         C:\simple51\...\corps.skl
+         C:\ktm\MediumAn\corps.skl
+         C:\ktm\corps.skl
+         \\Motoracer\c\...\corps.skl
+
+     The "..." is literal - the tool that wrote these elided the
+     middle of long paths. \\Motoracer\c is a UNC share, so the team
+     built from a machine named Motoracer.
+
+   THE POSE IS NOT IN HERE. Searched for it directly and it is absent:
+   no float within 0.002 of any cosine or sine of the runtime pose's
+   chassis angles, and no int16 within 2 of any of its .rot-unit
+   angles. See runtime-capture.txt section 7.2.
+
+3.  The part names
+
+   Names come from the .piv; the member and run columns come from
+   corps.skl; the mapping between them was measured at run time
+   [verified, runtime-capture.txt section 7.1].
+
+   +------+--------+--------------+-------+-------+--------------------+
+   | Part | Member | Name         | Verts | Faces | Reading            |
+   +======+========+==============+=======+=======+====================+
+   |  0   |   0    | corps        |  0-70 |  90   | frame, the root    |
+   |  1   |   1    | FourcheAv    | empty |   0   | front fork pivot   |
+   |  2   |   3    | FourcheAr    | 95-106|   6   | swingarm           |
+   |  3   |   5    | Pilote       | empty |   0   | rider root         |
+   |  4   |   6    | Bassin       |107-115|   6   | pelvis             |
+   |  5   |   7    | FemurG       |116-119|   2   | left thigh         |
+   |  6   |   8    | TibiaG       |120-129|  12   | left shin          |
+   |  7   |   9    | FemurD       |130-133|   2   | right thigh        |
+   |  8   |  10    | TibiaD       |134-143|  12   | right shin         |
+   |  9   |  11    | Colonne      |144-164|  20   | spine              |
+   | 10   |  12    | BrasG        |165-171|   2   | left upper arm     |
+   | 11   |  13    | AvbrasG      |172-185|  17   | left forearm       |
+   | 12   |  14    | 12-T         |186-218|  36   | head - see below   |
+   | 13   |  15    | BrasD        |219-224|   1   | right upper arm    |
+   | 14   |  16    | AvBrasD      |225-239|  19   | right forearm      |
+   | 15   |   2    | RoueAV       | 71-94 |  24   | front wheel        |
+   | 16   |   4    | RoueAr       | empty |   0   | rear wheel         |
+   | 17   |   -    | -            | none  |  91   | trailing group     |
+   +------+--------+--------------+-------+-------+--------------------+
+
+   PART ORDER IS NOT MEMBER ORDER, and the .piv lists parts. The
+   permutation is the .skl's own remap table, which the game keeps at
+   racer + 0x2d74 + lod*4:
+
+       0 1 15 2 16 3 4 5 6 7 8 9 10 11 12 13 14
+
+   "12-T" IS TRUNCATED IN THE FILE ITSELF - four characters, where its
+   neighbours run to twelve. Tete, the head, on the evidence that it
+   is a child of Colonne, carries the most faces of any rider part,
+   and holds the highest vertices in the model [inferred].
+
+   TWO OF THE NAMES ARE A WARNING. RoueAV is a real member with 24
+   vertices, while RoueAr is EMPTY - so the front wheel has geometry
+   inside corps.skl and the rear does not, even though the game also
+   attaches roueav.3df AND rouear.3df as separate instances. Something
+   is drawn twice or one of those readings is wrong, and page 10 has a
+   standing complaint about a front mudguard sitting too far forward.
+   Worth settling before trusting either.
+
+   G AND D ARE gauche AND droite - left and right. Consistent with the
+   thirteen French source paths in code-map.txt.
+
+4.  Open questions
+
+   o ANSWERED - THE GAME ALMOST CERTAINLY NEVER READS ONE. The bike
+     manifest keys sit in one block at 0x004e79c0 and there is no Piv
+     among them [verified]:
+
+         moto data          MotoCarac          PilotRot
+         FileCockpit        FileGuidon         FileMotoVeryLow
+         FileMotoLow        FileMotoMed        FileRoueAvant
+         FileRoueArriere    FileSklHand        FileSkl
+         FileBnk1           FileBnk0           Data\Carac.Spt
+         PersoAnim          MaterialBordRoute  MaterialHuile
+         MaterialGoudron
+
+     Every asset the bike loads is named by one of those keys, and a
+     .piv is named by none. So it is an authoring artifact that
+     shipped by accident [inferred - strong; a loader could in
+     principle build the name some other way, but nothing suggests
+     one does].
+
+     THE NAMES ARE THEREFORE EVIDENCE ABOUT THE ART, NOT THE CODE.
+     That is still worth having - they are the artists' own names for
+     the parts - but nothing should be built on the assumption that
+     the game agrees with them.
+
+     NOTE PilotRot IN THAT LIST. It is the key naming the rider pose
+     files, and src/bikes.h already carries ten slots for it, which is
+     exactly how many .rot files SPEEDPKT ships. Which of them the
+     bike-select page selects is still open - see
+     runtime-capture.txt section 7.2.
+
+   o The record layout. Only names, tags and paths were needed; the
+     numeric fields between them are unexamined. 5656 bytes over 16
+     named parts is 353 each, far more than a name and a path.
+
+   o What the "&N " tags count. They rise through a file and appear
+     next to paths, so they may be per-source-file indices [guess].
+
+   o Whether the KTM and PODIUM .piv name their own skeletons the same
+     way. Only the two corps.piv have been read.

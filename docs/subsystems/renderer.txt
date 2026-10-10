@@ -1,0 +1,723 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                                RENDERER
+
+
+Abstract
+
+   The primary modernization target, and the spine document for it.
+   Sections 1 and 2 are the original reconnaissance; section 3 is what
+   has since been read function by function - the frame skeleton, the
+   hardware seam, the queue, the geometry and state each back end
+   consumes, and the bring-up that has to happen before any of it runs.
+
+   Both halves of the hardware seam are now decoded. See
+   d3d-render-state.txt for the render-state half,
+   d3d-execute-buffers.txt for the instruction encoding, and
+   rasterizer-pipeline.txt for the software path that shares the queue.
+
+Table of Contents
+
+   1. Shape of the thing [verified]
+      1.1. DirectDraw layer [verified]
+      1.2. Direct3D path [verified]
+      1.3. The 16-bit lock [verified]
+   2. Supported resolutions [verified]
+   3. Graphics command-line flags [verified]
+      3.1. The frame skeleton
+      3.2. The hardware seam is one branch
+      3.3. What the queue is
+      3.3.1. The "extra list" is bucket 7999
+      3.3.2. Two clamps that look like defects and are not
+      3.3.3. The bucket key is in WORLD UNITS, a porting hazard
+      3.4. What a D3D9 back end actually has to implement
+         3.4.1. The vertex format is already D3D9's
+         3.4.2. Two orders to keep
+         3.4.3. The 2D layer is the BACKGROUND, and our debug
+                text is not
+      3.5. Screen3D_Open: what the renderer needs before a frame
+         3.5.1. Two numbers section 3.3 left open
+         3.5.2. A 16-bit assumption at the API boundary
+         3.5.3. The primitive-kind feature table
+   4. Work plan
+      4.1. A back end now exists
+   5. Open questions
+
+
+1.  Shape of the thing [verified]
+
+   MotoRacer has three drawing paths sharing one DirectDraw surface
+   layer:
+
+                       +-----------------------------+
+                       |  DirectDraw (ddraw.dll)     |  surfaces, page flip,
+                       |  imported AND LoadLibrary'd |  mode enumeration, blits
+                       +----------+------------------+
+                                  | QueryInterface
+                 +----------------+----------------+
+                 |                |                |
+         software rasterizer   D3D IM HAL      3Dfx / PowerVR
+         (MMX, gouraud)     (execute buffers)   (vendor paths)
+
+   Relevant original translation units: screen3d\screen3d.cpp,
+   screen3d\dd.cpp, screen3d\bankw.Cpp, Dsi_d3d.cpp, frame3d.cpp.
+
+1.1.  DirectDraw layer [verified]
+
+   o Imports DirectDrawCreate, DirectDrawEnumerateA.
+   o Also loads DDRAW.DLL by name at runtime - errors "Couldn't
+     LoadLibrary DDraw", "Couldn't create DDraw", "Couldn't QI DDraw2"
+     (~0x004ea3e4-0x004ea448). Worth establishing why both paths exist.
+   o Diagnostics print resolution and surface pitch: "Resolution: %dx%d
+     Pitch: %d (-> %d bytes)" at 0x004ea25c. Pitch is read and used, so
+     the rasterizer is at least not assuming width * 2 everywhere.
+   o Video memory accounting at 0x004eec34 / 0x004eece4 tracks texture,
+     primary, and Z-buffer allocations separately.
+
+1.2.  Direct3D path [verified]
+
+   Direct3D Immediate Mode with execute buffers - the DX2/DX3-era API.
+   Evidence: the D3DERR_EXECUTE_* string block at 0x004e51dc-0x004e52ac,
+   and "Error in D3DUnLockExecuteBuffer lpBufEnd OverFlow" at
+   0x004e4fa8.
+
+   There is no modern API this ports to mechanically. It has to be
+   replaced with a new backend that consumes the same geometry the game
+   already produces. The useful question is therefore not "how do we
+   port the D3D calls" but "what does the game hand the renderer, and
+   where?" - find the vertex/primitive assembly boundary in frame3d.cpp
+   / screen3d.cpp and cut there.
+
+   Init lives in Dsi_d3d.cpp (asserts at 0x004e6dc8). Known failure
+   paths: "Fatal error in Cd3d CreateDD", "No compatible D3D driver
+   found...", and ComplInit messages about video memory, viewport
+   creation, texture formats, and the back buffer not landing in video
+   memory. Cd3d is a class name - expect a C++ object with vtable, and a
+   matching CDD for DirectDraw [inferred].
+
+1.3.  The 16-bit lock [verified]
+
+   +----------------------------------------------------+-----------------------+
+   | String                                             | Address               |
+   +====================================================+=======================+
+   | "16 bit screen mode required !" (+ 4 translations) | 0x004df05c and nearby |
+   +----------------------------------------------------+-----------------------+
+   | "Available 16 bits fullscreen video modes:"        | 0x004ea118            |
+   +----------------------------------------------------+-----------------------+
+   | "At least 640x480 mode required"                   | 0x004ea38c            |
+   +----------------------------------------------------+-----------------------+
+
+   Mode enumeration filters to 16 bpp and refuses to continue otherwise.
+
+   PARTLY CORRECTED. The original hypothesis here was that RGB565 is
+   compiled into the rasterizer inner loops, palette conversion, blend
+   math and texture upload alike. For colour conversion that is wrong.
+   Cdd_InitCapsVariables (0x00473ba0) reads the primary surface's
+   DDPIXELFORMAT and derives a shift-right and a shift-left per channel
+   from the actual RGB masks; the .lez palette path uses those six
+   globals rather than any constant. It therefore already adapts to 555,
+   565 or any layout with contiguous masks. See formats/lez.txt.
+
+   The adaptivity stops there. Buffers are unsigned short, pixels are
+   packed two per dword, and the blitter compares 16-bit words, so the
+   memory layout and the blit loops still assume exactly 16 bpp. The
+   obstacle is buffer and loop width, not colour packing.
+
+   The rasterizer inner loops and the texture upload path remain
+   unmeasured and may still carry hardcoded constants. Worth cataloguing
+   5/6/5 immediates and masks there - 0xF800, 0x07E0, 0x001F, 0xFFE0,
+   0x7BEF/0xF7DE (blend half-masks), shift counts 3/2/3 and 11/5/0 - but
+   expect fewer hits than first assumed, and check against the six
+   globals before concluding anything is hardcoded.
+
+2.  Supported resolutions [verified]
+
+   320x240, 512x384, 640x480 - strings at 0x004deab4, 0x004deb64,
+   0x004dec30. Menu strings, so these are the user-selectable modes.
+   Whether the renderer has other internal constraints (fixed-size
+   buffers, tile sizes) is unknown.
+
+3.  Graphics command-line flags [verified]
+
+   Self-documenting help text at 0x004dc664. The graphics-relevant flags
+   map the subsystem better than anything else currently available -
+   each one should lead to a config global and a branch worth finding:
+
+   o Backend selection: -3DFX, -PowerVr, -NoPowerVr, -D3D, -NoD3D,
+     -OnlyPrimaryDisplay
+   o Texture format/size: -Alpha (4444), -Pal16, -NoPal256,
+     -TextureSquareOnly, -CorrectRatioTextures, -NoTextureSizeMax256,
+     -Min/MaxTextureWidth<n>, -Min/MaxTextureHeight<n>
+   o Raster behaviour: -NoDither, -NoGouraud, -ZBuffer,
+     -InfiniteZBuffer, -ScanOtReverse, -OpaqueBlackLevel<n>
+   o DirectDraw behaviour: -AskDirectDraw, -DoRealLock, -BlitTimeOut<n>,
+     -DontWaitBlits, -NoBlitAsync, -NoDuplicateSurfaces, -NoFlick
+   o CPU paths: -NoMMX, -NoCpuDetect, -NoAGP
+   o Timing: -FrameRateMax<XX> (default 30, 0 = uncapped).  The help
+     text says 20-99 and the parser stores only 21..98 - it tests
+     JLE 20 and JGE 99, so both endpoints are silently ignored.
+     frame-loop.txt 1.2.
+
+   -DoRealLock ("Really use DirectDraw lock/unlock") implies there is a
+   fake lock path - probably a cached surface pointer held across frames
+   [guess]. That matters a lot for any modern backend.
+
+3.1.  The frame skeleton
+
+   maybe_Game_RenderFrame at 0x0047ff90 draws one frame. Stripped of
+   profiling, detail-level table lookups and the stage-mask branches,
+   the sequence a port has to reproduce is short [verified]:
+
+       if (offScreenEnabled) Cdd_LockOffScreen();
+       Screen3D_BeginFrame(0, skipLock);
+           ...camera setup, world traversal, HUD - all of which
+              only QUEUE primitives...
+       Screen3D_DrawScene();          /* draws everything queued */
+       if (offScreenEnabled) Cdd_UnlockOffScreen(1);
+       Screen3D_EndFrame(0, skipLock);
+       Screen3D_Present(1);           /* the flip */
+       if (g_videoSettingsDirty) maybe_Screen3D_UpdateScreen(...);
+
+   Everything between BeginFrame and Screen3D_DrawScene only builds a
+   list. No pixels are touched by the game code at all - the whole frame
+   is submitted in one call.
+
+   Screen3D_Present is FUN_0049b1c0 at 0x0049b1c0, named in this pass.
+   It is the universal end-of-frame call - maybe_Game_RenderFrame plus
+   every one of the twenty-nine MenuPageNN_Tick functions - and its body
+   is short [verified]:
+
+       if (g_menu && g_menu->active) {
+           if (!g_menu->needsRedraw) goto tail;   /* SKIP the present */
+           g_menu->needsRedraw = 0;
+       }
+       Cd3d_PresentAndClearZ();       /* 0x00419900 */
+   tail:
+       if (DAT_004dbcec) { DAT_004dbcec = 0;
+                           FUN_00499ed0(g_ownsDisplayMode, 1); }
+       if (DAT_004e8940) { DAT_004e8940 = 0; DAT_004f1824 = 1; }
+
+   o The menu branch is an optimisation, not a guard. While a menu page
+     is up the frame is presented ONLY when that page marked itself
+     dirty, so an idle menu costs no flips at all. A port that presents
+     unconditionally draws correctly but does not behave the same.
+
+   o Cd3d_PresentAndClearZ is the whole of presenting: Cdd_Present of
+     dd-present.txt, then IDirect3DViewport::Clear with flags 2,
+     D3DCLEAR_ZBUFFER only. The colour buffer is never cleared, because
+     the queue walk repaints every pixel. Note the Z clear happens
+     AFTER the present rather than before the next frame.
+
+   Note Screen3D_DrawScene is called at one of two points depending on
+   the renderer: before EndFrame on the software path, after it on the
+   hardware path. Both call sites are in maybe_Game_RenderFrame.
+
+3.2.  The hardware seam is one branch
+
+   FUN_0049ad90, now Screen3D_DrawScene, is where the two renderers part
+   company, and the split is a single if [verified]:
+
+       void Screen3D_DrawScene(void) {
+           maybe_g_primCount = 0;
+           if (paused) { clear the bucket array; return; }
+
+           if (g_rendererReady && g_rendererMode == 0) {
+               D3D_DrawScene();          /* HARDWARE - and return */
+               return;
+           }
+
+           ...the entire software rasterizer...
+       }
+
+   That is the most important structural fact for the port. The software
+   rasterizer is not woven through the game - it sits behind one early
+   return, and the hardware path hands the same queued primitive list to
+   D3D_DrawScene instead.
+
+   o So a D3D9 backend replaces D3D_DrawScene and nothing else in this
+     function. The queue that feeds it is built by code that does not
+     know or care which renderer will consume it.
+
+   o And an initial software-only build is equally viable: leave the
+     branch alone, port the software side, and fix only the two-bytes-
+     per-pixel addressing catalogued in pixel-format.txt section 1.1.3.
+     The channel arithmetic is already format-agnostic.
+
+3.3.  What the queue is
+
+   The primitives are held in an array of about 8000 linked-list heads
+   based at DAT_00655d38, each node chained through +8. The index is a
+   depth key, clamped to the range 0x1f36 to 0x1f3e before the walk.
+   Both renderers consume the same structure [verified].
+
+   The traversal direction is chosen by g_spanBufferEnabled, and it is
+   exactly what each algorithm needs:
+
+   +---------------------+---------------------------------+-----------------------+
+   | g_spanBufferEnabled | Walk                            | Then                  |
+   +=====================+=================================+=======================+
+   | 0                   | buckets DOWNWARD, back to front | nothing               |
+   +---------------------+---------------------------------+-----------------------+
+   | 1                   | buckets UPWARD, front to back   | Screen3D_FlushSpans() |
+   +---------------------+---------------------------------+-----------------------+
+
+   Back-to-front is the painter's algorithm; front-to-back is what the
+   span buffer of rasterizer-pipeline.txt section 10.1 requires, since
+   whatever draws first claims its pixels. The same list serves both by
+   being walked in opposite directions.
+
+   o For a D3D9 port neither ordering is needed for correctness - a
+     depth buffer replaces both - but the ordering still matters for the
+     deferred kinds, which are the translucent ones. Section 34.3 of
+     rasterizer-pipeline.txt has that as the two-pass split to keep.
+
+   o A per-frame primitive limit is enforced during the walk, comparing
+     a running count against the float at 0x0062e438. Geometry beyond it
+     is silently dropped, which is worth knowing before chasing a
+     missing-object bug in a port.
+
+3.3.1.  The "extra list" is bucket 7999
+
+   Screen3D_DrawScene appears to walk a SECOND, separate list after the
+   bucket loop, in both directions, and then null it:
+
+       for (n = DAT_0065da34; n; n = n->pNext) Screen3D_DispatchPrimitive(n);
+       DAT_0065da34 = 0;
+
+   It is not a second list. The bucket array base is 0x00655d38, and
+
+       0x00655d38 + 7999 * 4 = 0x0065da34
+
+   exactly, so DAT_0065da34 is the LAST BUCKET. Ghidra had given it its
+   own symbol because it is referenced directly rather than through the
+   array [verified].
+
+   That makes the arrangement legible, and it is a deliberate design
+   rather than an accident:
+
+   o The ftol path clamps to 0..0x1f3e, i.e. 0..7998, so NOTHING that
+     sorts by depth can ever land in bucket 7999.
+
+   o bucketMode 2 puts a primitive there and nothing else does.
+     bucketMode 1 is the mirror of it - bucket 0, the nearest.
+
+   o It is walked LAST whichever direction the main loop ran, and its
+     walk carries NO primitive-limit check, where every dispatch inside
+     the bucket loop does.
+
+   So bucket 7999 is the "always on top, always drawn, never budgeted"
+   slot - which is what a HUD or an overlay wants, and it explains why
+   the depth clamp stops one short of the array rather than at its end.
+
+   The clear at the top of the function confirms the geometry from the
+   other side: it starts at DAT_0065da34 and walks DOWNWARD for 8000
+   entries, which covers exactly buckets 7999 to 0.
+
+3.3.2.  Two clamps that look like defects and are not
+
+   o THE HIGH-WATER CLAMP. Before the walk:
+
+         if (high > 0x1f3e) high = 0x1f3e;
+         if (high < 0x1f36) high = 0x1f3e;
+
+     The second line forces the walk to the top of the range whenever
+     the tracked high mark is below 7990, which is almost every frame -
+     so the high-water tracking is nearly always discarded. It reads
+     like a bug until you notice THE WALK CLEARS EACH BUCKET HEAD IT
+     PASSES. Forcing the high end is what guarantees every bucket from
+     the low mark upward is cleared for the next frame; the cost is
+     scanning several thousand empty buckets and the benefit is not
+     needing a separate clear pass [inferred - the code states the
+     clamp, not the reason, but the clearing is in the same loop].
+
+   o A NEGATIVE BUCKET IS DROPPED, NOT CLAMPED. The ftol path returns
+     without queueing when the result is below zero. Nothing clamps it
+     up to bucket 0, so a face nearer than the origin is thrown away
+     [verified].
+
+3.3.3.  The bucket key is in WORLD UNITS, and that is a porting hazard
+
+   The bucket index is __ftol of the depth key with no scaling of any
+   kind, clamped at 7998. So the sort has useful resolution only while
+   the scene's depths fall inside 0..7998 in whatever unit the world is
+   authored in, and every primitive beyond that distance collapses into
+   one bucket.
+
+   That assumption is not written down anywhere in the binary, and it
+   is easy to violate in a port: mracer's own logo demo, which derives
+   its camera distance from a bounding sphere over meshes scaled by
+   Load3dfAndMap's 96.0, saturates the key completely - every primitive
+   lands in bucket 7998 and the sort does nothing. Only the depth
+   buffer keeps the picture right, which the original did not have.
+
+   src/queue.c reports the bucket range used per frame for exactly this
+   reason.
+
+
+3.4.  What a D3D9 back end actually has to implement
+
+   D3D_DrawScene at 0x004af570 is the hardware consumer of the queue. It
+   walks the same bucket array the software path walks - MOV EBX,[EAX*4
+   + 0x655d38] - and shares maybe_g_primCount with it [verified]. Its
+   own structure needs no porting: walk buckets, per primitive write
+   vertices and emit a triangle or a line. Only the emit primitives are
+   DirectDraw-era.
+
+   Those primitives are a small, conventional set:
+
+   +------------------------------------+----------------------------------+
+   | Existing call                      | D3D9 equivalent                  |
+   +====================================+==================================+
+   | D3D_SetBlendMode          0x41dde0 | SetRenderState SRCBLEND /        |
+   |                                    | DESTBLEND / ALPHABLENDENABLE     |
+   +------------------------------------+----------------------------------+
+   | D3D_SetBlendModeFlatAlpha 0x41e000 | the same, one fixed pair         |
+   +------------------------------------+----------------------------------+
+   | D3D_SetBlendModeSrcAlpha  0x41e1b0 | the same, SRCALPHA / INVSRCALPHA |
+   +------------------------------------+----------------------------------+
+   | D3D_SetTextureFilter      0x41e2b0 | SetSamplerState MAGFILTER /      |
+   |                                    | MINFILTER                        |
+   +------------------------------------+----------------------------------+
+   | D3D_SetDither             0x41e380 | SetRenderState DITHERENABLE      |
+   +------------------------------------+----------------------------------+
+   | D3D_InvalidateBatch       0x41e730 | nothing - a batching cache only  |
+   +------------------------------------+----------------------------------+
+
+   Only three distinct blends exist in the entire hardware renderer,
+   selected by primitive kind, and every render state the binary emits
+   decodes cleanly against the D3D enums. So the state half is as
+   mechanical as the geometry half: no state in it lacks a D3D9
+   equivalent except TEXTUREMAPBLEND, which becomes a fixed
+   texture-stage setup, and STIPPLEDALPHA, which is a 1997 fallback a
+   modern back end deletes.
+
+3.4.1.  The vertex format is already D3D9's
+
+   D3D_WriteVertex fills a standard D3DTLVERTEX, 0x20 bytes - sx, sy,
+   sz, rhw, colour, specular, tu, tv - per section 4.3 of d3d-execute-
+   buffers.txt. That struct is screen-space transformed and lit, and
+   D3D9 still accepts exactly it [verified as to the layout]:
+
+       D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1
+
+   So the geometry needs no transformation, no matrices, and no vertex
+   shader. The game already produces screen coordinates with 1/z in rhw,
+   which is what that FVF expects. D3D_EmitProcessVertices asks for
+   TRANSFORM rather than TRANSFORMLIGHT because the colours are computed
+   on the CPU through a shade table - so lighting is already baked into
+   the diffuse value too.
+
+   o That answers the strategic question directly. Passing geometry to
+     D3D9 is not a rewrite of the renderer; it is reimplementing about
+     six small functions behind an interface the game already uses, with
+     a vertex layout that needs no conversion.
+
+   o It also means the pixel-PACKING problem does not arise on this
+     path. Nothing in the hardware route packs a pixel - colours go out
+     as 32-bit ARGB in the vertex, and the texture format is the
+     surface's own. The pixel-format work of pixel-format.txt is
+     software-rasterizer work only.
+
+   NARROWED. An earlier draft of this bullet said the 16-bit problem
+   "does not arise on this path at all". Reading D3D_DrawScene shows
+   that is one step too strong. The hardware path has exactly one
+   16-bit dependency, at 0x004af776 [verified]:
+
+       entry = *(ushort *)(palette + colourIndex * 2);
+       DAT_00709370 = ((g_maskR & entry) >> g_shlR) << (g_shrR + 16)
+                    | ((g_maskG & entry) >> g_shlG) << (g_shrG + 8)
+                    |  (g_maskB & entry) << g_shrB;
+
+   The flat colour for a keyed or paletted primitive is read out of a
+   palette whose entries are two bytes wide, then expanded to 32-bit
+   ARGB. So the hardware path never WRITES a 16-bit pixel, but it does
+   READ one.
+
+   The distinction matters and is favourable. The expansion uses the
+   six adaptive mask and shift globals that Cdd_InitCapsVariables
+   derives from the actual surface DDPIXELFORMAT - the same six the
+   .lez path uses - so the channel layout is already format-agnostic;
+   555, 565 or anything with contiguous masks works unchanged. What is
+   fixed is only the two-byte STRIDE of the palette entry.
+
+   o So the hardware path inherits the palette width, not the pixel
+     format. Whatever a port decides for the palette LUT in
+     pixel-format.txt section 1.1.3, this site has to follow it - it is
+     the one place the two paths are coupled on a width.
+
+3.4.2.  Two orders to keep
+
+   Two behaviours of the queue walk are not incidental and would show as
+   visual bugs if dropped:
+
+   o Depth order. The buckets are a coarse depth sort. With a real depth
+     buffer the opaque geometry no longer needs it, but the DEFERRED
+     kinds - the keyed, stencil and blended ones of rasterizer-
+     pipeline.txt section 34.2 - still have to be drawn after the opaque
+     pass, with depth writes off.
+
+   o The primitive limit. The walk compares a running count against the
+     float at 0x0062e438 and silently stops emitting past it. A port
+     that omits the limit draws MORE than the original, which is a
+     difference to make deliberately rather than by accident.
+
+
+3.4.3.  The 2D layer is the BACKGROUND, and our debug text is not
+
+   Sprites and text never enter the rasterizer: they are written as
+   u16 pixels straight into the framebuffer, which the port uploads
+   as one texture and draws as a full-screen quad BEFORE the geometry.
+   That is the original's order - a menu page draws its sprites during
+   the page tick and only then calls Screen3D_DrawScene - and it is
+   right for everything the game draws.
+
+   IT IS WRONG FOR AN OVERLAY WE ADDED.  The fps counter goes into the
+   same layer, so any building or palm standing in front of it hides
+   it.  MOTO.EXE has no fps counter, so there is no draw order to
+   match here and nothing to preserve.
+
+   r_draw_overlay_rect redraws one rectangle of that same framebuffer
+   after the geometry, OPAQUELY, so the counter arrives with the
+   cleared framebuffer behind it.
+
+   DO NOT COLOUR KEY IT.  Keying pixel 0 away so only the ink lands
+   looks like the tidy answer and is wrong: it leaves bare glyphs, and
+   white letters over pale geometry cannot be read.  The black behind
+   the text is not incidental - it is what made the counter legible
+   when the 2D layer was drawn whole, and the overlay has to carry it
+   across.  The rectangle is padded two pixels so the first and last
+   letters do not touch the geometry.
+
+   THE WHOLE-SCREEN CALL AND THE OVERLAY SHARE ONE BODY, fb_blit_rect,
+   parameterised by rect.  Keep it that way - they differ only in the
+   rectangle, and a copy would drift.
+
+   USE IT FOR OUR OWN OVERLAYS ONLY.  Game content belongs in the 2D
+   layer where the original puts it; drawing a sprite on top because
+   it looks better would be exactly the invented-behaviour trap of
+   CLAUDE.md rule 5a.
+
+
+3.5.  Screen3D_Open: what the renderer needs before a frame
+
+   FUN_004995a0, now Screen3D_Open, is the renderer bring-up called from
+   CWinApp::InitInstance and again from App_Init. It is the function a
+   port has to reproduce before Screen3D_BeginFrame can be called at all
+   [verified]:
+
+       Screen3D_Open(this, hwnd, width, height, ownsDisplayMode)
+
+         g_clipWidth  = width;   g_clipHeight = height;
+         x scale = K / width;    y scale = K / height;
+         g_pCd3d = Cd3d_Ctor(hwnd, w, h, 640, 480, 16, ownsMode);
+         if (!maybe_Cdd_SetVideoMode(w, h, 640, 480, ownsMode, 0))
+             fatal 'Cannot initialise screen mode';
+         ...build the primitive-kind feature table...
+         if (g_ddInitComplete) {
+             Screen3D_SetViewport(0, 0, w, h, 0, 0);
+             g_spanBufferEnabled = 1;
+             low = 7999;  high = -1;      /* empty range */
+             clear 8000 bucket heads at DAT_00655d38;
+         }
+
+3.5.1.  Two numbers section 3.3 left open
+
+   The queue's initial state and its limit are both set here [verified]:
+
+   +---------------------+---------+----------------------------------+
+   | Global              | Set to  | Meaning                          |
+   +=====================+=========+==================================+
+   | 0x0062e438          | 2000.0f | the per-frame primitive limit    |
+   +---------------------+---------+----------------------------------+
+   | DAT_0068b030        | 7999    | low bucket, starts at the top    |
+   +---------------------+---------+----------------------------------+
+   | DAT_0065e1d0        | -1      | high bucket, starts below it     |
+   +---------------------+---------+----------------------------------+
+   | g_spanBufferEnabled | 1       | the span buffer is ON by default |
+   +---------------------+---------+----------------------------------+
+
+   So the cap section 3.4.2 warns about is TWO THOUSAND primitives per
+   frame, and the bucket range starts inverted - high below low - which
+   is how the walk in Screen3D_DrawScene knows the queue is empty
+   without a separate flag.
+
+   o The span buffer defaulting to on means the front-to-back walk and
+     Screen3D_FlushSpans are the normal path, not the exception. A port
+     that only implements the painter's-algorithm branch is implementing
+     the one the shipped game does not use.
+
+3.5.2.  A 16-bit assumption at the API boundary
+
+   Cd3d_Ctor is called with a literal 640, 480 and 16 [verified]. The
+   width and height are fallbacks - maybe_Cdd_SetVideoMode receives the
+   same pair as its third and fourth arguments and dd-init.txt section 2
+   records that as the 640x480 fallback - but the 16 is a bit depth
+   passed straight into the D3D object's constructor.
+
+   o That is a different KIND of 16-bit dependency from the ones in
+     pixel-format.txt, which are all pixel addressing and channel
+     arithmetic. This one is a mode request at the API boundary, and it
+     is on the HARDWARE path - so it is the one 16-bit site a D3D9 back
+     end still has to deal with.
+
+3.5.3.  The primitive-kind feature table
+
+   Between the mode set and the viewport, the function builds a
+   0x46-entry table - seventy primitive kinds - by running each kind
+   through seven switch statements that OR in feature bits 1, 2, 4, 8,
+   0x10, 0x20, 0x40 and 0x80. The result goes to DAT_006d1f88[kind], and
+   a reverse index at DAT_00624b58[bits] records the first kind having
+   each bit pattern [verified].
+
+   Seventy kinds is a superset of both the 32 entries in g_spanTable and
+   the 43 the dispatcher switches on, so this is the master
+   classification. It is not needed for a first frame, but it is the
+   natural place to look when a port needs to know what any given kind
+   actually is.
+
+   ALL EIGHT BITS ARE NOW DECODED, and the table turns out to be the
+   level-of-detail system. Full treatment in detail-levels.txt; the
+   summary [verified]:
+
+   +------+------+-------------------------------------------------+
+   | Bit  | Mask | Meaning                                         |
+   +======+======+=================================================+
+   | 0    | 0x01 | quality tier 1                                  |
+   +------+------+-------------------------------------------------+
+   | 1    | 0x02 | family identity - never tested                  |
+   +------+------+-------------------------------------------------+
+   | 2    | 0x04 | quality tier 3                                  |
+   +------+------+-------------------------------------------------+
+   | 3    | 0x08 | do NOT filter this kind                         |
+   +------+------+-------------------------------------------------+
+   | 4    | 0x10 | family identity - never tested                  |
+   +------+------+-------------------------------------------------+
+   | 5    | 0x20 | near-distance upgrade                           |
+   +------+------+-------------------------------------------------+
+   | 6    | 0x40 | exempt from detail reduction                    |
+   +------+------+-------------------------------------------------+
+   | 7    | 0x80 | quality tier 2                                  |
+   +------+------+-------------------------------------------------+
+
+   Bits 0, 7 and 2 nest strictly and are stripped together; bits 1, 3,
+   4 and 5 identify which of twelve families a kind belongs to. The
+   reverse index turns a modified bit pattern back into a kind, so
+   reducing detail SUBSTITUTES ONE KIND FOR ANOTHER rather than
+   branching inside the rasterizer. Neither back end knows it happened.
+
+   Corrections to this section from that work [verified]:
+
+   o The access is [kind*4 + 0x6d1f88], so the table is 0x46 DWORDS,
+     not bytes.
+   o "Six entries hand-patched" overstates it. Three of the six literal
+     stores are no-ops restating what the loop already computed. Of the
+     three that bite, one repairs a genuine defect: the loop uses zero
+     as its not-yet-assigned sentinel, and kind 0 legitimately has
+     pattern zero, so kind 0x16 steals reverseIndex[0] and the literal
+     store puts it back. See detail-levels.txt section 1.1.
+
+   o Six entries are then overwritten with literals - kinds 0x20, 8, 0,
+     0, 0x25, 0x28, 0x33 into specific slots - which reads as hand-
+     patching a table the loop got almost right. Worth care if the table
+     is ever regenerated rather than transcribed.
+
+
+4.  Work plan
+
+   1. Parse the command-line handler -> recover every graphics config
+      global. Done - see config-globals.txt. Parser is FUN_004140a2; ~45
+      config globals recovered across 4 clusters, plus a confirmed
+      original bug in the texture-size flags. Ghidra renames not yet
+      applied.
+   2. Analyze FUN_00476100 - the texture-size clamp that consumes the
+      four texture-bound globals. Smallest next step with direct
+      renderer relevance.
+   3. Map Cd3d and the DirectDraw wrapper class: vtables, sizes, fields.
+      Partly done - Cd3d+0x04 is the vertex write cursor and Cd3d+0x08
+      the instruction write cursor, both confirmed from the emitters.
+      The rest of the object is unmapped.
+   4. Catalogue every RGB565 constant in .text; group by function;
+      identify which belong to the rasterizer vs. texture upload vs. UI
+      blitting. Largely done for the rasterizer - pixel-format.txt.
+      Texture upload is still unmeasured.
+   5. Find the boundary where the game hands geometry to a backend. That
+      is the seam the new renderer plugs into. DONE. It is
+      Screen3D_DrawScene at 0x0049ad90, one if, and the hardware
+      consumer behind it is D3D_DrawScene at 0x004af570. Sections 3.2
+      to 3.4 above.
+   6. Only then decide the target API.
+
+   The next steps that follow from where section 3 now stands:
+
+   7. Decode the remaining seven bits of the feature table at
+      DAT_006d1f88. Bit 3 is filtering; the other seven are the last
+      unknown in the per-primitive path, and the table is the master
+      classification for all seventy kinds.
+   8. Reconcile the primitive kinds across the two back ends - the
+      blend each kind gets on the hardware path is now known, and
+      rasterizer-pipeline.txt section 34.2 has the software path view
+      of the same numbers. Neither says what the kinds ARE.
+   9. Analyze FUN_00476100 - the texture-size clamp that consumes the
+      four texture-bound globals. Still the smallest open item with
+      direct renderer relevance.
+
+4.1.  A back end now exists
+
+   Section 3.4 is no longer a plan. src/render.h is the seam - the six
+   geometry calls and the six state calls with the execute-buffer
+   encoding removed - and src/d3d9rt.cpp implements it on Direct3D 9,
+   fixed function, with no D3DX and no shaders. src/README.txt
+   sections 16 and 17 are the write-up.
+
+   Two facts from that worth recording here, because they bear on this
+   note rather than on the reconstruction:
+
+   o SECTION 3.4.1 IS RIGHT AND THE MARGIN IS LARGE. The vertex needed
+     no conversion of any kind. The struct is 0x20 bytes in the same
+     field order, D3DFVF_XYZRHW | DIFFUSE | SPECULAR | TEX1 accepts it,
+     and there are no matrices anywhere in the back end because the
+     geometry arrives in screen space with 1/z attached.
+
+   o THE ONE 16-BIT SITE OF SECTION 3.4.1 HAS NOT BEEN REACHED. The
+     palette entry read as two bytes at 0x004af776 only fires for a
+     keyed or paletted primitive, and nothing paletted has been drawn
+     yet. It remains the single place the hardware and software paths
+     are coupled on a width.
+
+   THE QUEUE IS NOW PORTED TOO - src/queue.c, src/cull.c,
+   src/detail.c and src/drawscene.c, covering Screen3D_QueuePrimitive,
+   the bucket array and both walk directions, Screen3D_CullAndQueue-
+   Faces, and the feature table and its reverse index. Sections 3.3.1
+   to 3.3.3 above were found while writing it.
+
+   What is still NOT ported, in the order it will be missed:
+
+   o SCREEN3D_CLIPTRIANGLENEAR. A face with a vertex behind the near
+     plane arrives with hwFlags bit 0 set and has no valid screen
+     coordinates, so it is currently DROPPED rather than clipped.
+
+   o THE SHADE TABLE at DAT_005d43b0. D3D_DrawScene computes per-vertex
+     colours through it, indexed by the vertex intensity at +0x0c;
+     without it every vertex of a primitive gets one colour and there
+     is no Gouraud shading at all.
+
+   o THE .MAP FLAGS TO KIND TABLE. Until it is decoded every
+     reconstructed face is kind 0, so the blend ladder and most of the
+     detail system are being exercised on a single kind.
+
+5.  Open questions
+
+   o Why is ddraw both statically imported and LoadLibrary'd?
+   o Is the software rasterizer a full 3D path, or only a fallback for
+     2D/UI compositing?
+   o Where is the internal framebuffer format decided - one global, or
+     per-surface?
+   o Does the D3D path share the software rasterizer's transform/clip
+     stage, or duplicate it?
+   o What is the bankw.Cpp "bank" concept - texture memory banks
+     [guess]?
+   o Are 320x240 and 512x384 real render resolutions, or upscaled blits?
+   o Does -NoFlick indicate the flip chain is not a straightforward
+     double buffer?
+   o Confirm the version string in .rsrc against the mr320 path hint.

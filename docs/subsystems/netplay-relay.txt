@@ -1,0 +1,868 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                 NETPLAY RELAY AND THE SESSION PAGE
+
+
+Abstract
+
+   A DESIGN, NOT A RECONSTRUCTION. Nothing here is transcribed from
+   MOTO.EXE, because the thing it replaces - DirectPlay - is imported by
+   ordinal and has no modern equivalent. The game-side facts it builds
+   on are verified and carry their addresses; every choice the design
+   makes is marked PROPOSED and is ours to change.
+
+   The goal is a transport that needs no port forwarding and no firewall
+   exception: every machine makes an OUTBOUND connection to one relay,
+   and the relay carries opaque payloads between them. It knows nothing
+   about racing.
+
+   See subsystems/netplay.txt for the protocol this carries, and
+   subsystems/menu-pages.txt for the page it replaces.
+
+Table of Contents
+
+   1. Why a relay fits this game
+      1.1. The game already relays
+      1.2. What the relay must not do
+   2. The wire format
+      2.1. Framing
+      2.2. Control kinds
+      2.3. Addressing, and who stamps the sender
+      2.4. The two delivery classes
+      2.5. What the relay enforces
+   3. The double hop on 0x66, and why to keep it
+      3.1. The heading in a state packet is not racer+0x198
+      3.2. States arrive in bursts, so they are queued per slot
+      3.3. The snap arm and the lerp arm
+      3.4. There is no pause in a net race
+      3.5. Ending a net race
+      3.6. racer+0x04 is 1 in a network race
+      3.7. A peer's livery comes from its bike, not its slot
+      3.8. Ending a net race on screen
+   4. The pages
+      4.1. Page 2 - the relay
+      4.2. Page 7 - the games
+      4.3. Page 8 - the participants
+      4.4. What the pages must NOT collect
+      4.5. The ini keys
+   5. The message set, and what it replaces
+      5.1. Why clean room here, when the rest is not
+      5.2. The table
+      5.3. Dropped, and why
+      5.4. Kept deliberately
+      5.5. The improvements, and the reason for each
+   6. Open questions
+
+1.  Why a relay fits this game
+
+1.1.  The game already relays
+
+   maybe_Game_Tick sends the state packet 0x66 once per tick at
+   0x0047d831, and then, if the host flag 0x004dbff8 is set, walks the
+   player table with a stride of 0x24 and re-sends 0x66 for every entry
+   whose state is 3, at 0x0047d85b [verified]. So the topology is
+   already a STAR WITH A RELAYING HOST: a client tells the host where it
+   is and the host forwards it on.
+
+   A relay therefore changes the transport and nothing else. The game-
+   level forwarding stays exactly where it is, and the relay never has
+   to understand a single message type.
+
+1.2.  What the relay must not do
+
+   o It must not parse the payload. It reads the frame header and
+     nothing past it.
+
+   o It must not keep game state - no roster beyond transport peer ids,
+     no track, no lap count, no scores. The host owns all of that
+     through 0x6b, 0xd0, 0xd1, 0xd2 and 0xcb.
+
+   o It must not decide who may race. The join gate is the host
+     answering 0x64 with 0x65 and broadcasting 0x6a once the count
+     reaches [0x0050dbd8].
+
+   The reason is not purity. Anything the relay knows is a second
+   authority that can disagree with the host, and the game has no
+   mechanism for resolving that disagreement.
+
+2.  The wire format
+
+2.1.  Framing
+
+   PROPOSED. One frame, eight bytes of header, little-endian, followed
+   by the game message verbatim:
+
+       u8   kind        0 = payload, nonzero = a control kind in 2.2
+       u8   flags       bit0 reliable, bit1 broadcast, rest zero
+       u16  dst         peer id, ignored when bit1 is set
+       u16  src         STAMPED BY THE RELAY - see 2.3
+       u16  length      payload bytes, 0..1024
+       u8   payload[length]
+
+   The payload begins with the u16 the dispatcher switches on, so a
+   frame carries a game message with no translation at either end.
+   FUN_00455280 can be handed payload and length unchanged.
+
+2.2.  Control kinds
+
+   +-------------+-----------------+----------------------------+
+   | Kind        | Direction       | Carries                    |
+   +=============+=================+============================+
+   | HELLO       | client -> relay | version, player name       |
+   +-------------+-----------------+----------------------------+
+   | WELCOME     | relay -> client | your peer id, the host id, |
+   |             |                 | the room id, the peers     |
+   |             |                 | present, host or not       |
+   +-------------+-----------------+----------------------------+
+   | LIST_REQ    | client -> relay | nothing                    |
+   +-------------+-----------------+----------------------------+
+   | ROOM_LIST   | relay -> client | per room: id, state,       |
+   |             |                 | player count, host name    |
+   +-------------+-----------------+----------------------------+
+   | CREATE_ROOM | client -> relay | nothing                    |
+   +-------------+-----------------+----------------------------+
+   | JOIN_ROOM   | client -> relay | the room id                |
+   +-------------+-----------------+----------------------------+
+   | LEAVE_ROOM  | client -> relay | nothing                    |
+   +-------------+-----------------+----------------------------+
+   | ROOM_STATE  | client -> relay | waiting or racing; host    |
+   |             |                 | only                       |
+   +-------------+-----------------+----------------------------+
+   | PEER_JOINED | relay -> client | the new peer id            |
+   +-------------+-----------------+----------------------------+
+   | PEER_LEFT   | relay -> client | the departed peer id       |
+   +-------------+-----------------+----------------------------+
+   | ROOM_GONE   | relay -> client | the host left              |
+   +-------------+-----------------+----------------------------+
+   | REFUSED     | relay -> client | bad version, no such room, |
+   |             |                 | full, or already racing    |
+   +-------------+-----------------+----------------------------+
+   | KEEPALIVE   | either          | nothing; holds the NAT     |
+   +-------------+-----------------+----------------------------+
+
+   KEEPALIVE is the relay's own and has nothing to do with the game's
+   0xcd ping or the 0xce round trip. Keeping them separate matters: 0xce
+   is what the host uses to align the start, and a transport keepalive
+   mixed into it would corrupt that measurement.
+
+2.3.  Addressing, and who stamps the sender
+
+   PROPOSED. Peer ids are assigned by the relay, 1..N, and id 0 is
+   reserved for broadcast. The host is whoever created the room.
+
+   WELCOME NAMES THE HOST, not just whether the recipient is it.  A
+   client has to address its first game message before any lobby
+   exists to tell it who the host is, so the host's peer id has to
+   come from the transport.
+
+   THERE ARE NO ROOM CODES.  An earlier draft had the relay generate a
+   five-character code that the host read out and the guest typed, and
+   it was removed: it forces an out-of-band exchange on every single
+   session, which is the whole friction a lobby exists to avoid.  A
+   room is LISTED UNDER THE HOST'S PLAYER NAME and joining is a matter
+   of trusting that name.  Nothing here is secret, and nothing here
+   pretends to be.
+
+   ROOM ID 0 MEANS BROWSING, which is what lets one WELCOME serve
+   connecting, creating and joining - the room id is the only thing
+   that distinguishes them, so there is one parse rather than three.
+
+   THE RELAY STAMPS src ITSELF and overwrites whatever the client put
+   there. This is not hardening for its own sake: the receive path's
+   first test is an echo guard comparing the id at +0x400 with the
+   sender [verified], so a client that could forge src could make
+   another peer drop traffic it needed. The relay is the only party that
+   knows who actually sent a frame, so it is the only party that may
+   say.
+
+   Broadcast means EVERY ROOM MEMBER EXCEPT src. That is deliberately
+   the same semantics as the host's own relay loop, which skips the
+   originator, so the two layers cannot disagree about echo.
+
+2.4.  The two delivery classes
+
+   The game already splits its traffic and the relay must preserve the
+   split [verified]:
+
+   +------------+-------------------------+--------------------------+
+   | Class      | Game messages           | Relay behaviour          |
+   +============+=========================+==========================+
+   | reliable   | 0x64, 0x65, 0x67, 0x6a, | queue and deliver in     |
+   |            | 0x6c, and 0xc8 upward   | order; never drop        |
+   +------------+-------------------------+--------------------------+
+   | unreliable | 0x66, 0x68, 0x69        | deliver at once or DROP; |
+   |            |                         | never queue behind       |
+   |            |                         | reliable traffic         |
+   +------------+-------------------------+--------------------------+
+
+   Dropping rather than queueing is the whole point. 0x66 is sent every
+   tick and a late one is worse than a lost one - netplay.txt section 3
+   describes the hard resync that exists precisely because these are
+   fire-and-forget.
+
+   PROPOSED TRANSPORT, and the honest trade. One outbound TCP connection
+   per client carries both classes, with the unreliable ones droppable
+   at the relay. TCP alone is the firewall-friendliest thing that exists
+   and needs no NAT mapping held open, but its head-of-line blocking is
+   exactly wrong for 0x66. The alternative is TCP for control plus a
+   client-initiated UDP association for state, which is better under
+   loss and costs a keepalive and a mapping that can expire. START WITH
+   TCP ONLY, measure, and add the UDP path if the state stream justifies
+   it - the frame format above does not change either way.
+
+2.5.  What the relay enforces
+
+   These are its only policies, and all of them are about resources
+   rather than about the game:
+
+   o payload length 0..1024, and a frame over that closes the connection
+     rather than truncating.
+
+   o room size. The protocol caps itself: 0xcb carries the whole player
+     table as 0x144 bytes at a stride of 0x24, which is NINE SLOTS
+     [inferred, arithmetic on a verified size]. The relay should refuse
+     the tenth.
+
+   o a send rate ceiling per peer, so one machine cannot flood the room.
+
+   o an idle timeout, and a room that loses its host is closed with
+     ROOM_GONE rather than left to drift.
+
+   o a join is refused while the room is RACING, so nobody arrives
+     mid-countdown.  THE HOST OWNS THAT FLAG and the relay never
+     clears it by itself: BEGIN sends ROOM_STATE(1) and
+     page8_enter sends ROOM_STATE(0).  The second half was
+     missing, and the cost was total - one race made the room
+     unjoinable for the rest of its life, and the host had to
+     leave and recreate the game.  A lobby that never raced was
+     unaffected, which is what made it look like a leave bug.
+
+   A REFUSAL IS NOT A DISCONNECTION, on the client side either.
+   NOROOM, FULL and STATE are answers about one room and leave the
+   link intact, so only NET_REFUSE_VERSION fails it; page 7 keeps
+   browsing and shows why.  Routing all four through net_fail made
+   page 7's own status lines unreachable - it bounces to the
+   connect page on any state but BROWSING or JOINED - so a refused
+   join read as the relay dropping you.
+
+3.  The double hop on 0x66, and why to keep it
+
+   With a relay in place, a state packet travels client -> relay -> host
+   -> relay -> peers. Broadcasting it from the client instead would
+   halve that, and the host's forwarding loop would become a no-op.
+
+   DO NOT. A RELAYED PACKET IS THE HOST'S VIEW OF THE PEER, NOT THE
+   PEER'S OWN - netplay.txt 3.1. The host does not forward the bytes it
+   received; it re-builds the packet from its own copy of that racer. So
+   bypassing the host changes the DATA every client acts on, not merely
+   the path it took, and the receive path is written against the host's
+   version.
+
+   It is a real optimisation and it is available later, but it is a
+   behavioural change and has to be tested as one.
+
+3.1.  The heading in a state packet is not racer+0x198
+
+   Racer_RemoteApplyState @ 0x0045e560 steers a peer toward the
+   reported heading by taking a look-at from the ORIGIN to
+   racer+0x198 - verified: ECX is loaded LEA [ESI + 0x198] at
+   0x0045e57f and the eye triple at ESP+0x20 is zeroed just above.
+   So +0x198, the AI aim direction, is the field the receive side
+   reads.
+
+   IT IS THE WRONG FIELD TO SEND. The binary stores to +0x198 in
+   exactly two places - maybe_Racer_PlaceWheels at 0x0045c9cd and
+   Racer_AiFollowLine at 0x0046b517 [verified, an FSTP search over
+   239,708 instructions finds no third]. Neither runs for a racer a
+   human is driving, so on the local player the field holds the
+   heading PlaceWheels left in it on the grid, for the whole race.
+
+   The symptom is specific and worth recognising, because the
+   position looks right and only the orientation is wrong: moveDir
+   is rebuilt from the last two received positions (0x0045e64a), so
+   the bike TRAVELS the road correctly while matOrientation keeps
+   turning it toward the start line. It reads as a bike sliding
+   sideways or sitting perpendicular to its own motion - the same
+   shape as the early time-attack ghost, which runs the same
+   function.
+
+   So the send side recomputes it, with the formula the game itself
+   uses at 0x0045c9cd: matOrientation row 2 plus the translation.
+   racer_heading in racer.c is that, and PlaceWheels now calls it
+   too so the expression has one home.
+
+   WRITING +0x198 PER FRAME INSTEAD WOULD ALSO WORK and is the
+   wrong fix: it invents a store the original does not make, on a
+   field whose meaning is the AI's, and the AI reads it.
+
+3.2.  States arrive in bursts, so they are queued per slot
+
+   Measured through the agent pipe, with race_net_send_state and
+   race_net_on_state hooked into one trace.  The repeating unit is
+
+       recv recv FRAME FRAME  recv recv FRAME FRAME  ...
+
+   - two states dispatched inside ONE frame, then two frames with
+   none.  The send side is exactly one per frame (the tick field
+   increments by 1 and never repeats or reorders, 150 consecutive
+   samples), so the burst is TCP batching plus the relay loop, not
+   the game.
+
+   APPLYING EACH ONE AS IT LANDS IS THEREFORE A STROBE.  The
+   mode-0 arm of Racer_RemoteApplyState assigns the position
+   outright (section 3.3), so a frame that dispatches two advances
+   the peer two steps and the next two frames freeze it.  At 60 Hz
+   that is a bike flickering between two places.
+
+   race.c keeps a ring of 8 states per slot.  race_net_on_state
+   enqueues; the remote arm of race_tick_all drains ONE per frame,
+   or two when the ring is deeper than 4 so latency cannot grow
+   without bound.  A full ring drops its OLDEST entry - a ring that
+   fills means this machine is behind, and the stale end is what
+   nobody wants to watch.
+
+   THE RING MUST BE EMPTIED BETWEEN RACES, and so must the relay
+   mirror (README-relay.txt 5).  Held samples otherwise outlive the
+   race and the next one opens by replaying the end of the last -
+   seen as a peer flinging itself sideways on the first frame.
+
+   The tick field earns its place here: the transport is in order,
+   so a tick already seen is a duplicate and is dropped at the
+   enqueue.
+
+3.3.  The snap arm and the lerp arm
+
+   Racer_RemoteApplyState has two position paths, gated on
+   g_nSelectedMode [verified, decompiled]:
+
+   +------------+-------------------------------------------------+
+   | mode       | what happens to position                        |
+   +============+=================================================+
+   | 0          | position = placeWheels0, outright.  No chase,   |
+   |            | no lerp.  placeWheels2 is never touched and so  |
+   |            | holds whatever placement left in it.            |
+   +------------+-------------------------------------------------+
+   | non-zero   | placeWheels2 walks toward placeWheels0 at       |
+   |            | engineSpeed * dt * 1.28, snapping when the dot  |
+   |            | of the remainder goes negative; then position   |
+   |            | moves HALF WAY to placeWheels2, 0.5 at          |
+   |            | 0x004d1018.  Two smoothing stages.              |
+   +------------+-------------------------------------------------+
+
+   A NETWORK SINGLE RACE IS MODE 0, so it takes the snap arm and
+   gets neither stage.  Page 5 numbers the network list without
+   practice, so 0 means single race there while it means practice
+   in a solo game - the same global, two meanings, and this is
+   where it bites.  g_selectedMode read as 0 out of a running net
+   race confirms it.
+
+   Do not "fix" this by taking the non-zero arm in a net race.  The
+   gate is what the binary does; the burst is what the modem-era
+   receive path did not have to cope with, and 3.2 is where that
+   belongs.
+
+3.4.  There is no pause in a net race
+
+   Measured: tm_paused froze the simulation while 11,700 states
+   were still sent and received.  Stopping the clock stops THIS
+   machine; the peers keep simulating, the pump keeps running, and
+   the queue of 3.2 fills with positions nobody is integrating.
+   A local pause is therefore not a pause, it is a desync.
+
+   THE ORIGINAL HAS NO PAUSE MESSAGE.  Nothing in the 0x64..0xd6
+   set carries one, so there is nothing to transcribe and a
+   synchronised pause would mean inventing a type.  Decided
+   against: every netplay game of the era simply refused.
+
+   So, while !g_soloMode and race_ready():
+
+   o SPACE and F5 do nothing.  net_race_live in main.cpp gates
+     both.  Menus and solo races are untouched, which matters
+     because F5 single-stepping is how most of this project is
+     debugged.
+   o the in-race escape menu is an OVERLAY, not a freeze.  The
+     early return in race_update is now solo-only.  The cost is
+     real and accepted: your bike coasts while the menu is up,
+     because the alternative is to stop a world three other
+     people are still riding in.
+
+3.5.  Ending a net race
+
+   Nothing called netplay_send_race_over, so g_nRaceOverNet was
+   never raised, s_race_overHud never set, and a finished net race
+   sat on the track with no results prompt until the window was
+   closed.  The local-finish gate was solo-only AND hardcoded to
+   slot 1, so it could not arm it either.
+
+   Two halves, because they answer different questions:
+
+   o YOUR results, when YOU finish.  Crossing the line arms
+     s_race_overHud on s_race_localIndex regardless of
+     g_soloMode.  Same as solo, and it needs no agreement.
+   o EVERYONE converges, and the HOST decides.  Once at least one
+     racer is home, race_net_check_over broadcasts RACE_OVER -
+     immediately if nobody is still riding, otherwise
+     RACE_NET_OVER_GRACE seconds after the first finish.  Sent
+     once per race; s_race_overNet latches it.
+
+   THE GRACE WINDOW IS WHY A STRAGGLER CANNOT HANG THE RACE.
+   Without it a rider who crashes out and never crosses the line
+   leaves everybody else on the results page waiting for a
+   broadcast that never comes.  The window runs on tm_now, the
+   same virtual clock the race integrates, so it cannot be
+   outrun by a stall - and 3.4 having removed the pause, it
+   cannot be stopped either.
+
+   [open] RESULTS CONTENT.  0xd6 carries a 0xf9-byte blob whose
+   layout is unread, so netplay_send_results has no caller and
+   page 9 shows each machine its own standings rather than an
+   agreed table.
+
+3.6.  racer+0x04 is 1 in a network race
+
+   The field the port calls soloMode.  It was set to 0 for every
+   racer in a net race, on the strength of its name, and that was
+   wrong.
+
+   maybe_Game_StartRacePending @ 0x00410ee0 is the per-frame start
+   handler.  Solo leaves early; the network arm sends 0x64, finds
+   its own slot, and writes four fields of g_racers (0x00581218)
+   [verified, decompiled]:
+
+   +--------------+--------+------------+----------------------+
+   | absolute     | offset | field      | value                |
+   +==============+========+============+======================+
+   | 0x00581280   | +0x68  | active     | 1                    |
+   | 0x00583fe4   | +0x2dcc| player id  | from the session     |
+   | 0x0058121c   | +0x04  | soloMode   | 1                    |
+   | 0x00583fec   | +0x2dd4| playerName | g_playerName         |
+   +--------------+--------+------------+----------------------+
+
+   Corroborated twice over: the only other writer is
+   maybe_Game_CreateRacers at 0x00410c8d, storing the immediate 1,
+   and NO instruction in the image stores 0 to a +0x04 - a search
+   over all 239,708 instructions finds none.  So a set-up racer has
+   it set, always, and the name is misleading: it does not mean
+   "not networked".
+
+   WHAT A 0 COST.  The field gates behaviour, and every gate pairs
+   it with humanPlayer (+0x08), which is what actually excludes a
+   remote or an AI racer:
+
+   o racer_latch_stunt_request, 0x0045d6d4.  THE ONLY bridge from
+     the stunt button (stuntHeld, +0x31f9) to the wheelie request
+     (stuntOrOverspeed, +0x2e85).  At 0 the local player has no
+     wheelie and no stunt in a net race, on any track - which is
+     how this was found.
+   o race_lap_visible.  Guards the lap close-out, the best-lap scan
+     and the finish.  At 0 a peer never completes a lap, so it
+     never reaches RACESTATE_FINISHED and 3.5 never sees anyone
+     home - the race could not end either.
+   o racer_lean_response at 0x0046abee, the brake cancel, and the
+     tacho needle.
+
+   race.c had already written down the right answer - "every racer
+   this port builds has soloMode 1" - before the net work
+   contradicted it in racer.c.  Two files, one fact, and the newer
+   one was the guess.
+
+3.7.  A peer's livery comes from its bike, not its slot
+
+   EVERY RACER RIDES THE SAME MESH.  race_load_bike loads ONE bank
+   pair for the whole race, so a grid's variety is entirely
+   palette - the liveries are palettes of one indexed page.  The
+   draw passes racer+0x170 (livery), +0x5fc (liveryRider) and the
+   two wheel fields into cull_and_queue_faces per racer, so the
+   per-racer field is what reaches the screen.
+
+   maybe_Game_CreateRacers @ 0x00410b8c picks them from the SLOT
+   INDEX [verified]:
+
+       player      livery = g_nSelectedBike & 7
+       opponent i  livery = (i - 1) & 7
+                   except 0 when (i - 1) == g_nSelectedBike
+
+   WHICH IS RIGHT FOR SOLO AND WRONG FOR A NET RACE.  An AI
+   opponent never chose a bike, so keying off its slot is as good
+   as anything; a peer DID choose one, and the slot rule ignores
+   the choice completely.  The symptom is exact and worth
+   recognising: slot 2 always draws livery 1 whatever that rider
+   picked, so the only bike that ever looks right is the one
+   belonging to whoever is reading the screen.
+
+   Net races key on bikeIndex instead, which race_build_grid takes
+   from the lobby.  The solo arms are untouched.
+
+   THE SAME BLOCK ALSO HELD A SLOT-1 ASSUMPTION: "i <= 1" gave the
+   local rider's livery to slot 1, so on a guest the HOST wore it.
+   Now i == 0 || i == s_race_localIndex, which is identical in solo
+   because the local racer IS slot 1 there.  See hud-race.txt 7.2.2
+   for the rest of that family.
+
+   [open] STATS vs LIVERY ARE SEPARATE.  bikeIndex drives the carac
+   lookup and so the speeds and gearing, and it has come from the
+   lobby since the name fix; the livery was the visual half and was
+   not.  A peer riding with the right stats and the wrong paint was
+   therefore the expected symptom, and the drive figures have not
+   been measured either way yet.
+
+3.8.  Ending a net race on screen
+
+   RETAIL DOES NOT OPEN A MENU HERE, and that is worth stating
+   because it is the first thing anyone assumes.  The 0x6c case of
+   the dispatcher sets g_nRaceOverNet at 0x004556bd and jumps
+   straight to the exit - no page bit, no menu request [verified,
+   disassembled].  The HUD dispatcher then takes the finished
+   branch and draws the network scoreboard, FUN_00482f00, instead
+   of the best-lap block, and the race goes on until the player
+   opens the escape menu by hand.
+
+   QUIT RACE is where the net case differs: InGameMenu_OnQuitRace
+   posts g_menuPendingRequest = 0x100c, and bit 0x1000 is PAGE 7 -
+   the session list - where solo posts 0x20c for page 9.
+
+   AUTOMATIC PAGE PUSHES EXIST, JUST NOT FOR THE FINISH.  0x6a
+   ("everyone is here") posts 0x800, page 1, which is how the host
+   drives the field INTO a race; a leave posts 0x1000 so the
+   remaining peers land on page 7 by themselves; and 0xd4 is a
+   general host-driven "go to a menu page".  Nothing posts
+   anything when a race merely ends.
+
+   WHAT THE PORT DOES, AND IT IS OURS.  race_post_race_tick
+   already runs a per-mode dispatch when its sequence timer
+   reaches zero - single race raises the [REPLAY] question,
+   practice the CONTINUE prompt - and the network arm was a bare
+   "return", which is the whole reason a finished net race sat on
+   the track waiting for a keypress.  It now raises the same
+   question the key would, once, guarded by s_race_promptShown.
+   The solo arms are untouched: the dispatch was already keyed on
+   g_soloMode and g_selectedMode before this.
+
+   [open] TWO ROWS ARE WRONG FOR A NET RACE, and both are
+   cosmetic rather than harmful until someone picks them.  REPLAY
+   replays the local recording, which is a local novelty with no
+   bearing on the other machines; RESTART reloads the race on THIS
+   machine only, which desynchronises it from everybody else.  A
+   net post-race menu probably wants QUIT alone, or QUIT plus a
+   return to the lobby.
+
+   [open] THE SCOREBOARD.  FUN_00482f00 is the real retail
+   end-of-net-race readout and is not transcribed, so the port
+   shows the solo finishing-position block instead.
+
+4.  The pages
+
+   Three, and all of them plain text. The original has a protocol picker
+   (page 2), a DirectPlay session browser (page 7) and a race lobby
+   (page 8); the shape survives, the contents do not.
+
+4.1.  Page 2 - the relay
+
+   ONE ADDRESS, TYPED ONCE. The original lists protocols - TCP, IPX,
+   modem - and there is exactly one transport now, so the page asks for
+   the relay instead: a single host-or-host:port line, a CONNECT, and
+   the address kept in the ini so it is never typed twice on one
+   machine.
+
+   MULTIPLE SERVERS ARE DELIBERATELY NOT SUPPORTED. A list of relays is
+   a list nobody wants to maintain; one entry that remembers itself is
+   the whole requirement.
+
+4.2.  Page 7 - the games
+
+   What the relay knows, refreshed every two seconds and pushed whenever
+   a room appears or goes. One row a game:
+
+   +-----------+-----------------------------------------+
+   | Column    | From                                    |
+   +===========+=========================================+
+   | host name | the name in that peer's HELLO           |
+   +-----------+-----------------------------------------+
+   | players   | how many are in the room                |
+   +-----------+-----------------------------------------+
+   | state     | WAITING, or RACING once the host begins |
+   +-----------+-----------------------------------------+
+
+   Clicking a row joins it. CREATE A GAME makes one named after you.
+   DISCONNECT drops the relay and goes back to page 2. A room that is
+   already RACING is refused with reason 4 rather than hidden, so it is
+   obvious why it cannot be joined.
+
+4.3.  Page 8 - the participants
+
+   THE HOST PICKS THE TRACK HERE, and three things make that this
+   page's job rather than somebody else's:
+
+   o A LINK GAME NEVER VISITS PAGE 6, so nothing has chosen a track
+     or a lap count by the time the race starts.  g_selectedTrack is
+     still its initialiser.
+   o PAGE 6 IS ALSO THE ONLY CALLER OF tracks_load, so the island
+     list is not even loaded.  tracks_count() is 0 and every
+     track_at() returns NULL.
+   o PAGE 1 HAS NO FALLBACK BY DESIGN - "a [PATHS] stand-in for a
+     failed track list means a broken LIST.BPT shows ile01's art on
+     every island instead of saying so".  It gives up, and the result
+     is a black screen with one line in the log.
+
+   So page 8 loads the list for BOTH roles, and the host clamps the
+   track the way page 6 does, defaults the laps from the track record
+   and publishes both.  A guest adopts them from the lobby.  An OFF
+   track is fair game in a link race; availability gates solo
+   selection only [verified, Menu_ChooseStartTrack 0x00447920].
+
+   A GUEST MUST SEND JOIN ON ENTRY.  The host publishes its lobby
+   when IT enters this page, which is before any guest is in the
+   room, and a broadcast only reaches current members - so a guest
+   that never announces itself is in nobody's roster, receives no
+   lobby of its own, and therefore IGNORES START, because
+   net_sender_may needs a lobby to know which peer the host is.
+
+   The roster, the chat, and BEGIN. The roster comes from the one
+   idempotent LOBBY message the host publishes - 5.2 - so a guest draws
+   what arrived rather than guessing. Chat scrolls up like an IRC
+   window, oldest at the top, newest nearest the input.
+
+   BEGIN closes the room to joins and then sends the scheduled start, in
+   that order, so nobody can arrive mid-countdown.
+
+4.4.  What the pages must NOT collect
+
+   o A PEER IP OR PORT. Peers never learn each other's addresses under a
+     relay; the only address anybody types is the relay's.
+
+   o TRACK, LAPS, MODE OR DIFFICULTY from a guest. The host pushes all
+     four and they are written straight into g_nSelectedTrack,
+     g_nRaceLaps and g_nSelectedMode by 0x6b [verified]. A guest
+     choosing them would have the choice silently overwritten.
+
+   o THE PLAYER NAME. Page 15 owns it, it travels in HELLO and again in
+     JOIN, and it is what a room is listed under.
+
+   The bike IS per player - 0xcf carries it into racer+0x0078 - so bike
+   select runs for everyone.
+
+4.5.  The ini keys
+
+       [NET]
+       Relay = 127.0.0.1:27500
+
+   One key. The port is optional and defaults to 27500.
+
+   TEXT ENTRY NEEDS THE MODAL CAPTURE, and that is not a detail of these
+   pages but a condition for any of them working: the main loop takes
+   ESCAPE as quit and the digits and F-row as debug keys, all ahead of
+   the menu. See menu.h.
+
+5.  The message set, and what it replaces
+
+   THIS SET IS OURS. The original type numbers appear in the table below
+   ONLY so the lineage stays traceable - no byte of its wire format
+   survives, and nothing here could interoperate with retail in any
+   case, since the transport underneath is different.
+
+5.1.  Why clean room here, when the rest of the project is not
+
+   Three reasons, and the first is the decisive one:
+
+   o THERE IS NO REFERENCE BUILD. The original netplay cannot be
+     exercised on this machine - it needs DirectPlay, a second machine
+     and a session that will never form. So rule 15.2's compare loop has
+     nothing to attach to, and the strongest argument for a verbatim
+     port is simply absent. Everywhere else in this project a
+     transcription can be diffed against MOTO; here it cannot.
+
+   o THE SIMULATION CONTRACT IS ALREADY DECODED. netplay.txt section 4
+     maps every bit of the flag word onto a named field of the byte-
+     exact MR_Racer, and sections 3, 3.1, 5 and 6 cover the packet, the
+     two builders, remote motion and collisions. What has to be
+     PRESERVED is therefore written down, and reimplementing it needs no
+     further reading.
+
+   o THE TRANSPORT IS GONE REGARDLESS. DirectPlay has no modern
+     equivalent, so the bottom half was never going to be a
+     transcription.
+
+   What that buys: a protocol that can be validated, versioned and
+   debugged. What it costs is stated in 6 - there is no oracle, so the
+   testing burden moves onto us.
+
+5.2.  The table
+
+   +-----------+-------+-------------------+-------------------------+
+   | Ours      | Class | Replaces          | Notes                   |
+   +===========+=======+===================+=========================+
+   | JOIN      | rel   | 0x64              | name, bike, version     |
+   +-----------+-------+-------------------+-------------------------+
+   | JOIN_ACK  | rel   | 0x65              | accepted, or a reason   |
+   +-----------+-------+-------------------+-------------------------+
+   | LOBBY     | rel   | 0xc8, 0xcb, 0x6b, | ONE idempotent          |
+   |           |       | 0xd0, 0xd1, 0xd2, | full-state message      |
+   |           |       | 0xd4, 0xd5        | - see 5.5               |
+   +-----------+-------+-------------------+-------------------------+
+   | READY     | rel   | 0xca, 0xcf        | ready flag and bike     |
+   +-----------+-------+-------------------+-------------------------+
+   | START     | rel   | 0x6a, 0xce        | a scheduled start time  |
+   +-----------+-------+-------------------+-------------------------+
+   | CHAT      | rel   | 0xd3              | a LINE, not a keystroke |
+   +-----------+-------+-------------------+-------------------------+
+   | LEAVE     | rel   | 0x67, 0xcc        |                         |
+   +-----------+-------+-------------------+-------------------------+
+   | STATE     | unrel | 0x66, 0x6d        | per-racer, with a tick  |
+   |           |       |                   | number - see 5.5        |
+   +-----------+-------+-------------------+-------------------------+
+   | COLLISION | unrel | 0x6e              |                         |
+   +-----------+-------+-------------------+-------------------------+
+   | PLACE     | rel   | 0xc9              | teleport or respawn;    |
+   |           |       |                   | reliable because a lost |
+   |           |       |                   | one leaves a bike wrong |
+   +-----------+-------+-------------------+-------------------------+
+   | RACE_OVER | rel   | 0x6c              |                         |
+   +-----------+-------+-------------------+-------------------------+
+   | RESULTS   | rel   | 0xd6              | final standings         |
+   +-----------+-------+-------------------+-------------------------+
+   | TIME_PING | unrel | 0xcd              | clock sync, 5.5         |
+   +-----------+-------+-------------------+-------------------------+
+   | TIME_PONG | unrel | 0xce              | clock sync, 5.5         |
+   +-----------+-------+-------------------+-------------------------+
+
+   Fourteen of ours cover twenty-four of theirs, and the difference is
+   almost all lobby bookkeeping.  0x68 and 0x69 are dead and carry
+   forward as nothing - 5.3.  Two of theirs map to two of ours each:
+   0xce splits into the measurement (TIME_PONG) and the start instant
+   (START), and 0xca into READY and the LOBBY republish it causes.
+
+5.3.  Dropped, and why
+
+   o 0x68 AND 0x69 - sent and discarded by the original, with no handler
+     anywhere [verified, from the switch's own jump tables]. Dead on
+     arrival; nothing to carry forward.
+
+   o 0x6d - a per-racer raceClockMs (racer+0x2ddd). The 0x66 packet
+     already carries the same value at its +0x24, so it is redundant.
+     Folded into STATE.
+
+   o 0xd4, "go to a menu page" - remote control of another machine's
+     menu navigation. Replaced by replicating lobby STATE and letting
+     each client decide what to show. A client driven to a page it is
+     not ready for is a desync with no recovery path.
+
+   o THE ECHO GUARD. The original embeds a sender id at message +0x400
+     and drops anything whose id matches the receiver. Our relay stamps
+     src and excludes the sender from a broadcast, so the condition
+     cannot arise - 2.3.
+
+   o THE PACKED FLAG WORD. Eight fields bit-packed into one u32 to save
+     bytes on a modem. We have named fields and no modem.
+
+   o THE qsort AND timeGetTime BUSY-WAIT. Replaced by a scheduled start,
+     5.5.
+
+5.4.  Kept deliberately
+
+   o THE HOST REBUILDS STATE RATHER THAN FORWARDING IT. netplay.txt 3.1:
+     a relayed packet is the host's own view of that racer, not the
+     bytes the peer sent. This reads like pointless indirection and is
+     not - it is what makes every client agree. Simplify it away and
+     remote bikes disagree with each other. See 3.
+
+   o THE TWO DELIVERY CLASSES, 2.4.
+
+   o HOST AUTHORITY over track, laps, mode and difficulty. The original
+     pushes all four and overwrites the client's globals; we keep that,
+     and 4.3 keeps them off the guest's UI.
+
+   o START ALIGNMENT. The mechanism changes, the requirement does not:
+     without it every machine begins at a different moment.
+
+5.5.  The improvements, and the reason for each
+
+   Thirty years of hindsight, applied where it earns its place and not
+   further:
+
+   o A TICK NUMBER ON STATE. The original's state packet carries no
+     sequence, so a reordered or delayed one applies older state over
+     newer and the bike jumps backwards. One u32 fixes it: discard
+     anything not newer than the last applied. This is also what makes
+     netplay.txt 3's hard resync principled rather than a guess.
+
+   o INTERPOLATE REMOTE RACERS, NEVER THE LOCAL ONE. Buffer two or three
+     snapshots and render remote bikes a fixed short delay behind. It
+     costs that delay on remote positions and buys smoothness that no
+     amount of extrapolation gives. The original has a chase-and-lerp
+     arm for this which HAS NEVER RUN - netplay.txt 7 - so there is no
+     behaviour to match.
+
+   o ONE IDEMPOTENT LOBBY MESSAGE instead of eight incremental ones. The
+     roster is nine slots of a few fields; sending all of it on every
+     change is trivial and SELF-HEALING, where an incremental scheme
+     drifts permanently if one update is missed. The original needed
+     increments because it had a modem; we do not.
+
+   o A SCHEDULED START instead of a busy-wait. The host picks a start
+     instant, each client estimates its offset from the host clock with
+     TIME_PING/PONG, and everyone starts when their local clock reaches
+     it. No spinning, no qsort, and it degrades gracefully when one peer
+     is slow instead of holding the whole field.
+
+   o OWNERSHIP CHECKS. The original puts the racer slot INSIDE the state
+     packet, so a peer can claim to be any racer. With a relay-stamped
+     src we can require that a STATE naming slot N came from the peer
+     that owns slot N, and that only the host sends LOBBY, START,
+     RESULTS and RACE_OVER.
+
+   o RANGE VALIDATION ON EVERYTHING RECEIVED. The original writes
+     received values straight into gameplay globals - 0x6b into
+     g_nSelectedTrack, g_nRaceLaps and g_nSelectedMode with no check at
+     all, and 0xc9 teleports a racer to an arbitrary position. On a LAN
+     among friends that was reasonable. Over a public relay it is not.
+
+   o THE NAME COPY IS A GENUINE OVERFLOW, and it is the clearest single
+     argument for the point above. The player table's name field is 20
+     bytes (2.1) and the racer's playerName is NINE - racer+0x2dd4, with
+     raceClockMs immediately after it at +0x2ddd. Case 0x64 copies the
+     table name into the racer with a strcpy-shaped loop and no bound,
+     so a name longer than eight characters runs into the clock
+     [inferred, from verified field offsets and the copy at 0x00455303].
+     The original's own name entry caps it, so it never fires in normal
+     play - but it is reachable from the wire, and under a relay the
+     wire is public. Ours carries a length and refuses what will not
+     fit.
+
+   o CHAT AS A LINE, in the lobby AND in the race. The original sends
+     one keystroke per guaranteed packet with 8 as backspace and 10 as
+     clear, which is a remote echo of a text field rather than a
+     message. One CHAT per line, with a short scrollback and a send rate
+     limit, is simpler and also usable mid-race - which is the point of
+     having it at all.
+
+   o A PROTOCOL VERSION IN JOIN, refused with a reason. The original has
+     no version anywhere, so a mismatch presents as corruption.
+
+   Not doing, as premature: delta compression, float quantisation,
+   client-side prediction of remote bikes, and rollback. Nine players at
+   a small fixed packet on broadband does not need any of them, and each
+   one costs a great deal of debuggability.
+
+6.  Open questions
+
+   o ANSWERED: THE RELAY SERVES A DIRECTORY. It knows which rooms
+     exist, who hosts each and whether it is racing, and nothing more -
+     no track, no laps, no scores, and never a payload byte. That is
+     still not game logic, so 1.2 holds. It replaced room codes
+     outright, for the reason in 2.3.
+
+   o WHAT 0x004dbff8 IS beyond "non-zero on the host". It gates the
+     relay loop, the ping round trip and the lobby's authority, and the
+     design above assumes the relay's notion of host and this flag can
+     be kept in step. Untested.
+
+   o HOW 0xce BEHAVES WITH A RELAY HOP. The host measures every peer,
+     qsorts the results and busy-waits on timeGetTime so the slowest and
+     fastest start together [verified]. Every measurement now includes
+     two relay legs. Whether that merely shifts the alignment or breaks
+     it is unknown and cannot be settled statically.
+
+   o WHETHER NINE IS REALLY THE CAP. It is arithmetic on the 0x144 bytes
+     of 0xcb, not a constant anyone has read.
+

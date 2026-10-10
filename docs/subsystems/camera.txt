@@ -1,0 +1,2167 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       THE RACE CAMERA
+
+
+Abstract
+
+   How the game aims the view during a race. Covers the camera
+   record, the mode dispatch, and what is and is not yet known
+   about the chase camera itself.
+
+   The short version: the camera record is bigger than
+   MR_ModelInstance.txt 3.3 described, the race uses MODE 7, and the
+   camera's famous "settle" is three different lerp rates applied to
+   different components of the eye and the target.
+
+Table of Contents
+
+   1. The camera record
+      1.1. The view variant tables - three arrays and one index
+      1.2. The eight placements, read live
+      1.3. Four more scalars from the shot chooser
+      1.4. Coverage after the variant tables
+      1.5. The four frustum planes at +0xd4
+      1.6. Camera_InitRecord - the authority on which fields exist
+      1.7. Coverage after the frustum
+      1.8. A poison sweep on LIVE gameplay
+      1.9. camera+0x10 .. +0x1f is a screen bounding rectangle
+      1.10. camera+0xc0 is the camera's yaw
+      1.11. Two fields nothing reads, confirmed twice
+      1.12. Coverage, and what is still zero
+      1.13. There are three view keys, and they do three different
+            things
+         1.13.1. F5 is a distance ladder - the four chase views
+      1.14. camera+0x34 is a flag Camera_SelectView clears
+      1.15. The trackside director does not run in a live race
+      1.16. 100 of 108 survived, including first person
+      1.17. camera+0x21c IS the look-back key - the variant question, closed
+      1.18. 16:9 does not move the lens, and the menu never shows it
+      1.19. A live divergence: the projection bases read 394, not 480
+      1.20. What the sweep confirmed again
+   2. The mode dispatch
+   3. Mode 6 - the first-person camera, F6
+      3.1. It is not the mode a race starts in
+      3.2. The model, read out of 0x00470190
+         3.2.1. The roll is applied to the view matrix, not to the eye
+         3.2.2. Two things suppress it, and both are in the caller
+      3.3. Reconstructed in src/race.c
+   4. Mode 7 - the race chase camera
+      4.1. The settle, measured
+      4.2. The three angles, and the geometry they sit in
+      4.3. The angles are ZERO in gameplay, and the yaw does the work
+      4.4. The boom, checked twice in different places
+      4.5. The second matrix, and the whole camera closed
+      4.6. The chase camera, whole
+      4.7. What is NOT reconstructed
+      4.8. Reconstructed in src/race.c
+   5. The replay camera - who cuts, and on what
+      5.1. Camera_SelectView picks the mode, and names the replay
+      5.2. Camera_UpdateTrackside is the shot director
+      5.3. It is a timer AND a position test - both, not either
+      5.3.1. The zoom belongs to one shot and must not outlive it
+      5.4. What the watchpoints actually saw, and one correction
+      5.5. The cuts, caught
+         5.5.1. Both selection paths, seen firing
+   6. The look branch - TAB, and the pan it leaves behind
+      6.1. The placement, measured twice
+      6.2. The release pan is the target it did not write
+      6.3. Reconstructed
+   7. Open questions
+
+0.  CORRECTION: the rotation matrix in 4.5 is TRANSPOSED
+
+   The composed matrix recorded at 0x0046fbfe as
+
+       [  ca, 0, sa ]        [ ca, 0, -sa ]
+       [   0, 1,  0 ]   is   [  0, 1,   0 ]
+       [ -sa, 0, ca ]        [ sa, 0,  ca ]
+
+   read the other way round. Under the engine's row-vector
+   convention the recorded form mirrors the camera about the track
+   axis.
+
+   IT IS INVISIBLE IN THE MATHS. y passes through either way, a
+   rotation cannot change the boom length, and both offsets the
+   camera rotates - the eye (0, 64, boom) and the target
+   (0, -160, 1680) - have x = 0. So the only component the error can
+   reach is X, and a camera sitting on the wrong side of the bike
+   still tracks it, still sits at the right height and still holds
+   the right distance.
+
+   CAUGHT AGAINST MOTO.EXE, both after the same 20-frame left from a
+   reset, relative to the bike:
+
+   +----------+---------------------------+----------+
+   |          | eye                       | distance |
+   +==========+===========================+==========+
+   | MOTO.EXE | (+306.43, +216.72, -373.8)|   529.68 |
+   +----------+---------------------------+----------+
+   | port     | (-386.17, +254.45, -284.8)|   543.11 |
+   +----------+---------------------------+----------+
+
+   Same length, X negated. The target showed it too: -1115 against
+   +1352.
+
+   THE LESSON IS ABOUT WHAT A LIVE READ PROVES. 4.5 was right that
+   the numbers came out of the running game rather than off a
+   whiteboard, and still had them the wrong way round, because
+   reading a matrix out of memory does not record which way it is
+   indexed. A rotation matrix and its transpose differ only in signs
+   that a symmetric input cannot expose.
+
+1.  The camera record
+
+   An array of 0x238-byte records based at g_cameraRecords
+   (0x005161c0), indexed by DAT_004dc0f8 [verified]. Section 3.3 of
+   structs/MR_ModelInstance.txt had the last two of these; the rest
+   come from reading FUN_004700e0 and FUN_0046f840 and are confirmed
+   against a live race.
+
+   +--------+-----------+-------------------------------------------+
+   | Offset | Type      | Meaning                                   |
+   +========+===========+===========================================+
+   | +0x00  | ptr       | the racer record being followed           |
+   +--------+-----------+-------------------------------------------+
+   | +0x04  | int       | that racer's index                        |
+   +--------+-----------+-------------------------------------------+
+   | +0x08  | int       | THE CAMERA MODE - 3, 6 or 7               |
+   +--------+-----------+-------------------------------------------+
+   | +0x68  | float[12] | view matrix, 3x3 then translation at +0x8c|
+   +--------+-----------+-------------------------------------------+
+   | +0x98  | float[3]  | the eye. This is g_cameraPos              |
+   +--------+-----------+-------------------------------------------+
+   | +0xa4  | float[3]  | the look-at TARGET                        |
+   +--------+-----------+-------------------------------------------+
+   | +0xc8  | float[3]  | the PREVIOUS eye, kept for the smoothing  |
+   +--------+-----------+-------------------------------------------+
+
+   o READ LIVE, mid-race, to check all of the above at once:
+
+         +0x00  0x00584445 = 0x0058123c + 1 * 0x3209
+         +0x04  1
+         +0x08  7
+         +0x98  (-128.00, 254.45, 1578.18)
+         +0xa4  (-128.00, -160.00, 3738.00)
+
+     The +0x00 pointer resolving to exactly racer 1 confirms both the
+     racer base (0x0058123c) and the 0x3209 stride, and +0x98 matches
+     an independently captured camera position. [verified]
+
+   o THE TARGET IS BELOW THE GROUND. -160 on y, against an eye at
+     +254. That is not a bug; the camera aims at a point under the
+     track surface well ahead of the bike, which is what tips the
+     view down without pointing it at the bike.
+
+1.1.  The view variant tables - three arrays and one index
+
+   The record carries EIGHT CAMERA PLACEMENTS, selected by one index
+   at +0x21c, and both the chase camera and the replay director read
+   them. This is 228 bytes of the record, and it was the largest
+   single unmapped block in it.
+
+   +--------+--------------+-----------------------------------------+
+   | Offset | Type         | Meaning                                 |
+   +========+==============+=========================================+
+   | +0x11c | float[8][3]  | camera OFFSET, in bike-local space      |
+   +--------+--------------+-----------------------------------------+
+   | +0x17c | float[8][3]  | camera ANGLES, euler radians            |
+   +--------+--------------+-----------------------------------------+
+   | +0x1dc | float[8]     | a scalar per variant, all 64.0          |
+   +--------+--------------+-----------------------------------------+
+   | +0x21c | int          | THE VARIANT, 0..7 - indexes all three   |
+   +--------+--------------+-----------------------------------------+
+
+   All four are code-derived, not inferred from the data [verified]:
+
+       0046f390   MOV  ECX,[ESI+0x21c]              the variant
+       0046f396   LEA  EDX,[ECX+ECX*2]              variant * 3
+       0046f399   FLD  [ESI+EDX*4+0x17c]            angle[v].x
+       0046f3a0   FMUL [0x004d13a0]                 radians -> index
+       0046f3ad   CALL __ftol
+       0046f3b4   SUB  EAX,0x1000                   the cos->sin shift
+       0046f3b9   AND  ECX,0x3fff                   index g_cosTable
+
+       0046fbfe   MOV  EDX,[ESI+0x21c]              Camera_UpdateChase
+       0046fc04   FLD  [ESI+EDX*4+0x1dc]            scalar[v], stride 4
+       0046fc0b   LEA  EBX,[EDX+EDX*2]
+       0046fc0e   MOV  EAX,[ESI+EBX*4+0x11c]        offset[v].x
+
+   0x4000 cosTable entries span 2pi, so 0x1000 is pi/2 - the shift
+   that turns a cosine lookup into a sine. Three angles through that
+   path is a euler-to-matrix build.
+
+1.2.  The eight placements, read live
+
+   +---+----------------------+---------------------+---------------+
+   | v | offset  (x, y, z)    | angles (x, y, z)    | what it is    |
+   +===+======================+=====================+===============+
+   | 0 | (   0, -160, 1680)   | (0, 0, 0)           | far ahead,    |
+   |   |                      |                     | below, facing |
+   |   |                      |                     | forward       |
+   +---+----------------------+---------------------+---------------+
+   | 1 | (   0,  160,  -20)   | (0, pi, 0)          | on the bike,  |
+   |   |                      |                     | looking BACK  |
+   +---+----------------------+---------------------+---------------+
+   | 2 | (-250,  150,    0)   | (0, pi/2, 0)        | left side     |
+   +---+----------------------+---------------------+---------------+
+   | 3 | ( 250,  150,    0)   | (0, -pi/2, 0)       | right side    |
+   +---+----------------------+---------------------+---------------+
+   | 4 | ( -70,  120,  200)   | (0, pi, 0)          | rear left     |
+   +---+----------------------+---------------------+---------------+
+   | 5 | (  70,  120,  200)   | (0, pi, 0)          | rear right    |
+   +---+----------------------+---------------------+---------------+
+   | 6 | (   0,  400,  400)   | (-pi/4, pi, 0)      | high behind,  |
+   |   |                      |                     | pitched down  |
+   +---+----------------------+---------------------+---------------+
+   | 7 | (   0,  500,  500)   | (-pi/4, pi, 0)      | higher, same  |
+   +---+----------------------+---------------------+---------------+
+
+   o THE TWO TABLES AGREE WITH EACH OTHER, which is what makes this
+     more than a pair of coincidental arrays. A camera 250 units to
+     the LEFT is yawed +pi/2 to look right; the one 250 to the RIGHT
+     is yawed -pi/2. The two placed 400 and 500 units up and behind
+     are both pitched down a quarter turn. Nothing had to be assumed
+     to line them up - the code indexes both with the same value.
+
+   o THE OFFSETS ARE BIKE-LOCAL. Shot 5 loads the bike root matrix
+     from racer+0x2e55 with Matrix34_Copy2, transforms
+     offset[v] through it, and adds the bike position. So these
+     are a boom, not a world position.
+
+   o SHOT 5 CANNOT PICK VARIANTS 0 OR 1. Its chooser is
+
+         do { v = rand() & 7; } while (v < 2);
+
+     so the two on-bike placements are reserved for something else.
+     CLOSED IN 1.17: they are the player LOOK placements, v0 forward
+     and v1 backward, and camera+0x21c is the state of the look-back
+     key. The cockpit guess was wrong (1.13) and the answer was in
+     the input layer, not the camera.
+
+   o THE 64.0 ARRAY IS UNIFORM and therefore says nothing about what
+     it means. Eight identical values is what a table looks like
+     before anything varies it, so it may be per-variant data the
+     shipped tracks never differentiate. [open]
+
+   o SLOTS 2 AND 3 ARE A USABLE SIDE CAMERA and nothing in the
+     game reaches them - only 0 and 1 have a key. Writing 2 into
+     camera+0x21c is the whole hack: mrhook puts it on "1" and
+     re-asserts it, and tools/mr_cheats.py --on cam90 does it
+     once. It is the only angle the fork steering and the wheelie
+     pivot can be watched from, and it is what our port draws for
+     its own "1" key.
+
+     THE PORT MUST NOT ROUTE IT THROUGH THE CHASE CAMERA, and this
+     is why the slot has no lerp and no boom. Camera_UpdateChase
+     settles its eye at 0.2 a frame and then re-normalises the
+     distance; the lag that produces points BACKWARD along the
+     direction of travel, so a sideways offset fed through it is
+     dragged round behind the bike as speed rises until only the
+     rear wheel is in frame. The look slot places the eye outright
+     from the bike every frame, which is what keeps it locked on.
+
+     DO NOT REACH FOR camera+0x3c INSTEAD. It looks like the view
+     angle because Input_OnKeyDown writes pi into it in the same
+     breath as it writes 1 into +0x21c, and it is not: the look
+     branch never reads it, and on the chase path it shortens the
+     boom. Setting it to pi/2 gives slot 1 - a flat 180 - with
+     the pi/2 discarded.
+
+1.3.  Four more scalars from the shot chooser
+
+   +--------+---------------------------------------------------+
+   | +0x28  | ORBIT YAW, radians. The shot chooser writes pi or |
+   |        | -pi here on a coin flip for shot 2, pins it to pi |
+   |        | for shot 3, and zeroes it for shots 1 and 5.      |
+   +--------+---------------------------------------------------+
+   | +0x3c  | zeroed when shot 1 is entered                     |
+   +--------+---------------------------------------------------+
+   | +0x58  | ORBIT RADIUS. Shots 2 and 3 multiply it by the    |
+   |        | cosTable pair to build the orbit offset.          |
+   +--------+---------------------------------------------------+
+   | +0x220 | zeroed at the top of Camera_UpdateTrackside       |
+   +--------+---------------------------------------------------+
+
+   o WHICH CLOSES THE "orbit, angle out of g_cosTable" LINE of 5.2.
+     Shot 2 orbits at the angle in +0x28 and the radius in +0x58;
+     shot 3 is the same code with the angle pinned. The coin flip
+     between pi and -pi is why an orbit can start from either side.
+
+1.4.  Coverage after the variant tables
+
+   The record is 0x238 = 568 bytes. Section 1 had 96 of them. With
+   1.1 to 1.3 it is 340, or 60 per cent. What is left is mostly the
+   +0xd4 block, +0x100..+0x11c, and the tail past +0x220 - where
+   +0x228, +0x22c and +0x230 read 128.0, 256.0 and 512.0, a
+   power-of-two ladder that looks like distance thresholds. [open]
+
+1.5.  The four frustum planes at +0xd4
+
+   Sixty-four bytes at +0xd4 are FOUR PLANES, each a unit normal
+   followed by a distance [verified by arithmetic on a live record]:
+
+   +--------+------------------------------------+--------------+
+   | Offset | normal (x, y, z)                   | d            |
+   +========+====================================+==============+
+   | +0xd4  | (-0.039617, -0.084618, -0.995626)  |    7653.947  |
+   +--------+------------------------------------+--------------+
+   | +0xe4  | (-0.039617, -0.084618, -0.995626)  |  -10346.052  |
+   +--------+------------------------------------+--------------+
+   | +0xf4  | (-0.548060, -0.072559, -0.833286)  |   -6113.086  |
+   +--------+------------------------------------+--------------+
+   | +0x104 | ( 0.480118, -0.072559, -0.874198)  |   19239.498  |
+   +--------+------------------------------------+--------------+
+
+   Evaluating N.eye + d for each, with the eye read from +0x98 of
+   the same record:
+
+       +0xd4       0.000        passes through the eye
+       +0xe4  -17999.999        18000 units in front of it
+       +0xf4       0.000        passes through the eye
+       +0x104      0.000        passes through the eye
+
+   THREE PLANES THROUGH THE EYE AND ONE 18000 AHEAD IS A VIEW
+   FRUSTUM - near, left, right, far. Nothing else has that shape.
+
+   o AND THE NEAR/FAR NORMAL IS THE VIEW MATRIX'S THIRD COLUMN, bit
+     for bit. Column 2 of the matrix at +0x68 is
+     (-0.039617, -0.084618, -0.995626) and so is the normal at
+     +0xd4 - not approximately, identically. That is the camera's
+     forward axis, which is exactly what a near and a far plane
+     share.
+
+   o THERE ARE NO TOP OR BOTTOM PLANES. Four is the whole set, so
+     the culling is horizontal only. For a game whose tracks are
+     long ribbons that is the cheap and correct choice, and a
+     reconstruction should not "fix" it into six.
+
+   o THE ARITHMETIC IS THE EVIDENCE HERE, not a disassembly. Three
+     independent dot products landing on 0.000 and one on exactly
+     -18000.000 is not something a wrong reading produces.
+
+   o THE CONSUMER IS maybe_Racer_CullSphere (0x0046e8b0), which
+     tests all four with Plane_Distance (0x004b10c0) against the
+     object radius scaled by -4.0:
+
+         0x0046e945   +0xd4      0x0046e96c   +0xe4
+         0x0046e993   +0x104     0x0046e9af   +0xf4
+
+     NOTE THE ORDER - the third test is +0x104 and the fourth is
+     +0xf4, which is not address order. The first two reject
+     outright; the last two must BOTH pass.  [verified]
+
+     The producer is still unlocated. FUN_0046d680 is the camera
+     constructor and default-constructs four plane objects here via
+     FUN_004b0f10, which confirms the block is four planes, but it
+     does not compute them.  [open]
+
+1.6.  Camera_InitRecord - the authority on which fields exist
+
+   Camera_InitRecord (0x0046d760, __fastcall) fills a fresh record,
+   writing every dword by hand. That makes it a better field
+   inventory than any sweep: a dword it never writes is per-frame
+   state, and a dword it writes is a field with a default.
+
+   It builds the eight placements of 1.2 as alternating pairs - a
+   Vec3_Copy of the offset, then a call of FUN_0046d4f0 with the
+   angles, then the 64.0 scalar - and every constant matches what
+   the live record reads back.
+
+   Defaults worth recording [verified]:
+
+   +--------+---------+----------------------------------------+
+   | +0x0c  | 8       | reads 2 in a race [open]               |
+   +--------+---------+----------------------------------------+
+   | +0x30  | -1      | [open]                                 |
+   +--------+---------+----------------------------------------+
+   | +0x114 | 5500    | an INT, not a float [open]             |
+   +--------+---------+----------------------------------------+
+   | +0x118 | 3500    | an INT [open]                          |
+   +--------+---------+----------------------------------------+
+   | +0x228 | 128.0   | a power-of-two ladder. No reader found |
+   | +0x22c | 256.0   | by displacement search, and record 0's |
+   | +0x230 | 512.0   | absolute addresses have no xrefs.      |
+   |        |         | [open]                                 |
+   +--------+---------+----------------------------------------+
+
+   o WHAT IT DOES NOT WRITE IS AS USEFUL. The view matrix at +0x68,
+     the eye at +0x98, the target at +0xa4, the previous eye at
+     +0xc8 and the four planes at +0xd4 are absent from the
+     constructor - all per-frame state, which is consistent with
+     everything section 4 established about the settle.
+
+1.7.  Coverage after the frustum
+
+   568 bytes. Section 1 had 96; 1.1 to 1.6 bring it to 444, or 78
+   per cent.
+
+   +----------------+-------+------------------------------------+
+   | +0x10 .. +0x2c |  32   | mostly zero; +0x10 reads -22622    |
+   |                |       | and +0x1c reads 8895, both ints    |
+   +----------------+-------+------------------------------------+
+   | +0x34 .. +0x53 |  32   | zeroed by the constructor, unread  |
+   +----------------+-------+------------------------------------+
+   | +0x54          |   4   | 191.0 live, beside the orbit radius|
+   +----------------+-------+------------------------------------+
+   | +0x5c .. +0x67 |  12   | zero                               |
+   +----------------+-------+------------------------------------+
+   | +0xb0 .. +0xc7 |  24   | zero except +0xc0, an angle at     |
+   |                |       | -3.1018 rad - close to -pi but not |
+   |                |       | equal, so it is measured not set   |
+   +----------------+-------+------------------------------------+
+   | +0x1fc..+0x21b |  32   | zero                               |
+   +----------------+-------+------------------------------------+
+
+   o MOST OF THE REMAINDER IS ZERO IN EVERY SAMPLE, which is the
+     same situation MR_Racer's tail was in before the poison sweep
+     of structs/MR_Racer.txt 21. The same technique applies and is
+     the obvious next step if these 124 bytes matter.
+
+1.8.  A poison sweep on LIVE gameplay
+
+   1.7 said most of the remainder reads zero in every sample, and
+   that the technique of structs/MR_Racer.txt 21 applied. It does.
+   116 zero bytes were filled with 0xA5 while an autoplay demo was
+   running with the trackside director cutting between shots, and
+   read back after several cuts [verified, 2026-09-05].
+
+   96 OF 116 SURVIVED. Five dwords were written, and two of them
+   were already documented - +0x28, the orbit yaw of 1.3, and +0x3c,
+   which shot 1 zeroes. The other three are new.
+
+   o THIS IS THE FIRST POISON SWEEP THIS PROJECT HAS RUN ON LIVE
+     PLAY rather than a replay. There is no determinism to protect,
+     so the only cost of a wrong guess is a visibly broken camera -
+     which is itself the reader test. Nothing looked wrong, and 96
+     bytes carried garbage through several cuts with no effect.
+
+1.9.  camera+0x10 .. +0x1f is a screen bounding rectangle
+
+   A watchpoint on +0x1c caught sixteen hits across six instructions
+   in one function, and the function is unambiguous [verified]:
+
+       +0x10   int   min X
+       +0x14   int   min Y
+       +0x18   int   max X
+       +0x1c   int   max Y
+
+   maybe_Camera_BuildScreenBounds (0x0046e620, __fastcall) seeds min
+   and max from one projected point, folds in three more with a pair
+   of compares each, adds 1 to both maxima, clamps both minima to
+   >= 0, then swaps any pair that came out inverted.
+
+   o THE ORDER IS LOAD-BEARING. The clamp runs BEFORE the swap, so
+     the swap can put max+1 back into the min slot and a negative
+     survives. That is not hypothetical: the sweep read +0x10 at
+     -42255 and +0x14 at -2212 in a live frame. A reconstruction
+     that clamps after swapping produces different numbers.
+
+   o IT RUNS DURING RENDERING, NOT CAMERA SELECTION. The only caller
+     is FUN_0046e320 and its only caller is maybe_Game_RenderFrame.
+
+   o WHAT THE RECTANGLE IS FOR IS NOT ESTABLISHED. Clamping to >= 0
+     and adding one to the maxima is the shape of a clip or dirty
+     rectangle, and a camera is a plausible owner of a viewport -
+     but no consumer has been found and 0x18 is far too common a
+     displacement to search for. FUN_0046e320 is where to look.
+     [inferred, weakly - do not build on it]
+
+1.9.9.  THE CRASH CAMERA - the eye stops, the aim follows
+
+   Camera_UpdateChase wraps its ENTIRE chase path - boom, settle,
+   pull-back, Camera_LookAt - in a test of the viewed racer's
+   crashLatch at 0x0046f88a (racer+0x30c1) [verified].  The else arm
+   is three calls:
+
+       Vec3_Add   (t, racer+0x30 position, racer+0x30b5 riderPosition)
+       Vec3_Divide(t, t, 2.0)                      0x0046d590
+       Camera_LookAt(camera, t)
+
+   THE EYE IS NEVER WRITTEN on that arm.  It stays wherever the last
+   chase frame left it - at the impact - and only the aim moves,
+   tracking the MIDPOINT of the bike and the rider as the two
+   separate.  The camera stops at the crash and watches it happen.
+
+   MEASURED over sixteen frames after a shallow-angle crash:
+
+       MOTO   eye held (-1172.6, 10513.1) TO THE DIGIT while the bike
+              slid from 506 to 1819 units away from it
+       port   chased, holding a constant 483 units behind, the eye
+              travelling 1302 units
+
+   Vec3_Divide computes 1.0/k once and multiplies.  1.0/2.0 is exact
+   in binary, so a port writing * 0.5f has the same number and not an
+   approximation.
+
+   VERIFIED with the gate in place - both eyes hold to the digit for
+   fourteen frames, MOTO at (-1174.4, 10537.8) and the port at
+   (-1168.7, 10510.0), and the distance-to-bike curves stay within
+   about 25 units of each other the whole way out.  The 28 units
+   between the two freeze points is the run-in drift, not the camera:
+   they reach the rail at slightly different places for the reason
+   racers.txt 9.65.1 gives.
+
+1.10.  camera+0xc0 is the camera's yaw
+
+   Sixteen hits, every one at the same instruction [verified]:
+
+       0046e2ff   CALL FUN_00490220
+       0046e304   FSTP float ptr [ESI+0xc0]
+
+   It is the LAST thing Camera_LookAt does - build the view matrix
+   into +0x68, then store an angle. Matrix34_YawOf is the same helper
+   Camera_UpdateChase and maybe_Racer_BeginCrash call, and ECX here is
+   camera+0x68 - the VIEW MATRIX, not the camera. Values read -3.1018,
+   1.4400 and -0.5749 across three samples, always inside [-pi, pi].
+
+   IT IS THE VIEW'S HEADING, NEGATED. Recomputing Matrix34_YawOf's
+   general form offline from the stored matrix matches the stored
+   angle to five decimals at four headings: 0.00000, -0.61447,
+   -1.29248, -1.99184. Each is minus atan2(row2.x, row2.z) to within
+   a tenth of a degree, the difference being the pitch.
+
+   THE CONSUMER IS THE PARTICLE BILLBOARD. maybe_Fx_DrawParticle reads
+   it at 0x004b0dd1 and builds RotY of it, which - because the angle
+   is negated - CANCELS the view's yaw and leaves only the pitch, so
+   the quad faces the camera. See fx-particles.txt 7.4.
+
+1.11.  Two fields nothing reads, confirmed twice
+
+   +0x114 (5500) and +0x228 (128.0) were watched in mode=rw for the
+   whole sweep and took ZERO HITS - not read, not written, through
+   several camera cuts.
+
+   o WHICH MATTERS BECAUSE THE STATIC SEARCH HAD ALREADY FAILED to
+     find a reader for either, and a failed search proves nothing on
+     its own: a read through a pointer is invisible to a
+     displacement search. The watchpoint is the instrument that CAN
+     see one, and it saw nothing. Two methods with different blind
+     spots agreeing is worth more than either alone.
+
+   o SO THE POWER-OF-TWO LADDER AT +0x228 IS DEAD DATA in a race.
+     Written once by Camera_InitRecord and never looked at again.
+
+1.12.  Coverage, and what is still zero
+
+   About 460 of 568 bytes, or 81 per cent.
+
+   The 96 bytes that survived the poison are +0x20, +0x24, +0x38,
+   +0x40..+0x53, +0x5c..+0x67, +0xb0..+0xbf, +0x1fc..+0x21b and
+   +0x224. They are now VERIFIED untouched during live play with
+   camera cuts, rather than merely observed to be zero.
+
+   o ONE NEW LOOSE END: +0x34 is written with ZERO by something, in
+     the same window as +0x28 and +0x3c. It was not watched, so the
+     writer is unknown. [open]
+
+   o AND SHOT 5 NEVER RAN. The hook on 0x0046f390 took zero hits
+     across the whole sweep, so the matrix shot was not among the
+     cuts sampled. The variant tables of 1.1 were therefore NOT
+     exercised here, and nothing in this section speaks to them.
+
+1.13.  THERE ARE THREE VIEW KEYS, AND THEY DO THREE DIFFERENT THINGS
+
+   HELP.GEN names all three - input-bindings.txt 6.2 - and each has
+   its own mechanism in Input_OnKeyDown [verified]:
+
+   +-----+---------------------+--------------------------------------+
+   | Key | Advertised as       | What it actually writes              |
+   +=====+=====================+======================================+
+   | F5  | CHANGE VIEW         | camera+0x220 nViewSlot, (n+1) & 3 -  |
+   |     |                     | the four CHASE DISTANCES of 1.13.1   |
+   +-----+---------------------+--------------------------------------+
+   | F6  | 1RST PERSON VIEW    | DAT_004dc00c = 1 - DAT_004dc00c, and |
+   |     |                     | Camera_SelectView then picks MODE 6  |
+   +-----+---------------------+--------------------------------------+
+   | TAB | REAR VIEW           | camera+0x21c nLookBackKey = 1 and    |
+   |     |                     | camera+0x3c = pi, HELD - 1.17        |
+   +-----+---------------------+--------------------------------------+
+
+   So no single key is "the view key", and reading one of them as
+   such is the trap this section was written in. The mode toggle
+   below is F6 alone; F5 never touches the mode, which is exactly
+   why the sweep that watched the mode saw nothing from it.
+
+   THE F6 SWEEP, kept because the measurement is good. A race was
+   ridden cycling through every camera view the game offers, with
+   camera+0x21c watched in mode=w changed [verified, 2026-09-05]:
+
+       THE VARIANT TOOK ZERO HITS. It never moved off 0.
+
+   camera+0x08, the MODE, took twelve, all at one instruction:
+
+       0046da71   MOV [ECX+0x08],EAX      inside Camera_SetMode
+
+   and the values were 7, 6, 7, 6, 7, 6 ... - SIX FULL CYCLES of a
+   two-state toggle. Mode 3 never appeared.
+
+   o SO F6 SWITCHES BETWEEN MODE 7, THE CHASE CAMERA, AND MODE 6.
+     Section 3 called mode 6 "follow, and why it is not what a race
+     uses" - it IS what a race uses, as soon as the player asks for
+     it. That heading is about which mode the race STARTS in, not
+     which it can reach. And mode 6 being the FIRST PERSON view is
+     what its speed-dependent forward offset is for.
+
+   o AND THE VARIANT TABLES ARE NOT THE VIEW SYSTEM. Whatever
+     selects among the eight placements, it is not F6. 1.2's guess
+     is disconfirmed for this path; it says nothing about whether
+     some other code selects v0 or v1.  1.17 closes it - the index
+     is TAB's state.
+
+   o EBX CORRELATED WITH THE MODE - 0 when 6 was written, 1 when 7
+     was. So the caller is passing a two-state selector and mapping
+     it, rather than passing the mode directly.
+
+   o NEITHER SWEEP COULD HAVE SEEN F5. Both watched camera+0x21c and
+     camera+0x08, and F5 writes camera+0x220.
+
+1.13.1.  F5 IS A DISTANCE LADDER - the four chase views
+
+   Camera_UpdateChase takes its boom from a four-entry table in the
+   record, indexed by a slot the player cycles [verified]:
+
+       0046f926   MOV EAX, [ESI + 0x220]              nViewSlot
+       0046f92f   FLD  float ptr [ESI+EAX*4 + 0x224]  pViewBoom[slot]
+       0046f936   FADD float ptr [ESI + 0x58]         + flOrbitRadius
+
+   Camera_InitRecord seeds the table, and Input_OnKeyDown case 0x74
+   is the only other writer of either field:
+
+       nViewSlot  +0x220  int       0
+       pViewBoom  +0x224  float[4]  0, 128, 256, 512
+
+       00432096   MOV ECX, [EAX + 0x5163e0]    camera[active]+0x220
+       0043209c   INC ECX
+       0043209d   AND ECX, 0x3
+       004320a0   MOV [EAX + 0x5163e0], ECX
+
+   With the flOrbitRadius of -484 a live race reads - 4.4 - the four
+   booms are
+
+       slot 0   -484     the default chase
+       slot 1   -356
+       slot 2   -228
+       slot 3    +28
+
+   o SLOT 3'S BOOM IS POSITIVE, and that is the interesting one. The
+     pull-back is eye = pos - normalise(eye - pos) * boom, so a
+     positive boom puts the eye on the FAR side of the bike origin -
+     about 28 units in front of it, plus the usual +191 lift. Retail's
+     fourth view shows neither the rider nor the bike, which is what
+     a camera slightly ahead of the rider's head looks like
+     [observed], and it is NOT mode 6: F6's first person is a fifth,
+     separate view.
+
+   o THE WRITE HIDES FROM AN OFFSET SEARCH. It is encoded as
+     [EAX + 0x5163e0] with g_abCameraRecords (0x005161c0) folded into
+     the displacement, so a hunt for "+0x220" returns only
+     Camera_InitRecord, Camera_UpdateTrackside and the read in
+     Camera_UpdateChase - which is how F5 looked like it had no
+     writer at all.
+
+   o IT SURVIVES A RACE. Camera_InitRecord is reached only from
+     FUN_0046d680, off the Decor_Draw / FUN_00403190 / FUN_00413d60 /
+     FUN_00413d80 init chain and not from a race start, and the only
+     other zeroing writer is Camera_UpdateTrackside. So the player's
+     chosen distance persists across restarts.
+
+   o BOTH KEYS END IN maybe_Camera_SignalCut (0x0046d750), which
+     sets DAT_004dc138 = 1 - a cut notification read by
+     maybe_Snd_TickRace and maybe_Game_Tick [inferred].
+
+   RECONSTRUCTED: race_camera_cycle_view in src/race.c, on '5'
+   because F5 is the port's frame stepper. CAM_BOOM_TABLE there is
+   this table.
+
+1.14.  camera+0x34 is nSelectFlag - THE FINISH CAMERA
+
+   It is a boolean that says the viewed racer has FINISHED, and
+   under it the chase camera pulls in and swings round as the bike
+   coasts to a stop.  That is the pan a retail recording shows after
+   the line [verified].
+
+   TWO WRITERS, BOTH IN Camera_SelectView (0x004583e0), and both on
+   an arm that goes on to select mode 7 - so the finish uses the
+   SAME camera a live race does, with one field flipped:
+
+       raceState == 2    nSelectFlag = 1      finished
+       otherwise         nSelectFlag = 0      racing, and the grid
+
+   A live race therefore never sets it, which is why an earlier
+   sweep found it 0 at all sixteen hits and recorded one writer and
+   a guess.  The set path needs a lap to be completed first.
+
+   THREE TERMS IN Camera_UpdateChase (0x0046f840) ARE GATED ON IT:
+
+     1  THE BOOM PULLS IN, over time rather than at once.
+        flLookYaw (+0x3c) ramps by the frame delta while it is
+        above [0x004d13e8], stepping by [0x004d13f0], and the boom
+        is then shortened by
+
+            flOrbitRadius * [0x004d1400] * flLookYaw * [0x004d13f8]
+
+     2  THE AIM POINT CHANGES.  The racing arm builds the target
+        from pLookOffset[nLookBackKey] rotated into world space;
+        under the flag it is matrix row 1 scaled by [0x004d1354],
+        added to the racer position.
+
+     3  THE EYE DROPS, by
+
+            flLookYaw * [0x004d13f8] * flUnk54 * [0x004d1410]
+
+        subtracted after the usual flUnk54 lift.
+
+   o flLookYaw IS NOT AN ANGLE HERE.  It is the ramp the first and
+     third terms share, and the name is a leftover - Camera_
+     UpdateChase's plate comment already says so.  Input_OnKeyDown
+     writes pi into it beside the look-back key, which is what made
+     it look like a view angle.
+
+   o AND THIS CLOSES camera+0x54.  flUnk54 holds 191.0 and 1.3 had
+     it beside the orbit radius with nothing established.  It is
+     the EYE LIFT - added unconditionally - and term 3 scrubs a
+     fraction of it back off as the ramp runs.  So the camera
+     settles DOWN toward the bike as it closes in, which is what
+     the shot looks like.
+
+   THE CONSTANTS, AND ALL FIVE ARE CLOSED FORMS [verified]:
+
+   +--------------+-------------------------+--------------------+
+   | Address      | Value                   | What               |
+   +==============+=========================+====================+
+   | 0x004d13e8   | -3pi/4    (double)      | the ramp's floor   |
+   +--------------+-------------------------+--------------------+
+   | 0x004d13f0   | -pi/300   (double)      | the ramp's step    |
+   +--------------+-------------------------+--------------------+
+   | 0x004d13f8   | -4/(3pi)  (double)      | the shared scale   |
+   +--------------+-------------------------+--------------------+
+   | 0x004d1400   | -0.5                    | the boom's share   |
+   +--------------+-------------------------+--------------------+
+   | 0x004d1410   | 2/3                     | the eye drop's     |
+   +--------------+-------------------------+--------------------+
+   | 0x004d1354   | 64.0                    | term 2's scale -   |
+   |              |                         | the eye's own lift |
+   +--------------+-------------------------+--------------------+
+
+   THE FIRST THREE ARE ONE NUMBER.  -3pi/4 * -4/(3pi) is EXACTLY 1,
+   so at the end of the ramp both gated terms reduce to a plain
+   multiple: the boom by -0.5 and the eye by 2/3.  That identity is
+   the check that says these were read rather than fitted.
+
+   SO THE SHOT, IN NUMBERS.  The boom runs from -484 to -726, half
+   again as far back; the eye settles from +191 down to about +64,
+   which is the bike's own height; and the aim moves from 1680
+   units ahead of the rider onto the machine itself.  The ramp
+   takes about 135 frames - 2.2 seconds at 60fps - which is the
+   length of the pan in a retail recording [observed].
+
+   IMPLEMENTED IN THE PORT.  MR_Camera carries selectFlag and
+   lookYaw, race.c's camera block sets the flag from the VIEWED
+   racer's raceState the way Camera_SelectView does, and
+   camera_update carries the three terms.
+
+   ONE SIMPLIFICATION.  Term 2 is matrix ROW 1 scaled by 64 plus
+   the matrix translation; the port's frame is Ry alone, so row 1
+   is (0,1,0) and the translation is zero, and it writes the lift
+   directly.  If the unread orientation block in Camera_UpdateChase
+   is ever recovered, this is one of the two places it changes.
+
+   AND THERE IS A FOURTH TERM - THE ORBIT [inferred].  The ramp
+   swings the eye ROUND the bike as well as pulling the boom out
+   and dropping the eye, which is the "swings to the side and
+   front" a retail recording shows.  In the original it falls out
+   of that same unread composed matrix rather than standing on its
+   own, which is why the first three were found and this one was
+   not.
+
+   THE EVIDENCE IS A MEASUREMENT.  With both games paused on the
+   same 4th-place finish, every magnitude already agreed:
+
+   +---------------+------------+------------+
+   | Quantity      | MOTO       | port       |
+   +===============+============+============+
+   | boom length   |     726.8  |     726.2  |
+   +---------------+------------+------------+
+   | eye y         |     127.0  |     127.3  |
+   +---------------+------------+------------+
+   | aim y         |      64.0  |      64.0  |
+   +---------------+------------+------------+
+   | eye bearing   |   46.8 deg |  182.3 deg |
+   +---------------+------------+------------+
+
+   Only the bearing differed, by 135.5 degrees - and lookYaw had
+   ramped to -2.3646 rad, which is -135.5 degrees.  Adding it to
+   the eye's rotation reproduces MOTO's bearing to a tenth of a
+   degree, and at lookYaw 0 it is the identity, so a live race is
+   untouched.
+
+   IT REMAINS AN INFERENCE.  The real block may apply the rotation
+   somewhere else, or fold in a pitch this does not have.  The
+   three __ftol operands are recoverable with a trace hook the way
+   Dd_DrawHorizon's were, and that is what would settle it.
+   [open - the composed matrix in Camera_UpdateChase]
+
+1.15.  The trackside director does not run in a live race - tested
+
+   6.1 argued from the code that Camera_UpdateTrackside only runs
+   when g_dwReplayMode == 1 or one of four other flags is set. A
+   hook on its entry was armed for the whole view-cycling race as a
+   deliberate control, with g_dwReplayMode read as 0.
+
+   IT TOOK ZERO HITS. First runtime confirmation of 6.1, and the
+   reason to arm a hook you expect to stay silent.
+
+1.16.  100 of 108 survived, including first person
+
+   The same 108 zero bytes were poisoned again and carried through
+   a race in which every available camera view was selected. Only
+   camera+0x34 and camera+0x3c were written, both with zero, and
+   both already accounted for.
+
+   o WHICH IS THE STRONGER VERSION OF 1.8. That sweep ran on an
+     autoplay demo in the trackside director; this one ran in a
+     live race through the chase camera AND the cockpit. Two
+     different mode paths, the same 100 bytes untouched.
+
+   o +0x20 AND +0x24 SURVIVED THIS TIME AND NOT LAST TIME, which is
+     not a contradiction: 1.8's run was the replay director, where
+     shots 1 and 5 zero camera+0x28 next to them. A live race never
+     enters those shots.
+
+1.17.  camera+0x21c IS THE LOOK-BACK KEY - the variant question,
+       closed
+
+   1.2 asked what reserves variants 0 and 1, the two ON-BIKE
+   placements shot 5 refuses to select. 1.13 ruled out the in-race
+   view key. The answer is a THIRD input, and it is not a camera
+   field at all in the sense the name implied.
+
+   A watchpoint on camera+0x21c during a live race caught sixteen
+   hits - eight press/release cycles - alternating between two
+   instructions in the INPUT layer [verified, 2026-09-05]:
+
+       0043149f   camera[idx] + 0x3c  = 0x40490fdb    = pi
+       004314a9   camera[idx] + 0x21c = 1             Input_OnKeyDown
+
+       004328e5   camera[idx] + 0x3c  = 0
+       004328eb   camera[idx] + 0x21c = 0             maybe_Input_OnKeyUp
+
+   HELD-KEY SEMANTICS - down sets, up clears. Both handlers compute
+   the record address with the 0x238 stride, so this is camera[idx]
+   and not a displacement coincidence.
+
+   o SO THE "VARIANT" IS THE LOOK KEY'S STATE. Camera_UpdateChase
+     indexes all three placement tables - +0x11c, +0x17c, +0x1dc -
+     with the state of a key the player is holding down.
+
+   o AND SHOT 5'S EXCLUSION FINALLY MAKES SENSE. Its chooser is
+     do { v = rand() & 7; } while (v < 2), and the two entries it
+     refuses are exactly the player's own look placements: v0
+     forward, (0, -160, 1680) with no rotation, and v1 backward,
+     (0, 160, -20) with yaw pi. The replay director will not steal
+     the player's camera positions. That was visible in the data
+     from the start and could not be read until the writer was
+     found.
+
+   o camera+0x3c IS A LOOK YAW, pi while looking back and 0
+     otherwise. 1.3 had it only as "zeroed when shot 1 is entered",
+     which was the clear half of a set/clear pair.
+
+   o A LIVE READING OF 2 WAS OUR OWN TOOLING, not the game. mrhook's
+     side-camera feature writes slot 2 into this field and re-asserts
+     it every ten milliseconds, so a probe that finds 2 here is
+     reading mrhook and not MOTO. 1.2's "nothing in the game reaches
+     2 or 3" stands, and the sixteen hits above remain the only
+     writer found in the binary.
+
+     THAT IS A TRAP WORTH KEEPING. The value is indistinguishable
+     from a game write, it survives a race restart because it is
+     re-asserted, and it silently disables the first-person cockpit -
+     Racer_DrawCockpit's gate at 0x0046213e rejects any non-zero slot.
+     Read camera+0x21c before concluding anything about the look
+     tables, and check whether mrhook's side camera is on.
+
+   o AND A NON-ZERO SLOT SUPPRESSES THE COCKPIT ENTIRELY.
+     Racer_DrawCockpit's gate at 0x0046213e tests this field first and
+     returns having drawn nothing, and Camera_Update's mode 6 arm falls
+     through to the chase at 0x004701b5 on the same test. Worth knowing
+     when the first-person view appears to be doing nothing: read
+     camera+0x21c before suspecting the draw -
+     racer-draw-pipeline.txt 5.
+
+   o THE NAME "VARIANT" IN 1.1 AND 1.2 IS NOW MISLEADING and is left
+     in place only because the tables really are indexed by it. Read
+     it as LOOK STATE.
+
+1.18.  16:9 does not move the lens, and the menu never shows it
+
+   A hook on Screen3D_Open and watchpoints on g_projBaseX
+   (0x006d20cc) and g_projBaseY (0x00709360) were armed while a
+   rider went through the 16:9 option and every screen resolution
+   the game offers.
+
+   ALL THREE TOOK ZERO HITS. Read back afterwards, width and height
+   still 640 and 480 and both projection bases unchanged
+   [verified].
+
+   THAT IS A FACT ABOUT THE LENS, NOT ABOUT TIMING, and this section
+   used to draw the wrong conclusion from it - that display settings
+   are deferred to a restart.  They are not.  16:9 changes the
+   VIEWPORT, through Screen3D_SetViewport, and touches neither
+   Screen3D_Open nor either projection base - so the three probes
+   could not have seen it however it was applied.  See
+   projection.txt 5.2 and the plate comment on 0x00499ba0.
+
+   THE APPLY PATH EXISTS AND IS IMMEDIATE [verified]:
+
+       Menu_ToggleWidescreen  0x0043a370   dirty = 1, then flip
+       F4, Input_OnKeyDown    0x00431fd2   the same, inline
+       maybe_Game_RenderFrame 0x00480496   if (dirty) UpdateScreen
+
+   WHY THE OPTIONS PAGE LOOKS LIKE A RESTART SETTING.  Menu_SetPage
+   saves the three display globals into 0x00504e80 / 0x00504bc4 /
+   0x0050487c on the way into a menu session and forces the live
+   ones to 4:3 640x480; MenuPage11_Options_Tick then edits the SAVED
+   COPY.  The live values come back in MenuPage01_Loading_Tick
+   (0x0040ba3e) and in maybe_Event_WndProc (0x00432f9b), both of
+   which are on the way OUT of the menu.  So the row moves nothing
+   while the menu is up, because the menu is pinned to 4:3 whatever
+   the row says.
+
+   o WHICH MEANS THE FXCH TRAP OF projection.txt 3.1 IS STILL
+     UNTESTED. That section notes the width/height transposition is
+     invisible at 4:3 because both divisions give the same answer,
+     and would only show at another aspect. A 16:9 mode selected and
+     then RESTARTED into is the experiment; this was not it.
+
+1.19.  A live divergence: the projection bases read 394, not 480
+
+   projection.txt 3.1 derives, statically and marked [verified],
+   that Screen3D_Open computes 307200/width and 230400/height, which
+   at the 640x480 every call site passes gives 480 for both.
+
+   Read live, with width 640 and height 480 [verified]:
+
+       g_projBaseX  0x006d20cc   394.0
+       g_projBaseY  0x00709360   394.0
+       g_projScaleX 0x006d20c4   394.0
+       g_projScaleY 0x006d104c   394.0
+       g_projZoom   0x006d1f74     1.0
+
+   Both are 394.0, not 480.0, and neither moved during the whole
+   session - the watchpoints on them took zero hits.
+
+   o SO SOMETHING OTHER THAN Screen3D_Open SETS THEM. CLOSED: it is
+     maybe_Screen3D_UpdateScreen, which sets both to 394*W/640 and
+     394*H/480 - a third lens beside Screen3D_Open's 480 and
+     Menu_SetPage's 1911. See projection.txt 5.1.
+
+   o 394 IS NOT 307200/n OR 230400/n FOR ANY PLAUSIBLE n - the
+     quotients are 779.7 and 584.8 - so it is not the same formula
+     at another resolution either.
+
+1.20.  What the sweep confirmed again
+
+   The same 108 bytes were poisoned for a third configuration.
+   100 SURVIVED, the eight written being camera+0x34 and +0x3c, both
+   already accounted for.
+
+   The frustum of 1.5 re-read live with different numbers and the
+   same structure [verified]: the two side planes are mirror-image
+   normals, (0.51469, -0.09998, 0.85164) against (-0.51469, ...),
+   and the near/far pair share a normal with distances -1796.49 and
+   -19796.49 - a separation of EXACTLY 18000 again, on a different
+   track and a different frame.
+
+   camera+0x228, the tail of F5's pViewBoom, took zero hits for the
+   third time - as it should: only Camera_InitRecord writes the table,
+   and F5 moves the INDEX at +0x220. See 1.13.1.
+
+   o AND Screen3D_SetProjZoom IS CALLED EVERY FRAME FROM
+     Camera_SelectView, return address 0x00458433, always with 1.0.
+
+2.  The mode dispatch
+
+   FUN_004700e0 switches on +0x08 [verified]:
+
+   +------+--------------------------------------------------------+
+   | Mode | What happens                                           |
+   +======+========================================================+
+   | 3    | eye copied from the racer, then Camera_LookAt          |
+   +------+--------------------------------------------------------+
+   | 6    | the inline FIRST-PERSON camera - see section 3         |
+   +------+--------------------------------------------------------+
+   | 7    | falls through to FUN_0046f840                          |
+   +------+--------------------------------------------------------+
+   | else | also FUN_0046f840                                      |
+   +------+--------------------------------------------------------+
+
+   Mode 6 also defers to FUN_0046f840 when
+   (&DAT_005163dc)[DAT_004dc0f8 * 0x8e] is non-zero - that is
+   camera+0x21c at the 0x238 stride, nLookBackKey, so holding TAB in
+   first person gives the chase camera looking back (3.2.2). Between
+   that and mode 6 being off by default, FUN_0046f840 is the common
+   path by some margin.
+
+3.  Mode 6 - THE FIRST-PERSON CAMERA, F6
+
+   It is inline in Camera_Update rather than a function of its own,
+   and it is what HELP.GEN calls "1RST PERSON VIEW" - 1.13.
+
+3.1.  It is not the mode a race STARTS in
+
+   Kept because mode 6 was mistaken for the chase camera once, and
+   ruling it out is what found mode 7.
+
+   A captured start grid has the eye 256 up and 480 back. Mode 6
+   cannot produce that from any bike state, and reading camera+0x08
+   out of a live race gives 7 directly. So mode 6 is not the race
+   camera - it is the camera a race REACHES, the moment the rider
+   presses F6.
+
+3.2.  The model, read out of 0x00470190
+
+   +----------------------------------------------------------------+
+   |   k      = PersoAnim ? 10.0 : 5.0                              |
+   |   eye    = pos + M * (0, 170 - k * wheelieAngle,  0)           |
+   |   target = pos + M * (0, 170 + k * wheelieAngle, 40)           |
+   |   roll   = lean * 0.25, in trig-table units                    |
+   +----------------------------------------------------------------+
+
+   M is racer+0xbc, matOrientation - rows then translation, ROW 1 the
+   up axis and ROW 2 the forward one. So the eye sits 170 units up
+   the bike's OWN up axis and the aim point sits the same 170 up plus
+   40 forward: a rigid placement in bike space with no boom, no eye
+   lerp and no settle. 170 is a rider's head height, and it is the
+   only reason the view reads as first person at all.
+
+   +--------------+---------------+----------------------------------+
+   | Constant     | Value         | What it is                       |
+   +==============+===============+==================================+
+   | 0x004d1418   | 170.0         | eye height on the bike's up axis |
+   +--------------+---------------+----------------------------------+
+   | 0x004d141c   | 40.0          | how far ahead the aim point sits |
+   +--------------+---------------+----------------------------------+
+   | 0x004d1424   | 5.0           | wheelie term, target, PersoAnim 0|
+   +--------------+---------------+----------------------------------+
+   | 0x004d1428   | -5.0          | wheelie term, eye,    PersoAnim 0|
+   +--------------+---------------+----------------------------------+
+   | 0x004d1414   | 10.0          | wheelie term, target, PersoAnim  |
+   +--------------+---------------+----------------------------------+
+   | 0x004d1420   | -10.0         | wheelie term, eye,    PersoAnim  |
+   +--------------+---------------+----------------------------------+
+   | 0x004d1430   | 10/13, double | the y lerp, PersoAnim 0          |
+   +--------------+---------------+----------------------------------+
+   | 0x004d1408   | 0.5           | the y lerp, PersoAnim != 0       |
+   +--------------+---------------+----------------------------------+
+   | 0x004d13e0   | 0.25          | share of the lean the view rolls |
+   +--------------+---------------+----------------------------------+
+   | 0x004d13a0   | 2607.594588   | radians to trig units, double    |
+   +--------------+---------------+----------------------------------+
+
+   o THE WHEELIE PITCHES THE VIEW UP, and it is the one thing that
+     moves in bike space. The eye sinks by k * wheelieAngle while the
+     aim rises by the same amount, so the two effects add and the
+     rider watches the sky come down as the front wheel lifts. The
+     field is racer+0x307d, wheelieAngle - NOT speed. An earlier
+     reading of this section said speed, which was inferred from an
+     unnamed DAT rather than read.
+
+   o IT DOES NOT DEGENERATE. At wheelieAngle 0 the eye and the aim
+     differ by a pure 40 * forward, which is horizontal and non-zero,
+     so Camera_LookAt's zero-distance guard never fires. This section
+     used to claim a start grid under mode 6 would keep a stale
+     matrix; that followed from reading the 40 as belonging to the
+     eye rather than the target.
+
+   o ONLY Y IS SMOOTHED, against the previous frame's eye and target.
+     The original lerps all three components of both and two of the
+     three factors are 1.0, so the compiler emitted (v - prev) + prev
+     for x and z. That is a DIFFERENT scheme from mode 7's three
+     rates - do not carry one into the other.
+
+   o TWO CODE BLOCKS, ONE MODEL. The PersoAnim arm builds the
+     bike-local vector and calls Vec3_TransformByMatrix34; the other
+     unrolls the same product by hand. Only k and the y lerp differ,
+     which is why src/race.c folds them into one path.
+
+   o 0x004d13a0 IS THE COS TABLE'S OWN 2pi. It reads
+     2607.594587618272, which is 0x4000 / 6.283185307178 to the last
+     bit and not 0x4000 / the true 2pi (2607.5945876176133). Same
+     typed constant Trig_BuildCosTable uses - trig.h.
+
+3.2.1.  THE ROLL IS APPLIED TO THE VIEW MATRIX, not to the eye
+
+   After Camera_LookAt, 0x00470554 onward post-multiplies the view by
+   a rotation and then re-reads the yaw:
+
+       view = view * Rz(lean * 0.25)
+       camera+0xc0 = Matrix34_YawOf(view)
+
+   so the picture rotates and the eye does not move. A QUARTER of the
+   lean, not all of it - the rider's head stays more upright than the
+   bike.
+
+   o THE ORIGINAL BUILDS A FULL THREE-ANGLE EULER THERE and two of
+     the three angles are literally zero. The tell is the folding: it
+     reads g_cosTable[0] (1.0) and g_cosTable[0x3000] (sin of 0) as
+     bare absolute addresses instead of indexing. What survives is a
+     plane rotation, and nothing says the other two axes are reachable
+     - do not generalise the surviving form.
+
+   o THE YAW READS THE SAME EITHER WAY. Rz mixes x and y and leaves
+     every z alone, and the yaw is atan2 of two z components, so the
+     order Camera_LookAt -> roll -> Matrix34_YawOf is reproduced for
+     fidelity rather than because it changes a number.
+
+3.2.2.  Two things suppress it, and both are in the CALLER
+
+   +----------------------+-------------------------------------------+
+   | Gate                 | Where                                     |
+   +======================+===========================================+
+   | viewed racer crashed | Camera_SelectView 0x004583e1 - it only    |
+   |                      | asks for mode 6 when racer+0x30c1,        |
+   |                      | crashLatch, is zero                       |
+   +----------------------+-------------------------------------------+
+   | TAB held             | Camera_Update 0x004701b5 - nLookBackKey   |
+   |                      | non-zero falls THROUGH to mode 7          |
+   +----------------------+-------------------------------------------+
+
+   So a crash hands the rider the chase camera's crash shot and first
+   person comes back when they get up; and holding the rear-view key
+   in first person gives the chase camera looking back. Neither is a
+   mode change - mode 6 simply is not selected, or is not taken.
+
+3.3.  Reconstructed in src/race.c
+
+   camera_first_person is the mode 6 arm and camera_apply_roll is the
+   0x00470554 block. race_camera does Camera_SelectView's crashLatch
+   test and zeroes MR_Camera.roll on every other path, which the
+   original does not need to do because it holds no such field -
+   Camera_LookAt rebuilds the whole matrix each frame.
+
+   ON '6' AND NOT F6. F5 is the port's frame stepper, so '5' and '6'
+   stand in for the two camera keys until that moves.
+
+   NOT RECONSTRUCTED: the rear-view key, so the TAB gate of 3.2.2 has
+   nothing to test yet. [open]
+
+4.  Mode 7 - the race chase camera
+
+   FUN_0046f840. This is the one. It is a large function and is NOT
+   yet fully decoded; what follows is the shape, not a transcription.
+
+   o param_1[0x87] SELECTS A VARIANT - the in-race view toggle. Zero
+     takes the chase path below; non-zero takes a different path that
+     copies a matrix from the racer at +0x2e31 and composes it, which
+     is presumably the cockpit or bumper view.
+
+   o THE BOOM LENGTH is param_1[param_1[0x88] + 0x89] + param_1[0x16]
+     - a table of distances indexed by a selector, plus a base. So
+     the chase distance is a SETTING, not a constant.
+
+   o IT IS PULLED BACK ALONG A NORMALISED DIRECTION at the end:
+
+         d   = normalise(eye - racer.pos)
+         eye = racer.pos - d * boom
+
+     which is the classic boom, and explains why the camera keeps a
+     fixed distance rather than a fixed offset.
+
+   o A WHEELIE OR BRAKE TERM. When param_1[0xd] is non-zero the boom
+     is shortened by a term in param_1[0xf], which is itself ramped
+     each frame by param_2 (the frame delta) - a camera that pulls in
+     under some condition and eases back out.
+
+4.1.  The settle, measured
+
+   THE CAMERA'S SETTLE IS THREE DIFFERENT LERP RATES, not one. Every
+   one of them is a plain "move this fraction of the way there each
+   frame" against the value saved from last frame [verified]:
+
+   +------------------+------------+-----------------------------+
+   | Component        | Constant   | Rate                        |
+   +==================+============+=============================+
+   | eye x, y, z      | 0x004d1404 | 0.2                         |
+   +------------------+------------+-----------------------------+
+   | target x, z      | 0x004d1408 | 0.5                         |
+   +------------------+------------+-----------------------------+
+   | target y         | 0x004d140c | 0.333333                    |
+   +------------------+------------+-----------------------------+
+
+   The eye is the slowest, so the camera drifts into place while the
+   aim has already mostly arrived.
+
+   o THIS IS THE OBSERVED SETTLE. A retail recording shows the view
+     easing over roughly ten frames, finishing before the announcer
+     has said "three" [observed]. An eye lerping at 0.2 a frame is
+     within a pixel of its target in about ten frames, which is the
+     same number from the other direction.
+
+   o MODE 6 SMOOTHS ONLY Y, at 0.769231 (0x004d1430, a double) or
+     0.5 (0x004d1408) depending on the branch. Different scheme,
+     different constants - do not carry one into the other.
+
+4.2.  The three angles, and the geometry they sit in
+
+   THE ANGLES ARE PLAIN RECORD FIELDS, not lost temporaries. The
+   decompiler shows them as bare __ftol() calls only because it
+   cannot track the FPU stack; the disassembly names them outright:
+
+       0046f998   FLD [ESI+0x38]  FMUL [0x004d13a0]  CALL __ftol
+       0046f9c6   FLD [ESI+0x3c]  FMUL [0x004d13a0]  CALL __ftol
+       0046f9f8   FLD [ESI+0x40]  FMUL [0x004d13a0]  CALL __ftol
+
+   0x004d13a0 is 2607.5947, the project's usual 0x4000/(2*pi) trig
+   scale, so all three are RADIANS. A fourth angle - the negated
+   return of FUN_00490220, called with the eye - joins them at
+   0x0046faf0. [verified]
+
+   o +0x3c IS DOUBLE-DUTY. The same field is the wheelie/brake ramp
+     that shortens the boom at 0x0046f947. One float, two readers.
+
+   READ LIVE AT THE GRID, ALL THREE ARE ZERO. That is not a failed
+   measurement - it is what pins everything else down, because with
+   the rotation neutral the remaining terms can be solved directly.
+
+   +--------+------------------+---------------------------------+
+   | Offset | Live value       | Meaning                         |
+   +========+==================+=================================+
+   | +0x34  | 0                | wheelie/brake flag              |
+   +--------+------------------+---------------------------------+
+   | +0x38  | 0.0              | angle 1                         |
+   +--------+------------------+---------------------------------+
+   | +0x3c  | 0.0              | angle 2, also the wheelie ramp  |
+   +--------+------------------+---------------------------------+
+   | +0x40  | 0.0              | angle 3                         |
+   +--------+------------------+---------------------------------+
+   | +0x54  | 191.0            | added to eye.y, unconditionally |
+   +--------+------------------+---------------------------------+
+   | +0x58  | -484.0           | the boom BASE                   |
+   +--------+------------------+---------------------------------+
+   | +0x11c | (0, -160, 1680)  | per-variant target offset       |
+   +--------+------------------+---------------------------------+
+   | +0x1dc | 64.0             | per-variant scalar              |
+   +--------+------------------+---------------------------------+
+   | +0x21c | 0                | view variant - 0 is the chase   |
+   +--------+------------------+---------------------------------+
+   | +0x220 | 0                | index into the boom table       |
+   +--------+------------------+---------------------------------+
+   | +0x224 | {0,128,256,512}  | THE BOOM TABLE - four distances |
+   +--------+------------------+---------------------------------+
+
+   o THE BOOM TABLE IS THE IN-RACE CAMERA DISTANCES, the four the
+     view key cycles through. boom = table[+0x220] + (+0x58), which
+     at index 0 is -484.
+
+   o +0x54 IS ADDED ON BOTH PATHS. The JZ at 0x0046ffda skips only
+     the extra wheelie subtraction; both edges reach the same FSTP
+     at 0x0046fffc. So eye.y always gains 191.
+
+   THE WHOLE THING SOLVED AGAINST ONE LIVE FRAME. With the bike
+   parked at the grid on racer 1:
+
+       racer.pos              (-128,    0,    2058)
+       target offset +0x11c   (   0, -160,    1680)
+       target = pos + offset  (-128, -160,    3738)   <- reads +0xa4
+
+       eye (read at +0x98)    (-128,  254.45, 1578.18)
+       eye - racer.pos        (   0,  254.45, -479.82)
+       less the +0x54 lift    (   0,   63.45, -479.82)
+       magnitude                             484.00   <- = |boom|
+
+   Both lines close exactly, which is as good a confirmation of the
+   record layout as it is of the formula. [verified]
+
+   o AND IT EXPLAINS A LONG-STANDING FUDGE. src/menu.c's p1_camera
+     was fitted to this same frame as "480 back, 256 up". It is
+     neither: it is 484 along a direction, and a SEPARATE 191 lift
+     applied afterwards. Close enough to look right at the grid,
+     wrong everywhere else.
+
+
+4.3.  The angles are ZERO in gameplay, and the yaw does the work
+
+   THREE SAMPLES, THREE STATES, ALL ZERO. The camera was probed on
+   the start grid, in a wheelie, and mid-corner with the bike
+   leaned over. +0x34, +0x38, +0x3c and +0x40 read 0 in every one.
+
+   So the three angles are NOT bike lean, NOT track banking and NOT
+   the wheelie - the wheelie did not even set the +0x34 flag, which
+   means whatever gates the boom-shortening path is not what riding
+   on one wheel does. They are most likely a replay or cinematic
+   camera's offsets.
+
+   o WHICH IS GOOD NEWS FOR THE PORT. They were called "the whole
+     of the camera's orientation and the only real gap"; they turn
+     out not to block anything. Mode 7 can be implemented with all
+     three at zero and be correct for ordinary play.
+
+   o NOT PROOF THEY ARE ALWAYS ZERO. Three samples of normal riding
+     is not every state. Replay, podium and the finish sequence are
+     unsampled.
+
+   THE FOURTH ANGLE IS THE ONE THAT MATTERS. Racer_GetYaw
+   (0x00490220), negated at 0x0046f996, is the bike's heading, and
+   with the other three at zero it is the ONLY thing orienting the
+   boom while riding. It takes racer+0x98 - the racer's own 3x4
+   matrix - and NOT the camera's +0x98, which is a trap worth
+   naming: ECX still holds the racer record from 0x0046f881.
+
+   Read live, mid-corner, the racer matrix is a clean rotation with
+   ZERO translation, every row squaring to 1.00005:
+
+       row0  (-0.97988,  0.0,     -0.19990)
+       row1  (-0.05208,  0.96550,  0.25525)
+       row2  ( 0.19301,  0.26051, -0.94601)   forward
+       T     ( 0,        0,        0      )
+
+   The zero translation collapses the function to atan2(row0.z,
+   row2.z) - the textbook yaw extraction. See its plate comment.
+
+4.4.  The boom, checked twice in different places
+
+   +----------------+---------------------+---------------------+
+   | Sample         | On the straight     | Mid-corner          |
+   +================+=====================+=====================+
+   | racer.pos      | (-128, 0, 19963)    | (-25553,-995,47503) |
+   +----------------+---------------------+---------------------+
+   | eye            | (-128, 212, 19481)  | (-25485,-852,47979) |
+   +----------------+---------------------+---------------------+
+   | less +0x54     | (0, 21.0, -482.6)   | (68.0,-48.3,475.6)  |
+   +----------------+---------------------+---------------------+
+   | magnitude      | 483.1               | 482.9               |
+   +----------------+---------------------+---------------------+
+
+   against a predicted |boom| of 484 both times. The second sample
+   is the valuable one: different altitude, real lateral offset,
+   bike heading -z. The first two probes were both on the same
+   straight with x pinned at -128, where the model could have been
+   coincidence.
+
+   o THE 1-UNIT RESIDUAL IS NOT EXPLAINED. Most likely the eye
+     sitting one 0.2-lerp step short of converged, but that is a
+     hypothesis, not a measurement. An earlier note in this file
+     claimed the grid sample closed EXACTLY at 484 - that used a
+     racer position assumed from our own grid table rather than
+     read out of the game, so the exactness was partly circular.
+     Reading racer+0x0c directly is what turned it into 483.1.
+
+   o AND THE PRE-BOOM OFFSET IS LOCAL (offset.x, +0x1dc, boom) =
+     (0, 64, -484): 64 up and 484 back, before the matrix, the
+     renormalisation and the +191.
+
+
+4.5.  The second matrix, and the whole camera closed
+
+   THE SECOND MATRIX IS Ry(-yaw), CONFIRMED BY READING IT. Its angle
+   was traced through the FPU stack to the negated Racer_GetYaw
+   result: at 0x0046fac6 an FXCH ST2 brings the parked -yaw back to
+   the top, 0x0046fac8 scales it by 2607.5947 and 0x0046faf0 turns
+   it into a table index. The matrix built from it is then combined
+   with the three-angle matrix by Matrix34_Multiply at 0x0046fbf9.
+
+   A hook on the 6-byte MOV at 0x0046fbfe - immediately after that
+   multiply returns - captured the composed result at [ESP+0x98]:
+
+       m00  0.728993   m01  -4e-13    m02   0.684521
+       m10  ~0         m11   1.0      m12  ~0
+       m20 -0.684521   m21  ~0        m22   0.728993
+       t    0, 0, 0
+
+   Every off-diagonal is ~1e-12, which is zero to float precision,
+   and m11 is literally 0x3f800000. So the three-angle matrix IS
+   identity when the angles are zero, and the composition is a pure
+   Y rotation that leaves the local y untouched. [verified]
+
+   o ONE HAND-TRACED SIGN WAS WRONG. The convention is
+     [cos,0,sin; 0,1,0; -sin,0,cos]; a by-hand read of the FPU
+     stores had m02 = -sin. That error is the reason the hook was
+     used instead of more staring at FXCH.
+
+   THE CONTRADICTION WAS THE ORDER OF OPERATIONS, NOT THE MATRIX.
+   Section 4.3 recorded that rotating (0, 64, -484) by the yaw
+   predicts a local y of +64 while the corner sample measured
+   -48.3, and concluded the matrix was doing something unaccounted
+   for. It was not. The boom renormalisation runs AFTER the 0.2
+   lerp, so the direction it normalises is the LAGGED eye, not the
+   raw one. The raw y is always 64; the final y equals it only once
+   the camera has converged.
+
+   PROVED ON THE ONE SAMPLE THAT HAD CONVERGED - the start grid,
+   bike stationary:
+
+       |(0, 64, -484)|        = 488.213
+       boom scale 484/488.213 =   0.991368
+       y = 64 * 0.991368      =  63.447
+       + the +0x54 lift       = 254.447
+
+       measured eye.y         = 254.45   (racer.pos.y = 0)
+
+   Exact. The two moving samples missed by 42 and 112 for the same
+   reason they measured 483.1 and 482.9 against a boom of 484: the
+   eye was mid-lerp. [verified]
+
+4.6.  The chase camera, whole
+
+       boom   = boomTable[+0x220] + (+0x58)            = -484
+       M      = Ry(-Racer_GetYaw(racer + 0x98))
+
+       raw    = racer.pos + (0, +0x1dc, boom) * M
+       eye    = lerp(prevEye, raw, 0.2)
+
+       target = racer.pos + (+0x11c) * M
+                lerped 0.5 on x and z, 0.333 on y
+
+       Camera_LookAt(eye -> target)
+
+       eye    = racer.pos - normalise(eye - racer.pos) * boom
+       eye.y += (+0x54)                                 = 191
+
+   with (+0x11c) = (0, -160, 1680) and (+0x1dc) = 64, both
+   initialised from the constant block at 0x004d134c..0x004d1354.
+
+   The three angles at +0x38/+0x3c/+0x40 are zero in every sampled
+   gameplay state, so Ry(-yaw) is the entire orientation. Nothing
+   in the above is fitted: every constant is read out of the binary
+   or the live process.
+
+
+4.7.  What is NOT reconstructed
+
+   Everything between the boom length and the final pull-back. The
+   middle of FUN_0046f840 builds a rotation from three angles that
+   come out of FUN_00490220 and a run of __ftol calls the decompiler
+   has lost the operands of, multiplies it by a second matrix built
+   from the cosine table, and uses the result to offset the eye. That
+   block has not been read.
+
+   So the port cannot yet drive its camera from racer state. What it
+   CAN do, and should, is stop pretending: src/menu.c's p1_camera
+   reproduces ONE captured frame and says so.
+
+4.8.  Reconstructed in src/race.c
+
+   MR_Camera carries eye, viewEye, target and prevEye across frames;
+   camera_update takes a racer position and a racer matrix and does
+   the whole of 4.6. src/menu.c's p1_camera now feeds it the grid
+   slot for racer 1 and returns what it produces.
+
+   WHAT IT REPLACED IS THE POINT. p1_camera held three constants
+   fitted to ONE paused frame - 480 back, 256 up, 1975 ahead - under
+   a comment admitting they reproduced a measurement rather than
+   reconstructing anything. The real camera needs none of them, and
+   it explains why the fit was close but never right: the eye is 484
+   along a direction and THEN lifted 191, which at the grid happens
+   to land near "480 back, 256 up".
+
+   o CHECKED AGAINST THE GAME BEFORE A LINE WAS WRITTEN. Our own
+     grid slot for racer 1 is (-128, 0, 2058) with forward +Z, so
+     the yaw is zero and M is identity:
+
+         raw    = (-128, 0, 2058) + (0, 64, -484)
+         eye    = pos + 484 * normalise(0, 64, -484)
+                = (-128,  63.447, 1578.18)
+         + 191  = (-128, 254.447, 1578.18)
+         target = (-128, -160, 3738)
+
+     against the game's (-128.00, 254.45, 1578.18) and (-128.00,
+     -160.00, 3738.00). Both exact, from our own grid data.
+
+   o AND THE BUILT CODE LOGS EXACTLY THAT:
+
+         page1: track view - eye (-128 254 1578) at (-128 -160 3738)
+
+     against the game's (-128.00, 254.45, 1578.18) and (-128.00,
+     -160.00, 3738.00). All six values, from our own grid data
+     through the reconstructed camera. [verified]
+
+   o ONE FRAME, ONE STEP - AND THIS WILL REGRESS. The horizon and
+     the 3D pass both need the camera, and while both of them
+     STEPPED it every lerp ran at double rate. The target logged
+     (-128, -89, 3318) where one step gives (-128, -53, 2898) and
+     two give precisely -89 and 3318.
+
+     The eye hid it completely: it snaps on the first frame and the
+     raw value is static, so double-stepping a converged number is a
+     no-op. Only the still-easing target showed anything.
+
+     The original has the SAME split and no problem, because
+     Camera_UpdateChase runs in the game tick and
+     maybe_Game_RenderFrame only reads the record. p1_camera now
+     takes an advance flag. Worth re-checking when the real game
+     loop lands and page01_tick stops being the only per-frame hook.
+
+   o TWO DEVIATIONS, both deliberate and both commented in place.
+     The first frame SNAPS rather than lerping, because the original
+     seeds its record in maybe_Game_InitRace and we have nowhere
+     else to get a first eye. And the grid slot stands in for a
+     racer record, because page 1 has no moving racer yet - same
+     shape, static contents.
+
+   o THE LOOK-AT/BOOM ORDER IS PRESERVED. camera_update hands back
+     viewEye as well as eye, and page01_draw_3d builds the view
+     matrix from viewEye while positioning the frame at eye. That
+     reproduces the original's own inconsistency rather than tidying
+     it away.
+
+
+5.  THE REPLAY CAMERA - who cuts, and on what
+
+   Section 2 listed modes 3, 6 and 7. THERE IS A FOURTH, MODE 1,
+   and it is the whole replay camera. It was missed because nothing
+   in a normal race ever sets it.
+
+5.1.  Camera_SelectView picks the mode, and names the replay
+
+   Camera_SelectView (0x004583e0) runs every frame and ends with
+   two calls to Camera_SetMode (0x0046da70) [verified]:
+
+       if (DAT_004dc014)                    target=viewed, mode 3
+       else if (g_dwCockpitView active)     target=viewed, mode 6
+       else if (racer[+0x2de5] == 2)        target=viewed, mode 7
+       else if (countdown or DAT_004dc020)  target=viewed, mode 7
+       else                                 mode 1
+       Camera_SetMode(mode);
+
+       if ((DAT_004e9830 || DAT_00504ea0 || DAT_004e8968 ||
+            DAT_004dc134 || g_dwReplayMode == 1)
+           && maybe_g_trkCameraCount > 0) {
+           Camera_SetMode(1);
+           Camera_UpdateTrackside(dt, g_viewedRacerIndex);
+       }
+
+   THE REPLAY IS NAMED EXPLICITLY. g_dwReplayMode == 1 is one of
+   five conditions that switch the trackside director on, and the
+   whole thing is gated on maybe_g_trkCameraCount > 0 - the count of
+   CAMERA_xxx entries the track file places as decor. So a track
+   with no cameras in its decor gets no trackside shots at all.
+
+   o WHICH CLOSES subsystems/replay.txt 6.2. That section observed
+     the replay cutting between an orbit and fixed trackside shots
+     and connected it to the CAMERA_000 decor by name alone. This
+     is the code that reads the count.
+
+   o AND IT EXPLAINS MODE 6. DAT_004dc00c is toggled by
+     Input_OnKeyDown case 0x75 (F6), and that case is gated on
+     g_dwReplayMode != 1 - so the cockpit view is a live-play
+     toggle a replay cannot use. Mode 6 also drops out when the
+     viewed racer's crash latch racer+0x30c1 is set: you do not get
+     the cockpit while you are off the bike.
+
+5.2.  Camera_UpdateTrackside is the shot director
+
+   Camera_UpdateTrackside (0x0046e9f0) owns two globals:
+
+   +---------------------+-------------------------------------------+
+   | g_nCameraShot       | 0x004ea5a8 - the current shot type, 0..5  |
+   +---------------------+-------------------------------------------+
+   | g_nCameraShotTimer  | 0x004dc13c - dt units left on it          |
+   +---------------------+-------------------------------------------+
+
+   The timer is counted down at the end of the function.  When it
+   goes NEGATIVE the top of the function chooses a new shot and
+   reloads it [verified]:
+
+   IT COUNTS DOWN BY dt, NOT BY ONE, and the durations below are
+   therefore in dt UNITS rather than frames [verified, 0x0046f7c8]:
+
+       FILD  [g_nCameraShotTimer]
+       FSUB  [esp+0xc0]            ; the frame delta
+       __ftol, store
+
+   So a shot lasts the same WALL-CLOCK time whatever the frame rate,
+   and at the 1.667 a 60fps frame delivers, the 250 of a fixed shot
+   is 150 frames - two and a half seconds.
+
+   READING THEM AS FRAMES MAKES EVERY SHOT 1.67x TOO LONG at 60fps
+   and frame-rate dependent into the bargain.  The symptom is
+   specific: the camera holds a fixed trackside shot long after the
+   bike has gone behind a building, because nothing tests the view
+   (5.3) and only the timer can end it.
+
+   +------+----------+------------------------------------------+
+   | Shot | Duration | What it is                               |
+   +======+==========+==========================================+
+   |  0   |   250    | a fixed trackside camera                 |
+   +------+----------+------------------------------------------+
+   |  1   |   600    | plain follow - sets record mode 7        |
+   +------+----------+------------------------------------------+
+   |  2   |   300    | orbit, angle out of g_cosTable           |
+   +------+----------+------------------------------------------+
+   |  3   |   400    | orbit, angle pinned to pi (0x40490fdb)   |
+   +------+----------+------------------------------------------+
+   |  4   |   260    | fixed, with a computed projection zoom   |
+   +------+----------+------------------------------------------+
+   |  5   | 400/300  | a matrix shot off the bike root matrix   |
+   +------+----------+------------------------------------------+
+
+5.3.  It is a timer AND a position test - both, not either
+
+   This is the part worth getting right, because either half alone
+   gives the wrong model.
+
+   THE TIMER DECIDES WHEN TO CUT. THE TRACK DECIDES WHAT TO CUT TO.
+   When the timer expires the director calls Trk_FindNearestCamera
+   (0x0040d4f0) and asks maybe_Vec3_Differs (0x00470860) whether
+   the answer came back non-zero:
+
+       a camera was found -> shot 0 or 4, a FIXED trackside camera
+       none               -> rand() picks 0..11, and only three of
+                             the twelve are an orbit
+
+   "FOUND" IS PURE PROXIMITY ALONG THE TRACK, and it is worth being
+   precise because the obvious guess is wrong. Trk_FindNearestCamera
+   walks a window of 23 SEGMENTS from the bike's current one, walks
+   each segment's decor list, strncmp's the entry name against
+   "CAMERA" and "camera" (six characters, both cases), and keeps
+   the nearest by
+
+       d2 = (decor.x - bike.x)^2 + (decor.z - bike.z)^2
+
+   THERE IS NO LINE OF SIGHT TEST, no frustum, no occlusion, and Y
+   IS IGNORED ENTIRELY. A camera counts as available if a decor
+   object named CAMERA* exists within the next 23 segments, full
+   stop. The segment index wraps modulo the segment count, so the
+   search crosses the start line rather than stopping there.
+
+   o SO A TUNNEL ALWAYS ORBITS. A rider watching a replay reported
+     exactly that - "there is a tunnel that it goes through and
+     always does an orbit shot". The reason is not that the tunnel
+     blocks the view, because nothing tests the view: it is that no
+     CAMERA decor is PLACED within 23 segments of it. The orbits
+     are the fallback, and a tunnel is simply the longest stretch
+     of track where the fallback always fires.
+     [verified as to the code path, observed as to the tunnel]
+
+   THE FALLBACK IS MOSTLY THE ORDINARY CHASE, and the scale is
+   what says so.  The pick is (rand() & 0xffff) * 1/65535 * 12.0
+   truncated - 0x004d13c4 and 0x004d13c8, two multiplies the
+   decompiler drops - so it runs 0..11:
+
+   +--------+------------------------+----------+
+   | pick   | shot                   | odds     |
+   +========+========================+==========+
+   | 0      | orbit, running         | 1 in 12  |
+   +--------+------------------------+----------+
+   | 1      | orbit, pinned          | 1 in 12  |
+   +--------+------------------------+----------+
+   | 2      | a bike-local slot      | 1 in 12  |
+   +--------+------------------------+----------+
+   | 3..11  | the ordinary chase     | 9 in 12  |
+   +--------+------------------------+----------+
+
+   READ AS THIRDS - which is exactly what the decompiler's shape
+   suggests, since it tests 0, 1 and 2 and then has an else - the
+   chase becomes unreachable and the camera orbits at every cut.
+   That is a different-looking replay, and it is wrong.
+
+   o THE RANDOM CHOICE IS WHY IT DOES NOT REPEAT. rand() is
+     FUN_004b1160, which is above 0x004b0000 and so CRT [inferred
+     from the address range and from every use being masked - & 7,
+     & 1, & 0xffff]. So two replays of the SAME race do not
+     necessarily cut the same way, even though the physics is
+     bit-exact. That is worth knowing before anyone treats the
+     camera as part of the deterministic replay.
+
+5.3.1.  THE ZOOM BELONGS TO ONE SHOT AND MUST NOT OUTLIVE IT
+
+   Shot 4 sets the projection zoom to frame the bike at a constant
+   size, up to 3.0.  EVERY OTHER SHOT SETS IT BACK TO 1.0 - case 1,
+   the plain chase, included - and Camera_SelectView resets it once
+   more at the top of every frame, before any mode is chosen
+   [verified, 0x0045841e].
+
+   TWO RESETS FOR ONE VALUE IS NOT REDUNDANCY.  The director can
+   hand the frame back to the CHASE, and the chase is not part of
+   the director - so leaving each shot to restore what it changed
+   is not enough.  Without the per-frame reset a zoom of up to 3x
+   survives the cut and the chase camera draws from its usual place
+   magnified, which reads as an impossibly close shot from just
+   behind the helmet rather than as a zoom.  It comes and goes with
+   whether shot 4 happened to run first, so it looks like the shot
+   choice is at fault and it is not.
+
+5.4.  What the watchpoints actually saw, and one correction
+
+   Four watchpoints on the record's first sixteen bytes filled
+   16/16 in about five frames, catching the per-frame churn rather
+   than a cut [verified]:
+
+       +0x08  3 -> 7 at Camera_SetMode, 7 -> 1 at Camera_SetMode,
+              1 -> 3 at 0x0046f2f7 inside Camera_UpdateTrackside
+       +0x04  -1 -> 1 -> -1
+       +0x00  0 -> racer1+0x24 -> 0
+
+   That sequence IS Camera_SelectView running: mode 7 chosen, then
+   overridden to 1 by the replay branch, then the director settling
+   it to 3 for a shot. Every frame.
+
+   o A CORRECTION TO SECTION 1. An earlier reading of this record
+     - taken by hooking Camera_Update's ENTRY and dumping 32 bytes
+     - reported +0x00 through +0x10 as "constant across every hit"
+     and +0x14/+0x18/+0x1c as the camera position. Both were
+     wrong. The fields are rewritten several times a frame; the
+     hook simply always sampled the same instant, when the record
+     is at rest. The eye is +0x98, as section 1 already had it.
+
+     SAMPLING ONE INSTRUCTION DOES NOT SHOW THAT A FIELD IS
+     CONSTANT. It shows what the field reads at that instruction.
+     A watchpoint is the instrument for the other question.
+
+   o AND CAPS MUST SUIT THE FIELD. Catching an actual CUT needs a
+     filter or a much larger cap, because the resting churn will
+     exhaust any small budget in a few frames. Not yet done.
+     [open]
+
+5.5.  The cuts, caught
+
+   Section 5.4 said catching an actual CUT needed a field that only
+   moves when one happens. g_nCameraShot is that field: a watchpoint
+   on it, cap 16, over two laps of a replay caught SIXTEEN SHOT
+   SELECTIONS, and Trk_FindNearestCamera was hooked alongside to say
+   where each one happened [verified].
+
+   The eight hooked selections, with the segment and the bike's
+   position the search was run from:
+
+   +---------+---------+------------+------------+
+   | Segment | Gap     | x          | z          |
+   +=========+=========+============+============+
+   |   207   |    -    |  -25183.1  |   23884.0  |
+   +---------+---------+------------+------------+
+   |   253   |    46   |  -27876.7  |    1003.7  |
+   +---------+---------+------------+------------+
+   |   280   |    27   |  -26991.0  |  -12436.8  |
+   +---------+---------+------------+------------+
+   |   322   |    42   |  -43604.8  |  -15025.1  |
+   +---------+---------+------------+------------+
+   |   430   |   108   |  -43276.6  |   39215.8  |
+   +---------+---------+------------+------------+
+   |   449   |    19   |  -39962.1  |   48454.0  |
+   +---------+---------+------------+------------+
+   |   490   |    41   |  -23680.7  |   60989.6  |
+   +---------+---------+------------+------------+
+   |   543   |    53   |    1056.2  |   69760.0  |
+   +---------+---------+------------+------------+
+
+   THE GAP IS NOT CONSTANT - 46, 27, 42, 108, 19, 41, 53 segments -
+   which is what a TIME-based timer looks like when it is sampled in
+   DISTANCE. A bike moving quickly covers more segments before the
+   shot expires. The 108 is the long fast section; the 19 is slow
+   and tight. This is consistent with 5.2's durations counting down
+   in TIME, and it rules out any fixed segment interval.
+
+5.5.1.  Both selection paths, seen firing
+
+   The sixteen writes land on ten distinct instructions inside
+   Camera_UpdateTrackside, and they divide exactly along 5.3's two
+   paths [verified]:
+
+   +------------+-------+--------------------------------------+
+   | 0x0046ebdb |   0   | camera FOUND - shot 0                |
+   +------------+-------+--------------------------------------+
+   | 0x0046ebe9 |   4   | ... then a coin flip promotes it to 4|
+   +------------+-------+--------------------------------------+
+   | 0x0046eb2a |   2   | none found, rand() -> 0              |
+   +------------+-------+--------------------------------------+
+   | 0x0046eb66 |   5   | none found, rand() -> 2              |
+   +------------+-------+--------------------------------------+
+   | 0x0046eb1b |   1   | none found, rand() -> anything else  |
+   +------------+-------+--------------------------------------+
+
+   o THE 0-THEN-4 PAIR IS ONE DECISION, NOT TWO. Hits 3 and 4 fired
+     back to back with identical registers: the code stores 0 and
+     then overwrites it with 4 when rand() & 1 is clear. A reader
+     of the trace who counted writes would double-count the cuts.
+
+   o AND rand() IS CONFIRMED. ECX read 0x7fff on every one of the
+     sixteen hits - RAND_MAX. Section 5.3 called FUN_004b1160 rand()
+     from its address range alone; the mask settles it. [verified]
+
+   o THE SHOT SEQUENCE OVER TWO LAPS was 0, 1, 0, 4, 1, 0, 1, 1, 0,
+     4, 2, 1, 4, 5, 2, 0 - so the fallback orbits (1, 2, 5) came up
+     about as often as the fixed cameras (0, 4). Nine of sixteen
+     selections found no camera within 23 segments, which says the
+     placed cameras cover well under half this track.
+
+6.  THE LOOK BRANCH - TAB, and the pan it leaves behind
+
+   nLookBackKey (camera+0x21c) is an INDEX, and a non-zero one takes a
+   whole different path from the chase - Camera_UpdateChase forks on it
+   at 0x0046f8a4 and Camera_Update's mode 6 arm falls THROUGH to the
+   chase on it at 0x004701b5. So the rear view pre-empts both cameras,
+   and it suppresses the cockpit meshes as well: Racer_DrawCockpit's
+   gate at 0x0046213e tests the same field.
+
+6.1.  The placement, measured twice
+
+   +------------------------------------------------------------------+
+   |   eye  = racerPos + matOrientation * pLookOffset[slot]           |
+   |   view = transpose(euler(pLookAngles[slot]) * matOrientation)    |
+   |   target  IS NOT WRITTEN                                         |
+   +------------------------------------------------------------------+
+
+   No boom, no settle, no lerp. Slot 1 was forced into the live record
+   and read back at two headings [verified]:
+
+   +---------------+----------------------+-----------------------+
+   | State         | racerPos             | eye                   |
+   +===============+======================+=======================+
+   | grid, yaw 0   | (-128, 0, 2058)      | (-128, 160, 2038)     |
+   +---------------+----------------------+-----------------------+
+   | corner, yaw   | (-1224.68, 0,        | measured  (-1206.35,  |
+   | ~111 deg      | 2924.14)             | 160, 2931.15)         |
+   |               |                      | predicted (-1206.03,  |
+   |               |                      | 160, 2931.36)         |
+   +---------------+----------------------+-----------------------+
+
+   o THE VIEW IS THE TRANSPOSE of the camera's world orientation, which
+     is what a view matrix is. At the grid the record held Ry(pi)
+     exactly; mid-corner it held the transpose of
+     euler(0, pi, 0) * matOrientation to the digit. Taking the product
+     without transposing mirrors the scene.
+
+   o THE SCALAR AT +0x1dc IS 64.0 for all eight slots and does NOT
+     reach the eye - both measurements match the offset alone. It is
+     loaded at 0x0046fc04 into the same FPU block, so it does something;
+     what, is unread. [open]
+
+   o BOTH SAMPLES ARE PURE YAW and slots 6 and 7 carry a pitch. Ry
+     rotations commute, so neither settles whether the original
+     composes euler * matrix or matrix * euler. Slot 1 is unaffected.
+     [open]
+
+6.2.  THE RELEASE PAN IS THE TARGET IT DID NOT WRITE
+
+   Releasing the key in COCKPIT view tilts the view and recovers over a
+   few frames; releasing it on the chase does not [observed]. It is not
+   an animation and nothing in the game plays one - it falls out of two
+   facts that are already established:
+
+     1  the look branch leaves camera+0xa4, the target, ALONE. Read
+        back while slot 1 was live it still held the forward cockpit
+        target, (-128, 170, 2098) [verified].
+     2  mode 6 SMOOTHS ONLY Y, against the previous frame's eye and
+        target - 3.2. x and z snap.
+
+   So on release the eye's y lerps from the look placement's 160 to the
+   cockpit's 170 while x and z snap, and the target - never disturbed -
+   is already where it belongs, only 40 units ahead. Ten units of eye
+   error against a 40-unit lever arm is atan(10/40) = 14 degrees of
+   tilt, shed at 0.769 per frame.
+
+   o AND THAT IS WHY THE CHASE DOES NOT DO IT. Mode 7's target sits
+     1680 ahead and all three components lerp, so the same ten units is
+     0.34 degrees. The cockpit's short aim distance is the whole
+     amplifier.
+
+   o SO A PORT GETS IT FOR FREE, and must not implement it. Reproduce
+     the two facts - leave the target alone in the look branch, smooth
+     only y in mode 6 - and the pan appears. Adding a tilt on top would
+     double it.
+
+6.3.  Reconstructed
+
+   camera_look_slot in src/race.c, from the offsets and angles
+   Camera_InitRecord seeds, with MR_Camera carrying a view matrix so
+   the branch can write one the way camera+0x68 does.
+   race_camera_look_back is the key, HELD, on '7' because the port's
+   TAB is the 4x clock.
+
+   NOT RECONSTRUCTED: the FPU block at 0x0046fc04 that consumes the
+   scalar, and whatever else the branch does with it. The placement and
+   the view are measured rather than transcribed, which is why they are
+   trusted; the rest of the branch is not read. [open]
+
+7.  Open questions
+
+   o WHAT WOULD MAKE THE THREE ANGLES NON-ZERO? Straight, wheelie
+     and corner all read zero - see 4.3. Replay and the finish
+     sequence are the obvious unsampled states.
+
+   o WHAT SETS +0x34? Not a wheelie, which was the assumption. It
+     gates the boom-shortening term, so something shortens the
+     camera and it is not what was guessed.
+
+   o CLOSED - see 4.5. The second matrix is Ry(-yaw) and was read
+     out of the running game rather than argued about. The apparent
+     mismatch was this document's own error: the boom renormalises
+     the LERPED eye, not the raw one.
+
+   o WHAT IS param_1[0x88], the index into the boom-length table at
+     param_1[0x89]? Almost certainly the camera-distance setting from
+     the options screen.
+
+   o WHAT SETS +0x08 TO 7? Only mode 7 has been seen live. Where 3
+     and 6 are selected, and by what, is unread.
+
+   o WHICH RACER FIELD IS +0x3059, read as "speed" in mode 6? Named
+     from its use, not from the racer struct - see racers.txt.
+
+
+Open: the camera keeps moving while the game is paused
+
+   THE PORT'S CHASE CAMERA SETTLES DURING A PAUSE. Held paused at
+   the end of a scripted straight-line run it drifts to rest,
+   which means it is integrating against something other than the
+   virtual clock.  [observed]
+
+   That matters beyond the cosmetics. race.h says the camera steps
+   in race_update and nowhere else, and race_update takes a zero
+   step while tm_now is frozen - so if the camera still moves, one
+   of those two statements is wrong. Anything reading tm_real_now,
+   or timeGetTime directly, would do it.
+
+   It also means a camera position sampled at a pause boundary is
+   not necessarily the position that frame ended on, which would
+   quietly corrupt any camera comparison against MOTO.EXE. Settle
+   this before measuring the camera.  [open]
+
+
+The camera advances only when time passed - RESOLVED
+
+   THE CHASE CAMERA IS A FIRST-ORDER FILTER chasing a point
+   rigidly attached to the bike, so stepping it on a frame the bike
+   did not move pulls it IN toward that point for free. race_update
+   runs on paused frames - it just takes a zero step - so the
+   port's camera converged whenever the game sat paused. Visible as
+   the view creeping in after a pause; race_camera(1) is now gated
+   on dt > 0.  [verified]
+
+   IT ALSO CORRUPTED EVERY STEPPED MEASUREMENT, which is the part
+   worth remembering. A scripted comparison pauses between bursts,
+   and the port's camera closed up during each pause while the
+   original's stayed frozen. That produced a long hunt through
+   constants, matrices and boom arithmetic, all of which turned out
+   to be identical:
+
+       raw eye radius      488.21 both, = sqrt(484^2 + 64^2)
+       boom scale          -484.00 both
+       eye lerp            0.2 both, 0x004d1404
+       record constants    lift 191, base -484, up 64,
+                           table {0,128,256,512}, slot 0
+       yaw source          racer+0xbc, matOrientation, both
+
+   The raw eye and the boom scale were read out of the RUNNING game
+   with a hook at 0x0046fcf0 capturing ESP+1c, ESP+50 and the
+   racer position through EBX - the stack locals could not be
+   decomposed from the listing, and two wrong conclusions had
+   already been drawn by trying.
+
+   AFTER THE GATE, same run, no constant changed:
+
+       frames   MOTO camAng   port camAng   diff
+           10      +168.03       +167.62    0.41
+           20      +143.53       +143.08    0.45
+           30      +116.82       +116.44    0.38
+           40       +90.47        +90.02    0.45
+
+       eye minus bike, frame 40:
+           MOTO  +482.9  +223.5    -3.9
+           port  +482.8  +225.1    -0.2
+
+   Tracking went from 0.98 of the bike's rotation to matching the
+   original's 0.48-rising-to-0.83, and the height from 21 units
+   out to under 2 - the eye now DESCENDS through a turn as the
+   original's does.  [verified]
+
+   THE LESSON IS ABOUT THE HARNESS, not the camera. The virtual
+   clock freezes the simulation, and it was verified frozen; what
+   was not checked is that everything downstream of it respects
+   the same gate. Anything integrating outside the dt path keeps
+   running through a pause and silently biases every stepped
+   measurement taken of it.
+
+Open: the camera keeps moving while the game is paused
+
+   THE PORT'S CHASE CAMERA SETTLES DURING A PAUSE. Held paused at
+   the end of a scripted straight-line run it drifts to rest,
+   which means it is integrating against something other than the
+   virtual clock.  [observed]
+
+   That matters beyond the cosmetics. race.h says the camera steps
+   in race_update and nowhere else, and race_update takes a zero
+   step while tm_now is frozen - so if the camera still moves, one
+   of those two statements is wrong. Anything reading tm_real_now,
+   or timeGetTime directly, would do it.
+
+   It also means a camera position sampled at a pause boundary is
+   not necessarily the position that frame ended on, which would
+   quietly corrupt any camera comparison against MOTO.EXE. Settle
+   this before measuring the camera.  [open]
+
+
+Open: the port tracks higher and swings faster
+
+   Measured side by side, both builds driven from the grid by the
+   same scripted run with frame counts verified equal. Eye minus
+   bike position, world axes, MOTO in camera mode 7 (record 0 at
+   g_cameraRecords, the farthest vantage):
+
+       frames        MOTO dx,dy,dz            port dx,dy,dz
+           0     +0.0  +230.9  -482.4     +0.0  +251.5  -480.2
+          10   +100.0  +229.5  -472.0   +189.9  +251.4  -441.1
+          20   +286.8  +228.0  -388.1   +373.6  +250.9  -301.8
+          30   +430.8  +225.4  -217.8   +470.6  +250.2   -96.2
+          40   +482.9  +223.5    -3.9   +462.8  +249.8  +128.9
+
+   THE BOOM LENGTH IS RIGHT - 482.4 against 480.2 at rest - so the
+   distance is not the problem. Two things are:  [verified]
+
+   o HEIGHT. The port sits about 21 units higher throughout, 251
+     against 230, and the original DESCENDS slightly through the
+     turn (230.9 to 223.5) where the port barely moves (251.5 to
+     249.8). Whether 21 is a vantage-point difference or a
+     constant is unread - retail offers several and this capture
+     is mode 7 only.
+
+   o SWING RATE. As an orbit angle atan2(dx, dz), the original
+     travels 89.5 degrees over those forty frames and the port
+     travels 105.6 - about 18 per cent more. The port's camera
+     gets AHEAD of the turn, which is what puts the bike between
+     the eye and the front wheel and why the fork cannot be seen
+     from behind in the port but can in the original.
+
+   THE BIKE HEADING IS EXACT between the two builds (racers-convergence.txt
+   9.59.1) - measured at the same samples, +25.18 against +25.18,
+   +108.37 against +108.46 - so this is the camera's own lag and
+   not the thing it is following.
+
+   THE PORT HAS ALMOST NO LAG AT ALL. Camera rotation as a
+   fraction of the bike's, same run:
+
+       frames   bike turned   MOTO      port
+           10      25.18       0.48      0.98
+           20      53.44       0.68      0.99
+           40     108.37       0.83      0.995
+
+   The original's camera starts less than half way round and
+   catches up over about a second; ours is rigidly attached. That
+   is the whole difference, and it is why the front wheel is
+   visible from behind in the original and not in the port - a
+   camera that swings with the bike keeps the body between the eye
+   and the fork.  [verified]
+
+   IT IS NOT THE CONSTANTS AND NOT THE MATRIX. Read live,
+   0x004d1404 is 0.2, 0x004d1408 0.5, 0x004d140c 0.333333,
+   0x004d1354 64.0, and the target offset (-160, 1680) - all
+   matching the port. The camera calls Racer_GetYaw on ECX+0x98 at
+   0x0046f991, which is racer+0xbc, matOrientation - the same
+   heading the port uses, NOT the travel frame.  [verified]
+
+   WHERE IT DIVERGES IS THE FILTER STATE. Read live mid-turn:
+
+       MOTO  eye     - bike   len 531.73   angle +64.81
+             prevEye - bike   len 985.97   angle +64.81
+
+   The original keeps its previous eye at nearly TWICE the radius
+   its eye ends up at, where the port keeps it at the pre-boom
+   radius of about 484. 985.97 is close to 512 + 484 = 996, the
+   FARTHEST boom slot, and the capture was taken with retail set
+   to its farthest view.
+
+   THE BOOM ITSELF IS CORRECT IN THE PORT - read at 0x0046ff60:
+
+       0046ff76  MOV [ESI+0xc8],EAX    prevEye = eye, PRE-boom
+       0046ff88  ...                   eye = racerPos - d * s
+       0046ffba  FLD [ESI+0x54]        then the 191 lift on y
+
+   and the live numbers agree: eye - bike is
+   (437.04, 222.42, 205.59), and taking the 191 lift back off y
+   leaves a length of 484.00 EXACTLY. Final radius, lift order and
+   the pre-boom prevEye store all match the port.  [verified]
+
+   SO THE DIFFERENCE IS IN THE LERP TARGET, NOT THE BOOM. The
+   original's PRE-boom eye sits 986 from the bike, about twice the
+   484 it ends at, while the port's converges to the 488 its raw
+   is built at - (0, 64, -484). A filter always pulling toward a
+   point well outside the boom sphere, and renormalised back onto
+   it every frame, is what produces a heavy swing; one pulling
+   toward a point already on the sphere tracks rigidly.
+
+   MEASURED ON BOTH, same turning state:
+
+                 prevEye radius   eye radius less the lift
+       MOTO           985.97               484.00
+       port           569.38               484.00
+
+   RULED OUT, all read live from the record at 0x005161c0: lift
+   +0x54 = 191.0, boom base +0x58 = -484.0, local up +0x1dc = 64.0,
+   boom table +0x224 = {0,128,256,512}, slot +0x34 = 0, mode 7 -
+   every one matching the port. The lerp is the same shape too,
+   eye = prev + (raw - prev) * 0.2 at 0x0046fcf0, with prev in
+   stack locals and the result stored to +0xc8 pre-boom. And the
+   port steps the camera once a frame, gated on race_camera(1).
+
+   A TRAP WORTH MARKING: prevEye.y reads exactly 64.00, which
+   looks like the filter having converged onto raw. It has not.
+   racerPos.y is 0 and the up offset is 64, so the y term
+   converges trivially and says nothing about the horizontal -
+   where the lag actually lives.
+
+   So the filter is identical and its state still ends up nearly
+   twice as far out in the original. What differs has to be raw
+   itself, built at 0x0046fc60 as a matrix-vector accumulation
+   through stack locals that cannot be decomposed from the
+   listing. THE NEXT STEP IS A HOOK, not more reading: dump
+   [ESP+0x1c..0x24] and [ESP+0x10] at 0x0046fcf0 and compare the
+   raw eye directly.  [open]
+
+2.  The side view rolls with the bike, and one immediate fixes it
+
+   The look-slot path of Camera_UpdateChase builds its view from the
+   racer matrix it loads at 0x0047000f:
+
+       0047000f  ADD EAX, 0x0058406d       g_racers + 0x2e55
+
+   and racer+0x2e55 is matBikeRoot, WHICH CARRIES THE WHEELIE PITCH.
+   Measured through a wheelie at wheelieAngle pi/2 [verified]:
+
+   +---------------------------+---------+
+   | racer+0x2e55  matBikeRoot | m[7] =  |
+   |                           | 0.70711 |
+   +---------------------------+---------+
+   | racer+0x00bc  matOrient   | 0.00000 |
+   +---------------------------+---------+
+
+   THE TWO ARE DIFFERENT MATRICES, which is easy to miss because both
+   are the identity at rest. matOrientation holds the heading only;
+   matBikeRoot holds the whole attitude.
+
+   POINTING THE ADD AT +0x00bc GIVES A LEVEL VIEW, and the A/B is
+   clean. Same wheelie, the camera view matrix at record+0x68:
+
+       unpatched   m[4]  0.8522 -> 0.7074 -> 0.7071   rolls to 45 deg
+       patched     m[4]  1.0000 throughout            stays level
+
+2.1.  Patch the camera read, not the field
+
+   LEVELLING racer+0x2e55 ITSELF DOES NOT WORK AND IS NOT SAFE.
+
+     o It does not work from a script. The field is rewritten every
+       frame by maybe_Racer_UpdateLean at 0x0046a5b2, before the
+       camera reads it, so a poll that writes it between frames is
+       gone by the time it matters - measured, the pitch came back
+       every frame.
+
+     o It would not be safe even if it stuck. maybe_Racer_Draw copies
+       the same matrix at 0x0045f2e5 into the slot that becomes
+       rearMat, and maybe_Racer_ChassisAttitude reads it at
+       0x0045ca35 - the suspension target is built from it. The bike
+       and its physics would tilt along with the camera.
+
+   The single immediate at 0x00470010 is read by nothing else.
+
+2.2.  Where it lives
+
+   mrhook, in side_cam_level, toggled with the side camera on the "1"
+   key - so the level view arrives with the side view and leaves with
+   it. The write goes through hook_suspend_game because it happens
+   long after the entry point.
+
+   tools/mr_levelcam.py is the probe that established the field and
+   is kept for reading the matrix; its polling approach is the one
+   that does NOT work, and it says so.

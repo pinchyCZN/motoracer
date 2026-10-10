@@ -1,0 +1,151 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                              MR_CLIPSPAN
+
+
+Abstract
+
+   Size: 0x08 = 8 bytes [verified] - from the bump allocator in
+   Screen3D_ClipSpanK3, where the three field writes are strided by 8.
+
+   Ghidra type applied: yes. The decompiler renders the free-list walk
+   in every clipper in terms of it.
+
+   One free RANGE of a scanline. The rasterizer has no z-buffer; hidden-
+   surface removal is a per-scanline list of the x ranges that are still
+   UNCOVERED, with the scene drawn front to back. Whatever draws first
+   claims its pixels and is subtracted from the list, so later polygons
+   are clipped out of them. See subsystems/rasterizer-pipeline.txt
+   sections 10.1, 26.1 and 37.
+
+Table of Contents
+
+   1. Fields
+   2. Storage
+   3. The invariant
+   4. Operations
+   5. Open questions
+
+1.  Fields
+
+   +--------+------+---------------+------+------------+----------------------+
+   | Offset | Size | Type          | Name | Confidence | Notes                |
+   +========+======+===============+======+============+======================+
+   | +0x00  | 2    | short         | x0   | verified   | left edge, inclusive |
+   +--------+------+---------------+------+------------+----------------------+
+   | +0x02  | 2    | short         | x1   | verified   | right edge           |
+   +--------+------+---------------+------+------------+----------------------+
+   | +0x04  | 4    | MR_ClipSpan * | next | verified   | NULL at the end      |
+   +--------+------+---------------+------+------------+----------------------+
+
+   The stride is read directly from the split in Screen3D_ClipSpanK3,
+   which writes x0 and x1 as shorts indexed by count * 4 from a short
+   base, and next as a dword indexed by count * 2 from a base four bytes
+   higher. All three resolve to a byte stride of 8 [verified].
+
+2.  Storage
+
+   +--------------------+------------+-----------------------------------+
+   | Global             | Address    | Meaning                           |
+   +====================+============+===================================+
+   | g_spanFreePool     | 0x0060d3d0 | the node pool, bump-allocated     |
+   +--------------------+------------+-----------------------------------+
+   | g_spanFreeCount    | 0x0065e1d4 | next free index; the bump pointer |
+   +--------------------+------------+-----------------------------------+
+   | g_spanScanlineHead | 0x00623bd8 | one list head per scanline        |
+   +--------------------+------------+-----------------------------------+
+
+   Nodes are never individually freed. Cross-referencing every
+   instruction in the binary that touches g_spanFreeCount gives the
+   whole picture in forty instructions, and every one of them is a plain
+   MOV [verified]:
+
+   +------------------------------+------------------------------------+
+   | Function                     | What it does                       |
+   +==============================+====================================+
+   | Screen3D_BeginFrame          | resets it to 0 and seeds the heads |
+   +------------------------------+------------------------------------+
+   | the 4 Walk4-7 Now clippers   | load, increment, store             |
+   +------------------------------+------------------------------------+
+   | ClipSpanFlatScalar / FlatMMX | load, increment, store             |
+   +------------------------------+------------------------------------+
+   | ClipSpanK3, K1Full, K1Half   | load, increment, store             |
+   +------------------------------+------------------------------------+
+
+   Those nine bumpers are exactly the nine Now clippers of rasterizer-
+   pipeline.txt section 26.2. No Defer clipper appears, which is the
+   same fact as section 34.2 seen from the allocator.
+
+   The pool's declared length is not established. The next referenced
+   global sits 0x16808 bytes above it, which is 11521 nodes, but that is
+   an upper bound and not a size read from the code [inferred].
+
+3.  The invariant
+
+   The list for a scanline is sorted ascending by x0, and its ranges do
+   not overlap [inferred]. The evidence is the early return every
+   clipper contains:
+
+       if (spanEnd < node->x0) return;
+
+   Abandoning the walk at the first node starting too far right is only
+   correct if no later node starts further left. Nothing sorts the list
+   explicitly; it stays sorted because the only operations - shrink an
+   endpoint, unlink, split in place - cannot reorder it, and
+   Screen3D_BeginFrame seeds each scanline with a single node covering
+   the full width.
+
+4.  Operations
+
+   A clipper subtracts the drawn range from the list. Four cases, all
+   present in every Now clipper [verified]:
+
+   +----------------------------------+-------------------------------+
+   | Case                             | Effect on the node            |
+   +==================================+===============================+
+   | node extends left of the span    | x1 = spanStart                |
+   +----------------------------------+-------------------------------+
+   | node extends right of the span   | x0 = spanEnd                  |
+   +----------------------------------+-------------------------------+
+   | node lies wholly inside the span | unlink it                     |
+   +----------------------------------+-------------------------------+
+   | span lies wholly inside the node | split: bump-allocate the tail |
+   +----------------------------------+-------------------------------+
+
+   Defer clippers walk the list READ-ONLY and perform none of these;
+   they copy the surviving sub-ranges into span records instead. Which
+   of the two a kind gets is the coverage question of rasterizer-
+   pipeline.txt section 34.2.
+
+5.  Open questions
+
+   THERE IS NO BOUND CHECK. Not one CMP or TEST against g_spanFreeCount
+   exists anywhere in the binary; all forty references are loads,
+   increments and stores [verified]. The allocator cannot fail and
+   cannot report failure.
+
+   That is a deliberate asymmetry with the other span structure, not an
+   oversight of this note. g_spanBufferCount is tested against 0x2800
+   before every single record and sets g_spanAccepting on overflow. The
+   node pool has neither. A scanline complex enough to exhaust the pool
+   writes past it silently [inferred from the absence].
+
+   Whether that is reachable depends on the pool's true length, which is
+   still not established - the next referenced global sits 0x16808 bytes
+   above it, 11521 nodes, but that is an upper bound and not a declared
+   size. Two things follow for the port. The bound must be recovered
+   before the structure is reimplemented, and the reimplementation
+   should check it even though the original does not.
+
+   o The pool's declared length. It bounds a real overrun, so it is
+     worth more than the usual curiosity about a size.
+
+   The DEMAND side is now known. Screen3D_BeginFrame seeds exactly
+   g_viewHeight nodes, one per scanline, index-parallel so that node y
+   serves scanline y, and leaves g_spanFreeCount equal to g_viewHeight
+   [verified]. At the tallest supported mode that is 480 nodes spent
+   before any drawing, and every node after them is a split. So the
+   question is not how large the pool is in the abstract but how many
+   splits a frame can survive: pool length minus 480.
+

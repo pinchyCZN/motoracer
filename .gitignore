@@ -1,0 +1,51 @@
+# Original binary and Ghidra project  -  copyrighted, ~51 MB, never committed
+decomp/
+*.exe
+*.dll
+
+# Ghidra artifacts anywhere
+*.gpr
+*.rep/
+*.lock
+*.lock~
+.ghidra/
+
+# Extracted game assets
+assets/
+extracted/
+*.bin
+*.dat
+
+# Scratch
+scratch/
+tmp/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build output
+build/
+out/
+*.obj
+*.pdb
+*.ilk
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
+
+# Claude Code local overrides (keep .claude/settings.json committed)
+.claude/settings.local.json
+
+# The agent dev journal - work state, disposable, never committed.
+# tools/README-journal.txt
+.journal.db
+.journal.db-wal
+.journal.db-shm

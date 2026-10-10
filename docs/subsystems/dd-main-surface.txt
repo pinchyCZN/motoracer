@@ -1,0 +1,206 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                         CDD::CREATEMAINSURFACE
+
+
+Abstract
+
+   Step 3 of the DirectDraw init chain. Acquires the "main surface" -
+   the render target the game actually draws into, as distinct from the
+   primary surface the user sees.
+
+   Address 0x00475630. Named from its error string "in Create Main
+   surface" at 0x004eebac [verified].
+
+   This is the function that decides where the render target lives:
+   video memory or system memory. For a modernisation effort that
+   decision is the whole ball game, because a software rasterizer
+   writing into video memory across a bus behaves very differently from
+   one writing into RAM.
+
+Table of Contents
+
+   1. Three ways to get a main surface
+   2. Memory placement, and an undocumented flag explained
+   3. The out-of-video-memory retry
+   4. The IDirectDrawSurface2 QueryInterface
+   5. Where the render target ended up
+   6. Cdd::Init signature, now fully resolved
+   7. Names and types applied
+   8. Open questions
+
+
+1.  Three ways to get a main surface
+
+   +---------------------------+----------------------------------------+---------------------------------+
+   | Mode                      | Acquisition                            | Caps                            |
+   +===========================+========================================+=================================+
+   | Fullscreen, flip chain    | GetAttachedSurface(DDSCAPS_BACKBUFFER) | inherited from the chain        |
+   +---------------------------+----------------------------------------+---------------------------------+
+   | Fullscreen, no flip chain | CreateSurface                          | 0x4040, or 0x6040 with 3D       |
+   +---------------------------+----------------------------------------+---------------------------------+
+   | Windowed                  | CreateSurface                          | 0x40 plus memory placement bits |
+   +---------------------------+----------------------------------------+---------------------------------+
+
+   In the flip-chain case no surface is created at all: the back buffer
+   built by Cdd_CreatePrimarySurface in step 2 is simply fetched with
+   DDSCAPS_BACKBUFFER (0x4). That is the normal fullscreen path, and it
+   is why steps 2 and 3 must run in order.
+
+   Caps decode:
+
+   +--------+------------------------+
+   | Value  | Meaning                |
+   +========+========================+
+   | 0x0004 | DDSCAPS_BACKBUFFER     |
+   +--------+------------------------+
+   | 0x0040 | DDSCAPS_OFFSCREENPLAIN |
+   +--------+------------------------+
+   | 0x0800 | DDSCAPS_SYSTEMMEMORY   |
+   +--------+------------------------+
+   | 0x2000 | DDSCAPS_3DDEVICE       |
+   +--------+------------------------+
+   | 0x4000 | DDSCAPS_VIDEOMEMORY    |
+   +--------+------------------------+
+
+   dwFlags is 7 throughout: DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH.
+
+2.  Memory placement, and an undocumented flag explained
+
+   In windowed mode the caps are assembled in three steps:
+
+   caps = DDSCAPS_OFFSCREENPLAIN
+   if (DAT_004dc030)        caps |= DDSCAPS_3DDEVICE
+   if (g_ddPreferVideoMem)  caps |= DDSCAPS_VIDEOMEMORY
+   else                     caps |= DDSCAPS_SYSTEMMEMORY
+
+   if (DAT_004ee93c && (DAT_004dc06c == 0 || DAT_004dc070 != 0))
+       caps = (caps & ~DDSCAPS_VIDEOMEMORY) | DDSCAPS_SYSTEMMEMORY
+
+   DAT_004ee93c is the global set by the undocumented -windowSystem
+   command-line flag, recorded in config-globals.txt with no known
+   meaning. Its meaning is now clear: it forces the main surface into
+   system memory in windowed mode. The flag name reads as "windowed,
+   system memory" [inferred], and the behaviour is verified.
+
+3.  The out-of-video-memory retry
+
+   Both create paths retry on one specific error code:
+
+   if (hr == -0x7789fe84) { caps = (caps & ~VIDEOMEMORY) | SYSTEMMEMORY; retry }
+
+   -0x7789fe84 is 0x8876017C unsigned. DirectDraw HRESULTs are
+   MAKE_DDHRESULT(n) = 0x88760000 + n, so this is error 380:
+   DDERR_OUTOFVIDEOMEMORY [verified].
+
+   So the policy is precise: only an out-of-video-memory failure
+   triggers a fall back to system memory. Any other failure is reported
+   as-is. This mirrors the three-step ladder in step 2 and is worth
+   preserving.
+
+   If CreateSurface fails in windowed mode and leaves the pointer null,
+   the user-facing message is "Windowed mode not supported."
+   (0x004eebc4).
+
+4.  The IDirectDrawSurface2 QueryInterface
+
+   Every path converges on a QueryInterface against a GUID at
+   0x004d15f8, storing the result in a second global:
+
+   g_lpDDSMain->lpVtbl->QueryInterface(g_lpDDSMain,
+                                       &IID_IDirectDrawSurface2,
+                                       &g_lpDDSMain2);
+
+   The GUID bytes at 0x004d15f8 are [verified]:
+
+   85 58 80 57  EC 6E  CF 11  94 41 A8 23 03 C1 0E 27
+   = {57805885-6EEC-11CF-9441-A82303C10E27}
+
+   That is IID_IDirectDrawSurface2 [inferred] - the GUID itself is read
+   straight out of the binary, but the identification is from memory of
+   the DirectDraw headers and should be confirmed against a real ddraw.h
+   before anything depends on it. The v2 surface interface adds
+   GetDDInterface, PageLock and PageUnlock to the 36 v1 methods;
+   PageLock in particular is what a software rasterizer wants before
+   writing directly into a surface, which makes the QI plausible on its
+   own terms.
+
+   Both interfaces are retained: g_lpDDSMain (v1) and g_lpDDSMain2 (v2).
+
+5.  Where the render target ended up
+
+   After GetSurfaceDesc succeeds:
+
+   g_mainSurfaceInVideoMem = (caps & DDSCAPS_VIDEOMEMORY) >> 14;
+
+   A one-bit record of whether the request for video memory was actually
+   honoured. Anything later in the engine that behaves differently for a
+   video-memory versus system-memory render target will read this
+   global, so it is a good handle for finding the rasterizer's memory-
+   access paths.
+
+6.  Cdd::Init signature, now fully resolved
+
+   dd-init.txt listed param_4, param_5 and param_6 as unidentified. All
+   three are now known. param_6 was resolved in step 1 and the other two
+   here, because this function stores them into the surface description
+   as height and width:
+
+   auStack_84.dwHeight = g_mainHeight;   // DAT_005d8948, was param_5
+   auStack_84.dwWidth  = g_mainWidth;    // DAT_005d93c8, was param_4
+
+   The prototype is now applied in the database:
+
+   int __thiscall Cdd_Init(void *this,
+                           int screenWidth,  int screenHeight,
+                           int mainWidth,    int mainHeight,
+                           int bpp);
+
+   Note the consequence: the render target is sized independently of the
+   screen. The game can draw at one resolution and present at another,
+   which is exactly the mechanism a modern renderer would want to
+   exploit.
+
+7.  Names and types applied
+
+   +------------+-------------------------+-----------------------+
+   | Address    | Name                    | Type                  |
+   +============+=========================+=======================+
+   | 0x005d4320 | g_lpDDSMain             | IDirectDrawSurface *  |
+   +------------+-------------------------+-----------------------+
+   | 0x005d93b8 | g_lpDDSMain2            | IDirectDrawSurface2 * |
+   +------------+-------------------------+-----------------------+
+   | 0x005d93c8 | g_mainWidth             | int                   |
+   +------------+-------------------------+-----------------------+
+   | 0x005d8948 | g_mainHeight            | int                   |
+   +------------+-------------------------+-----------------------+
+   | 0x0053c52c | g_mainSurfaceInVideoMem | int                   |
+   +------------+-------------------------+-----------------------+
+   | 0x004ee95c | g_ddPreferVideoMem      | int                   |
+   +------------+-------------------------+-----------------------+
+   | 0x004d15f8 | IID_IDirectDrawSurface2 | GUID                  |
+   +------------+-------------------------+-----------------------+
+
+   IDirectDrawSurface2Vtbl was created with 39 methods. The
+   DDSURFACEDESC stack local is typed, so the whole function now reads
+   in terms of named fields.
+
+8.  Open questions
+
+   o RESOLVED. DAT_004dc030 is g_use3DHardware: set to 1 by -D3D and
+     -3DFX, cleared by -NoD3D, and seeded from the stored DetectD3DCard
+     setting. It gates DDSCAPS_3DDEVICE and the DirectDraw device
+     enumeration. See renderer-mode.txt.
+   o RESOLVED. DAT_004dc06c is g_rendererReady (3D init succeeded) and
+     DAT_004dc070 is g_rendererMode (0 hardware, 1 software, 2 unknown).
+     DAT_004dc0d4 and DAT_0053c524 are still open; DAT_0053c524 is now
+     g_ddUsingEnumeratedDevice but what sets the enumeration path is not
+     fully traced. See renderer-mode.txt.
+   o Confirm the IID against a real ddraw.h.
+   o What sets g_ddPreferVideoMem (0x004ee95c)? It gates the primary
+     memory choice but no writer has been located.
+   o FUN_00472800 is the message-box helper used for "Windowed mode not
+     supported." Name it.
+   o FUN_004758f3 and FUN_004758e9 are the SEH unwind helpers, same
+     shape as the pair in step 2.

@@ -1,0 +1,245 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       TRACK DECOR AND AnimDecor
+
+
+Abstract
+
+   The scenery beside the track - palm trees, boats, spectators,
+   the finish gantry, the trackside cameras and the seagulls - is
+   one system, and it has a name in the original source:
+   animDecor.cpp, one of the thirteen translation units the assert
+   paths leaked.
+
+   This note covers the table the decor lives in, how a track fills
+   it, how it is drawn, and the limits the game enforces on it. It
+   answers the question left open when a bird was first spotted
+   standing motionless in the scene.
+
+Table of Contents
+
+   1. The table
+   2. What one decor object holds
+   3. What a real track contains
+   4. How it is drawn
+      4.1. The per-object gate at +0x2c
+   5. AnimDecor - the animated ones
+   6. Open questions
+
+1.  The table
+
+   +--------------+---------------------------------------------+
+   | 0x004dc0e4   | pointer to an array of decor object         |
+   |              | pointers                                    |
+   +--------------+---------------------------------------------+
+   | 0x004dc0ec   | how many - read from the track file         |
+   +--------------+---------------------------------------------+
+
+   Trk_Load builds it at 0x0040dd19 [verified]:
+
+       read DAT_004dc0ec from the file        4 bytes
+       DAT_004dc0e4 = malloc(count * 4)
+       for i in 0 .. count-1:
+           p = malloc(0x65)                   101 bytes
+           construct p                        0x00402180
+           DAT_004dc0e4[i] = p
+
+   maybe_Game_FreeRaceResources frees it and nulls the pointer, so
+   the table is per-track and rebuilt on every load.
+
+   EVERY ENTRY SHARES ONE VTABLE, 0x004d0110. The decor is not a
+   class hierarchy - it is one class with a type code, which is
+   consistent with the rest of the binary: 35 of the 36 RTTI
+   descriptors in the image are MFC's, and the game's own use of
+   polymorphism is thin. See src/README.txt section 24.
+
+2.  What one decor object holds
+
+   101 bytes used of a 112-byte heap block, read live from a
+   running race [verified]:
+
+   +--------+------+-----------+----------------------------------+
+   | Offset | Size | Type      | Notes                            |
+   +========+======+===========+==================================+
+   | +0x00  |   4  | void*     | vtable, 0x004d0110               |
+   +--------+------+-----------+----------------------------------+
+   | +0x04  |  20  | char[]    | INSTANCE name - "palmier_006",   |
+   |        |      |           | "Gull05_001". Always the class   |
+   |        |      |           | name, an underscore, and three   |
+   |        |      |           | digits                           |
+   +--------+------+-----------+----------------------------------+
+   | +0x18  |   4  | float     | an angle. 3.156 on a gull,       |
+   |        |      |           | which is pi to two places        |
+   +--------+------+-----------+----------------------------------+
+   | +0x1c  |   4  | float     | a second angle, usually 0        |
+   +--------+------+-----------+----------------------------------+
+   | +0x20  |  12  | float[3]  | POSITION, x y z                  |
+   +--------+------+-----------+----------------------------------+
+   | +0x2c  |   4  | int       | DRAWN WHEN NON-ZERO. See 4.1     |
+   +--------+------+-----------+----------------------------------+
+   | +0x38  |   4  | int       | 1 on every instance a real track |
+   |        |      |           | places. CountCameras requires it |
+   +--------+------+-----------+----------------------------------+
+   | +0x3c  |   4  | int       | its own index in the table       |
+   +--------+------+-----------+----------------------------------+
+   | +0x44  |   4  | int       | -1 on the static objects, 0 on   |
+   |        |      |           | the gull                         |
+   +--------+------+-----------+----------------------------------+
+   | +0x4c  |   4  | void*     | the mesh. AnimDecor_Load reads   |
+   |        |      |           | *(+0x4c) then that +0x1c         |
+   +--------+------+-----------+----------------------------------+
+   | +0x54  |   4  | void*     |                                  |
+   +--------+------+-----------+----------------------------------+
+   | +0x58  |   4  | void*     |                                  |
+   +--------+------+-----------+----------------------------------+
+   | +0x5c  |   ?  | char[]    | CLASS name - "palmier", "Gull05" |
+   +--------+------+-----------+----------------------------------+
+
+   TWO NAMES, AND THE PAIR IS THE POINT. The instance name at
+   +0x04 identifies the placement and the class name at +0x5c
+   identifies the model, so twelve palm trees share one mesh and
+   differ only in position.
+
+3.  What a real track contains
+
+   Read live from the running game, 112 objects. The first nine:
+
+   +----+----------------+-------------+------------------------+
+   | i  | instance       | class       | position               |
+   +====+================+=============+========================+
+   | 0  | FINISH_000     | FINISH      |                        |
+   +----+----------------+-------------+------------------------+
+   | 1  | palmier_006    | palmier     | 1646, 26, 1119         |
+   +----+----------------+-------------+------------------------+
+   | 2  | boat2_001      | boat2       | -629, ..., 1912        |
+   +----+----------------+-------------+------------------------+
+   | 3  | CAMERA_000     | CAMERA      |                        |
+   +----+----------------+-------------+------------------------+
+   | 4  | Gull05_001     | Gull05      | -4580, 965, 4096       |
+   +----+----------------+-------------+------------------------+
+   | 5  | palmier_007    | palmier     | 1706, 21, 5209         |
+   +----+----------------+-------------+------------------------+
+   | 6  | nana2_000      | nana2       | -3630, -1704, 7167     |
+   +----+----------------+-------------+------------------------+
+   | 7  | nanaDEB1_000   | nanaDEB1    | -5749, -2239, 9063     |
+   +----+----------------+-------------+------------------------+
+   | 8  | palmier_008    | palmier     | 1655, 26, 1483         |
+   +----+----------------+-------------+------------------------+
+
+   o "palmier" IS FRENCH FOR PALM TREE and "nana" is slang for a
+     girl - the spectators. The asset names are French, which
+     matches the source tree at D:\Dsed\mr320\ and the six-language
+     string tables.
+
+   o THE GULL IS AT Y = 965, well above the palm trees at 21 to 26.
+     IT IS FLYING, and it is placed there by the track file rather
+     than by any animation. That answers the question from the
+     first session that noticed a bird sitting motionless in the
+     scene: the bird is decor, its height is data, and whether it
+     MOVES depends on section 5.
+
+   o CAMERA IS DECOR TOO. maybe_Trk_CountCameras (0x00473240) also
+     reads this table, so the trackside camera positions are decor
+     entries rather than a separate list.
+
+4.  How it is drawn
+
+   maybe_Trk_DrawZonesAndListSegments (0x0040ce60) draws decor as
+   it walks the visible segments, at 0x0040d21b and 0x0040d2eb:
+
+       (**(code **)(**(int **)(DAT_004dc0e4 +
+            *(short *)(track[0] + 0xb4 + seg*0xfc) * 4) + 0xc))
+                  (DAT_004dc0c0, camera)
+
+   o A SHORT IN THE SEGMENT RECORD at +0xb4 indexes the table, and
+     a count at +0xd4 says how many that segment has. So decor is
+     attached to segments, and only segments in the visible list
+     draw theirs. See racer-draw-pipeline.txt 8.
+
+   o THE DRAW IS VTABLE SLOT +0xc.
+
+   o IT IS SKIPPED ENTIRELY WHEN g_cfgDetailLevel IS 0. At the
+     lowest detail the track has no scenery at all - no trees, no
+     spectators, no gulls. Worth knowing before concluding that a
+     reconstruction is failing to draw something.
+
+4.1.  The per-object gate at +0x2c
+
+   The draw, FUN_004022f0, opens with a single test and draws
+   nothing when it fails [verified]:
+
+       if (*(int *)(this + 0x2c) != 0) { ... }
+
+   Read live off the speed bay, all 112 objects [verified]: every
+   prop carries 1 and the twenty CAMERAs carry 0, with nothing
+   else clear. maybe_Trk_CountCameras is what clears them, and
+   this gate is what the clear buys.
+
+   SO THE CAMERA MARKERS ARE FULLY-FORMED DECOR THAT IS SIMPLY
+   NEVER DRAWN. They have a template, a mesh, a position and three
+   euler angles exactly as a palm tree does; the mesh is a small
+   rectangular box, and it stands at head height beside the track
+   pointing in at the racing line. A reconstruction that ignores
+   the flag draws them, which is the symptom that led here.
+
+   The port carries it as MR_TrkInstance.drawable, set at parse
+   and cleared by trk_count_cameras.
+
+5.  AnimDecor - the animated ones
+
+   AnimDecor_Load (0x0048ba00) is the TU anchor for animDecor.cpp
+   and reads a chunk whose magic is the string "AnimDecor". It
+   layers animation onto entries of the table above.
+
+   Per animated object it unpacks one packed dword:
+
+       index = packed & 0xffff        which table entry
+       type  = (packed >> 16) & 0xff
+       flags = packed >> 24
+
+   then caches the table pointer into the record and, FOR TYPE 7
+   ONLY, reads a keyframe list - each frame 12 bytes, which is a
+   vec3.
+
+   TWO HARD LIMITS, both fatal with a French message box
+   [verified]:
+
+   +--------------------------------+---------+------------------+
+   | "TROP D'OBJETS ANIMES"         | > 0x3f  | 63 animated      |
+   |                                |         | objects a track  |
+   +--------------------------------+---------+------------------+
+   | "TROP DE FRAMES DANS L'ANIM"   | > 0x4f  | 79 - AND IT IS   |
+   |                                |         | ON THE PATH      |
+   |                                |         | COUNT, not the   |
+   |                                |         | frames at all    |
+   +--------------------------------+---------+------------------+
+
+   Both quote D:\Dsed\mr320\animDecor.cpp and its line number,
+   which is what anchors the TU.
+
+   o TYPE 7 IS A KEYFRAMED PATH - a list of vec3 positions. That
+     is the shape a flying gull needs, and it is the most likely
+     reason a gull would move.
+
+   o TYPE 8 GETS ONE FIELD SCALED at load, and is otherwise
+     unread.
+
+6.  Open questions
+
+   o WHICH TYPE THE GULL IS. Type 7 keyframes would animate it;
+     nothing here has read a live AnimDecor record to check. The
+     bird seen standing still may simply be an unanimated entry,
+     or the animation may be gated on something not yet found.
+
+   o THE CONSTRUCTOR at 0x00402180 and the vtable at 0x004d0110 -
+     neither has been read, so the meaning of +0x44, +0x54 and
+     +0x58 is unknown.
+
+   o THE OTHER READERS of DAT_004dc0e4: FUN_00405790, FUN_0040d4f0,
+     FUN_0040faf0 and FUN_00458f40 all touch it and none has been
+     looked at.
+
+   o WHETHER THE 112 ENTRIES ARE PER-TRACK OR PER-BANK. The count
+     comes out of the track file, so per-track is the assumption,
+     but only one track has been sampled.

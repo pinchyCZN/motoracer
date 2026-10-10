@@ -1,0 +1,256 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                     THE .BPT BINARY SCRIPT FORMAT
+
+
+Abstract
+
+   A .bpt is the compiled form of a text script the source calls .spt.
+   The game can read either form; the binary one is an obfuscated,
+   positional dump of the values the text script would have produced.
+
+   Integers, floats and strings all decode. A string is a plaintext
+   length followed by masked bytes, and the mask stream does not advance
+   over the length; see section 5. The three readers are named below.
+
+   +-------------------+------------+-------------------------------------------------+
+   | Function          | Address    | Role                                            |
+   +===================+============+=================================================+
+   | Script_Open       | 0x004242a0 | opens, rewrites the extension, seeds the cipher |
+   +-------------------+------------+-------------------------------------------------+
+   | Script_Close      | 0x004246e0 |                                                 |
+   +-------------------+------------+-------------------------------------------------+
+   | Script_ReadValue  | 0x00425080 | one 32-bit value; 4 bytes then unmask           |
+   +-------------------+------------+-------------------------------------------------+
+   | Script_ReadFloat  | 0x00424c00 | the same for a float                            |
+   +-------------------+------------+-------------------------------------------------+
+   | Script_ReadString | 0x00424e60 | plain length, then unmask that many bytes       |
+   +-------------------+------------+-------------------------------------------------+
+   | Script_NextToken  | 0x00424720 | tokeniser for the text form                     |
+   +-------------------+------------+-------------------------------------------------+
+   | Settings_ReadInt  | 0x00425bb0 | look a name up in the text form                 |
+   +-------------------+------------+-------------------------------------------------+
+   | Crypt_Xor         | 0x0045a4a0 | the mask; advances the stream len steps         |
+   +-------------------+------------+-------------------------------------------------+
+   | Rand_Next         | 0x004b1160 | Park-Miller generator, per-stream               |
+   +-------------------+------------+-------------------------------------------------+
+   | Rand_Seed         | 0x004b1140 | seeds one stream                                |
+   +-------------------+------------+-------------------------------------------------+
+   | dsi_fgetc         | 0x0042f650 | buffered character read, no decoding            |
+   +-------------------+------------+-------------------------------------------------+
+
+Table of Contents
+
+   1. The extension is rewritten
+   2. Two forms, selected by two globals
+   3. The mask
+      3.1. Where the masked stream starts
+   4. Verification
+   5. Strings
+   6. Reference decoder
+   7. Open questions
+
+
+1.  The extension is rewritten
+
+   The loader uppercases the requested path, then unless the name
+   contains ".DEM" it truncates at the first "." and appends "BPT", or
+   appends ".BPT" if there is no dot [verified]. So a request for
+   Data\Config.Spt opens DATA\CONFIG.BPT, and Data\champ%c.spt with
+   difficulty 0, 1 or 2 opens CHAMPA.BPT, CHAMPB.BPT or CHAMPC.BPT,
+   which is exactly the set on disk.
+
+   The error strings call these "binary script file", so Spt and Bpt
+   read as script and binary script.
+
+2.  Two forms, selected by two globals
+
+   DAT_004e7148 enables writing the compiled form and DAT_004e714c
+   enables reading it. Script_ReadValue branches on the second:
+
+   if (text mode)  { token = NextToken();  sscanf(token, ..., &v); }
+   else            { fread(&v, 4, 1, f);   Crypt_Xor(&v, 0, 4);    }
+   if (writing)    { w = v; Crypt_Xor(&w, 0, 4); fwrite(&w, 4, 1, out); }
+
+   The mask is applied on the way in and on the way out, so the same
+   routine serves both directions.
+
+   The binary form stores no names. The text path finds a value by
+   tokenising and comparing strings; the binary path simply takes the
+   next value in sequence. That is why none of the setting names
+   catalogued in subsystems/settings.txt appear anywhere in the file,
+   and why a decoder has to know the read order rather than look
+   anything up.
+
+3.  The mask
+
+   Crypt_Xor walks the buffer a byte at a time and applies
+
+   *p = ~(*p & k) & (*p | k)
+
+   which is XOR written longhand, where k is the low byte of the next
+   output from generator stream 6.
+
+   Rand_Next is the Park-Miller "minimal standard" Lehmer generator with
+   multiplier 16807 and modulus 2^31-1, using Schrage's method to avoid
+   overflow. The state keeps the full 31-bit value; the returned value
+   is reduced modulo 0x7fff when it exceeds it, and only the low byte is
+   used.
+
+   Stream 6 is seeded with 0x1a2b3c4d when the file is opened. The same
+   generator serves nine other callers elsewhere in the game, so it is a
+   general RNG with independent streams, not a dedicated cipher.
+
+3.1.  Where the masked stream starts
+
+   This is not the same for every file, and an earlier version of this
+   note got it wrong by generalising from CONFIG.BPT alone.
+
+   CONFIG.BPT opens with a plain little-endian count and the masked
+   stream begins at offset 4. Decoding it from offset 0 produces noise.
+   The CARAC files are the other way round: they decode perfectly from
+   byte 0 and produce noise from offset 4 [verified].
+
+   Scoring both alignments makes the split unambiguous. CARAC1 scores
+   1.00 from offset 0 against 0.08 from offset 4; CONFIG scores 0.96
+   from offset 4 against 0.12 from offset 0.
+
+   So there is no single rule. Try both alignments on any file whose
+   class you have not already established. Why the two differ is not
+   known; see the open questions.
+
+4.  Verification
+
+   CONFIG.BPT, 209 bytes, decodes to a four-character tag followed by a
+   run of 32-bit values that are plainly real: 0, 256, 512, 1024, 32,
+   and 11025, which is a standard audio sample rate.
+
+   The end of the file is the input bindings, and it cross-checks
+   against work done from a completely different direction:
+
+   25 00 00 00  fe ff ff ff     0x25 VK_LEFT   button -2
+   27 00 00 00  fd ff ff ff     0x27 VK_RIGHT  button -3
+   41 00 00 00  02 00 00 00     'A'            button  2
+
+   subsystems/input-bindings.txt derives -2 as stick left and -3 as
+   stick right from the sprite file names jleft.lez and jright.lez. Here
+   the same pairing falls out of a decrypted settings file. Two
+   unrelated routes, the same encoding [verified].
+
+   MOTOSPD.BPT decodes its opening bytes to the readable path
+   data\speed\bnk00_00.raw, confirming the mask is right for that file
+   too, and then desynchronises.
+
+5.  Strings
+
+   SOLVED. A string is a PLAINTEXT little-endian u32 length followed by
+   that many masked bytes. The length is not part of the RNG stream and
+   the generator must not be advanced across it [verified].
+
+       +----------------+---------------------------+
+       | u32 length, N  |  N bytes, XOR-masked      |
+       |  NOT masked    |  stream continues here    |
+       +----------------+---------------------------+
+
+   That single detail is what broke every earlier attempt. Advancing the
+   generator four steps across the length, as a byte-for-byte decode
+   does, puts it out of step by four for the whole rest of the file,
+   which is why output turned to noise immediately after the first
+   string.
+
+   The lengths are visible in the raw file without decoding anything.
+   FONTS.BPT is 10.2 percent zero bytes against the 0.4 percent expected
+   by chance, in 143 runs of three, and each run is the top three bytes
+   of a small little-endian length. That is how the structure was found.
+
+   Applying it to FONTS.BPT yields 143 strings, every one of them fully
+   printable, and the file reads as a font declaration table. The result
+   is used in structs/MR_Font.txt section 5.
+
+   A reader therefore needs one rule: at each position, if the next four
+   bytes are a plausible length and the string would fit in the file,
+   take a string; otherwise take one masked 32-bit value. tools/bpt.py
+   --records does this. Integer-only files are unaffected - CONFIG.BPT
+   still yields no strings under the same rule, so the heuristic does
+   not produce false positives there.
+
+   The reader has since been found and it says exactly this.
+   Script_ReadString at 0x00424e60, binary path, in full:
+
+       fread(&len, 4, 1, file);      /* length, NOT masked */
+       fread(dst, 1, len, file);
+       dst[len] = 0;
+       Crypt_Xor(dst, 0, len);       /* only the bytes */
+
+   The length dword never reaches Crypt_Xor, which is the whole of the
+   rule. Its errors name the case outright: "Could not read STRING in
+   binary script file" and, on the write side, "Could not write STRING
+   SIZE in binary script file". The write path is the mirror: strlen,
+   mask into a scratch buffer, write the length plain, write the masked
+   bytes [verified].
+
+   There is a third reader, Script_ReadFloat at 0x00424c00, identical to
+   Script_ReadValue but with a %f format on the text path. Floats and
+   integers both consume four masked bytes, so nothing in the file
+   distinguishes them.
+
+   That last point is a real limit on any generic decoder. The file
+   carries no type tags at all: the reader knows what to expect only
+   because the caller invokes ReadValue, ReadFloat or ReadString in a
+   fixed order. A decoder without that order has to guess.
+
+   Guessing on the length alone does not work. A small integer value is
+   indistinguishable from a small length, and files like CHAMPA and the
+   CARAC tables are full of 0, 1, 2 and 3; taking each as a string
+   desynchronises the mask immediately.
+
+   What does work is to verify before committing. Decode the candidate
+   bytes speculatively and accept the string only if they are printable,
+   rolling the generator back otherwise. The state is a single integer,
+   so the trial costs nothing. tools/bpt.py --records does this.
+
+   The check that the result is right is that the parse consumes the
+   file exactly. A wrong decision shifts the mask and the file stops
+   ending on a boundary. All fifteen .bpt files in DATA, and all thirty-
+   two CARAC files in the banks, consume to their final byte [verified].
+   The CARAC files yield no strings at all under the same rule, so the
+   verification does not invent them.
+
+   The CARAC set turned out to be the bike characteristic tables, 73
+   values each. They are documented separately in formats/bpt-carac.txt.
+
+6.  Reference decoder
+
+   tools/bpt.py.
+
+   python tools/bpt.py --dump PATH        decoded 32-bit values
+   python tools/bpt.py --raw  PATH        decoded bytes, hex and ascii
+   python tools/bpt.py --scan PATH        compare both stream alignments
+
+   Pass --skip 1 to start the stream after a leading count. That is what
+   CONFIG.BPT needs; the CARAC files need the default, which starts at
+   byte 0. Use --scan when in doubt.
+
+7.  Open questions
+
+   o RESOLVED. Strings are a plaintext u32 length plus masked bytes, and
+     the generator does not advance over the length. The reader is
+     Script_ReadString at 0x00424e60 and it confirms the rule directly.
+     See section 5.
+   o RESOLVED entirely. The CARAC files are the bike characteristic
+     tables; see formats/bpt-carac.txt. The offset-4 workaround for
+     CONFIG.BPT is gone: every file starts its mask stream at byte 0.
+     The apparent offset was CONFIG.BPT opening with a string, whose
+     plaintext length looked like a leading plain value.
+   o RESOLVED. There is no tag. What looked like one was the first
+     string's masked bytes read as an integer. CONFIG.BPT begins with a
+     player name, LIST.BPT with PLUGIN, LIST01.BPT with TWO_NEW_ISLANDS;
+     the championship and CARAC files begin with a count instead. See
+     formats/bpt-content.txt.
+   o RESOLVED. It is not a count. The 5 in CONFIG.BPT is the length of
+     the player name it opens with and the 23 in MOTOSPD.BPT is the
+     length of data\speed\bnk00_00.raw. Both files simply begin with
+     a string.
+   o Confirm whether the text .spt form ever ships. No .spt file exists
+     in the data, so the text path may be development-only.

@@ -1,0 +1,451 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            OBJECT SOUNDS
+
+
+Abstract
+
+   Every track may ship a SOUND.BPT beside its geometry, and it is
+   a small sound-design script rather than a list of cues.  It names
+   samples, gives them fade envelopes, LFOs on volume and pitch,
+   random pitch and pan, repeat counts and a distance falloff - and
+   then attaches the result to named decor objects, so a gull or a
+   corsair carries its own sound through the world.
+
+   Six functions in the 0x00404xxx-0x00406xxx block, out of the
+   sound half of animDecor.cpp.  Reconstructed in src/objsnd.c.
+
+Table of Contents
+
+   1. The six functions
+   2. The script
+   3. Cue ids are assigned at load
+   4. The descriptor
+   5. The slot and its state machine
+   6. The distance model and the pan
+   7. Placement
+      7.1. How a signal finds its segment
+      7.2. The emitter is a point ON the model
+      7.3. Placement kinds
+   8. Open questions
+
+1.  The six functions
+
+   +------------+--------------------------------------------+
+   | Address    | What it does                               |
+   +============+============================================+
+   | 0x0042e700 | opens Sound.Spt through the script layer   |
+   +------------+--------------------------------------------+
+   | 0x0042e850 | the parser - soundDesc / ambiance / signal |
+   +------------+--------------------------------------------+
+   | 0x004056c0 | name -> cue id, interning as it goes       |
+   +------------+--------------------------------------------+
+   | 0x004059a0 | loads the samples the descriptors named    |
+   +------------+--------------------------------------------+
+   | 0x00405790 | binds a descriptor to every decor instance |
+   +------------+--------------------------------------------+
+   | 0x00405bc0 | the per-frame placement                    |
+   +------------+--------------------------------------------+
+   | 0x00405030 | the per-voice state machine                |
+   +------------+--------------------------------------------+
+
+   THE SCRIPT IS "Sound.Spt" AND THE FILE IS SOUND.BPT.  The loader
+   rewrites any .spt request to .bpt - the same rule that turns
+   Data\Config.Spt into DATA\CONFIG.BPT - so the shipped member is
+   ILE01\SOUND.BPT and it reads with the ordinary bpt primitives.
+   See formats/bpt.txt.  [verified]
+
+2.  The script
+
+   Three commands.  A .bpt HAS NO FRAMING, so every value has to be
+   read whether or not it is used: one skipped field desynchronises
+   the whole rest of the file and the parser has no way back in.
+
+      soundDesc <id> <n> <name>*n <flags> <13 ints> <2 floats>
+      ambiance  <n> <descId>*n
+      signal    <signalKind> <n> <descId>*n
+
+   THE FIRST NUMBER AFTER signal IS NOT AN ID, it is the signal
+   kind, and the n values after it are descriptor ids - one
+   entry registered per value.  Reading it the other way round
+   is the obvious mistake and it parses cleanly either way.
+
+   THE FLAG WORD is pipe-separated, e.g.
+   "LOOPED|FADEIN|FADEOUT|FADEFREQ" - ten __stricmp tests in a chain
+   at 0x0042eb00 onward.  [verified]
+
+   +-------+----------+---------------------------------------+
+   | Bit   | Name     | Effect                                |
+   +=======+==========+=======================================+
+   | 0x001 | LOOPED   | the voice loops rather than one-shots |
+   +-------+----------+---------------------------------------+
+   | 0x002 | PAN      | pan by direction from the camera      |
+   +-------+----------+---------------------------------------+
+   | 0x004 | RANDPAN  | a fresh random pan at each trigger    |
+   +-------+----------+---------------------------------------+
+   | 0x008 | VOL      | attenuate by distance                 |
+   +-------+----------+---------------------------------------+
+   | 0x010 | FADEIN   | ramp up over fadeInMs                 |
+   +-------+----------+---------------------------------------+
+   | 0x020 | FADEOUT  | ramp down over fadeOutMs              |
+   +-------+----------+---------------------------------------+
+   | 0x040 | FADEFREQ | ramp pitch across a fade              |
+   +-------+----------+---------------------------------------+
+   | 0x080 | INFPLAY  | never leave sustain                   |
+   +-------+----------+---------------------------------------+
+   | 0x100 | SINVOL   | sine LFO on volume                    |
+   +-------+----------+---------------------------------------+
+   | 0x200 | SINFREQ  | sine LFO on pitch                     |
+   +-------+----------+---------------------------------------+
+
+   PAN AND VOL ARE OPTED INTO SEPARATELY and that is the whole
+   reason some things on a track follow the camera and others do
+   not.  ressac has VOL without PAN: surf gets quieter with
+   distance but stays centred, because it is not a point source.
+
+3.  Cue ids are assigned at load
+
+   The parser interns each sample name as it meets it and hands
+   back index + 0x5d [verified, 0x00405716].  So OBJECT-SOUND IDS
+   ARE NOT CONSTANTS - they count up from 0x5d per track and differ
+   between tracks.
+
+   That is why no object sample has a hardcoded id anywhere in the
+   cue table, and why searching MOTO.EXE for "ressac" finds
+   nothing: the names live in the encrypted .bpt, not in .rdata.
+
+   The samples come from the Divers bank.  ILE01 interns 22 names
+   across 18 descriptors, taking 0x5d..0x72.  [verified - live,
+   both builds]
+
+4.  The descriptor
+
+   19 dwords, the array at 0x00502930 with a stride of 0x4c
+   [verified, the copy loop at 0x0042ebbe].  Capacity 32; the
+   parser throws past that.
+
+   The field ORDER is the script's own - the parser reads them in
+   sequence and the file stores no names.
+
+   +--------+---------------+-------+---------------------------------+
+   | Offset | Field         | Type  | Notes                           |
+   +========+===============+=======+=================================+
+   | +0x00  | id            | int   | matched against the decor       |
+   +--------+---------------+-------+---------------------------------+
+   | +0x04  | firstSound    | int   | cue id of the first sample      |
+   +--------+---------------+-------+---------------------------------+
+   | +0x08  | sampleCount   | int   | how many; one picked at random  |
+   +--------+---------------+-------+---------------------------------+
+   | +0x0c  | flags         | uint  | section 2                       |
+   +--------+---------------+-------+---------------------------------+
+   | +0x10  | waitBase      | int   | ms of silence before a trigger  |
+   +--------+---------------+-------+---------------------------------+
+   | +0x14  | waitRand      | int   |                                 |
+   +--------+---------------+-------+---------------------------------+
+   | +0x18  | sustainBase   | int   | ALSO the LFO period - see 5.2   |
+   +--------+---------------+-------+---------------------------------+
+   | +0x1c  | sustainRand   | int   |                                 |
+   +--------+---------------+-------+---------------------------------+
+   | +0x20  | fadeInMs      | int   |                                 |
+   +--------+---------------+-------+---------------------------------+
+   | +0x24  | fadeOutMs     | int   |                                 |
+   +--------+---------------+-------+---------------------------------+
+   | +0x28  | repeatBase    | int   | plays before going quiet        |
+   +--------+---------------+-------+---------------------------------+
+   | +0x2c  | repeatRand    | int   |                                 |
+   +--------+---------------+-------+---------------------------------+
+   | +0x30  | freqBase      | int   | < 1 means the sample's own rate |
+   +--------+---------------+-------+---------------------------------+
+   | +0x34  | freqRand      | int   |                                 |
+   +--------+---------------+-------+---------------------------------+
+   | +0x38  | fadeFreqDelta | int   | pitch swing over a fade or LFO  |
+   +--------+---------------+-------+---------------------------------+
+   | +0x3c  | volume        | int   | 0..255                          |
+   +--------+---------------+-------+---------------------------------+
+   | +0x40  | pan           | int   | the fixed pan, -64..+64         |
+   +--------+---------------+-------+---------------------------------+
+   | +0x44  | radiusIn      | float | full volume inside this, metres |
+   +--------+---------------+-------+---------------------------------+
+   | +0x48  | radiusOut     | float | silent beyond this, metres      |
+   +--------+---------------+-------+---------------------------------+
+
+   EVERY "Rand" FIELD IS A SPREAD, NOT A MAXIMUM.  The slot takes
+   base + Rand_Next(4) % rand, so 0 means "always exactly base"
+   [verified, 0x00404ee0].  Every spread is drawn ONCE PER PLAY,
+   which is what stops six gulls on one descriptor calling in
+   unison.
+
+   A freqBase UNDER 1 MEANS "THE SAMPLE'S OWN RATE" and the value
+   is then an offset from it.  mouet asks for -1500, so the gulls
+   call a little below the recording.
+
+5.  The slot and its state machine
+
+5.1.  The slot
+
+   One playing sound.  Only the fields whose OFFSET matters are
+   listed; the rest are in src/objsnd.h.
+
+   +--------+----------+-------+-----------------------------+
+   | Offset | Field    | Type  | Notes                       |
+   +========+==========+=======+=============================+
+   | +0x04  | voice    | int   | -1 when not playing         |
+   +--------+----------+-------+-----------------------------+
+   | +0x08  | sound    | int   | the sample THIS play drew   |
+   +--------+----------+-------+-----------------------------+
+   | +0x2c  | state    | int   | 5.2                         |
+   +--------+----------+-------+-----------------------------+
+   | +0x30  | cutoff   | float | radiusOut * 128             |
+   +--------+----------+-------+-----------------------------+
+   | +0x34  | slope    | float | 255 / ((rOut - rIn) * 128)  |
+   +--------+----------+-------+-----------------------------+
+   | +0x38  | lastDist | float | last frame's distance       |
+   +--------+----------+-------+-----------------------------+
+   | +0x3c  | stopped  | int   | the voice has been released |
+   +--------+----------+-------+-----------------------------+
+
+   THE THREE AT +0x30 ARE FLOATS AND THAT IS NOT A DETAIL.  The
+   decompiler types the slot as int* and so renders the stores with
+   an (int) cast, but the reads are FCOM [ESI+0x30], FMUL
+   [ESI+0x34] and a float store to [ESI+0x38] - all three are
+   floats.  [verified, 0x00405118 / 0x0040516f / 0x0040515d]
+
+   SLOPE IS ALWAYS LESS THAN ONE.  For the ILE01 gulls it is
+   255 / ((100 - 30) * 128) = 0.028, so believing the cast and
+   holding it in an int truncates it to zero, and then every VOL
+   sound on the track plays at volume nothing.  Silently: the voice
+   still starts, the state machine still runs, and the log still
+   reports the right number of bound objects.
+
+   The 128 and the 255 are doubles at 0x004d0140 and 0x004d0148.
+   128 is the world-units-per-metre scale the radii are given in.
+
+5.2.  The states
+
+   ORIGIN  FUN_00405030 @ 0x00405030.
+
+       0 wait -> 1 start -> 2 fadeIn -> 5 sustain -> 4 fadeOut
+                     |                                   |
+                     +------ (no FADEIN) --> 3 stop <-----+
+
+   State 3 decrements the repeat count and re-arms at state 0 if
+   any are left, so repeatBase is plays-per-burst rather than a
+   lifetime.  INFPLAY pins the slot in 5 for ever and neither the
+   sustain timer nor the repeat count is consulted again.
+
+   THE TWO LFOs SHARE sustainBase AS THEIR PERIOD.  The original
+   reads descriptor +0x18 for both, which is the same field the
+   sustain LENGTH comes from - one value doing two jobs, not a
+   transcription slip.  vent asks for 22000 ms, so the wind
+   breathes once every twenty-two seconds; four copies of it drawn
+   from different spreads never line up.
+
+   SINVOL swings the volume about its base by +/-100 per cent, and
+   SINFREQ swings the pitch by +/-fadeFreqDelta - the same field
+   FADEFREQ ramps, again doing two jobs.
+
+   RANDPAN IS DRAWN AT THE TRIGGER, not per frame: the birds
+   scatter around you and then hold still while each call plays
+   out.  A per-frame draw would sound like static.
+
+6.  The distance model and the pan
+
+   THE DISTANCE MODEL IS THE SECOND GATE, NOT THE FIRST.  An
+   object sound is only considered at all when its segment is
+   within 60 segments of the player's, wrapping
+   (Trk_IsSegmentNearPlayer, 0x0040d350, called from
+   ObjSnd_TickAll at 0x00405bf9 with 0x3c).  Kind 0 is also
+   skipped outright when the detail level is 0 - skipped, not
+   ticked with audible 0, so a sounding voice is left alone
+   rather than released.
+
+   THAT WINDOW IS DOING MORE WORK THAN IT LOOKS.  radiusOut is
+   often big enough to cover most of a track, so without it a
+   prop is audible from anywhere - ile01's aeroplane is bound to
+   segment 378 of 788 and reaches the grid at segment 3.  On the
+   grid, eight of that track's eleven object sounds are inside
+   the window and three are not.  [verified - live, both
+   builds]
+
+   Within it, distance is measured from the CAMERA EYE, not from
+   the bike - the same eye maybe_Snd_TickRace uses for the
+   racers, so a gull and a bike never disagree about which is
+   nearer.
+
+       vol = clamp((cutoff - dist) * slope, 0, 255)
+
+   THE DESCRIPTOR'S OWN volume IS NOT A FACTOR HERE.  The distance
+   result REPLACES it rather than scaling it [verified, 0x00405168
+   - nothing reads +0x3c between the FMUL and the clamp].
+
+   CROSSING OUT OF RANGE RELEASES THE VOICE, which is what keeps a
+   small voice pool enough for a track with forty sounding objects.
+   It takes TWO consecutive frames outside to do it - the test is
+   dist > cutoff AND lastDist > cutoff - so a single frame of
+   camera snap does not cut a sound off.  [verified, 0x00405126]
+
+   PAN IS THE SINE OF THE ANGLE OFF THE CAMERA'S FORWARD: the 2D
+   cross of the flattened forward with the normalised direction to
+   the object, scaled to the script's -64..+64.  Same expression as
+   race_audio_pan uses for the bikes, and with NO dead zone - a
+   gull is a point that moves past you, and the jitter the racers'
+   dead zone exists to suppress does not arise.
+
+7.  Placement
+
+   FUN_00405bc0 has three arms, and the difference between them is
+   audible.
+
+   +------------+-----------------------------------+---------------+
+   | Kind       | Where the sound is                | Reconstructed |
+   +============+===================================+===============+
+   | AT_OBJECT  | the decor instance's own position | yes           |
+   +------------+-----------------------------------+---------------+
+   | AT_SEGMENT | a track segment's origin          | no - see 8    |
+   +------------+-----------------------------------+---------------+
+   | AT_GLOBAL  | nowhere; always audible           | no - see 8    |
+   +------------+-----------------------------------+---------------+
+
+7.2.  The emitter is a point ON the model, not its origin
+
+   ObjSnd_TickAll's kind-0 arm rotates an EMITTER OFFSET by the
+   instance's euler triple and adds the instance position
+   [0x00405cd0 onward].  The offset is `*(instance+0x4c) + 4` -
+   the model's vertex array - and the point used is its FIRST
+   VERTEX.  Confirmed to the digit: MOTO's corsair3 reads
+   (17585.61, 332.32, 878.44) and so does the port's
+   named[23].mesh[0].verts[0].  [verified - live, both builds]
+
+   FOR ANYTHING THAT TURNS THIS IS THE WHOLE EFFECT, not a
+   refinement.  ile01's aeroplane NEVER TRANSLATES - a write
+   watchpoint on its instance position caught nothing across a
+   whole flypast - and only its three euler angles move.  The
+   model origin is the PIVOT of the circular flight path and the
+   aircraft sits 17610 units, 137 metres, out on that arm.
+   Rotating the instance is what flies it.
+
+   Read the sound off the pivot and it never moves: constant
+   distance, constant volume, a drone instead of a pass that
+   swells and fades.  MOTO's distance ran 4156 -> 476 -> 6802
+   over 64 frames where the port sat at 16203 throughout.
+
+   USE THE DECOR EULER (FUN_00403880), the one trk_draw places
+   props with - the sound must come from where the model is
+   DRAWN.  mat34_from_euler is a different matrix and tilts the
+   emitter off anything carrying pitch or roll.
+
+7.3.  Placement kinds
+
+   A gull moves with its model; a wind anchored to a segment does
+   not; an arena rumble has no position at all and is neither
+   panned nor attenuated.
+
+7.1.  How a signal finds its segment
+
+   ambiance calls ObjSnd_AddAmbiance(descId) and registers kind 2.
+   signal calls ObjSnd_AddSignal(descId, signalKind) and registers
+   kind 1, keeping signalKind at header +0x08.  The kind is
+   REJECTED unless 5 < kind < 13, so the seven legal values are
+   6..12 and they map to BITS 0..6 of a per-segment flag word.
+
+   EVERY SEGMENT CARRIES THAT WORD AT +0x0f8, AND IT IS NOT READ
+   FROM THE FILE.  Trk_Load computes it in a pass of its own at
+   0x0040e0da, immediately after AnimDecor_Load.  [verified]
+
+   THE ENCODING IS A TOGGLE AND THAT IS THE WHOLE TRICK.  The
+   segment field `extra` (+0x0ec) carries a signal kind on the
+   segments where a span STARTS or ENDS, and -1 - anything
+   outside 6..12 - everywhere else.  Walking the track in order
+   and XORing bit (kind - 6) at each marker leaves every segment
+   holding the set of spans it lies inside:
+
+       acc = 0
+       for each segment in order:
+           if 6 <= extra <= 12:  acc ^= 1 << (extra - 6)
+           segment.signalFlags = acc
+
+   So two markers bound a REGION rather than naming a point.
+   ile01 opens kind 8 at segment 0, and every segment along the
+   water carries bit 2 from there on - segment 2 reads extra -1
+   and signalFlags 0x04.  READING THE MARKERS AS POINTS instead
+   would put the surf at one post and is the obvious wrong
+   answer.  [verified - live]
+
+   The accumulator is not reset per lap, so an unclosed span
+   simply runs to the end of the track.
+
+   ObjSnd_TickAll rebuilds a SEVEN-ENTRY TABLE every frame, one
+   slot per bit, by calling Trk_FindSignalSegments
+   (FUN_0040d3b0) with a window of 40.  That scans the 80
+   segments from cur-40 to cur+40, wrapping, and for each bit
+   keeps the segment carrying it whose origin is NEAREST the
+   current segment's origin - squared distance, no line of
+   sight, Y included.  A bit no segment in the window carries
+   leaves -1, and a kind-1 entry resolving to -1 is simply not
+   audible that frame.
+
+   So a signal sound follows the nearest piece of the track that
+   is TAGGED with its kind, and goes quiet once that tag is more
+   than forty segments away.  It is how surf stays by the water
+   without being attached to any object.
+
+   Read live on ILE01 with the player at the grid, the table at
+   0x005041ec held segment 34 for kind 6, segment 2 for kind 8,
+   and -1 for the other five.  ILE01's four signal entries are
+   kinds 8, 8, 9 and 9, so two of them were sounding and two
+   were dormant.  [verified - live]
+
+   THE SEARCH WINDOW IS 40, NOT THE 60 SECTION 6 USES.  Two
+   different literals in the same function - 0x28 at 0x00405bab
+   for the span search and 0x3c at 0x00405bf9 for the decor
+   audibility test.
+
+   THE ENTRIES ARE APPENDED DURING THE PARSE, before the samples
+   are loaded, and the decor objects are appended after - which
+   is the order MOTO's list reads back in.  A slot armed that
+   early cannot ask a sample for its rate, so anything with
+   freqBase < 1 has to be re-armed once the samples exist.
+
+   BINDING WALKS THE PER-SEGMENT DECOR LISTS, not the flat
+   instance array, and the segment it finds each object under is
+   kept - that segment is what section 6's window tests.  A flat
+   walk finds the same objects and cannot say where they are.
+   Each segment's list is its indexCount/indices pair, which the
+   original keeps at +0xd4 and +0xb4.
+
+   An instance listed by two segments binds twice, as it does in
+   the original - two slots drawing their spreads separately.  No
+   shipped track does it.
+
+   BINDING IS BY THE DECOR INSTANCE'S soundDesc FIELD, matched
+   against descriptor +0x00.  The default is -1 and NOT 0, because
+   0 is a valid descriptor id - ILE01's gulls are descriptor 0, so
+   a calloc'd instance would otherwise bind every unsounded object
+   on the track to the seagulls.  Capacity 40; the original raises
+   a message box past it.
+
+8.  Open questions
+
+   o WHAT THE SEVEN SIGNAL KINDS MEAN is not known.  The
+     mechanism is fully reconstructed and the spans are read
+     off the track, but nothing says which kind is water,
+     which is crowd and so on - only that ile01 uses 6, 8 and
+     9.  Naming them wants a second track to compare against.
+
+   o WHICH MESH THE EMITTER COMES FROM.  The offset is the first
+     vertex of the object's model (7.2), and we always read mesh
+     0 where the original follows whichever LOD the instance
+     currently points at.  corsair3's three LODs share a first
+     vertex so nothing separates them; a template whose LODs
+     disagreed would move its emitter as the detail changed.
+
+   o WHAT DECIDES audible IN THE PLACEMENT is only partly read.
+     Segment distance round the track and the detail level are both
+     involved; the exact test is not transcribed.
+
+   o THE SAMPLE NAMES ARE NOT CROSS-CHECKED against the Divers
+     bank.  A descriptor naming a sample that bank does not hold
+     logs and is skipped, which would hide an off-by-one in the
+     interning as a handful of missing sounds.
+

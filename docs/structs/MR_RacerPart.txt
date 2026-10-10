@@ -1,0 +1,294 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            MR_RACERPART
+
+
+Abstract
+
+   Size: 100 (0x64) [verified] - the stride Racer_Create walks.
+   Lives in the racer at racer + 0x63c + (slot*20 + part)*100.
+   Ghidra type applied: yes, rebuilt 2026-09-04.
+
+   The runtime pose slot for one skeleton part. Twenty of them make
+   a pose block, five blocks make the pose array, and the array is
+   10,000 of the racer's 12,809 bytes. See MR_Racer.txt.
+
+   EVERY ONE OF THE 100 BYTES IS NOW NAMED, and three independent
+   lines of evidence agree on the phase. That matters because the
+   two previous versions of this file were both one record out.
+
+   NOT the same thing as MR_SklMember in src/skl.h. That is the FILE
+   side: parent, origin, first vertex, vertex count, 24 bytes. This
+   is the runtime state the game poses and draws from.
+
+Table of Contents
+
+   1. The layout
+      1.1. Static and posed halves
+   2. The phase, settled three ways
+      2.1. What the earlier versions got wrong
+   3. The tree
+   4. The matrix at +0x18
+   5. The second block carries no pose
+   6. Open questions
+
+1.  The layout
+
+   +--------+------+---------------+------------+---------------------------+
+   | Offset | Size | Type          | Confidence | Notes                     |
+   +========+======+===============+============+===========================+
+   | +0x00  |   4  | MR_RacerPart* | verified   | NEXT SIBLING, or 0        |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x04  |   4  | MR_RacerPart* | verified   | PARENT. 0 at the two      |
+   |        |      |               |            | roots, parts 0 and 3      |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x08  |   4  | MR_RacerPart* | verified   | FIRST CHILD, or 0         |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x0c  |  12  | float[3]      | verified   | THE ANGLES, radians.      |
+   |        |      |               |            | Written by the pose       |
+   |        |      |               |            | blend, read by            |
+   |        |      |               |            | Skl_BuildPartMatrices     |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x18  |  48  | float[12]     | verified   | THE MATRIX, 3x3 then      |
+   |        |      |               |            | translation. Written at   |
+   |        |      |               |            | 0x0046415c                |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x48  |  12  | float[3]      | verified   | THE JOINT PIVOT. Read at  |
+   |        |      |               |            | 0x004641a2 and negated;   |
+   |        |      |               |            | re-centred by             |
+   |        |      |               |            | Racer_Create              |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x54  |   4  | int           | verified   | firstVertex into          |
+   |        |      |               |            | g_meshSkl[slot].vertices  |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x58  |   4  | int           | verified   | vertexCount               |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x5c  |   4  | int           | verified   | faceCount                 |
+   +--------+------+---------------+------------+---------------------------+
+   | +0x60  |   4  | MR_Primitive* | verified   | the part's OWN face       |
+   |        |      |               |            | array. The pointer        |
+   |        |      |               |            | Racer_Create frees        |
+   +--------+------+---------------+------------+---------------------------+
+
+   IT SUMS EXACTLY: 12 + 12 + 48 + 12 + 12 + 4 = 100.
+
+   THE VERTEX RANGES PARTITION THE MESH WITH NO GAP AND NO OVERLAP.
+   Read live from racer 1, in tree order rather than index order
+   [verified]:
+
+   +------+--------+-------+-------+---------------------------------+
+   | Part | first  | verts | faces | covers                          |
+   +======+========+=======+=======+=================================+
+   |   0  |     0  |   71  |   90  |   0 ..  70                      |
+   |  15  |    71  |   24  |   24  |  71 ..  94   RoueAV, front wheel|
+   |   1  |    71  |    0  |    0  |  a joint - the fork             |
+   |   2  |    95  |   12  |    6  |  95 .. 106                      |
+   |   3  |   107  |    0  |    0  |  a joint - Pilote, the rider    |
+   |  16  |   107  |    0  |    0  |  a joint                        |
+   |   4  |   107  |    9  |    6  | 107 .. 115                      |
+   |   5  |   116  |    4  |    2  | 116 .. 119                      |
+   |   6  |   120  |   10  |   12  | 120 .. 129                      |
+   |   7  |   130  |    4  |    2  | 130 .. 133                      |
+   |   8  |   134  |   10  |   12  | 134 .. 143                      |
+   |   9  |   144  |   21  |   20  | 144 .. 164                      |
+   |  10  |   165  |    7  |    2  | 165 .. 171                      |
+   |  11  |   172  |   14  |   17  | 172 .. 185                      |
+   |  12  |   186  |   33  |   36  | 186 .. 218                      |
+   |  13  |   219  |    6  |    1  | 219 .. 224                      |
+   |  14  |   225  |   15  |   19  | 225 .. 239                      |
+   +------+--------+-------+-------+---------------------------------+
+
+   240 vertices, every index used once. A chain that closes like
+   that cannot be an accident of phase: shift the base by one record
+   and the sums stop meeting.
+
+   o AND THE MESH AGREES DIRECTLY. g_meshSkl at 0x0053a6a8 reads
+     vertexCount 240 and faceCount ZERO [verified]. The count is
+     the partition sum exactly, and the zero is the other half of
+     the design: the skeleton mesh owns the vertex pool and every
+     FACE belongs to a part, at +0x60. g_meshSkl[1], the hand
+     skeleton at 0x0053a718, is 240 and 0 as well.
+
+   o AND THE FACE POINTER DEREFERENCES CLEANLY. Part 0's +0x60 was
+     followed live and the first two 64-byte records read as
+     MR_Primitive without a single field out of range - kind 2 and
+     1, colour indices 126 and 118, five UV pairs each, vertex
+     indices 45/27/20/45 and 45/20/21/7/45 all inside part 0's own
+     0..70 range, and flatColor 0xffffffff. That is what confirms
+     the name rather than the offset alone. [verified]
+
+1.1.  Static and posed halves
+
+   Read live, the record splits cleanly - but NOT into two
+   contiguous halves. The posed fields sit in the middle:
+
+   +------------------+-------+--------------------------------------+
+   | Range            | Bytes | Behaviour                            |
+   +==================+=======+======================================+
+   | +0x00 .. +0x0b   |  12   | STATIC - the tree links              |
+   +------------------+-------+--------------------------------------+
+   | +0x0c .. +0x47   |  60   | POSED - the angles and the matrix    |
+   +------------------+-------+--------------------------------------+
+   | +0x48 .. +0x63   |  28   | STATIC - pivot, vertex ranges, faces |
+   +------------------+-------+--------------------------------------+
+
+   So a port loads 40 bytes once and updates 60 per frame, and the
+   60 are one run.
+
+   o THE UNPOSED BLOCK PROVES THE SPLIT. Block 1 holds identical
+     links, pivots, vertex ranges and its own face pointers, and
+     +0x0c through +0x47 ENTIRELY ZERO - see section 5. The
+     boundary falls in exactly the same two places from a second,
+     independent direction.
+
+2.  The phase, settled three ways
+
+   The record base is racer+0x63c. Three independent arguments, any
+   one of which would do:
+
+   o RACER_CREATE'S CLEANUP LOOP. It frees the pointer at
+     this+0x69c, then zeroes 25 dwords starting 0x18 dwords LOWER -
+     that is this+0x63c - and advances by 25 dwords, twenty times
+     [verified]. A loop that frees one field and clears its record
+     defines the record. Under any other phase the 100-byte window
+     straddles a boundary.
+
+   o THE POINTERS RESOLVE TO RECORD BASES. Every non-null value at
+     +0x00, +0x04 and +0x08 is exactly racer + 0x63c + k*100 for
+     some k in 0..16. Under the old base the same values land 0x48
+     inside the previous record, which is not a place a link points.
+
+   o THE VERTEX CHAIN CLOSES - section 1.
+
+2.1.  What the earlier versions got wrong
+
+   THE BASE WAS 0x684 IN THE FIRST VERSION AND 0x620 IN THE SECOND.
+   Both are wrong and both are off by a whole record from each
+   other, which is worth pausing on: two hand derivations landed a
+   full 100 bytes apart and each read as self-consistent.
+
+   The reason they were hard to catch is that Racer_Create's own
+   arithmetic looks like it names the base. It re-centres parts with
+
+       *(this + (slot*20 + i)*100 + 0x684) -= root.x
+
+   and 0x684 is simply the PIVOT FIELD of record 0 - 0x63c + 0x48.
+   A formula's constant is the base plus the field offset, and
+   nothing in the expression says which is which.
+
+   o THE ONE THING BOTH VERSIONS GOT RIGHT was the address of the
+     steering angle, racer+0x6b0, which is part 1's Y angle -
+     0x6a0 + 0x0c + 4. Part 1 is the fork, and part 15, RoueAV, is
+     its only child. Arriving at the right address through the
+     wrong layout is exactly the hazard docs/README.txt warns
+     about.
+
+   THE TWO TREE POINTERS WERE ALSO READ THE WRONG WAY ROUND, +0x00
+   as the child and +0x08 as the sibling, which is the order the
+   field order suggests.  THE LIVE TREE SETTLES IT: parts 1 and 2
+   both name part 0 as their parent, so part 0 HAS children - yet
+   its +0x00 is null and its +0x08 is part 2.  Read the corrected
+   way the seventeen parts form exactly the two trees of section 3,
+   covering every part once; read the other way they do not close.
+
+3.  The tree
+
+   Seventeen parts, two roots, every part reached exactly once
+   [verified]:
+
+       part 0   corps   the bike
+         part 1                 the fork
+           part 15   RoueAV     the front wheel
+         part 2
+           part 16
+
+       part 3   Pilote  the rider
+         part 4
+           part 5
+             part 6
+           part 7
+             part 8
+           part 9
+             part 10
+               part 11
+             part 12
+             part 13
+               part 14
+
+   maybe_Racer_Draw calls Skl_BuildPartMatrices on part 0 at
+   0x00460f16 and on part 3 at 0x00460f51 - the two roots, named in
+   its own comment. THE TWO ROOTS ARE WHY THE RIDER CAN BE POSED
+   INDEPENDENTLY OF THE BIKE, and Racer_Create makes part 3 a root
+   deliberately: it unlinks it from whatever parent the .skl gave
+   it, walking the sibling chain to repair the list first.
+
+   EACH CHILD CHAIN DESCENDS IN PART INDEX. Part 0's first child is
+   2 and its sibling is 1; part 9's is 13 then 12 then 10. That is
+   the signature of a push-front list -
+   node->next = parent->children; parent->children = node - so the
+   chain is the file order reversed, and a port that appends will
+   walk the tree in the opposite order.
+
+4.  The matrix at +0x18
+
+   Read live from part 1 of racer 1, sitting on the grid:
+
+       row0  ( 1.00000,  0.00000,  0.00000)
+       row1  ( 0.00000,  1.00000,  0.00000)
+       row2  ( 0.00000,  0.00000,  1.00000)
+
+   The off-diagonal entries print as 0x97db4000-shaped values -
+   DENORMALS, not pointers. A matrix that looks like garbage may
+   just be nearly the identity, and this record produces that
+   reading often.
+
+   Skl_BuildPartMatrices writes it at 0x0046415c with
+   LEA ECX,[ESI+0x18], which is what fixes the offset rather than
+   the shape of the values.
+
+5.  The second block carries no pose
+
+   Read live, block 1 at racer+0xe0c has:
+
+   o THE SAME tree shape - every link is exactly 0x7d0 higher, the
+     block stride, so each block's pointers stay inside itself;
+   o THE SAME pivots and the same vertex ranges, bit-identical;
+   o DIFFERENT face pointers at +0x60, so they are separate
+     allocations;
+   o and +0x0c through +0x47 ENTIRELY ZERO. No angles, no matrix.
+
+   ON A KTM THE TWO BLOCKS ARE GENUINELY DIFFERENT. Read live at
+   the grid, block 0 matched KTMCROSS\corps.skl and block 1 matched
+   KTMCROSS\mHand\corps.skl on all seventeen parts - and block 1
+   was STILL unposed. So a second skeleton being loaded is not what
+   poses it. formats/skl-rot.txt 5.1.1.
+
+   ONLY BLOCK 0 IS POSED, AND THE IDENTICAL PIVOTS ARE NOT A
+   COINCIDENCE. This note used to call them "a coincidence worth
+   distrusting", which was the right instinct and the wrong
+   conclusion. MOTOSPD.BPT names data\speed\corps.skl at BOTH
+   index 2 and index 3, so on a Speed bike Racer_Create loads THE
+   SAME FILE into both blocks. The KTM manifest names
+   mHand\corps.skl at index 3 - a genuinely different, reduced
+   skeleton - so a KTM racer should show two different blocks.
+   See formats/skl-rot.txt 5.1.
+
+6.  Open questions
+
+   o WHETHER THE FIRST-PERSON CAMERA POSES BLOCK 1. A KTM racer
+     HAS been read now and block 1 does hold a different skeleton -
+     mHand, the rider's hands - but it was still entirely unposed
+     from the third-person view. formats/skl-rot.txt 5.1.
+
+   o SETTLED: THE REMAP CONFIRMS THIS TREE FROM THE FILE SIDE.
+     Both shipped Speed skeletons carry remap = 0 1 15 2 16 3 4 5
+     6 7 8 9 10 11 12 13 14, and every vertex and face count lines
+     up with the live parts under that mapping - member 2 with 24
+     and 24 becomes part 15, RoueAV. The tree above was derived
+     from live pointers with no sight of the table.
+     formats/skl-rot.txt 5.4.
+
+   o HOW THE TWO RECURSIVE CALLS GET DIFFERENT PARENT MATRICES.
+     From the disassembly both appear to receive the same frame -
+     see the plate comment on Skl_BuildPartMatrices.

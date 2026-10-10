@@ -1,0 +1,108 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      THE .TGA PATH, AND ITS ABSENCE
+
+
+Abstract
+
+   Bitmap_LoadFile at 0x0043e280 is a TARGA loader, not a Windows BMP
+   loader, despite the name it was given from its translation unit.
+   Its four rejection messages all begin "TGA File" [verified].
+
+   It is also DEAD as far as shipped data is concerned: there is not a
+   single .TGA file anywhere under decomp/DATA. Every image the menu
+   loads is .LEZ.
+
+   Reconstructed in src/tga.c, and unverified there, because there is
+   nothing to verify it against.
+
+Table of Contents
+
+   1. What it accepts
+   2. What it does
+   3. Why it is here at all
+   4. Open questions
+
+
+1.  What it accepts
+
+   The loader reads an 18-byte Targa header and rejects anything that
+   is not exactly one shape. Each rejection is fatal - a message box,
+   g_fatalError, App_Shutdown, exit(1) - and each carries its own
+   assert line in menu/bitmap.cpp [verified]:
+
+   +--------+----------------+-------+--------------------------------+
+   | Offset | Field          | Must  | Message                        |
+   +========+================+=======+================================+
+   | 0x00   | idLength       |   0   | TGA File numid not supported   |
+   +--------+----------------+-------+--------------------------------+
+   | 0x01   | colorMapType   |   0   | TGA File must be no paletted   |
+   +--------+----------------+-------+--------------------------------+
+   | 0x02   | imageType      |   2   | TGA File imgtyp not supported  |
+   +--------+----------------+-------+--------------------------------+
+   | 0x07   | colorMapDepth  |   0   | TGA File must be no paletted   |
+   +--------+----------------+-------+--------------------------------+
+   | 0x10   | pixelDepth     |  24   | TGA File must be 24 bits       |
+   +--------+----------------+-------+--------------------------------+
+
+   Image type 2 is uncompressed true-colour, so there is no RLE path in
+   the loader at all. Width and height are the u16 at 0x0c and 0x0e.
+
+   o SO IT IS 24-BIT UNCOMPRESSED TARGA AND NOTHING ELSE. That is what
+     a paint package of the era wrote by default, which fits section 3.
+
+
+2.  What it does
+
+   Straightforward, and the same shape as the tail of Lez_Decode:
+
+   o Seeks forward by the IMAGE DESCRIPTOR byte at 0x11 before reading
+     pixels. That is almost certainly meant to be idLength at 0x00 -
+     which it has already required to be zero - so on a well-formed
+     file with descriptor 0 it is a no-op. A file with a non-zero
+     descriptor, for instance one flagging a top-left origin, would
+     have that many bytes of pixel data skipped [inferred - no file
+     exists to test it].
+
+   o Reads width * height * 3 bytes, B then G then R per pixel.
+
+   o Allocates the 16 bpp destination the same hand-aligned way
+     Lez_Decode does: request size + 0x13, round the pointer up to a
+     16-byte boundary, stash the original in the dword before it. Any
+     free has to recover that pointer.
+
+   o Converts bottom-up to top-down while packing, because Targa
+     stores the last row first. The pack goes through the same run-time
+     mask globals as everything else - see subsystems/pixel-format.txt.
+
+   o Stores 0x10 into MR_Sprite +0x3c, which is the alignment it just
+     used. That identifies the last unnamed field in the struct; see
+     structs/MR_Sprite.txt.
+
+
+3.  Why it is here at all
+
+   Sprite_LoadFromFile splits on the file extension: ".LEZ" goes to
+   Lez_LoadFile, ANYTHING ELSE goes here. So this is the fallback, and
+   in the shipped game the fallback is never taken.
+
+   The obvious reading is that .TGA is the authoring format and .LEZ
+   the packed one, and that the loader survived into the release build
+   so an artist could drop an uncompressed file in place of a packed
+   one and have it load [inferred, but the compression ratios support
+   it: LOAD.LEZ is 79 KB for a 640x480 image that is 300 KB raw].
+
+   It is worth keeping in a port for the same reason: it is fifty
+   lines, and it means a replacement asset does not have to be packed
+   before it can be tested.
+
+
+4.  Open questions
+
+   o The image descriptor seek in section 2. Deliberate or a slip for
+     idLength? Unanswerable without a file that has a non-zero
+     descriptor, and none exists.
+
+   o Whether any .TGA ever shipped on the CD outside DATA. The tree
+     examined here is the extracted one.

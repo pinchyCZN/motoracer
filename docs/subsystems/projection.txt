@@ -1,0 +1,634 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                     THE PROJECTION: BASE TIMES ZOOM
+
+
+Abstract
+
+   How screen3d turns camera-space coordinates into pixels. The
+   transform reads two scale globals directly; those scales are
+   derived, never assigned, from a per-axis BASE and a shared ZOOM.
+   This note records the five accessors, the two constants that set
+   the bases from a resolution, and the one place that rewrites the Y
+   scale behind everyone's back.
+
+   Two headline numbers, and the second matters more. Screen3D_Open
+   computes a focal length of 480 pixels, not the half-width the
+   reconstruction had assumed. But the MENU does not use it: on every
+   page change Menu_SetPage overrides both bases with 1911, a lens
+   four times longer again. The reconstruction was running menu pages
+   at 320 against the correct 1911, so menu geometry was drawn six
+   times too small.
+
+Table of Contents
+
+   1. The Model
+   2. The Accessors
+   3. Screen3D_Open and the Two Constants
+      3.1. Reading the FXCH
+      3.2. Why 480
+   4. What Reads the Scales
+   5. The Menu Runs a Different Lens
+      5.1. The race runs a THIRD lens - 394
+      5.2. What the shipped 16:9 option actually does
+      5.3. Where UpdateScreen gets its 640x480 - the mode table
+      5.4. Why 16:9 cannot reach the lens
+   6. The Reconstruction
+   7. The Two Constants Are Redundant, and That Is the
+      Widescreen Lever
+      7.1. What the port does
+   8. Open Questions
+
+1.  The Model
+
+   Five globals, of which the transform reads only the last two.
+
+    +----------------+------------+---------+-------------------------+
+    | Global         | Address    | At open | Role                    |
+    +================+============+=========+=========================+
+    | g_projBaseX    | 0x006d20cc | 480.0   | X focal length, pixels  |
+    | g_projBaseY    | 0x00709360 | 480.0   | Y focal length, pixels  |
+    | g_projZoom     | 0x006d1f74 | 1.0     | shared multiplier       |
+    | g_projScaleX   | 0x006d20c4 | 480.0   | DERIVED, base * zoom    |
+    | g_projScaleY   | 0x006d104c | 480.0   | DERIVED, base * zoom    |
+    +----------------+------------+---------+-------------------------+
+
+   The invariant is simply
+
+       g_projScaleX == g_projBaseX * g_projZoom
+       g_projScaleY == g_projBaseY * g_projZoom
+
+   and every setter restores it for the axes it touches. Nothing else
+   in the image writes a scale except Screen3D_Open, which writes all
+   five at once, and Screen3D_DrawScene - see section 6.  [verified]
+
+   The split exists so a caller can push a temporary zoom without
+   knowing or restoring the field of view, which is what page 14 does:
+   MenuPage14_Title_Enter calls Screen3D_SetProjZoom(1.0), so on the
+   title screen the scales equal the bases.  [verified]
+
+2.  The Accessors
+
+    +--------------------------+------------+-------+-----------------+
+    | Function                 | Address    | Bytes | Writes          |
+    +==========================+============+=======+=================+
+    | Screen3D_SetProjBaseX    | 0x0049a0e0 |  ~32  | baseX, scaleX   |
+    | Screen3D_SetProjBaseY    | 0x0049a100 |  ~32  | baseY, scaleY   |
+    | Screen3D_SetProjZoom     | 0x0049a120 |   46  | zoom, 2 scales  |
+    | Screen3D_GetProjZoom     | 0x0049a150 |    6  | -               |
+    +--------------------------+------------+-------+-----------------+
+
+   SetProjBaseX computes zoom * f and SetProjBaseY computes f * zoom.
+   That is codegen, not a difference in meaning.  [verified]
+
+   SetProjZoom is worth reading in full, because the C hides its
+   shape:
+
+       0049a120  FLD   float ptr [g_projBaseY]
+       0049a126  FMUL  float ptr [esp + 0x4]
+       0049a12a  FLD   float ptr [g_projBaseX]
+       0049a130  FMUL  float ptr [esp + 0x4]
+       0049a134  FXCH
+       0049a136  FSTP  float ptr [g_projScaleY]
+       0049a13c  FSTP  float ptr [g_projScaleX]
+       0049a142  MOV   eax, dword ptr [esp + 0x4]
+       0049a146  MOV   [g_projZoom], eax
+       0049a14b  RET   0x4
+
+   Two things. Both products are computed BEFORE either is stored -
+   harmless here, since the bases are not the scales, but it is the
+   same load-before-store shape as Matrix34_Multiply, where it does
+   matter. And the zoom is stored last, as a raw dword copy rather
+   than through the FPU, so it is a bit-exact copy of the argument
+   with no rounding.  [verified]
+
+   Screen3D_GetProjZoom is FLD and RET. Six bytes.  [verified]
+
+3.  Screen3D_Open and the Two Constants
+
+   Screen3D_Open is at 0x004995a0, and its signature is
+
+       Screen3D_Open(this, param_1, width, height, flag)
+
+   with width at [ebp+0xc] and height at [ebp+0x10]. There are five
+   call sites - 0x0041516a, 0x004151ea, 0x00415271, 0x004152e0 and
+   0x00472e58 - and every one of them pushes 0x280 and 0x1e0, that is
+   640 and 480.  [verified]
+
+3.1.  Reading the FXCH
+
+   The projection set-up is not contiguous; the two divides straddle
+   twenty other instructions. Reassembled in issue order:
+
+       004995d1  MOV   [0x00655d10], esi      ; esi = width  = 640
+       004995d7  FILD  dword ptr [0x00655d10] ; st0 = 640
+       004995e3  MOV   [0x00624b18], ebx      ; ebx = height = 480
+       004995e9  FILD  dword ptr [0x00624b18] ; st0 = 480, st1 = 640
+       004995ef  FXCH                         ; st0 = 640, st1 = 480
+       004995f1  FDIVR double ptr [0x004d1f50]; st0 = 307200/640 = 480
+       004995f7  MOV   [g_projZoom], 0x3f800000        ; 1.0
+       00499650  FST   float ptr [g_projBaseX]
+       00499656  FSTP  float ptr [g_projScaleX]        ; pops, st0 = 480
+       0049965c  FDIVR double ptr [0x004d1f58]; st0 = 230400/480 = 480
+       00499662  FST   float ptr [g_projBaseY]
+       00499668  FSTP  float ptr [g_projScaleY]
+
+   THE FXCH IS THE TRAP. The two FILDs push width then height, so
+   without the exchange the natural reading is that 307200 divides the
+   height and 230400 the width. The FXCH swaps them, and the FST/FSTP
+   pair pops exactly one value, leaving the height on top for the
+   second divide. Get this wrong and the two axes come out transposed
+   - which at 640x480 is invisible, because both answers are 480, and
+   would only show up at some other resolution.  [verified]
+
+   So the formula is
+
+       g_projZoom  = 1.0
+       g_projBaseX = g_projScaleX = 307200.0 / width
+       g_projBaseY = g_projScaleY = 230400.0 / height
+
+   Both constants are doubles: 307200.0 at 0x004d1f50 and 230400.0 at
+   0x004d1f58.  [verified]
+
+3.2.  Why 480
+
+   307200 is 640 * 480. 230400 is 480 * 480. So with w0 = 640 and
+   h0 = 480 the design resolution, the formula is
+
+       baseX = h0 * (w0 / width)
+       baseY = h0 * (h0 / height)
+
+   which is "480, rescaled by how far the actual resolution is from
+   the design one". At the design resolution both come out at 480.
+   [inferred - the algebra is verified, the intent is read off it]
+
+   480 IS A FOCAL LENGTH IN PIXELS. A point at camera-space (x, z)
+   lands at screenX = centreX + 480 * x/z, so the half-field is
+   atan(320/480) and the horizontal field of view is about 67 degrees,
+   not the 90 that a half-width focal length would give.
+
+   This is the correction. The reconstruction had assumed 320 - the
+   half-width, the obvious choice - and every pixel the geometry
+   pipeline produced was 1.5x too small, uniformly. A uniform scale
+   error is the hard kind to spot, because it presents as "the art is
+   the wrong size" rather than "the projection is wrong".
+
+4.  What Reads the Scales
+
+   Only the two transform functions, and they read the SCALES, never
+   the bases or the zoom. Screen3D_TransformVertsFlat (0x0049b2c0)
+   folds them into the composed matrix rather than applying them per
+   vertex: matrix elements 0, 3, 6 and 9 are premultiplied by
+   g_projScaleX and 1, 4, 7 and 10 by g_projScaleY, with 2, 5, 8 and
+   11 copied raw. The perspective divide then happens per vertex.
+   [verified]
+
+   That is why a wrong scale is uniform and silent: it is applied once
+   into the matrix, upstream of everything, and no single vertex looks
+   wrong relative to its neighbours.
+
+5.  The Menu Runs a Different Lens
+
+   Screen3D_Open's 480 is not what most of the game draws with.
+   Menu_SetPage (0x0040a000) reinstates a completely different
+   projection on EVERY page change, at 0x00409ffe..0x0040a041:
+
+       0040a003  PUSH  0x44eee000              ; 1911.0
+       0040a008  MOV   ecx, [0x004dc0c0]
+       0040a013  MOV   [0x006d1f70], 0x471c4000; 40000.0
+       0040a022  CALL  Screen3D_SetProjBaseX
+       0040a027  PUSH  0x44eee000              ; 1911.0
+       0040a032  CALL  Screen3D_SetProjBaseY
+       0040a037  MOV   [0x00625774], 0x43800000; 256.0, the near plane
+
+   plus [0x004ee9f0] = 1 and [0x0062e444] = 1, neither identified.
+   [verified]
+
+    +------------------+------------------+---------------------------+
+    | Global           | Screen3D_Open    | Menu_SetPage              |
+    +==================+==================+===========================+
+    | both proj bases  | 480              | 1911                      |
+    | 0x006d1f70       | 16000            | 40000                     |
+    | 0x00625774 near  | (not set here)   | 256                       |
+    +------------------+------------------+---------------------------+
+
+   1911 IS A LONG LENS. The horizontal half-field is atan(320/1911),
+   so the field of view is about 19 degrees against the 67 that
+   Screen3D_Open gives. That is why menu models read as
+   near-orthographic - very little perspective divergence across the
+   object - and it is what lets page 14 park a model at z = -40000 and
+   still have it be a recognisable shape rather than a dot.
+
+   THE FAR DISTANCE GOES TO EXACTLY 40000, which is exactly page 14's
+   start z. The menu widens its own depth range to fit the title
+   animation. [the constants are verified; that the two are causally
+   related is inferred, but 40000 appears nowhere else in the image]
+
+   0x00625774 is already documented as maybe_g_nearPlaneZ in
+   rasterizer-pipeline.txt section 13.4, noted there as "runtime,
+   written by Menu_SetPage" - this is that write, and its value is
+   256.0, not the 1.0 a near plane is usually assumed to be.
+
+   WHY PER PAGE CHANGE AND NOT ONCE. Because the race and the menu
+   genuinely disagree about the lens, and whichever ran last owns the
+   globals. Re-establishing them on entry is the cheap way to be
+   correct after returning from a race. Any reconstruction that sets
+   the projection once at start-up will be right until the first time
+   the player leaves the menu and comes back.
+
+   MenuPage14_Title_Enter then calls Screen3D_SetProjZoom(1.0) at
+   0x004469d2, so on the title screen the scales equal the bases at
+   1911. [verified]
+
+5.1.  The Race Runs a THIRD Lens - 394, and it is not 230400/height
+
+   Section 5 has Screen3D_Open at 480 and Menu_SetPage at 1911. There
+   is a third, and it is the one a race actually draws with.
+
+   maybe_Screen3D_UpdateScreen (0x004592a0) calls both setters, and
+   the value is built by two identical LEA chains - x4, x12, x49,
+   x197, then ADD EAX,EAX - which is a hardcoded 394, followed by an
+   INTEGER divide [verified, hooked live 2026-09-05]:
+
+       0045946e..00459497   projBaseY = 394 * height / 480   IDIV 0x1e0
+       004594a3..004594d?   projBaseX = 394 * width  / 640   IDIV 0x280
+
+   Hooks on both setters caught five calls each, every one with
+   EBX = 0x280 (640), EBP = 0x1e0 (480) and the argument 0x43c50000,
+   which is 394.0. Read back live during a race the four globals are
+   394.0 throughout.
+
+   +----------------+---------+-------------+---------------------+
+   | Global         | at Open | Menu_SetPage| maybe_Screen3D_-    |
+   |                |         |             | UpdateScreen        |
+   +================+=========+=============+=====================+
+   | both proj bases|   480   |    1911     |        394          |
+   +----------------+---------+-------------+---------------------+
+
+   o SO Screen3D_Open's 480 IS DEAD ON ARRIVAL. Section 3's formula
+     is a correct reading of code whose result is overwritten before
+     anything is drawn - by the menu on every page change, and by
+     UpdateScreen for the race. The FXCH trap of 3.1 is real in the
+     code and UNREACHABLE in the picture.
+
+   o AND 394 IS NOT 230400/height FOR ANY MODE. 230400/480 is 480.
+     The race lens is a different formula with a different constant,
+     so section 7's "the X formula carries no information" is true
+     of Screen3D_Open and says nothing about what a race uses.
+
+   o THE TWO RACE FORMULAS ARE STILL SQUARE-PIXEL AT 4:3, because
+     394*640/640 and 394*480/480 are both 394 - the same degeneracy
+     section 7 describes, arrived at by different arithmetic.
+
+5.2.  What the shipped 16:9 option actually does - measured
+
+   A rider selected 16:9, restarted, and rode. Watchpoints on the
+   four projection globals and hooks on both setters were armed
+   throughout [verified, 2026-09-05]:
+
+   o THE SURFACE HEIGHT CHANGES. The global at 0x00624b18 toggles
+     480 <-> 360, driven by a flag in EBX - 1 gives 360, 0 gives
+     480. Width stays 640. Screen3D_Open is NOT called for it; a
+     watchpoint and a hook both confirm this.
+
+     The store is Screen3D_SetViewport's, at 0x00499d04, and the
+     arithmetic reduces to newHeight = height * 3 / 4 for ANY mode.
+     The plate comment on 0x00499ba0 has the instruction-level
+     reading.  (A watchpoint reports the address AFTER the store,
+     which is how this was first written down as 0x00499d0a - that
+     address is the next instruction, a write of 0 to 0x00624374.)
+
+   o THE PROJECTION DOES NOT FOLLOW. During a 16:9 race, with the
+     height global reading 360, maybe_Screen3D_UpdateScreen still
+     computed with EBP = 480 and set both bases to 394. The four
+     len=4 watchpoints recorded ZERO changes across the race.
+
+   o SO THE SHIPPED WIDESCREEN IS VERT-MINUS, NOT HOR-PLUS. The lens
+     is unchanged and the frame is 120 scanlines shorter, so the
+     player sees LESS vertically and no more horizontally. That is
+     the opposite of the convention section 7 recommends, and it
+     means the option is a CROP rather than a widening.
+     [verified as to the numbers; that the visible result is a crop
+     is inferred from them, since rule 8 forbids judging it by eye]
+
+   o WHICH DOES NOT WEAKEN SECTION 7 - it strengthens it. The port
+     should do Hor+ because the original's own widescreen is the
+     cheap Vert- version, not because nobody thought about it.
+
+   o WHERE UpdateScreen GETS ITS 640x480: CLOSED in 5.3 - a lookup
+     into g_displayModes keyed by g_screenPixelCount, which still
+     reads 307200. EBX and EBP are the table's width and height
+     fields, not the surface globals.
+
+5.3.  Where UpdateScreen gets its 640x480 - the mode table
+
+   5.2 left this open. It is not a global holding the surface size; it
+   is a LOOKUP INTO THE DISPLAY MODE TABLE, keyed by pixel count
+   [verified]:
+
+       0045936e   MOV  EAX,[0x004dc0cc]        g_screenPixelCount
+       00459374   MOV  ECX,[0x00624afc]        the Cdd object
+       0045937a   CALL Cdd_FindModeByPixels    dir 0, exact match
+       0045937f   MOV  [0x004dc0d0],EAX        the mode index
+       00459384   CMP  EAX,-1
+       00459387   JZ   0045939f                not found - ladder below
+       00459389   SHL  EAX,2
+       0045938c   MOV  EBX,[EAX+EAX*8+0x5d8960]   g_displayModes[i].width
+       00459393   MOV  EBP,[EAX+EAX*8+0x5d8964]   g_displayModes[i].height
+
+   EAX*4 then EAX+EAX*8 is a stride of 36, which is sizeof
+   MR_DisplayMode, and 0x005d8960 is g_displayModes + 0x10 - the
+   width field. structs/MR_DisplayMode.txt 1 has width at +0x10 and
+   height at +0x14, so both reads land exactly on the named fields.
+
+   When the lookup returns -1 there is a hardcoded ladder on ESI,
+   which is the sizeClass of the same struct [verified]:
+
+       ESI == 0   ->  0x004593bd   320 x 240
+       ESI == 1   ->  0x004593c9   512 x 384
+       otherwise  ->  0x004593b1   640 x 480
+
+   Read live during a 16:9 race [verified]:
+
+       g_screenPixelCount  0x004dc0cc  = 307200
+       mode index          0x004dc0d0  = 4
+       g_displayModes[4]               = 640 x 480
+       surface height      0x00624b18  = 360
+
+5.4.  Why 16:9 cannot reach the lens
+
+   Two independent reasons, either of which alone is enough.
+
+   o THE KEY IS A PIXEL COUNT, AND IT STILL SAYS 640x480.
+     g_screenPixelCount reads 307200 while the surface height global
+     reads 360. Whatever the widescreen option writes, it does not
+     write this - so the lookup returns the 640x480 entry and the
+     lens is computed for a frame that is not being drawn.
+
+   o AND 640x360 IS NOT IN THE TABLE ANYWAY. The enumerated modes
+     read back as 320x200, 320x240, 512x384, 640x400 and 640x480.
+     230400 matches none of them, so even a corrected pixel count
+     would miss the exact-match lookup and fall to the ladder -
+     which returns 640x480 for sizeClass 2.
+
+   SO THE WIDESCREEN OPTION IS STRUCTURALLY INCAPABLE OF CHANGING THE
+   PROJECTION. It is not a bug in the sense of a mistake in one line;
+   the path from the setting to the lens does not exist. That is
+   consistent with 5.2's measurement - the lens stayed at 394 through
+   a whole 16:9 race - and it explains it rather than merely
+   repeating it.
+
+   o WHICH SHARPENS SECTION 7. A Hor+ port cannot be done by feeding
+     a wider mode into this path, because the path selects by pixel
+     count from an enumerated 4:3 table. The reconstruction has to
+     drive g_projBaseX and g_projBaseY from the FRAME size directly,
+     as 7 proposes, and skip the mode lookup entirely.
+
+   o AND CHECK docs/ FIRST, AGAIN. Cdd_FindModeByPixels,
+     g_displayModes, g_screenPixelCount and the +0x10/+0x14 field
+     offsets were all already recorded in
+     structs/MR_DisplayMode.txt and subsystems/mode-change.txt. What
+     was missing was only the EDGE - that the projection is one of
+     this table's readers. Two hooks and a live read found the
+     connection; the pieces were on the shelf.
+
+6.  The Reconstruction
+
+   src/transform.c holds all five globals and the five accessors:
+
+       screen3d_open_projection   <- Screen3D_Open, the projection half
+       screen3d_set_proj_base_x
+       screen3d_set_proj_base_y
+       screen3d_set_proj_zoom
+       screen3d_get_proj_zoom
+
+   main.cpp calls screen3d_open_projection(g_frameWidth,
+   g_frameHeight) at start-up. The framebuffer is 640x480, the same
+   size all five original call sites pass, so the values agree
+   exactly.
+
+   menu.c menu_set_page then does what Menu_SetPage does - both bases
+   to 1911 and g_nearPlaneZ to 256 - and page14_enter calls
+   screen3d_set_proj_zoom(1.0f). So the title screen runs at 1911,
+   which is the number that actually governs what is on screen.
+
+   Not yet done: 0x006d1f70, the 16000-to-40000 far distance, has no
+   counterpart in the reconstruction because the global has not been
+   identified. See section 7.
+
+   The one divergence is a pair of zero guards on the divides. The
+   original divides unconditionally and has the zero-divide exception
+   masked, so it would produce an infinity rather than trap; ours
+   substitutes 480 rather than let an infinite scale poison every
+   vertex downstream. No legitimate caller passes zero.
+
+   THE RULE FOR CALLERS: set a base or set the zoom. Never assign a
+   scale. The scales are derived, and the next setter call would
+   silently overwrite the assignment.
+7.  The Two Constants Are Redundant, and That Is the Widescreen Lever
+
+   Section 3.2 explains where 307200 and 230400 come from.  What that
+   section does not say is that ON EVERY MODE THE GAME OFFERS THE TWO
+   FORMULAS AGREE:
+
+   +-----------+---------------+---------------+--------+
+   | Mode      | 307200/width  | 230400/height | Same?  |
+   +===========+===============+===============+========+
+   | 320 x 240 |         960.0 |         960.0 | yes    |
+   +-----------+---------------+---------------+--------+
+   | 512 x 384 |         600.0 |         600.0 | yes    |
+   +-----------+---------------+---------------+--------+
+   | 640 x 480 |         480.0 |         480.0 | yes    |
+   +-----------+---------------+---------------+--------+
+
+   That is not a coincidence and it is not an accident of the numbers.
+   307200 is 640*480 and 230400 is 480*480, so for any mode with
+   width/height = 4/3,
+
+       230400 / height = 230400 / (3*width/4) = 307200 / width
+
+   identically.  All three supported modes are 4:3, so g_projBaseX has
+   never once differed from g_projBaseY in the shipped game.
+
+   WHAT THAT MEANS IS THAT THE X FORMULA CARRIES NO INFORMATION.  The
+   projection is square-pixel and always has been; the horizontal
+   field of view comes from how wide the screen is relative to a scale
+   that is really a function of HEIGHT alone.
+
+   o KEEPING THE X FORMULA AND WIDENING WOULD SQUASH THE PICTURE.
+     307200/854 is 359.7 against a vertical 480, so horizontal
+     magnification would fall below vertical and the image would
+     compress sideways.  The bug would look like a bad aspect ratio
+     rather than a wrong constant.
+
+7.1.  What the port does
+
+   Hor+ at 854x480, behind [OPTIONS] Mode_169.  The original's own
+   Vert- crop is [OPTIONS] Wide169Crop=1.
+
+       4:3    640x480   horizontal 67.4 deg   vertical 53.1 deg
+       16:9   854x480   horizontal 83.3 deg   vertical 53.1 deg
+
+   THE 3D NEEDED ALMOST NOTHING, because the port had already
+   converged on square-pixel by a different route: menu_set_page sets
+   both bases to 1911 and race_draw_3d sets both to RACE_VIEW_LENS, so
+   the X formula was already unreachable in every frame anyone sees.
+   Only screen3d_open_projection still used it, and it now falls back
+   to the Y formula when width*3 != height*4.  Everything else -
+   g_viewCentreX, g_viewMaxX, the D3D frustum in apply_projection, the
+   guard band - was already derived from the frame size.
+
+   +-----------------------------+-----------------------------------+
+   | options_frame_size          | the setting -> a back buffer      |
+   | options.c                   | size.  The ONLY place that        |
+   |                             | decides                           |
+   +-----------------------------+-----------------------------------+
+   | apply_video_settings        | reallocates the framebuffer and   |
+   | main.cpp                    | re-derives the view globals       |
+   +-----------------------------+-----------------------------------+
+   | g_videoSettingsDirty        | asks for it, at the top of the    |
+   | options.c                   | next frame                        |
+   +-----------------------------+-----------------------------------+
+   | r_set_design_size           | recomputes the letterbox; the     |
+   | d3d9rt.cpp                  | device is untouched               |
+   +-----------------------------+-----------------------------------+
+   | screen3d_open_projection    | square-pixel X off 4:3            |
+   | transform.c                 |                                   |
+   +-----------------------------+-----------------------------------+
+   | g_fb2dOriginX               | where the 640-wide block of       |
+   | framebuffer.c               | authored art sits in the frame    |
+   +-----------------------------+-----------------------------------+
+   | sprite_draw, font_draw_text | add it.  NOTHING ELSE DOES        |
+   +-----------------------------+-----------------------------------+
+   | menu_set_cursor             | takes it back off                 |
+   +-----------------------------+-----------------------------------+
+   | hud_menu_draw               | forces it to 0 - hud_align        |
+   |                             | anchors on the real frame         |
+   +-----------------------------+-----------------------------------+
+
+   THE 2D LAYER IS THE WORK, and the offset above is how it is paid
+   for: the 640x480 art is drawn as ONE BLOCK, centred, so everything
+   inside it stays in register with everything else.  The alternative
+   - teaching every page its own anchoring - is a page-by-page job
+   with a page-by-page chance of being wrong.
+
+   o THE HIT TESTS ARE WHY IT GOES IN THE BLITTERS AND NOT IN THE
+     POSITIONS.  A button's rectangle IS its sprite's placed rect, so
+     offsetting sprite->x would move the art and the rectangle
+     together and leave both wrong relative to the cursor.  Offsetting
+     at draw time keeps every stored coordinate authored, and one
+     subtraction in menu_set_cursor puts the cursor in the same space.
+
+   o ONE HIT TEST GOES THE OTHER WAY.  p15_hit_test compares the
+     cursor against a PROJECTED 3D point, which is in frame space, so
+     it adds the origin back.  It is the only such site.
+
+   o sprite_set_position IS BACK ON THE ORIGINAL'S LITERAL.  It
+     centres on FB_DESIGN_W, which is the 0x280 the binary hardcodes;
+     the block offset does the rest.  Centring on g_frameWidth as it
+     used to would centre twice.
+
+   o THE SCROLLING BACKGROUND IS UNAFFECTED and should be:
+     sprite_draw_wave tiles to g_frameWidth, so the pages that use it
+     fill a widescreen frame outright.  So does the horizon band,
+     which writes the framebuffer directly.
+
+   o hud_scale NOW DERIVES FROM THE HEIGHT.  The original's three
+     modes are all 4:3 so the two ratios are one number and the choice
+     never arose; at 854x480 the width says 1.33 and the height says
+     1.0, and a wider frame is more picture, not bigger letters.
+
+   THE WINDOW IS NOT RESIZED BY ANY OF THIS.  Both present paths scale
+   the back buffer into the client area with the aspect preserved and
+   bars on whichever axis is left over, so a 16:9 buffer maximized
+   onto a 16:9 monitor simply has none.
+
+   IT APPLIES ON THE NEXT FRAME, through the original's own dirty
+   flag - the one maybe_Game_RenderFrame tests at 0x00480496 before
+   calling UpdateScreen.  What is OURS is the options page raising it:
+   the original's page 11 edits a saved copy and the live setting does
+   not come back until the menu is left, because Menu_SetPage pins the
+   whole menu to 4:3 on the way in.  We keep no such copy.  See
+   camera.txt 1.18.
+
+   ONE DIVERGENCE IN THE APPLY.  The original's UpdateScreen also
+   rewrites both projection bases to 394*W/640 and 394*H/480.  Ours
+   does not touch them: they do not depend on the frame size, both
+   being always set to the same number, and rewriting them mid-page
+   would stamp on the 1911 a menu page set on entry and leave it
+   wrong until the next page change.
+
+   Still 4:3 and left that way:
+
+   o THE GLASS PANE.  bipbip.3df is authored 640.8 x 480.3 and drawn
+     at the distance where the projection is 1:1, so the shatter
+     transition covers 640 of an 854-wide frame and leaves the sides
+     bare.  It is the original's mesh; scaling it is a deviation
+     nobody has needed yet.
+
+   o STATIC PAGE BACKGROUNDS are 640x480 art and stay pillarboxed
+     inside the block.  Extending them means new art.
+
+8.  Open Questions
+
+   o SCREEN3D_DRAWSCENE REWRITES THE Y PROJECTION. Four writes, at
+     0x0049aea4 and 0x0049aeaa, and again at 0x0049b071 and
+     0x0049b07d, in Screen3D_DrawScene (0x0049ad90):
+
+         FLD  float ptr [g_projScaleY]
+         FMUL float ptr [0x004d1f90]      ; 0.5
+         FLD  float ptr [g_projBaseY]
+         FMUL float ptr [0x004d1f90]      ; 0.5
+         FXCH ; FSTP [g_projScaleY] ; FSTP [g_projBaseY]
+
+     and in the same block [0x00624b18] and [0x00624f88] are each
+     halved with CDQ/SUB/SAR, with [0x00625784] set to
+     [0x00624b18] - 1. Halving a dimension, a dimension-minus-one, and
+     the Y projection together is the shape of a viewport change, and
+     the two obvious candidates are the 320x240 display mode and a
+     horizontally split two-player view. NEITHER HAS BEEN READ. This
+     block was reached by looking for writers of g_projScaleY, not by
+     reading DrawScene, so its guarding condition is unknown.
+
+     Until it is settled, do not treat the projection as static for
+     the whole frame, and do not assume the values Screen3D_Open sets
+     survive to the transform.  [verified that the writes exist; the
+     condition is unread]
+
+   o Note that [0x00624b18] is the same global Screen3D_Open FILDs the
+     height out of. So the height is not a constant the renderer keeps
+     for reference; it is live state that DrawScene edits. Anything
+     reading it must know which phase of the frame it is in.
+
+   o Screen3D_Open's fifth argument alternates 0 and 1 across the four
+     call sites in the 0x00415... cluster, which looks like a pairing
+     rather than a mode. Not read.
+
+   o param_1 is [0x0052c068] at every call site and is stored to
+     0x0068b028. Not read.
+
+   o WHAT IS 0x006d1f70? Screen3D_Open sets it to 16000 at 0x0049960c
+     and Menu_SetPage raises it to 40000. Set alongside the projection
+     in both places, and 40000 is exactly page 14's start z, so a far
+     distance or a depth-bucket range is the obvious reading - but it
+     has not been traced to a reader. Until it is, the reconstruction
+     has no equivalent and page 14 may draw geometry the original
+     would have dropped.  [guess]
+
+   o The base and zoom setters have plenty of callers, so the split is
+     not vestigial. Six call SetProjBaseX and the same six call
+     SetProjBaseY - Menu_SetPage, maybe_Screen3D_UpdateScreen,
+     MenuPage15_NameEntry_Enter and _Tick, FUN_00436250 and
+     FUN_00437890. Eighteen call SetProjZoom, including
+     MenuPage10_BikeSelect_Enter, MenuPage24_Podium_Enter and
+     MenuPage25_DsiLogo_Enter, and seven of the eighteen are inside
+     FUN_0046e9f0 alone. Five call the getter, one of which is
+     maybe_Racer_SelectLod - so THE LEVEL OF DETAIL SELECTION READS
+     THE ZOOM, which means zoom is not merely cosmetic.  [verified]
+
+   o MenuPage15_NameEntry sets the bases in BOTH its enter and its
+     tick. Setting them every frame rather than once suggests
+     something else is expected to clobber them within a frame - which
+     points back at the Screen3D_DrawScene halving above. Worth
+     reading those two together.

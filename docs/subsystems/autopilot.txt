@@ -1,0 +1,865 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                              AUTOPILOT
+
+
+Abstract
+
+   A DEBUG DRIVER for the local racer.  It is OURS - MOTO.EXE has
+   nothing of the kind - and it exists so that the end of a race can
+   be reached without driving four laps by hand.
+
+   It synthesises the same button word the keyboard produces and
+   hands it to race_poll_input.  Nothing downstream can tell the
+   difference: the drivetrain, the steering, the cornering and the
+   collision all run exactly as they do for a human.  It is a pair of
+   hands, not a shortcut.
+
+   src/autopilot.c and src/autopilot.h.
+
+Table of Contents
+
+   1. Why it is not a race-end trigger
+   2. Why the game's own AI is no use
+   3. The controller
+   4. Driving it
+   5. Fast-forward has a ceiling
+   6. Open questions
+
+1.  Why it is not a race-end trigger
+
+   Because the state at the line has to be real.  The finish
+   sequence - the victory pose, the forced brake, the camera pull-in
+   (camera.txt 1.14) - all read fields the simulation spent a lap
+   writing.  A trigger that jumps raceState to 2 arrives with a bike
+   at the wrong speed, the wrong lean and the wrong lap times, and
+   then every discrepancy has two possible causes.
+
+   THE SAME ARGUMENT RULES OUT PLACING THE BIKE.  race.c already has
+   a rail-follower for demos - s_race_autoSpeed and
+   racer_set_track_pos - and it moves a racer along the track
+   without the physics running.  Useful for a camera test, useless
+   here.
+
+2.  Why the game's own AI is no use
+
+   maybe_Racer_TickAI (0x0046bf80) does not drive.  It PLACES a
+   rider - "no drive, no steering, no cornering, no drivetrain"
+   (racer.h) - and its line follower FUN_0046b120 "never touches the
+   player's inputs": it lerps a movement direction toward a target
+   point and integrates.  The one input it synthesises is
+   tickInputWord = 1 for the benefit of the dust effect.
+
+   So routing the player through it would bypass the physics this
+   exists to exercise.
+
+   ITS RACING LINE IS NOT OUT OF REACH, THOUGH, and an earlier
+   version of this note said it was.  The per-segment offset at
+   segment +0xb0 is lineOffset in the port's layout - the dword the
+   file stores after the four planes, read as a float - and
+   racer_ai_target_point turns it into a world point:
+
+       offset = segment +0xb0 + chargeMeter
+       target = origin + row0 * offset + row3
+
+   The autopilot aims there with chargeMeter 0 - see 3.1.
+
+   IT READ THE WRONG FIELD FIRST, and the symptom was not obvious.
+   racer_ai_target_point and racer_lane_of_position both took
+   planes[3][0], which formats/trk.txt had implied was the fourth
+   plane's first float at +0xb0.  It is wallPlane1's normal x at
+   +0x70, a flat -1.0 on ile01 - so "aim at the racing line" aimed
+   at the centreline give or take one unit, and switching to it
+   changed nothing.  A line that is silently the centreline looks
+   exactly like a line that needs tuning.  trk.txt 10 is corrected.
+
+3.  The controller
+
+   Look-ahead pursuit.  Everything is measured along the BIKE'S OWN
+   ROW 0 - its lateral axis - so that no term needs a handedness
+   convention:
+
+       aimDot   where a point AP_LOOKAHEAD segments ahead lies, +1
+                hard toward +row0 and -1 hard away from it
+       lateral  signed distance off the segment centreline, same axis
+       bar      the steering angle ALREADY applied, normalised by
+                the bike's lock stop
+       want     aimDot - gain*lateral - damp*bar
+       steer    bang-bang on want, with hysteresis
+       speed    a target from the look-ahead curvature, then
+                accelerate under it and brake over it
+
+   A TRACK IS A ONE-DIMENSIONAL RAIL, which is why nothing cleverer
+   is warranted.  There is no route to choose and no branch to
+   search; the only decisions are how far from the centre to sit and
+   how fast to arrive.
+
+   It drives conservatively on purpose.  A slower clean lap beats a
+   fast one into a wall, because the point is to REACH THE FINISH
+   unattended, not to set a time.
+
+3.1.  What it reuses, and what it declines to guess
+
+   THE AIM POINT IS THE GAME'S OWN RACING LINE - the same
+   racer_ai_target_point the AI follows, with chargeMeter 0 so it
+   takes the line itself rather than one rider's displacement off
+   it.  The lateral term measures from the line as well.
+
+   AIMING AT THE MIDDLE OF THE ROAD IS WRONG ON A NARROW SECTION,
+   and that is not a refinement - the authored line is displaced
+   across the road per segment, so a controller that ignores it has
+   to be wrong on one side or the other.  It showed up as
+   wall-to-wall bouncing wherever the track pinched in.
+
+   THE BAND TEST STILL USES THE CENTRE.  bandLo/bandHi are measured
+   from the segment centre, not from the line, because that is the
+   GAME's road test; only the steering terms are line-relative.
+
+   THE LATERAL PROJECTION IS trk_surface_at_point's, lifted so the
+   distance itself can be used rather than the surface id.  Keeping
+   them identical makes the autopilot's notion of "on the road" the
+   GAME's - bandLo/bandHi, +-1024 against walls at 1280.
+
+   THE SEGMENT FORWARD IS TAKEN FROM GEOMETRY, not from a matrix
+   row, and that is deliberate.  Row 0 is the lateral axis - both
+   trk_surface_at_point and the grid builder use it that way - but
+   which of the remaining rows is "forward" is NOT settled: the
+   racer builds its own heading as matOrientation row3 + row2
+   forward and row3 - row2 in reverse (maybe_Game_InitRace), so row
+   3 is part of the direction sum even though the grid code treats
+   the same row as a plain translation.  The difference between two
+   segment centres needs no such guess.
+
+   THE BIKE FORWARD IS racer_apply_drive's own sum,
+   matOrientation[9..11] + [6..8] normalised.  Steering against a
+   different vector would fight a bike that thinks it is pointing
+   somewhere else.
+
+3.1.1.  aimDot CANNOT TELL AHEAD FROM BEHIND
+
+   The bearing to the target is split into a sideways component
+   (aimDot, against the bike's row 0) and a forward one (fwdDot).
+   THE STEERING ONLY NEEDS THE SIDEWAYS ONE, which is why the first
+   version computed nothing else - and that is a hole.
+
+   A BIKE FACING EXACTLY BACKWARDS READS aimDot NEAR ZERO, and the
+   deadband accepts that as "aligned, drive on".  The worst possible
+   heading looks like the best one and the throttle stays in.
+
+   It showed up where ile01 crosses a bridge and the road narrows,
+   segments 415 to 423: aim flipping between +0.99 and -0.99 sample
+   to sample at 1 to 10 km/h, the segment index walking BACKWARDS,
+   and the accel bit set through all of it.  The bike was facing
+   across the road being driven into the wall it was already on.
+
+   So fwdDot gates two things:
+
+       >  AP_ALIGN_DOT   pointing roughly at the target - drive
+       <= AP_ALIGN_DOT   turn first, carrying only AP_TURN_KMH,
+                         enough for the bars to answer and no more
+
+   and while turning the demand SATURATES to the side aimDot names
+   rather than trusting its magnitude.  At exactly 180 degrees
+   either side is as good, so the tie goes right and the bike
+   commits instead of dithering.
+
+3.1.2.  THERE IS NO CORNER FEEDFORWARD, AND THERE MUST NOT BE
+
+   One was added and taken out again in the same day, so the reason
+   is recorded rather than the attempt.
+
+   THE REASONING THAT PUT IT IN WAS WRONG.  It ran: want = aim -
+   gain*off - damp*bar is pure PD, PD against a constant disturbance
+   settles with a steady-state error, a constant-radius corner is a
+   constant disturbance, therefore a corner needs feedforward.
+
+   aim IS NOT A POSITION ERROR.  It is a PURSUIT BEARING, and the
+   bearing to a point ahead on a circular path is already non-zero
+   and constant.  Pursuit handles constant curvature by
+   construction; there was no error to feed forward against.
+
+   WHAT IT ACTUALLY DID was double-count in steady corners and go
+   out of phase at transitions, because it read the curvature HERE
+   while the aim term reads the road AHEAD.
+
+3.1.3.  THE BRIDGE IS AN S-BEND, AND THAT IS THE WHOLE PROBLEM
+
+   Measured from ile01, signed curvature over four segments:
+
+        seg 404-410   here -0.209, at the aim point +0.209
+        seg 414-422   here +0.209, at the aim point -0.084
+
+   The lobes are about eight segments each and the speed-based
+   look-ahead was eleven, so THE AIM POINT SAT ON THE OPPOSITE LOBE
+   for ten of the thirteen sampled positions through the bridge.
+   The controller steered for a corner it had not reached, through
+   the one it was in, on a road that is also half width there.
+
+   AIMING PAST THE END OF A CORNER IS AIMING AT THE WRONG CORNER,
+   and speed alone does not shorten the look-ahead enough - the bike
+   is already slow there.  Scaling it by the curvature AT the aim
+   point pulls it back inside the lobe: measured the same way
+   afterwards, five of thirteen rather than ten, and the five that
+   remain are real transitions where the road does change direction
+   and aiming at the next bend is correct.
+
+   THE WIDTH SCAN KEEPS THE LONG VIEW.  ap_min_half wants to see a
+   narrowing coming, which is the opposite requirement, so it uses
+   the speed-based look-ahead from before the shortening.
+
+3.1.4.  THE BARS SPEND THE LAP NEAR FULL LOCK, AND THAT IS CORRECT
+
+   Measured over a lap: 90 per cent of samples had |bar| above 0.9.
+   roueLimiteAngulaire is 600 in the game's steering units and
+   Racer_AiFollowLine scales by 4096/pi - its own comment says
+   "8192 units to the turn" - so full lock is 0.46 rad, TWENTY-SIX
+   DEGREES, where a bicycle model says ile01's corners want about
+   one.
+
+   THAT LOOKS LIKE A FAULT AND IS NOT.  This engine's steering feeds
+   a TORQUE, not a kinematic steer angle - racer.c's steer-torque
+   helper returns a value proportional to -steering - so the
+   bicycle model does not apply and the "one degree" it gives is
+   meaningless here.  The engine genuinely wants large values.
+
+   A CAP AT 0.35 WAS TRIED ON THAT REASONING AND COST A MINUTE AND A
+   QUARTER A LAP.  The comment that introduced it stated the model
+   did not apply and then used its number anyway.  With the digital
+   path the cap was soft - the actuator takes time to reach it - but
+   against a directly-set angle it became hard starvation: the
+   demand exceeded 0.35 on 34 per cent of samples, which is exactly
+   the 34 per cent where steering was being asked for, and the bike
+   under-steered into a wall on every hard curve.  1:35 became 2:50.
+
+   THE LOCK STOP IS THE ONLY CLAMP.  A proportional law needs no
+   other: on line the demand is small, so the angle is small.
+
+3.1.5.  TWO FRAMES, AND IN REVERSE THEY ARE OPPOSITE
+
+   aimDot is measured against the BIKE's row 0.  lateral and offLine
+   are measured against the SEGMENT's, and they have to be: bandLo
+   and bandHi live in that frame, and ap_lateral_of deliberately
+   mirrors trk_surface_at_point so the autopilot's idea of "on the
+   road" is the game's.
+
+   GOING FORWARDS THOSE ARE THE SAME AXIS, because
+   maybe_Game_InitRace copies the segment matrix straight into
+   matOrientation.  IN REVERSE THEY ARE OPPOSITE: the reverse arm
+   builds row0 = worldUp x forward from a negated forward, and the
+   segment's own row 0 is worldUp x (row3 + row2) - verified on all
+   788 segments of ile01, formats/trk.txt section 5.
+
+   So want was adding a bike-frame aim term to a segment-frame
+   cross-track term and the correction PUSHED AWAY FROM THE LINE.
+   It read as a slow drift into one wall: at the grid offLine is
+   near zero so the term is tiny, and it grows as the bike wanders
+   until the road stops it.  Reverse mode looked fine for the first
+   stretch and then scraped.
+
+   THE RELATIONSHIP IS MEASURED, NOT TAKEN FROM THE REVERSE FLAG.
+   A dot product of the two axes says which way they actually lie,
+   which stays right whatever else ends up rotating a racer's frame
+   - and costs one multiply.
+
+   AP_TURN_SIGN NEEDS NO SUCH TREATMENT.  It maps a bar angle to the
+   BIKE's row 0, and both directions build that axis the same way
+   from their own forward, so it holds in reverse unchanged.
+
+3.2.  THE STEERING WAS A RATE - AND IT DID NOT HAVE TO BE
+
+   racer_apply_steering HAS TWO PATHS.  The digital one INTEGRATES:
+   holding a button ramps r->steering toward roueLimiteAngulaire at
+   roueAccAngulaire and keeps turning for as long as it is held.
+   Proportional control of a rate actuator always overshoots, and
+   three separate mechanisms were built to contain that - a damping
+   term, steering hysteresis, and a cap short of the lock stop.
+
+   THE ANALOG PATH SETS THE ANGLE DIRECTLY:
+
+       steering = (axis1 - 0x8000) * roueLimiteAngulaire / 32768
+
+   No ramp, no saturation dynamics, no snap to zero on a direction
+   change.  All three containment mechanisms are artefacts of the
+   digital path and are gone with it; what is left is an angle to
+   ask for, which is a far easier question than which button to
+   hold.
+
+   IT IS THE GAME'S OWN JOYSTICK PATH.  maybe_Game_ReadInput centres
+   both axes for any racer whose deviceType is not 2 or 4 - a
+   KEYBOARD player - so a stick player has been driving this branch
+   all along.  The port centred the axes because it has no stick;
+   the autopilot is not a keyboard and does not have to pretend.
+
+   o THE DIGITAL BITS ARE STILL SET, and must be: the steer-torque
+     helper pins grip when the brake is held together with a
+     direction.  The angle and the bits agree rather than compete.
+
+   o leanMode BECOMES 1 - racer_lean_response stops applying its
+     20 ms dt floor.  That is what a stick player gets, and it is
+     the only behavioural difference.
+
+   o THROTTLE STAYS DIGITAL.  axis0's analog branch divides its
+     negative side by 2000, making it an engine-braking curve rather
+     than a brake, and the brake lives on the button.
+
+
+   racer_apply_steering INTEGRATES: holding a button ramps
+   r->steering toward roueLimiteAngulaire at roueAccAngulaire and it
+   keeps turning for as long as it is held.  It is a bar ANGLE built
+   up over time, not a heading.
+
+   PROPORTIONAL CONTROL OF A RATE ACTUATOR ALWAYS OVERSHOOTS.  When
+   the heading error reaches zero the bars are still wound over, so
+   the bike carries on turning past the line and the controller
+   reverses - a limit cycle, and on screen it is indistinguishable
+   from random input.  The first version had exactly this.
+
+   Subtracting the bar angle already applied (AP_DAMP) is the fix:
+   as the bars come over the demand falls, so the controller lets go
+   BEFORE the nose arrives rather than after it.
+
+   Hysteresis is the second half.  A plain threshold sitting on its
+   boundary toggles the button every frame, and racer_apply_steering
+   reads a direction change as a reason to SNAP the bar angle to
+   zero - so a chattering controller ends up with no steering at all.
+
+3.3.  The one sign that had to be measured - and measured ONCE
+
+   Whether a POSITIVE bar angle swings the nose toward +row0 or away
+   from it cannot be read cheaply.  What is established is that the
+   LEFT bit drives r->steering negative (racer_apply_steering's
+   want = -1) and that the steer torque is proportional to
+   -steering; where that ends up in the matrix runs through the
+   cornering code and a cosine table.
+
+   IT IS +1, and AP_TURN_SIGN records it.
+
+   It was obtained by learning it live, accumulating
+
+       turn = dot(fwd - fwdPrev, rightPrev)
+       sum += turn * barPrev
+
+   over a run that drove segments 3 to 113 of ile01 cleanly with the
+   sum positive.  THE LEARNER WAS THEN DELETED, and that is the part
+   worth knowing:
+
+   o IN A LONG CONSTANT-RADIUS CORNER the nose swing is dominated by
+     the CORNER rather than by the bars, so the product goes negative
+     for long stretches.  A sum with no forgetting and no
+     normalisation can flip on that.
+
+   o AND A FLIP IS SELF-REINFORCING.  With the sign wrong the damping
+     term ADDS to the demand instead of subtracting it, which is
+     positive feedback: the bars go to full lock and stay there.  The
+     log shows it at segment 113 - bar pinned at 1.000, lat running
+     to +1524 against a band of +-1024, fifteen seconds at 3 to
+     57 km/h in a wall, and no recovery.
+
+   A measurement worth making once is not worth making every frame.
+   If a future track disagrees, learn it again offline and change
+   the constant - do not put the learner back in the loop.
+
+3.4.  Three cases it hands control back
+
+   o WHILE DOWN, it holds nothing.  The remount is a state machine
+     with its own timer; leaning on the throttle does not speed it
+     up and does change what it sees on the way out.
+
+   o PAST THE LINE, it stops driving entirely.  racer_apply_drive
+     forces buttons = INPUT_BRAKE for a finished human, and THAT
+     FORCED BRAKE IS THE COAST-TO-STOP the finish camera plays
+     over.  Driving through it would replace the behaviour this was
+     built to look at.
+
+   o OFF THE BAND, it steers for the centre and the THROTTLE
+     DEPENDS ON SPEED - see 3.5, which is the trap in this whole
+     file.
+
+3.3.0.  ARRIVING TOO FAST IS A PLANNING FAILURE, NOT A CONTROL ONE
+
+   ile01 needs 6169 units - twelve of its 512-unit segments - to go
+   from 170 km/h to 65.  So the brakes have to come on long before
+   anything a look-ahead window can see, and a window can only ever
+   answer "is there a corner within N segments", never "start easing
+   now".
+
+   THE ANSWER IS A SPEED PROFILE, built once at race start, two
+   steps and the standard racing-line construction:
+
+     1  every segment gets the speed its own curvature allows
+     2  a BACKWARD pass drags each one down until it is slow enough
+        to reach its neighbour's limit, v = sqrt(vnext^2 + 2*a*d)
+
+   Step 2 is what turns a corner into a braking zone that STARTS IN
+   THE RIGHT PLACE.  Three passes, because the track is a loop and a
+   constraint can propagate past the start.
+
+   It is also cheaper per frame than the window scan it replaced -
+   the runtime cost is one array read.
+
+3.3.1.  BRAKING AND STEERING ASK DIFFERENT QUESTIONS
+
+   Steering wants to know where the road goes next.  Braking wants
+   to know whether anything within stopping distance needs the speed
+   off.  They had one look-ahead between them, and they want two.
+
+   THE BRAKING WINDOW SCALES WITH SPEED, because braking distance
+   does.  A fixed window gives a bike at 170 km/h half the warning
+   it gives one at 85 - the corner arrives in half the time - so the
+   fast approach got the least notice.
+
+   AND THE MEASURE TAKES THE WORST IN THE WINDOW, not the difference
+   between its two ends.  The end-to-end version is wrong in a way
+   that is easy to miss: AN S-BEND WHOSE EXIT LINES UP WITH ITS
+   ENTRY READS AS PERFECTLY STRAIGHT.  Left then right cancels, the
+   road is reported flat, and the bike arrives at the first half
+   with everything on.  A tight corner mid-window with an aligned
+   exit disappears the same way.
+
+3.3.2.  THE CORNERING LIMIT IS PHYSICS, NOT A CURVE FIT
+
+   v = sqrt(A * R), with the radius taken as the MEASURED arc over
+   AP_CURVE_STEP segments divided by the turn angle.  Segment
+   lengths vary - ile01 runs 327 to 512 - so a nominal length would
+   misjudge exactly the short segments corners are made of.
+
+   A LINEAR RAMP IN CURVATURE IS THE WRONG SHAPE, and this is
+   measurable rather than a matter of taste.  Working back what
+   lateral acceleration the old ramp implied, segment by segment:
+
+                      p10    median     max
+           ile01     0.704    0.872    0.945
+           ile04     1.888    3.832    4.253
+
+   On ile01 it is roughly constant, which is the only reason it
+   worked there.  ON ile04 IT ASKS FOR FOUR TIMES THE GRIP - and the
+   per-track curvature scale is what does it: a tighter track gets
+   normalised back into the same 65..170 band, so the tighter the
+   track the harder it over-drives.  ile04 was over-speed on 447 of
+   its 782 segments and nobody had driven it to find out.
+
+   AP_LAT_ACCEL 0.85 IS CALIBRATED, NOT GUESSED: ile01's median
+   corner is already observed to survive 0.872.  It raises ile01's
+   tightest corners from 65 to 79 km/h and pulls ile04 down to where
+   it always should have been.
+
+   THE CURVATURE SCALE SURVIVES for one job only - shortening the
+   aim look-ahead in 3.1.3, where a relative measure is what is
+   wanted.  It no longer sets any speed.
+
+3.3.3.  THE OLD SCALE, AND WHY IT WAS MEASURED OFF THE TRACK
+
+   Local curvature over four segments, from the shipped files:
+
+                  median   tightest
+        ile01      0.105      0.279
+        ile04      0.314      1.257
+
+   FOUR AND A HALF TIMES APART on the tightest corner, and ile04's
+   MEDIAN is tighter than ile01's worst.  Any fixed threshold is
+   badly wrong on one of them - at 0.25 a bike sits on the speed
+   floor for most of ile04, at 1.0 it carries everything ile01 has.
+
+   So the scale is the tightest corner on THIS track, found in one
+   pass at race start, and the schedule reads "how tight is this
+   corner compared with the worst one here".  That question
+   transfers between tracks; a number in radians does not.
+
+3.3.3.  THE BRAKING MODEL HAS TO BE ACHIEVABLE
+
+   The world is 128 units to the metre - race.c,
+   RACE_UNITS_PER_METRE_DEFAULT, measured there against a straight
+   run - so AP_DECEL converts to a = AP_DECEL * 128 / 12.96 / 2.
+
+   AT 2.0 THAT IS 1.01 g: the absolute limit of a motorcycle brake
+   on dry tarmac, with no margin, while the same tyres are being
+   asked to corner.  A profile that plans braking the bike cannot
+   deliver arrives at every corner too fast, and no amount of
+   steering tuning fixes that.
+
+   The log agrees: 133 to 80 km/h over segments 386 to 407, about
+   10750 units, is 0.53 - and that had coasting in it, so the true
+   brake is above 0.53 and nowhere near 2.0.  1.2 is 0.60 g, firm
+   and achievable with grip left for the corner.
+
+   THE IDEAL LAP BARELY MOVES (89.6 to 89.8 s on ile01), and that is
+   the point being made rather than a disappointment: the gain is a
+   profile the bike can actually follow, not a faster one on paper.
+   Approach speeds drop where it matters - segment 386 from 166 to
+   142, 394 from 139 to 123 - while corner speeds are unchanged.
+
+   AP_LAT_ACCEL IS BINARY-SEARCHED AGAINST THE slip COLUMN, not set
+   by feel.  Over a
+   logged lap the racer's fxGate - the game's own
+   onGround && |slipAbs| >= 0.04 test - read ZERO on all 622
+   samples, including all 354 taken in corners.  The bike was not
+   sliding anywhere, so the cornering limit was nowhere near the
+   grip limit.  1.15 came back clean as well - zero slip on all 934
+   corner samples, with the bike holding a mean 69 units off the
+   line, half a metre on a ten-metre road - so the search goes on.
+
+   TWO ACCEPTANCE TESTS, AND BOTH MATTER.  Slip is the obvious one.
+   But A BIKE CAN RUN WIDE WITHOUT EVER SLIDING, so mean |off| is
+   the other: if it climbs from 69 while slip stays 0, the limit
+   reached is the front tyre's rather than the rear's and the
+   number is still too high.  Lap times cannot tell those apart and
+   the log can.
+
+   AND THE SPEED CEILING IS THE BIKE'S OWN.  realSpeedMax * 3.6 -
+   288 km/h on the superbike, per bike - rather than a written
+   constant.  In practice the backward pass holds ile01's straights
+   near 150 anyway, so this changes little there; it matters for a
+   track with a straight long enough to use it, and for the pocket
+   bike, which should not be handed a superbike's profile.
+
+3.3.4.  THE OFF-LINE PENALTY MUST NOT BITE FROM THE CENTRELINE
+
+   The profile already carries the physical limit, which is grip.
+   The off-line cut is a SAFETY MARGIN on top of it, and a margin
+   that starts at zero deviation is not a margin - it is a tax.
+
+   MEASURED LIVE at ile01 segment 407, stepping the autopilot into
+   the bridge with the debug agent: the bike sat 142 units off a 512
+   half width - 28 per cent, an ordinary racing deviation - and the
+   profile's 91.2 km/h became 80.  91.2 * (1 - 0.28 * 0.45) = 80
+   exactly.  Since the bike is ALWAYS slightly off line, it braked
+   continuously through the whole approach and never got back on the
+   throttle.  The probe trace over those four seconds is almost all
+   coast and brake words.
+
+   So the penalty is free within AP_OFFLINE_FREE of the band and
+   ramps only beyond it.  At that same 28 per cent the target goes
+   back to 91.
+
+3.4.1.  THE ROAD IS NOT A CONSTANT WIDTH
+
+   Read out of ile01's band pairs, the half width is 1024 for most
+   of the lap, tapers over segments 401 to 403, holds 512 across the
+   bridge at 404 to 423, and drops to 384 through 424 to 435 - the
+   narrowest twelve segments on the track.
+
+   A STEERING GAIN IN WORLD UNITS DOES NOT NOTICE.  The same offset
+   gives the same demand on all three, so where the road halves the
+   correction silently halves in relative terms - at exactly the
+   place that needs it most.  Two versions of this controller were
+   tuned against a constant 1024 and both failed on the bridge.
+
+   So the lateral term divides by the segment's own half width and
+   AP_LATERAL_K is what a bike AT THE EDGE contributes, whatever the
+   road is doing.  The off-line speed penalty scales the same way.
+
+3.5.  THE BARS ARE DEAD BELOW 2 km/h, and that shapes everything
+
+   racer_apply_steering will not move r->steering at all unless
+   speed is at least STEER_MIN_SPEED, which is 2 km/h (racer.c).  A
+   slow bike has NO STEERING AUTHORITY.
+
+   That makes the obvious recovery wrong in both directions, and
+   both have been in the file:
+
+   o HOLDING THE THROTTLE off the band does not recover a bike
+     leaning on a wall, it PINS it there - fifteen seconds at 3 to
+     57 km/h with the accel bit set, going nowhere.
+
+   o CUTTING THE THROTTLE off the band is worse.  Speed decays, the
+     bars stop answering, and the controller presses a direction key
+     into a dead actuator for ever.  The log caught this at segment
+     407: spd 0, bar +0.000, btn 8, repeating until somebody let go
+     of TAB.
+
+   THE ANSWER IS A FLOOR, NOT A SECOND RULE.  Three things cut the
+   target speed - the curvature schedule, the off-line penalty and
+   the turn-around cap - and they used to MULTIPLY: off the road in
+   a corner facing the wrong way asked for 19 km/h, so the
+   controller braked hard in the one situation that needed steering.
+   They now apply in order with AP_MIN_KMH under the lot.
+
+   AND ONE PLACE OWNS THE THROTTLE.  The off-band arm used to set it
+   as well, on a different rule, which left a five km/h window where
+   consecutive frames disagreed and the bike chattered on and off
+   the gas instead of recovering.  That arm now steers and nothing
+   else; the speed chain already knows it is off line and which way
+   the bike is facing.
+
+   THE STUCK BACKSTOP OVERRIDES BOTH, and it counts both ways rather
+   than resetting: a bike grinding along a wall bounces through any
+   speed threshold every few frames, so a counter that cleared on a
+   single good frame never reached its limit.  Rising two and
+   falling one accumulates through the twitching.
+
+4.  Driving it
+
+   F8 TOGGLES IT AND THAT IS THE ONLY WAY.  There is deliberately no
+   ini key, so a stale config can never start a race with the bike
+   driving itself.  Off by default, and unset nothing in the file
+   runs.
+
+   [DEBUG] autopilotlog=1 prints one line in thirty frames with
+   every number the decision was made from - segment, lateral, the
+   aim and damping terms, the demand, curvature and both speeds.
+   Rule 8 means nobody on this side can watch it drive, so a bad lap
+   has to be readable out of the log rather than guessed at.
+
+   IT IS SECOND OF TWO OVERRIDES in race_poll_input, behind the
+   agent.  The order is not arbitrary: a scripted mr_place.py run
+   has to win, or a flag somebody left on would fight the comparison
+   it was set up to make, and the trace would diverge from MOTO's
+   for a reason nothing on screen shows.
+
+4.1.  THE LOOK-AHEAD SIMULATOR
+
+   race_autopilot_probe (race.c) runs the REAL physics forward from
+   the current state with one button word held, reports where the
+   bike ended up, and restores every byte it touched.  Always on -
+   it is part of how the autopilot drives, not an option beside it.
+
+   THE POLL LIVES INSIDE THE TICK, and that is the trap.
+   race_poll_input is called from within race_tick_physics, so a
+   nested tick calls it again and OVERWRITES the word being tested -
+   the probe then simulates the autopilot rather than the candidate,
+   every candidate scores the same, and the veto is noise at four
+   times the cost.  s_race_dryRun suppresses the poll as well as the
+   FX for exactly this reason.
+
+   It showed up as the bike's speed going BACKWARDS between log
+   samples - 14, 8, 21, 38, 29, 48 - with the segment stepping 4
+   then 3.
+
+   IT LIVES IN race.c AND THAT IS NOT A LAYERING MISTAKE.
+   race_tick_physics is static, and so is every piece of cross-frame
+   state a tick carries; reaching them from autopilot.c would mean
+   exporting six statics and the tick itself.  One self-contained
+   function that borrows them in place is a far smaller hole, and
+   the autopilot sees only an MR_AutoProbe.
+
+   WHAT HAS TO BE PUT BACK IS SHORT, because the reconstruction
+   operates on the racer struct it is handed rather than on globals:
+   the racer (packed and byte-exact, so a memcpy), the drivetrain,
+   the gearbox, four scalars, and g_racerShiftLatch - the one piece
+   of cross-frame state living outside MR_Racer, reached through two
+   accessors in racer.c.  The wheel-FX emitter is the only side
+   effect that cannot be restored - it appends particles and burns
+   RNG - so it is suppressed for the duration by s_race_dryRun.
+
+4.1.1.  THE AGENT OWNS THE INPUT AHEAD OF THE AUTOPILOT
+
+   agent_input_get returns 1 for the whole of a mracer_send_input
+   run, and race_poll_input checks it FIRST - so driving the port
+   through the debug agent SUPPRESSES the autopilot entirely.
+
+   That is deliberate - a scripted mr_place.py run must never record
+   whatever the user was leaning on - but the autopilot is a THIRD
+   input source that turned up after agent.c was written, and a run
+   that owns the keyboard suppresses it silently.
+
+   keys=auto IS THE ANSWER.  It steps the frames and claims nothing,
+   so whatever normally drives the bike drives it.  Everything else
+   about a run is unchanged, and the important part is that a
+   scripted run STEPS THE CLOCK rather than free-running it - every
+   frame integrates exactly 33 ms whatever the wall clock did.  So
+
+       mracer_send_input frames=300 keys=auto
+
+   is ten seconds of GAME time as fast as the machine can manage,
+   deterministically, and a lap is about nine of those.  That is
+   better than TAB fast-forward for inspection, and TAB cannot be
+   held through the agent anyway.
+
+4.1.2.  THE PROBE WAS HALF DEAD UNTIL IT TOOK AN ANGLE
+
+   race_autopilot_probe injected a button word and nothing else, so
+   every rollout inherited whatever steering angle the live frame
+   had left on the racer.  Once the steering moved to the analog
+   axis, THE CANDIDATE THAT FLIPPED THE LEFT/RIGHT BUTTON BITS
+   STOPPED STEERING ANYTHING - all four candidates simulated the
+   same angle and only the throttle varied.  Half the search was
+   inert and nothing said so, because the button bits are still set
+   and still read by the grip logic.
+
+   It takes axis1 now, restored with the rest of the racer like
+   every other field.
+
+   THE STEERING CANDIDATES ARE MORE LOCK AND LESS, not left and
+   right.  The controller has already decided which way to go; it is
+   far more often wrong about HOW HARD, and a candidate that steers
+   the opposite way is a candidate that will never be chosen.
+
+4.2.  IT IS A VETO, NOT A CHOOSER
+
+   The controller decides as it always did; the probe asks "does
+   that end in a wall", and only then are alternatives tried.
+
+   THAT ORDERING IS THE WHOLE COST ARGUMENT.  Scoring every
+   candidate each frame is six rollouts a frame - a hundred-odd
+   physics ticks where the game does one.  Vetoing costs ONE, and
+   escalates only where the controller is about to be wrong.  The
+   controller's own word is scored first so a tie always leaves it
+   alone.
+
+   TROUBLE IS SPEED LOST, NOT A CRASH FLAG, and the first version
+   had that wrong.  It escalated only on a predicted crash, and a
+   live hook trace over a whole lap escalated ZERO times: the bike
+   does not CRASH at the bridge, it scrapes, stalls and spends
+   fifteen seconds turning round, none of which sets the crash
+   timer.  The rollout ran every third frame and bought nothing.
+
+   A clean line keeps most of its speed over the horizon; anything
+   that touches a wall scrubs it hard.  Predicting less than
+   AP_PROBE_KEEP of the speed the bike has now is the cue to go
+   looking.
+
+   THE SCORE AVOIDS SEGMENT-RELATIVE TERMS ON PURPOSE.  Where this
+   fails worst the segment lookup is itself degrading - the log
+   walks 431, 412, 405, 407 in four samples, which no bike can do -
+   so "how far off the line did I end up" is measured against a
+   reference that is part of the problem.  Distance made good toward
+   the aim point plus the speed still on the bike needs none of it,
+   and a wall costs both terms at once.
+
+4.3.  NOTHING HERE COUNTS FRAMES, AND THAT IS LOAD-BEARING
+
+   TAB fast-forward works by making each frame integrate MORE time
+   (timing.h, tm_set_speed), so at 10x on a 60 fps display one frame
+   is 166 ms.  A controller whose cadences are in frames then runs
+   at 6 Hz instead of 60:
+
+                          at 1x        at 10x
+       probe interval      50 ms        0.5 s
+       stuck backstop       2 s          20 s
+
+   THAT IS NOT A TUNING DIFFERENCE, IT IS A DIFFERENT CONTROLLER -
+   and it is the one a fast-forwarded test session measures.  Every
+   cadence is therefore in milliseconds, taken from
+   race_frame_delta, so the autopilot behaves the same watched at
+   1x, fast-forwarded at 10x, or stepped through the debug agent.
+
+   IT IS NOT ENOUGH ON ITS OWN, and the rest is not in this file.
+   race_update takes ONE physics step per RENDERED frame with the
+   whole frame's dt - main.cpp says so at the frame loop: the
+   fixed-timestep pump exists and the race does not use it.  So at
+   10x a step is 166 ms, and at 90 km/h the bike covers 533 world
+   units in it - MORE THAN A WHOLE SEGMENT, and 1.4 times the
+   bridge's road half-width.  Wall clipping, ground contact and the
+   segment walk are each handed a displacement larger than the
+   geometry they test against, so the bike tunnels.
+
+   dt-SCALING IS NECESSARY AND NOT SUFFICIENT: one large Euler step
+   is not several small ones once collision is involved.  timing.h
+   names the fix - "several normal-sized ticks per frame rather than
+   one big one" - and frame_next_step already exists for it.  Until
+   the race tick is substepped, FAST-FORWARDED GAMEPLAY IS NOT A
+   VALID MEASUREMENT of anything that touches a wall.
+
+   THE AGENT CANNOT FAST-FORWARD, and should not.  A SEND_INPUT run
+   uses the STEPPED clock, and tm_set_speed deliberately does
+   nothing to a pending step - "a single step that is a different
+   size each time is not reproducible enough to debug with"
+   (timing.h).  An agent run is therefore always true-rate, which is
+   what makes it a measurement.  The honest way to make one cover
+   more ground is more steps per rendered frame, not bigger steps.
+
+4.4.  REACHING THE FINISH WITHOUT DRIVING THE RACE
+
+   tools/mr_place.py --finish puts the bike a few segments short of
+   the line with lapCounter one BELOW the race's lap count, so the
+   next crossing is the last one.  --finish N marks N-1 opponents as
+   already home, which is what makes every finishing position - and
+   the podium - reachable on demand.
+
+       mr_place.py --finish          cross the line in first
+       mr_place.py --finish 3        come home third
+       mr_place.py --finish --to moto        the same, on MOTO
+       mr_place.py --finish --to both        both, for a diff
+
+   REVERSE IS NOT THE FORWARD CASE MIRRORED, because the lap test
+   is not either.  Forward closes a lap on the segment index
+   WRAPPING past zero, so the bike is placed just below the top of
+   the array and drives up through it.  Reverse tests the two
+   indices directly instead - previous below the midpoint, new one
+   above it - so the bike is placed a few segments ABOVE zero and
+   drives DOWN through it, and the progress seed takes the other
+   arm of racer_place_from_grid (-seg below half, count-seg at or
+   above).  Placed the forward way in a reverse race the bike ends
+   up at the far end of the lap facing backwards, and no amount of
+   driving reaches the test.
+
+   The script reads the direction itself - g_reverseEnabled in the
+   port, and the RACE's own copy at 0x004dc144 on MOTO rather than
+   the menu setting at 0x004dc068, because that is the one
+   maybe_Race_UpdateProgress reads.
+
+   COMING SECOND TAKES A SMALLER CLOCK, NOT A BIGGER ONE.
+   race_compute_standings buckets the finished racers and sorts
+   them on raceClockMs ASCENDING, so an opponent is only ahead of
+   you if its clock READS LOWER.  On a placed race the player's is
+   tiny - the race started moments ago - so the fixed 60s the
+   script used to hand out was slower than a player finishing at
+   6.7s, and --finish 3 awarded first place every time.  The
+   opponents are now spaced a second apart just BELOW the player's
+   current clock; when it is too small to fit them under, the
+   player's is raised to make room and the script says so.
+
+   AND AN OPPONENT MUST BE active.  race_compute_standings skips an
+   inactive racer outright, so a slot marked finished but not
+   active is not merely last - it is not in the standings at all,
+   and the player counts as the only finisher.
+
+   PLACE IT AT THE RACE START, PAUSED.  The writes only stick on a
+   race that has not accumulated progress yet: seeding the progress
+   pair mid-race leaves the accumulator disagreeing with the
+   distance actually travelled, and the wrap step that closes the
+   lap never lands - the bike drives over the line and the lap
+   counter does not move.  Pause at the grid, run the script, then
+   drive.  [open - which other field carries the mid-race progress]
+
+   THE LINE IS THE SEGMENT WRAP, not a plane in the track:
+   race_update_progress closes a lap when the segment index rolls
+   past zero.  So the progress pair has to be reseeded to agree with
+   the segment, exactly as racer_place_from_grid seeds it - without
+   that the very next frame reads the jump as a lap on its own and
+   ends the race instantly.
+
+   IT WORKS ON BOTH GAMES, and that is the point of it: MR_Racer is
+   byte-exact, so every offset is shared and only the way the bytes
+   are reached differs - absolute addresses down the MOTO pipe
+   against name+offset through the port's map.  The port's segment
+   centres come from the .trk FILE rather than from either process,
+   so a port-only session needs no MOTO running.
+
+   TWO TRAPS, BOTH ALREADY HIT.  segment_centre returns the segment
+   ORIGIN, and the centre everything else uses is origin + row 3 -
+   a finish placed on the bare origin sits off to one side of the
+   road.  And set_yaw's third argument is the ROW-3 TRANSLATION TO
+   KEEP, not a flag: the racer's heading is row3 + row2, so zeroing
+   it turns the bike.
+
+5.  Fast-forward has a ceiling
+
+   TAB sets tm_set_speed(s_fastForward), 4x by default and
+   [DEBUG] fastforward=N otherwise.  But race.c clamps a single
+   frame's dt to 0.25 s, so past roughly fps * 0.25 the surplus is
+   discarded and virtual time stops scaling - about 15x at 60 fps.
+
+   Raising fastforward beyond that buys nothing and quietly makes
+   the step coarse enough to change the physics.  A one-lap practice
+   run wants 8-12x.
+
+6.  Open questions
+
+   o The tuning constants are ours.  AP_LATERAL_GAIN and the
+     look-ahead range have been moved once each against a logged
+     run; the rest are still unmeasured.  They are named rather than
+     buried so they can be moved.
+
+   o THE STUCK TEST COUNTS FRAMES, not milliseconds, so it fires
+     twice as fast at 60 fps as at 30.  It is a backstop rather than
+     a control path, so this has not mattered yet; it wants a delta
+     if it ever becomes load-bearing.
+
+   o Opponent avoidance is not implemented.  autopilot_input takes
+     the roster already so the signature does not churn when it
+     lands.  Practice - the mode this exists for - has nobody to
+     avoid.
+
+   o It has never driven a track other than ile01.

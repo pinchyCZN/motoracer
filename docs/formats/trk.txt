@@ -1,0 +1,912 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                         THE .TRK TRACK FORMAT
+
+
+Abstract
+
+   A versioned scene graph holding the whole circuit: track segments,
+   the meshes attached to them, named prop templates, placed instances,
+   a per-segment link table, and an optional animated-decor block.
+
+   Verified: all ten shipped tracks parse with every byte consumed and
+   zero trailing data [verified]. Reference reader at tools/trk.py.
+
+   +----------------+------------+-----------------------------+
+   | Function       | Address    | Role                        |
+   +================+============+=============================+
+   | Trk_Load       | 0x0040d650 | the whole loader            |
+   +----------------+------------+-----------------------------+
+   | Trk_ReadVec3   | 0x004902f0 | 12 bytes                    |
+   +----------------+------------+-----------------------------+
+   | Trk_ReadMatrix | 0x00490320 | 48 bytes, a 4x3 matrix      |
+   +----------------+------------+-----------------------------+
+   | Trk_ReadPlane  | 0x004b1120 | 16 bytes, vec3 plus scalar  |
+   +----------------+------------+-----------------------------+
+   | Trk_ReadMesh   | 0x00422a20 | vertex and face arrays      |
+   +----------------+------------+-----------------------------+
+   | Trk_ReadFace   | 0x00423240 | 58 bytes, version < 6 only  |
+   +----------------+------------+-----------------------------+
+   | AnimDecor_Load | 0x0048b7e0 | the optional trailing block |
+   +----------------+------------+-----------------------------+
+
+Table of Contents
+
+   1. Overall shape
+   2. Segment
+      2.1. The first decoded segment fields
+      2.2. The reader, and the two surface banks
+      2.3. The four planes ARE the road surface
+      2.4. The track object, and a pair that is really one thing
+   3. Mesh
+      3.1. Face colour uses the engine's 16-bit layout
+   4. Named templates and instances
+   5. Link table - a SECOND PER-SEGMENT SECTION
+   6. AnimDecor
+   7. What the shipped tracks contain
+   8. Geometry export and validation
+      8.1. Cross-validation against the minimap
+      8.2. What the export does not do
+      8.3. The reconstruction
+      8.4. THE TRACK DOES NOT FIT IN THE QUEUE, and it never will
+      8.5. DRAW DISTANCE IS A SETTING
+   9. Reference reader
+   10. Open questions
+
+
+1.  Overall shape
+
+   "TRK\0"              4
+   version              4      signed; all shipped tracks are 5
+   segmentCount         4
+
+   segment[segmentCount]
+   meshCount            4
+   mesh[meshCount]
+
+   if version > 0:
+       namedCount       4
+       named[namedCount]
+       instanceCount    4
+       instance[instanceCount]
+
+   if version > 1:
+       linkCount        4
+       link[linkCount]
+
+   if version > 2:
+       two dwords
+       optional AnimDecor block
+
+   The loader is written against versions 0 to 5 with separate guards at
+   each step, so it can still read older tracks. Only version 5 ships.
+
+2.  Segment
+
+   Fixed 132 bytes, plus a variable index array from version 1 on.
+
+   12   vec3
+   48   4x3 matrix; the first segment's is the identity
+    4   dword
+   64   four planes, 16 bytes each
+    4   dword
+   if version > 0:
+        4   index count n
+      n*2   n u16 indices
+   if version > 3:
+        8   two dwords
+
+   In memory a segment occupies 0xfc, 252 bytes.
+
+2.1.  The first decoded segment fields
+
+   Section 10 has carried "the field meanings inside a segment are
+   not decoded" since this document was written. Trk_SurfaceAtPoint
+   (0x0040ec60, was FUN_0040ec60) decodes seven of them, and it is
+   nineteen lines long [verified]:
+
+       seg = g_pTrkSegments + segment * 0xfc;
+       n   = (float *)(seg + 0x0c);          matrix row 0
+       t   = n + 9;                          matrix row 3
+
+       d = n[0]*(x - seg[0x00]) + n[1]*(y - seg[0x04])
+         + n[2]*(z - seg[0x08]) - dot(n, t);
+
+       return (seg->f0 < d && d < seg->f4) ? seg->e4 : seg->e8;
+
+   +------------+--------------+------------------------------------------------+
+   | Offset     | Type         | Role                                           |
+   +============+==============+================================================+
+   | +0x00      | float[3]     | the segment origin - the leading vec3 of       |
+   |            |              | section 2                                      |
+   +------------+--------------+------------------------------------------------+
+   | +0x0c      | float[3]     | ROW 0 of the 4x3 matrix, used as a DIRECTION   |
+   +------------+--------------+------------------------------------------------+
+   | +0x30      | float[3]     | ROW 3 of the 4x3 matrix, used as a TRANSLATION |
+   +------------+--------------+------------------------------------------------+
+   | +0xe4      | int          | surface id INSIDE the band                     |
+   +------------+--------------+------------------------------------------------+
+   | +0xe8      | int          | surface id OUTSIDE the band                    |
+   +------------+--------------+------------------------------------------------+
+   | +0xf0      | float        | low bound of the band                          |
+   +------------+--------------+------------------------------------------------+
+   | +0xf4      | float        | high bound of the band                         |
+   +------------+--------------+------------------------------------------------+
+
+   o d IS A SIGNED DISTANCE ALONG ROW 0, from the segment origin and
+     offset by the matrix translation, tested against a low and a
+     high bound. Two surface ids either side of that band reads as
+     ROAD versus VERGE. The arithmetic is verified; the road/verge
+     reading is [inferred].
+
+   o THE PER-SEGMENT 4x3 MATRIX IS A REAL FRAME. Section 10's last
+     open question asks "whether the per-segment 4x3 matrix is a
+     placement transform, which would affect prop positions". This
+     does not answer that in full, but it settles that the matrix is
+     LIVE GEOMETRY rather than inert data: row 0 is consumed as a
+     direction and row 3 as a translation, by the physics, every
+     frame, for every racer.
+
+   o THE FOUR PLANES ARE NOT READ BY THIS FUNCTION. An earlier draft
+     of this bullet concluded from that that the planes are not the
+     road surface. THEY ARE - see 2.3. Trk_SurfaceAtPoint returns a
+     surface ID and has no reason to touch them; Trk_GroundHeightAt
+     is the reader, and it uses three of the four.
+
+   o THE FIELDS ABOVE +0x84 ARE NOT IN THE 132-BYTE FIXED PART.
+     +0xe4 and +0xe8 come from the second per-segment section - see
+     5 - and are read from the file, not built.
+
+   o +0xf0 AND +0xf4 ARE THE LAST TWO WORDS OF THE SEGMENT RECORD -
+     ANSWERED, and the loader was already reading them.  They are the
+     version > 3 pair this document and src/trk.c both carried as an
+     unnamed `tail`; nothing had looked at the values.
+
+     THEY ARE FLOATS, not words.  Read live on ile01 they are
+     -1024.0 and +1024.0 on every segment.
+
+     HOW IT WAS SETTLED, because a fixed-stride assumption is what
+     hid it: the per-segment geometry records are NOT a fixed length.
+     Correlating each segment's live origin against ile01.trk gives
+     record starts 12, 158, 304, 450, 596, 740, ... - strides that
+     alternate 146 and 144, because the record carries a
+     count-prefixed index list.  The band bounds are the LAST EIGHT
+     BYTES of each record whatever its length, confirmed across 23
+     consecutive segments.  Testing at a FIXED offset of 138 matches
+     the first four segments and then silently drifts.
+
+     NO INSTRUCTION WRITES THEM.  The immediate -1024.0f occurs ONCE
+     in the whole image, at 0x004d0318 in .rdata, and its only reader
+     is a mesh builder.  That is what rules out a load-time default
+     and points at the file.
+
+2.2.  The reader, and the two surface banks
+
+   maybe_Racer_SurfaceUnder (0x00465d20, was FUN_00465d20) is the
+   racer-side wrapper, and the whole of it is:
+
+       int r = 0;
+       if (g_nTrkSegmentCount != 0)
+           r = Trk_SurfaceAtPoint(this->segmentStart, p[0], p[1], p[2]);
+       if (bAlt) r += 9;
+       return r;
+
+   o THE FLAG ADDS NINE, which selects a parallel id range.
+     formats/bpt-carac.txt section 5 records the grip table as NINE
+     named surfaces - neutral, deep water, water, sand, grass, earth,
+     tarmac, oil and roadside - so a bank of nine and an offset of
+     nine fit each other exactly. [inferred]
+
+   o AND WITH NO TRACK LOADED IT RETURNS 0, or 9 with the flag. So
+     "neutral" is what the code falls back to, not an error value.
+
+   o maybe_Snd_TickRacer CALLS IT WITH THE FLAG SET and then folds
+     three of the results together - 9 to 6, 0xb to 5, 0xc to 4 -
+     before choosing a roll loop. The audio classes are therefore
+     coarser than the surface ids. See subsystems/audio-cues.txt 9.5.
+
+   o g_pTrkSegments AND g_nTrkSegmentCount WERE IDENTIFIED IN
+     subsystems/game-object.txt AND NOT NAMED IN THE DB. Both are
+     named in Ghidra now.
+
+2.3.  The four planes ARE the road surface
+
+   Section 10 guessed that the four planes are "probably the
+   segment's bounding volume or its road surface". Section 2.1 of
+   this document then said the road-surface half of that guess had
+   no support. THAT WAS WRONG, and it was wrong because 2.1 was
+   written from Trk_SurfaceAtPoint alone - the function that returns
+   a surface ID, which genuinely does not read the planes.
+
+   Trk_GroundHeightAt (0x0040c8b0, was FUN_0040c8b0) does, and it is
+   the segment's ground-height solver [verified]:
+
+       if (trk->segCount <= 0) return 0.0f;
+       seg = trk->segments + segIndex * 0xfc;
+       if (Plane_Distance(seg + 0xa0, p) >= 0.0f)
+            { pl = seg + 0x80; d = *(float *)(seg + 0x8c); }
+       else { pl = seg + 0x90; d = *(float *)(seg + 0x9c); }
+       if ((bits(pl->y) & 0x7fffffff) == 0) return 0.0f;
+       return -((pl->x * p->x + pl->z * p->z) + d) / pl->y;
+
+   That is the standard plane-height solve: for
+   a*x + b*y + c*z + d = 0, y = -(a*x + c*z + d) / b.
+
+   +--------------+------------------------------------------------------------+
+   | Memory       | Role                                                       |
+   +==============+============================================================+
+   | +0x80        | GROUND PLANE A - used when the point is on the positive    |
+   |              | side of the selector                                       |
+   +--------------+------------------------------------------------------------+
+   | +0x90        | GROUND PLANE B - used on the negative side                 |
+   +--------------+------------------------------------------------------------+
+   | +0xa0        | THE SELECTOR - Plane_Distance against this picks A or B    |
+   +--------------+------------------------------------------------------------+
+   | +0xb0        | NOT A PLANE - the racing line offset, section 10           |
+   +--------------+------------------------------------------------------------+
+
+   o SO A SEGMENT'S ROAD SURFACE IS TWO PLANES SPLIT BY A THIRD,
+     which is what a quad divided into two triangles looks like. The
+     selector is the diagonal.
+
+   o THREE BUILT PLANES AT +0x80..+0xaf, AND THE FILE'S FOUR AT
+     +0x40..+0x7f. Section 2 gives the file's at offset 64 of a
+     132-byte record, and 64 bytes of header precede them in memory
+     too, so those do NOT move. What is new in memory is the ground
+     pair and the selector, which the loader computes.
+
+     +0xb0 IS NOT A FOURTH PLANE. It is the record's last dword, and
+     it is the racing line - section 10. An earlier version of this
+     note ran the plane block to +0xbf and that was wrong.
+
+   o Plane_Distance IS AT 0x004b10c0 - thirteen instructions,
+     dot(plane.xyz, p) + plane.d, seven callers, and ANOTHER GAME
+     FUNCTION ABOVE THE 0x004b0000 CLIFF. See
+     subsystems/copy-protection.txt 5.3.2.
+
+2.4.  The track object, and a pair that is really one thing
+
+   Trk_GroundHeightAt is __thiscall and its ECX is the TRACK OBJECT.
+   Its first two fields are
+
+       +0x00   the segment array base
+       +0x04   the segment count
+
+   which are exactly g_pTrkSegments (0x0052c108) and
+   g_nTrkSegmentCount (0x0052c10c).
+
+   o SO THOSE TWO ARE NOT INDEPENDENT GLOBALS. They are fields 0 and
+     1 of one object at 0x0052c108, which is why every function that
+     touches one touches the other. subsystems/game-object.txt
+     identified them as a pair from the outside; this says why.
+
+   o AND IT SETTLES AN ARGUMENT-TYPE QUESTION THAT WAS NEVER REAL.
+     subsystems/racers.txt 9.16.2 flagged a contradiction: two
+     callers appeared to pass different kinds of first argument, and
+     the function seemed to dereference it. There was no
+     contradiction - ECX is the track, both stack arguments are
+     exactly what the callers pass, and the [ECX+4] that looked like
+     a pointer dereference was the segment count. racer->segmentStart
+     is an index, and so is Trk_FindSegmentForPoint's return.
+
+     THE LESSON IS THE SAME ONE AS 5.3.2's: a hidden this makes a
+     decompiled argument list shift by one, and an argument list
+     that does not add up is more often a missing prototype than a
+     real inconsistency.
+
+3.  Mesh
+
+   4          vertex count
+   n * 16     per vertex: vec3 plus one dword
+   4          face count
+   m * 58     per face
+
+   A face is 58 bytes read as 2, 2, 2, 2, 10, 40.
+
+3.1.  Face colour uses the engine's 16-bit layout
+
+   After reading a face the loader expands the u16 at face+2 into a
+   packed RGB888 value:
+
+   c = *(u16 *)(face + 2);
+   face[0x3c] = (((c & 0x7c0) >> 6) << 8
+               | (c >> 11) << 16
+               | (c & 0x1f)) << 3;
+
+   Five bits per channel, shifted left three to fill eight.
+
+   An earlier version of this note called that RGB555. The formula above
+   was right but the label was not, and misleadingly so: true RGB555
+   puts red at bit 10, whereas this reads red from bit 11 and green from
+   bit 6. It is the engine's own 16-bit layout, which is 5-5-5
+   positioned to sit on a 565 surface with bit 5 unused. See
+   subsystems/pixel-format.txt.
+
+   It is still a genuine hardcoded colour format, unlike the .lez
+   palette path and the TGA path, which both derive their shifts at run
+   time from the DirectDraw surface. formats/lez.txt records that colour
+   handling is parameterised; that is true of the image loaders but not
+   of track face colours.
+
+   Verified at instruction level in FUN_00423240: AND CX,0x7c0 for
+   green, SHR DX,0xb with AND EAX,0x1f for red, AND 0x1f for blue.
+
+4.  Named templates and instances
+
+   A named entry is a length-prefixed name followed by three meshes. The
+   three parallel arrays the loader builds are 0x79, 121 bytes, each.
+
+   An instance is a length-prefixed name, a vec3, three dwords, an index
+   selecting which named entry it refers to, and from version 5 one more
+   dword. In memory an instance is 0x65, 101 bytes, and its name is
+   copied with a 15-character limit.
+
+   So the file separates prop templates from their placements, which is
+   why a track with 63 named entries can carry 257 instances.
+
+   Instances named CAMERA are not props. maybe_Trk_CountCameras at
+   0x00473240 walks the instance array after loading, compares the first
+   six characters of each one's TEMPLATE name - +0x5c, not the instance
+   name at +0x04 - against "CAMERA", and counts the matches into
+   maybe_g_trkCameraCount, clearing each one's +0x2c as it goes
+   [verified].
+
+   So the track's camera positions are authored as ordinary named
+   instances and picked out by name at load time. The limit is 256,
+   enforced with a message box that names the offending instance.
+
+   CLEARING +0x2c IS WHAT MAKES THEM INVISIBLE - it is the decor draw's
+   own enable, tested on the first line of FUN_004022f0. See
+   subsystems/decor.txt section 4.1.
+
+   Instance fields that follow from this: +0x38 must be 1 for an
+   instance to be considered at all, and +0x5c holds the name copied
+   from its template.
+
+
+5.  Link table - a SECOND PER-SEGMENT SECTION
+
+   One record per entry: three u16, plus four dwords from version 4 on.
+
+   IT IS NOT A LINK TABLE. Trk_Load's loop at 0x0040df49 indexes
+   g_pTrkSegments by the SEGMENT stride - i*0xfc, built as ((i<<6)-i)<<2
+   - and writes every field straight into the segment [verified]. There
+   is no link array. The name is kept here because it is where the file
+   format puts the section, not because it describes the contents.
+
+   +--------------+------------+-----------------------------------+
+   | File order   | Lands at   | Meaning                           |
+   +==============+============+===================================+
+   ROW 0 IS worldUp CROSS (row3 + row2), and that is verified rather
+   than assumed: across all 788 segments of ile01 the file's row 0
+   points the same way as normalise((0,1,0) x (row3 + row2)) - 788
+   agreeing, none opposite.
+
+   IT MATTERS FOR REVERSE MODE.  row3 + row2 is the heading a racer
+   builds for itself (maybe_Racer_ApplyDrive), and
+   maybe_Game_InitRace's reverse arm constructs row0 the same way
+   from a NEGATED forward.  So both directions lay row 0 out
+   right-handed about their own travel, and the bike's lateral axis
+   is the segment's going forwards and MINUS the segment's going
+   back.  Anything mixing a bike-frame quantity with a
+   segment-frame one has to account for that - see
+   subsystems/autopilot.txt 3.1.5.
+
+   | u16          | seg +0x0d8 | gridShort                         |
+   +--------------+------------+-----------------------------------+
+   | u16          | seg +0x0da | stored as a DWORD, then           |
+   |              |            | overwritten from a walked array   |
+   |              |            | when +0x0d8 is not -1             |
+   +--------------+------------+-----------------------------------+
+   | u16          | seg +0x0de |                                   |
+   +--------------+------------+-----------------------------------+
+   | dword        | seg +0x0ec | unknown                           |
+   +--------------+------------+-----------------------------------+
+   | dword        | seg +0x0e8 | surfaceOut - outside the band     |
+   +--------------+------------+-----------------------------------+
+   | dword        | seg +0x0e4 | surfaceIn - inside the band       |
+   +--------------+------------+-----------------------------------+
+   | dword        | seg +0x0e0 | SHADED - see below                |
+   +--------------+------------+-----------------------------------+
+
+   THE FOUR DWORDS ARE READ IN DESCENDING OFFSET ORDER, +0xec first
+   and +0xe0 last, at 0x0040dff8..0x0040e08b. Reading them in offset
+   order silently swaps the two surface ids with the shade flag.
+
+   +0x0e0 IS THE SHADE FLAG. maybe_Racer_ShadeLevel (0x00465d60) is
+   its whole consumer and returns 0x10 when it is set and 0x1f when it
+   is clear, so a bike darkens under a bridge. It is strictly 0 or 1
+   in every shipped track [verified]:
+
+   +-------------+----------+----------+-------------+
+   | Track       | Segments | Shaded   | Links       |
+   +=============+==========+==========+=============+
+   | ile01       |      788 |       32 | 788         |
+   | ile02       |      648 |      154 | 648         |
+   | Track03     |      622 |       20 | 622         |
+   | ile04       |      782 |      155 | 782         |
+   | ile05       |      668 |       40 | 668         |
+   | Track06     |      435 |       18 | 435         |
+   | ile08       |      919 |      263 | 919         |
+   | bercy       |      716 |        3 | 716         |
+   | ile10       |     1048 |        8 | 1048        |
+   | ile11       |      848 |       15 | 848         |
+   +-------------+----------+----------+-------------+
+
+   The link count equals the segment count in all ten tracks [verified].
+   That invariant is a useful integrity check: if any earlier field were
+   mis-sized the count read here would be nonsense. It is also WHY the
+   loop can index segments with its own counter - and the original does
+   so with no bounds test, which a malformed file would walk off.
+
+6.  AnimDecor
+
+   Introduced by a 10-byte tag. If the tag does not read "AnimDecor" the
+   loader seeks back 10 bytes and the section is simply absent, so it is
+   genuinely optional.
+
+   10   tag, "AnimDecor"
+    4   subversion
+    4   object count
+   per object:
+       0x20 bytes when subversion == 1, otherwise 0x40
+       if subversion > 2 and the object kind is 7:
+           4        path count
+           4        frames per path
+           paths * frames * 12   vec3 per frame
+
+   The loader enforces two limits and aborts the game if either is
+   exceeded, with messages in French: at most 63 animated objects,
+   and at most 79 PATHS. The second message says frames, but 0x4f is
+   tested against the path count read above it; frames per path are
+   not bounded. The object kind is bits 16 to 23 of the record's
+   first dword.
+
+7.  What the shipped tracks contain
+
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | Track   | Segments | Meshes | Vertices | Faces | Named | Instances | Anim |
+   +=========+==========+========+==========+=======+=======+===========+======+
+   | ile01   | 788      | 197    | 8738     | 11408 | 49    | 112       | 42   |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | ile02   | 648      | 162    | 6001     | 8164  | 38    | 72        | 14   |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | Track03 | 622      | 155    | 6783     | 9247  | 29    | 64        | 8    |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | ile04   | 782      | 198    | 9355     | 12854 | 16    | 78        | 0    |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | ile05   | 668      | 167    | 9639     | 13568 | 22    | 102       | 3    |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | Track06 | 435      | 110    | 7997     | 12032 | 18    | 41        | 20   |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | ile08   | 919      | 230    | 12052    | 16073 | 32    | 145       | 14   |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | bercy   | 716      | 179    | 6968     | 9342  | 24    | 74        | 51   |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | ile10   | 1048     | 262    | 12709    | 16773 | 63    | 257       | 32   |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+   | ile11   | 848      | 212    | 7756     | 9494  | 38    | 119       | 48   |
+   +---------+----------+--------+----------+-------+-------+-----------+------+
+
+   Two patterns stand out. The mesh count is close to a quarter of the
+   segment count in every track, so meshes appear to be built per group
+   of four segments [inferred].
+
+   CLOSE TO A QUARTER IS NOT A QUARTER, AND THE DIFFERENCE IS LOAD
+   BEARING. It is exact on five tracks - ile01, ile02, ile05, bercy and
+   ile10 - and on the other five the integer ratio TRUNCATES TO 3:
+   ile04 782/198, Track06 435/110, ile08 919/230, ile11 848/212 and
+   Track03 622/155. Nothing may derive a mesh index by dividing; the
+   segment record names its own at +0x3c and that is the only correct
+   source. See section 2 and MR_TrkSegment.meshIndex.
+
+   Read live off Track06's loaded segments, the first twenty-four
+   meshIndex values are
+
+       0 0 0 0 0 0 1 2 2 3 3 3 3 4 4 4 4 5 5 5 5 6 6 6
+
+   so mesh 0 covers six segments, mesh 1 one and mesh 2 two before the
+   grouping settles near four [verified]. And ile04 has an AnimDecor block with
+   zero objects rather than no block at all, which is why its trailing
+   bytes were 26 before that section was implemented.
+
+   ile10 is the largest circuit on every measure and sits at exactly the
+   63-object ceiling for named entries, which suggests the limit was
+   reached in production rather than chosen with headroom [guess].
+
+8.  Geometry export and validation
+
+   The structure above was established by walking the loader, which
+   proves the file is being *consumed* correctly. It does not prove the
+   geometry is being *interpreted* correctly. Exporting a track and
+   comparing it against an independent source does.
+
+   Recovering the face layout was the missing step. Trk_ReadFace
+   (0x00423240) reads the 58 bytes out of order, so the file layout is
+   not the struct layout, and src/prim.h names the struct fields.
+   They were pinned by cross-referencing the struct
+   offsets against FUN_00420a50, the .map loader, which passes +0x2c,
+   +0x2e, +0x30 and +0x32 as the four vertex indices to its triangle and
+   quad setup routines and tests +0x34 against -1 to choose between
+   them. See formats/mesh-3df-map.txt.
+
+   +-------------+---------------+---------------------------------+
+   | File offset | Struct offset | Meaning                         |
+   +=============+===============+=================================+
+   | 0           | +0x00         | kind, the authored kind         |
+   +-------------+---------------+---------------------------------+
+   | 2           | +0x38         | flags, five bits used           |
+   +-------------+---------------+---------------------------------+
+   | 4           | +0x02         | colour, engine 16-bit layout    |
+   +-------------+---------------+---------------------------------+
+   | 6           | +0x36         | bankIndex, rebased on load      |
+   +-------------+---------------+---------------------------------+
+   | 8           | +0x2c         | vertex index 0                  |
+   +-------------+---------------+---------------------------------+
+   | 10          | +0x2e         | vertex index 1                  |
+   +-------------+---------------+---------------------------------+
+   | 12          | +0x30         | vertex index 2                  |
+   +-------------+---------------+---------------------------------+
+   | 14          | +0x32         | vertex index 3                  |
+   +-------------+---------------+---------------------------------+
+   | 16          | +0x34         | quad marker; -1 means triangle  |
+   +-------------+---------------+---------------------------------+
+   | 18          | +0x04         | 40 bytes of uv and shading data |
+   +-------------+---------------+---------------------------------+
+
+   With that, ile01.trk exports to 197 meshes, 8738 vertices and 11408
+   faces, with no face skipped: every index resolves inside its own
+   mesh's vertex array [verified].
+
+   The bounds corroborate the axis convention. X and Z each span about
+   117000 units while Y spans about 24000, so the track is broad and
+   shallow and Y is vertical.
+
+8.1.  Cross-validation against the minimap
+
+   The decisive check is that MAP.LEZ, the in-game minimap for the same
+   circuit, decodes through a completely separate path: an LZ77 stream
+   wrapping a TGA, described in formats/lez.txt, with no code or
+   assumptions shared with the .trk reader.
+
+   Rendered side by side, the exported geometry and the minimap show the
+   same circuit [verified]: a serpentine layout with three hairpins, a
+   narrower left loop and a wider right loop joined at the top, and the
+   start line on the bottom straight where the minimap draws its arrow.
+
+   Two independent decoders agreeing on the same shape is strong
+   evidence that both are right. It is the same technique that validated
+   the .bkf reader against the pre-extracted tree, and it is worth
+   reaching for whenever a second representation of the same data
+   exists.
+
+   The export also carries detail the minimap does not: banked corners
+   built from radial fans at the hairpins, rectangular grandstand or
+   barrier blocks along the straights, and a large flat paddock area off
+   the top left of the circuit.
+
+8.2.  What the export does not do
+
+   Meshes are written as stored, with no segment transform applied.
+   Each of the 197 meshes keeps its own vertex array in the file and
+   indices are rebased per mesh on output.
+
+   That the result forms a coherent circuit implies the meshes are
+   already in world space rather than in a per-segment local space. That
+   is an inference from the picture, not something read out of the code
+   [inferred]. Each segment record does carry a 4x3 matrix and it
+   clearly means something; if it turns out to be a placement transform
+   then some props may be positioned wrongly even though the track
+   surface reads correctly. Treat prop placement as unverified.
+
+8.3.  The reconstruction
+
+   src/trk.h has the structures and src/trk.c the loader, one
+   section per heading above. page01_enter calls it for the
+   selected track, taking the file name from the level manifest's
+   FileLand rather than building it from the island number - three
+   of the eight are not ileNN.trk.
+
+   THE PARSE IS BYTE-EXACT OR IT FAILS, the same rule tools/trk.py
+   applies. That matters more for a binary format than for a text
+   one: a wrong field width still parses and yields plausible
+   garbage geometry, so it is nearly unfalsifiable on its own - but
+   a wrong width that must ALSO land on the final byte very rarely
+   survives. The loader logs consumed-of-total when it does not.
+
+   AND SECTION 7 IS A KNOWN-ANSWER TEST. The table above was
+   produced by the reference reader for all ten tracks, so the
+   counts trk_log prints can be read straight against it with no
+   new tooling. ile01 must say 788 segments, 197 meshes, 8738
+   vertices, 11408 faces, 49 named, 112 instances and 42 anim.
+
+   IT DOES, MEASURED. All seven counts match, the parse landed
+   exactly on the last byte of 1.3 MB, and links came back 788 -
+   equal to the segment count, which is section 5's invariant and
+   an INDEPENDENT check, because the link table is read after the
+   meshes, the named templates and the instances. A wrong field
+   width anywhere earlier would have made that count nonsense.
+
+   The assets line on the same run read "110 from archives, 3
+   loose, 0 from the pre-extracted tree, 0 missing", so both the
+   manifest and the track resolve the way a stock install would:
+   LEVEL.BPT out of ILE01.BKF, ile01.trk from the loose
+   DATA\ile01\ path. CLAUDE.md rule 10.
+
+   o GETTING THERE TOOK ONE WRONG TURN WORTH RECORDING. The first
+     run failed with "cannot find ILE01\LEVEL.SPT". bpt_open does
+     NOT rewrite the extension - bpt.h says so in capitals and
+     tells callers to name the file they want - but level.h had
+     claimed it did, copied from tools/bpt.py's docstring, which
+     describes the ORIGINAL's Script_Open. A true statement about
+     the game asserted about the port. Callers pass Level.Bpt.
+
+   Deliberate differences from the original:
+
+   o COUNTS ARE BOUNDED. The original trusts the file; a corrupt
+     count there allocates whatever it says. Ours refuses anything
+     over 2^22, and keeps the loader's own AnimDecor limits of 63
+     objects and 79 paths - but fails the load where the original
+     puts up a French message box and aborts the game.
+
+   o VERSION 6 IS REFUSED RATHER THAN GUESSED. Trk_ReadFace is
+     gated on version < 6 and nothing establishes what 6 changes,
+     so reading 58 bytes that may not be 58 bytes is not attempted.
+     No shipped track is affected; all ten are version 5.
+
+   o ANIMDECOR IS LOCATED AND SKIPPED, not parsed into a structure.
+     It is skipped EXACTLY, so the byte-exact check still covers
+     it, and animDecorObjects is recorded. Nothing needs the
+     animation data until something draws scenery.
+
+   NOT REPRODUCED: nothing consumes a segment or a mesh yet. The
+   loader is inert on purpose, the same way level.c is - the point
+   of the byte-exact check is that it can be trusted before there
+   is any geometry on screen to judge it by.
+
+
+8.4.  THE TRACK DOES NOT FIT IN THE QUEUE, and it never will
+
+   ile01 alone holds 11408 world faces across 197 meshes, plus 112
+   prop instances drawn from 49 named templates, plus whatever the
+   racers cost. QUEUE_NODE_MAX is 7499 - the ORIGINAL's constant,
+   not ours. So under 60 per cent of one track's static geometry can
+   be queued at once even with nothing else in the scene.
+
+   THAT IS NOT A DEFECT, it is the absence of a subsystem - but not
+   the subsystem this section used to name. It said the visibility
+   system was "LenBPlane, MediumZone, HightZone and the per-segment
+   index arrays". IT IS NONE OF THOSE. The per-segment index arrays
+   at +0xb4 with their count at +0xd4 are the DECOR lists, and
+   MediumZone and HightZone are per-detail-level distances at
+   0x0051d1c8 and 0x0051d1cc, not a visibility set.
+
+   THE REAL SYSTEM IS A ONE-DIMENSIONAL RING WINDOW, and it is much
+   simpler than any of that. maybe_Trk_DrawZonesAndListSegments
+   (0x0040ce60) draws the mesh covering the camera segment plus a
+   fixed number of meshes each way along the track:
+
+       forward + backward + 1  meshes, at most 12 of ile01 197
+
+   with the split chosen by one dot product and the span a hard-coded
+   10 from the Track constructor at 0x0040c5b4. There is no bounding
+   volume, no tree, no precomputed visibility - just the assumption
+   that a closed circuit is a loop and you can only see so far along
+   it. Section 9.1 has the whole algorithm.
+
+   SO THE QUEUE PRESSURE THIS SECTION DESCRIBES IS AN ARTEFACT OF
+   OUR OWN SUBSTITUTE. Twelve meshes is roughly 700 faces against
+   QUEUE_NODE_MAX 7499; the problem disappears with the real
+   selection rather than needing a budget. src/trk.c still uses
+   "nearest first until the queue is full" for the geometry, and
+   that is now the only part left to replace - the segment LIST half
+   is reconstructed as trk_list_visible_segments.
+
+   WHAT IT LOOKS LIKE FROM THE FRONT. Nearest-first is exactly the
+   wrong order for large distant flat things, so the far ocean is
+   among the first casualties [observed, the start grid on ile01].
+   With the horizon in place the hole is now obvious: what shows
+   through where the sea should be is the horizon's GROUND FILL, so
+   it reads as the sky bleeding down over the water rather than as
+   missing geometry. Worth knowing before someone goes looking for
+   a bug in horizon.c.
+
+   o A COUNTING TRAP THAT HID THIS. trk_draw returns props PLUS
+     world meshes as one number, and page 1 logged it against
+     meshCount alone. 76 of 197 world meshes drawn therefore printed
+     as "188 of 197" once the 112 props were folded in - 39 per cent
+     reading as 95. The two are now counted and logged separately.
+
+8.5.  DRAW DISTANCE IS A SETTING
+
+   The manifest's LenBPlane is 18000 on ile01 and the original clips
+   there, which is why scenery pops in as you approach.
+
+8.5.0.  MEASURED AGAINST MOTO ON THE DIRT ARENA
+
+   Read live, both sides on the same track:
+
+       MOTO  near 64      DAT_00625788 10000   DAT_0062e438 2000
+             DAT_006d1f70 8000      <- the live LenBPlane
+       ours  near 64      g_drawSceneZFar 40000
+             s_race_backPlane 7000
+
+   THREE SEPARATE THINGS MAKE OURS SHORTER, and only one of them is
+   the back plane.
+
+   o THE DETAIL LEVEL PICKS THE ZONE RECORD AND WE IGNORE IT.
+     Race_SetupRenderState (0x00410e10) does
+
+         DAT_006d1f70 = DAT_0051d1c0[g_cfgDetailLevel * 9]
+
+     - a table of five nine-key records, selected by the config's
+     detail level.  MOTO is running at level 4 and gets 8000; the
+     port hardcodes index 0 and gets 7000.  The port already HAS
+     g_cfgDetailLevel (fx_draw_all_particles reads it); it simply is
+     not used for these keys.
+
+   o AND THE KEY ORDER DOES NOT AGREE. Column 0 of MOTO's table runs
+     4000, 3000, 4000, 4000, 8000 across the five levels, and that is
+     exactly what OUR reader calls flatZ; our lenBPlane reads 7000 at
+     all five.  One of the two labellings is wrong and it has to be
+     settled from the .spt text before anything is wired to it.
+     [open]
+
+   o THE REAL DIFFERENCE IS NOT A DISTANCE AT ALL. Section 8.4: the
+     original's visibility is a RING WINDOW - the camera segment plus
+     ten meshes each way - with no bounding volume and no budget.
+     trk_draw still uses "nearest first until the queue is full",
+     and nearest-first is exactly the wrong order for large distant
+     flat things, so they are the first casualties and they come and
+     go as the near count changes.  THAT is what reads as harsh
+     popping rather than as a clean far clip.
+
+     trk_list_visible_segments was already reconstructed and already
+     fed race_draw_racers; trk_draw is converted now.
+
+8.5.1.  The ring window, in trk_draw
+
+   trk_draw takes camSegment and camForward and selects world meshes
+   the way 0x0040ce60 does: the camera's mesh, plus a span each way
+   along the track, and nothing else.  trk_zone_span holds the split
+   rule - one dot product against the camera segment's first plane
+   normal gives 10 ahead and 1 behind, or 5 and 5, or 1 and 10.
+
+   A MESH COVERS FOUR SEGMENTS.  716 segments to 179 meshes on the
+   dirt arena and 788 to 197 on ile01, exact on both - which is what
+   the *4 in trk_list_visible_segments was already encoding.  The
+   mesh index is camSegment / 4.
+
+   THE DISTANCE SORT IS STILL THERE, as the fallback for a caller
+   with no track position - page 10's preview - and the window is
+   still sorted nearest-first inside itself, which costs nothing and
+   suits the queue.
+
+   THE SETTING IS REDEFINED and the three values are now genuinely
+   different:
+
+   +----------------------+--------------------------------------+
+   | [RENDER] drawdistance | Effect                              |
+   +======================+======================================+
+   | 0, or absent         | the ring window alone - retail       |
+   +----------------------+--------------------------------------+
+   | -1                   | NO window: every mesh, nearest       |
+   |                      | first, no clip. A debug view for a   |
+   |                      | flyover, NOT what retail does        |
+   +----------------------+--------------------------------------+
+   | N > 0                | the window AND a clip at N           |
+   +----------------------+--------------------------------------+
+
+   THE BACK PLANE IS NO LONGER THE SELECTION.  It was standing in for
+   a rule it was never the whole of, and the default is now no
+   distance test at all - which is what the original does.
+
+   +----------------------+--------------------------------------+
+   | [RENDER] drawdistance | Effect                              |
+   +======================+======================================+
+   | 0, or absent         | the manifest's LenBPlane - the       |
+   |                      | DEFAULT, and what the original does  |
+   +----------------------+--------------------------------------+
+   | -1                   | unlimited, no far clip               |
+   +----------------------+--------------------------------------+
+   | N > 0                | N world units                        |
+   +----------------------+--------------------------------------+
+
+   Drawing further than the original is a deliberate deviation and
+   the user's decision rather than a reconstruction one, which is
+   why it is opt-in and the retail value is the default.
+
+   o UNLIMITED DOES NOT CURRENTLY WORK, and the reason is worth
+     knowing before anyone tries it again. queue.c buckets a face by
+     its INTEGER camera depth and clamps at 7998, so everything
+     beyond 7998 units shares one bucket with no ordering between
+     its members. Retail never notices because it clips at 18000.
+     Remove the clip and the enormous far meshes - 106 to 117 are 54
+     faces each with extents up to 43771 units at 51000 to 58000
+     out - land unordered in that bucket and paint over the frame.
+     Scaling the buckets with the draw distance was tried and did
+     not fix it; the next suspect is drawscene.c's rule that turns
+     depth WRITES off for blended faces.
+
+   o AND THE CLIP WAS ADDED AS A REGRESSION IN THE FIRST PLACE. It
+     did not exist, was introduced on the reasoning that the
+     original clips there, and took the scene from 76 world meshes
+     to 29 - removing the distant palms and the offshore boats -
+     while the primitive budget sat at 596 of 6800. Several rebuild
+     cycles were then spent looking for a rendering fault that was
+     this clip. Check whether a limit is doing anything before
+     adding one.
+
+   o THE MEANING OF -1 CHANGED TWICE while this was being settled,
+     at one point to a value where -1 and ABSENT were both
+     unlimited - so the two settings anyone would compare first were
+     the same setting. The table above is final.
+
+
+9.  Reference reader
+
+   tools/trk.py.
+
+   python tools/trk.py --check PATH [PATH ...]
+   python tools/trk.py --info  PATH
+
+   --check walks the file exactly as the loader does and reports the
+   trailing byte count. Zero is the pass condition, and all ten tracks
+   give zero.
+
+10.  Open questions
+
+   o PARTLY RESOLVED. Seven segment fields are decoded in section
+     2.1 - the origin, two rows of the 4x3 matrix, two surface ids
+     and a low/high band - by Trk_SurfaceAtPoint. THREE OF THE FOUR
+     PLANES are decoded in 2.3 by Trk_GroundHeightAt: two ground
+     planes and a selector between them, so the "road surface" half
+     of the guess is CORRECT. The fourth plane at +0xb0 and the u16
+     index array are still unconfirmed.
+   o PARTLY RESOLVED. The four vertex indices and the triangle/quad
+     marker are now identified, at file offsets 8 to 16. The 40-byte
+     block at struct +0x04 is still undecoded and is presumably uv
+     coordinates and shading data.
+   o THE BIKE DRAWS SUNK INTO THE GROUND OFF THE SIDE OF THE ROAD,
+     at one spot on SPEED_BAY, and the BIKE IS NOT THE CAUSE.
+     Driving the same lap on both games and sampling every frame,
+     the racer's position.y, the matBikeRoot translation, both wheel
+     contact heights and riderPosition.y all agree with MOTO to
+     0.02 units, with a single 0.76 transient - so the collision
+     surface and everything hung off it are right, and what differs
+     is the DRAWN ground beside the road.  A placement sweep across
+     the rail line at z = 2058 also came back identical, so the
+     stretch to look at is not that one.  The suspects are the
+     apron geometry in the segment mesh and the Y placement of the
+     MR_TrkInstance props that carry it (section 4).  [open]
+   o RESOLVED, AND IT IS NOT A PLANE.  +0xb0 is the THE RACING LINE:
+     a per-segment lateral offset along matrix row 0, in world
+     units.  Racer_AiFollowLine adds the rider's chargeMeter to it
+     and aims there; Trk_LaneOfRacer centres its three 240-wide lane
+     bands on it.
+
+     IT IS THE DWORD THE FILE STORES AFTER THE FOUR PLANES, read as
+     a float - the last field of the 132-byte record, section 2.
+     ile01 spans -432 to +128 over 367 distinct values and varies
+     smoothly segment to segment; ile04 spans -368 to +112 with
+     plateaus through its constant-radius corners.  Both sit well
+     inside the +-1024 band, which is what a racing line should do.
+
+     THIS ENTRY USED TO SAY "the fourth plane's FIRST float", and
+     that reading cost two functions in the port.  The error is in
+     the sentence below about +0x80..+0xbf: the FILE's four planes
+     land at +0x40..+0x7f, the three at +0x80..+0xaf are BUILT by
+     the loader, and +0xb0 is this dword - not a fourth built plane.
+     Reading planes[3][0] instead gives wallPlane1's normal x, a
+     flat -1.0 on ile01 with the wall distance 1280 beside it, so
+     the "line" it produced was the centreline give or take a unit.
+   o The three meshes per named entry are presumably levels of detail
+     [guess].
+   o The two dwords before AnimDecor are unread by this parser and their
+     meaning is unknown.
+   o The 0x20 versus 0x40 animated-object record is not decoded beyond
+     the kind field.
+   o RESOLVED. ile01 exports cleanly and matches its own minimap; see
+     section 8. Still open is whether the per-segment 4x3 matrix is a
+     placement transform, which would affect prop positions.

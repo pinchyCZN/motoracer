@@ -1,0 +1,311 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+             COMMAND-LINE PARSER AND CONFIGURATION GLOBALS
+
+
+Abstract
+
+   Parser: FUN_004140a2 @ 0x004140a2 - also the process entry/init path
+   (DirectX version check, registry read, language selection, then
+   argument parsing). Help text: 0x004dc664, printed via FUN_0043fcf0(0,
+   <help>, "MrHelp"). Flag string table: 0x004dc238-0x004dc664.
+
+Table of Contents
+
+   1. How the parser works [verified]
+   2. Confirmed bug in the original [verified]
+   3. Undocumented flags [verified]
+   4. Group A  -  main config block, 0x004dc158-0x004dc200 (.data)
+   5. Group B  -  0x004e4f44-0x004e4f98 (surface / texture)
+   6. Group C  -  0x004e8xxx (misc)
+   7. Group D  -  0x004ee93c-0x004ee9a0 (D3D / texture caps)
+   8. Group E  -  elsewhere
+   9. Other findings
+      9.1. A default is not findable by searching for writers
+   10. Open questions
+
+
+1.  How the parser works [verified]
+
+   A flat if / else-if chain over argv, using two comparators:
+
+   +--------------+-----------------------------------------------------------------+---------------+
+   | Comparator   | Semantics                                                       | Used for      |
+   +==============+=================================================================+===============+
+   | __strcmpi    | exact, case-insensitive. == 0 means match                       | boolean flags |
+   +--------------+-----------------------------------------------------------------+---------------+
+   | FUN_0045acd0 | substring search; returns ptr into arg, else NULL. 0 = no match | numeric flags |
+   +--------------+-----------------------------------------------------------------+---------------+
+
+   FUN_0045acd0 uppercases heap copies of both strings and runs strstr,
+   so it is stristr returning an offset pointer. The numeric flags then
+   read their value with _atoi(match + N), where N is the length of the
+   flag name. Every numeric flag in the binary is self-consistent under
+   that rule (12/12), which is what pins each global to its flag - the
+   else branches unwind in reverse chain order and sit far from their
+   guards, so this offset identity is the reliable link, not proximity.
+
+   Suggested name: Str_CaseInsensitiveFind / stristr_offset.
+
+   NOTE:
+      The comparator is a substring match, not a prefix match. -NoD3D
+      contains -D3D only as a non-prefix substring, so chain ordering
+      is what saves it here. That is fragile by construction and worth
+      remembering when reasoning about flag precedence.
+
+2.  Confirmed bug in the original [verified]
+
+   -MinTextureHeight<n> writes to the max-texture-width global.
+
+   The four texture-bound globals are laid out 0x004dc158/15c/160/164 =
+   min-W / max-W / min-H / max-H. The parser writes:
+
+   +-------------------+----------------+-----------------+
+   | Flag              | Writes         | Should write    |
+   +===================+================+=================+
+   | -MinTextureWidth  | 0x004dc158     | 0x004dc158 [ok] |
+   +-------------------+----------------+-----------------+
+   | -MaxTextureWidth  | 0x004dc15c     | 0x004dc15c [ok] |
+   +-------------------+----------------+-----------------+
+   | -MinTextureHeight | 0x004dc15c [X] | 0x004dc160      |
+   +-------------------+----------------+-----------------+
+   | -MaxTextureHeight | 0x004dc164     | 0x004dc164 [ok] |
+   +-------------------+----------------+-----------------+
+
+   Evidence - cross-references:
+
+   o 0x004dc15c has two writes from the parser (0x0041460a, 0x00414632).
+   o 0x004dc160 has no writer at all: its only reference is a READ at
+     0x00476397 inside the consumer FUN_00476100.
+   o FUN_00476100 seeds defaults into 0x004dc15c and 0x004dc164 (the two
+     maxima) at 0x004762b6 / 0x004762bb, and reads all four.
+
+   So passing -MinTextureHeight silently clamps maximum texture width
+   instead, and minimum texture height is permanently whatever
+   FUN_00476100 leaves at 0x004dc160. A classic copy-paste slip.
+   Preserve the behaviour in transcription; fix it only in a later,
+   deliberate change.
+
+3.  Undocumented flags [verified]
+
+   Present in the binary, absent from the built-in help text:
+
+   -BMG, -DataV2, -Modem, -waitForBlit<n>, -windowSystem,
+   -TotalVideoMem<n>, -TextureVideoMem<n>, -saverecord, -savpath, -path,
+   -noMMX (lowercase variant).
+
+   -BMG at 0x004dc4ac sets ONE global, g_useBmgBranding at
+   0x004dc1c4 (0x00414865).  It is the PUBLISHER BRANDING
+   SWITCH - eight resource ids, GRAND PRIX against CHAMPIONSHIP
+   - and the command line is only its third and last writer;
+   see menu-resources.txt 5.4.1 for the default and the
+   registry value that precede it.
+
+   0x004dc1a4 IS A DIFFERENT FLAG.  It is set by the token
+   compared immediately after -BMG, at 0x00414888, against a
+   string built on the stack rather than a literal - so it has
+   no name in a strings dump.  Input_OnKeyDown then uses it as
+   a COUNTER, cycling it 1 -> 2 -> 1 alongside 0x004dc124,
+   which is a debug or cheat gate rather than a branding one.
+   [open] which flag spells it, and what the key does.
+
+4.  Group A  -  main config block, 0x004dc158-0x004dc200 (.data)
+
+   Contiguous and densely packed on a 4-byte stride. Almost certainly
+   one config struct, not loose globals [inferred] - worth typing as
+   such once the boundaries are confirmed.
+
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | Flag                    | Global     | Set to                            | Meaning                            |
+   +=========================+============+===================================+====================================+
+   | -MinTextureWidth<n>     | 0x004dc158 | atoi(+0x10)                       | min texture width                  |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -MaxTextureWidth<n>     | 0x004dc15c | atoi(+0x10)                       | max texture width                  |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -MinTextureHeight<n>    | 0x004dc15c | atoi(+0x11)                       | BUG  -  see above                  |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | (never written)         | 0x004dc160 | -                                 | min texture height; read at        |
+   |                         |            |                                   | 0x00476397                         |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -MaxTextureHeight<n>    | 0x004dc164 | atoi(+0x11)                       | max texture height                 |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -NoDither               | 0x004dc16c | 0                                 | dither enable (default on)         |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -DoRealLock             | 0x004dc170 | 0                                 | clears a "don't really lock" flag  |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -BlitTimeOut<n>         | 0x004dc178 | atoi(+0xc), clamped >= 0          | max blit wait loops                |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -DontWaitBlits          | 0x004dc17c | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -DataV2                 | 0x004dc180 | 1                                 | undocumented                       |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -TextureVideoMem<n>     | 0x004dc188 | atoi(+0x10), -1 if out of range   | range 2 MB-256 MB                  |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -TotalVideoMem<n>       | 0x004dc18c | atoi(+0xe), -1 if out of range    | range 2 MB-256 MB                  |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -AskDirectDraw          | 0x004dc190 | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -D3D                    | 0x004dc194 | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -NoD3D                  | 0x004dc198 | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -3DFX                   | 0x004dc19c | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -OnlyPrimaryDisplay     | 0x004dc1a0 | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -BMG                    | 0x004dc1a4 | 1                                 | undocumented                       |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -NoSound                | 0x004dc1a8 | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -Pal16                  | 0x004dc1ac | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -NoPal256               | 0x004dc1b0 | 0                                 | 256-colour palettes enable         |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -ZBuffer                | 0x004dc1b4 | 1                                 | hardware Z-buffer                  |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -ScanOtReverse          | 0x004dc1b8 | 1                                 | Z front-to-back                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -Alpha                  | 0x004dc1c0 | 1                                 | texture format 4444                |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -BMG (side effect)      | 0x004dc1c4 | 1                                 | zeroed at entry; feeds             |
+   |                         |            |                                   | DAT_004f0dd0                       |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -NoBlitAsync            | 0x004dc1c8 | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -PowerVr                | 0x004dc1cc | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -NoPowerVr              | 0x004dc1d0 | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -Modem                  | 0x004dc1d4 | 1                                 | undocumented                       |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -NoGouraud              | 0x004dc1d8 | 0                                 | gouraud enable (default on)        |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -waitForBlit<n>         | 0x004dc1e4 | atoi(+0xc); default 0x18 (24)     | undocumented                       |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -NoFlick                | 0x004dc1e8 | 1                                 |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -                       | 0x004dc1ec | FUN_0045a480(...)                 | set from registry/path init        |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -fullscreen / -windowed | 0x004dc1f0 | 1 / 0                             |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -                       | 0x004dc1f4 | 1                                 | CRACKED: see copy-protection.txt   |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+   | -frameratemax<n>        | 0x004dc200 | atoi(+0xd), only if 20 < n < 99;  | doc'd default 30                   |
+   |                         |            | 0 = unlimited                     |                                    |
+   +-------------------------+------------+-----------------------------------+------------------------------------+
+
+5.  Group B  -  0x004e4f44-0x004e4f98 (surface / texture)
+
+   +-----------------------+------------+---------------------------------------+
+   | Flag                  | Global     | Set to                                |
+   +=======================+============+=======================================+
+   | -NoDuplicateSurfaces  | 0x004e4f44 | 0                                     |
+   +-----------------------+------------+---------------------------------------+
+   | -OpaqueBlackLevel<n>  | 0x004e4f48 | atoi(+0x11); out of [1..3] -> 3, or 0 |
+   +-----------------------+------------+---------------------------------------+
+   | -CorrectRatioTextures | 0x004e4f94 | 1                                     |
+   +-----------------------+------------+---------------------------------------+
+   | (unidentified)        | 0x004e4f98 | 1                                     |
+   +-----------------------+------------+---------------------------------------+
+
+   What -OpaqueBlackLevel actually does, traced later [verified]: pure
+   black is the transparent colour key for hardware textures, so a
+   genuinely black texel would vanish. During texture upload every
+   palette entry whose three channels all fall below
+
+       (g_cfgOpaqueBlackLevel + 1) << (8 - bits)
+
+   is raised to that floor. A higher setting pushes near-black colours
+   further from the key, which is safer against black artwork
+   disappearing and washes out dark artwork more. See
+   subsystems/d3d-textures.txt section 3.
+
+6.  Group C  -  0x004e8xxx (misc)
+
+   +--------------+------------+--------------------------+
+   | Flag         | Global     | Set to                   |
+   +==============+============+==========================+
+   | -SnapShot    | 0x004e8928 | 1                        |
+   +--------------+------------+--------------------------+
+   | -noCpuDetect | 0x004e8cd0 | 0 (CPU detection enable) |
+   +--------------+------------+--------------------------+
+   | -            | 0x004e8580 | 3 at init                |
+   +--------------+------------+--------------------------+
+
+7.  Group D  -  0x004ee93c-0x004ee9a0 (D3D / texture caps)
+
+   A second cluster, distinct from Group A. Likely fields of the D3D
+   device wrapper or its config [inferred] - Dsi_d3d.cpp territory.
+
+   +----------------------+------------+------------------------------------------------------------+
+   | Flag                 | Global     | Set to                                                     |
+   +======================+============+============================================================+
+   | -windowSystem        | 0x004ee93c | 1 (undocumented)                                           |
+   +----------------------+------------+------------------------------------------------------------+
+   | -NoTextureSizeMax256 | 0x004ee968 | 0; static init 1, so it turns a default-ON 256px clamp OFF |
+   +----------------------+------------+------------------------------------------------------------+
+   | -TextureSquareOnly   | 0x004ee96c | 1                                                          |
+   +----------------------+------------+------------------------------------------------------------+
+   | -InfiniteZBuffer     | 0x004ee9a0 | 1                                                          |
+   +----------------------+------------+------------------------------------------------------------+
+   | (unidentified)       | 0x004ee954 | 1                                                          |
+   +----------------------+------------+------------------------------------------------------------+
+
+8.  Group E  -  elsewhere
+
+   +---------------------+------------+------------------------------------------------------------+
+   | Flag                | Global     | Set to                                                     |
+   +=====================+============+============================================================+
+   | -J<n>               | 0x004dbf7c | atoi(+2)  -  joystick threshold                            |
+   +---------------------+------------+------------------------------------------------------------+
+   | -nbcomp<n>          | 0x004dbf78 | atoi(+7)  -  computer players                              |
+   +---------------------+------------+------------------------------------------------------------+
+   | -noMMX              | 0x004dbcf4 | 0  -  MMX enable; default from FUN_00458fb0() (CPU detect) |
+   +---------------------+------------+------------------------------------------------------------+
+   | (language)          | 0x004dbce8 | 0-5 from registry Language or -fr/-gr/-it/-sp/-sw/-us      |
+   +---------------------+------------+------------------------------------------------------------+
+   | -ThreadHighest      | (local)    | thread priority 2                                          |
+   +---------------------+------------+------------------------------------------------------------+
+   | -ThreadTimeCritical | (local)    | thread priority 0xf                                        |
+   +---------------------+------------+------------------------------------------------------------+
+
+9.  Other findings
+
+   o Registry root [verified]: SOFTWARE\DelphineSoft\MotoRacer..., read
+     via FUN_0045a330(key, value, dest) for DataPath, SavingPath,
+     Language. Confirms Delphine Software; matches the Dsed source-path
+     prefix.
+   o DirectX version gate [verified]: FUN_0045adb0 returns a version; if
+     < 0x300 the game shows "The game require DirectX 3 or la..." and
+     calls ExitProcess(1). Consistent with the DX3-era execute-buffer
+     D3D path.
+   o MMX default comes from FUN_00458fb0() - the CPU detection routine.
+     -noCpuDetect zeroes 0x004e8cd0 and forces DAT_004dbcf0 = 0.
+
+9.1.  A default is not findable by searching for writers
+
+   Thirteen of these flags are spelled as a negation - -NoGouraud,
+   -NoDither, -NoMMX, -NoAGP, -NoPal and the rest.  For every one of
+   them the DEFAULT LIVES IN .data AS AN INITIALISED VALUE, and the
+   only instruction that writes the global is the handler that turns
+   the feature OFF.
+
+   So the obvious method gets each one backwards: search for writers,
+   find exactly one, see it store 0, and conclude the feature ships
+   disabled.  It ships ENABLED.  0x004dc1d8 reads 01 00 00 00 in
+   .data [verified]; the single writer is the -NoGouraud handler.
+
+   READ .data FIRST, and treat a flag named as a negation as saying
+   so in its own name - the positive is the default, or the switch
+   would have nothing to disable.  The flag block at 0x004dc664
+   confirms it in words: "Disable gouraud shading".
+
+10.  Open questions
+
+   o RESOLVED. 0x004dc1f4 is g_protectionPassed. It is set to 1
+     unconditionally ONLY because this MOTO.EXE is cracked - the
+     conditional jump guarding it at 0x00414331 was overwritten with 90
+     90. In the original it is set only when the registry PId check
+     passes, and when it is 0 Carac_Load subtracts 1.0 from every bike's
+     NbSpeed. See subsystems/copy-protection.txt [verified].

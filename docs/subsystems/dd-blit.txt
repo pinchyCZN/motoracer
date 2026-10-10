@@ -1,0 +1,230 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                             THE BLIT CORE
+
+
+Abstract
+
+   maybe_Cdd_DrawSurface at 0x00478990 is the single function every 2D
+   draw in dd.cpp goes through: clipping, colour keying, a software
+   blit, a textured-quad path, surface-loss retry and a deferred queue,
+   in 1748 bytes.
+
+   Reading it settled three things that were open elsewhere - the
+   colour-key pair in the texture bank, the purpose of four large
+   buffers, and a fourth surface-loss recovery.
+
+   +---------------------------+------------+
+   | Item                      | Address    |
+   +===========================+============+
+   | maybe_Cdd_DrawSurface     | 0x00478990 |
+   +---------------------------+------------+
+   | maybe_Cdd_DrawScaled      | 0x004788b0 |
+   +---------------------------+------------+
+   | maybe_Cdd_ResetBlitQueue  | 0x00473af0 |
+   +---------------------------+------------+
+   | maybe_g_deferBlits        | 0x004ee970 |
+   +---------------------------+------------+
+   | maybe_g_deferredBlitCount | 0x004ee978 |
+   +---------------------------+------------+
+
+Table of Contents
+
+   1. What it does
+   2. Clipping
+      2.1. The clip mode is a separate argument from the flags
+         2.1.1. What the three bits do
+   3. The colour key, confirmed
+   4. Two draw paths
+   5. The deferred blit queue
+   6. What this means for the port
+   7. Open questions
+
+1.  What it does
+
+   The destination is g_lpDDSMain, or the off-screen surface
+   DAT_005d8940 when DAT_004ee940 is set and this+0x28 is zero. Missing
+   rectangles default to the surface's natural size, taken from
+   this+0x40 and this+0x44 through SetRect. It checks IsLost and
+   Restores before drawing [verified].
+
+   maybe_Cdd_DrawScaled at 0x004788b0 is the wrapper that builds a
+   destination rectangle first, with a fast path for a scale of exactly
+   1.0f.
+
+2.  Clipping
+
+   Both rectangles are clipped together against a view box -
+   DAT_00624374, g_viewTopMargin, g_viewMaxX and g_viewMaxY - and the
+   source rectangle is adjusted by the SAME delta as the destination. So
+   the image is cropped, not squeezed [verified].
+
+   Bits 1, 2 and 4 of the flags argument choose whether the view box or
+   the destination rectangle bounds the draw. After clipping it re-tests
+   that the result is still inside the box and skips the draw entirely
+   if not.
+
+2.1.  The clip mode is a separate argument from the flags
+
+   Section 2 attributes the clip choice to 'the flags argument'. There
+   are two flag-like arguments and it is the other one. Tracing the call
+   chain from maybe_DdSprite_Draw at instruction level [verified]:
+
+   +-------------+------------------+------------------------------------+
+   | Source      | Through          | Arrives as                         |
+   +=============+==================+====================================+
+   | sprite+0x3a | DrawScaled arg 5 | DrawSurface param_4, the flags     |
+   +-------------+------------------+------------------------------------+
+   | sprite+0x4a | DrawScaled arg 6 | DrawSurface param_5, the CLIP MODE |
+   +-------------+------------------+------------------------------------+
+
+   param_5 is the one tested with & 1, & 2 and & 4, and DrawScaled never
+   reads it - it only forwards it. So the clip behaviour is selected per
+   SPRITE by its +0x4a field, not by the blit flags at +0x3a.
+
+2.1.1.  What the three bits do
+
+   The bits are read at two points [verified]:
+
+       if ((mode & 1) || (mode & 4))
+           box = { DAT_00624374, g_viewTopMargin,
+                   g_viewMaxX,   g_viewMaxY };      /* the view box */
+       else
+           box = { 0, 0, 1, 1 };
+
+       clip = destRect;
+       if (mode & 2) clip = box;
+
+       ...then clamp clip to box, moving the source rect by the
+          same delta so the image is cropped, not scaled...
+
+   +--------+---------------------------------------------------------+
+   | Bit    | Effect                                                  |
+   +========+=========================================================+
+   | 1 or 4 | clip against the VIEW box rather than a degenerate one  |
+   +--------+---------------------------------------------------------+
+   | 2      | start from the box instead of the destination rectangle |
+   +--------+---------------------------------------------------------+
+
+   With neither bit 1 nor bit 4 the box collapses to {0, 0, 1, 1} and
+   the draw is clipped away to almost nothing. That is only reachable
+   with a mode of 0 or 2, and the constructor leaves +0x4a at 0 - so any
+   sprite drawn without its mode being set would be invisible. Section
+   6.3.2 of dd-statics.txt records that exactly one sprite in the
+   program ever has +0x4a written, which makes this worth restating:
+   every other sprite passes 0 here.
+
+   o That does not mean they are invisible. maybe_DdSprite_Draw's caller
+     may pass a non-zero mode of its own, and the +0x4a default only
+     applies when the caller passes 0. What it does mean is that the
+     DEFAULT is a degenerate clip, so the mode is normally supplied per
+     call rather than per sprite.
+
+   o The one sprite with a stored mode gets 1, 4 or 6 from FUN_004121e0
+     depending on screen mode, widescreen and fullscreen - and 6 is 4|2,
+     which selects the view box AND starts the clip from it. That is
+     what a full-screen background image needs.
+
+
+3.  The colour key, confirmed
+
+   When the key argument is non-zero, two byte triples are packed into
+   16-bit values and DDBLT_KEYSRCOVERRIDE, 0x10000, is OR-ed into the
+   blit flags [verified]:
+
+       key = (b >> g_shrB) << g_shlB
+           | (g >> g_shrG) << g_shlG
+           | (r >> g_shrR) << g_shlR
+
+   Those six globals are the runtime pixel-format values that
+   subsystems/pixel-format.txt describes Cdd_InitCapsVariables deriving
+   from the primary surface. So colour keys are converted at draw time
+   using the actual surface layout rather than a hardcoded 565 - which
+   is one less thing for a port to unpick.
+
+   This CONFIRMS a reading left as [inferred] in subsystems/dd-
+   statics.txt. The texture bank entry has two adjacent 3-byte fields at
+   +0x34 and +0x37 that share a default of 00 ff 00, and that was
+   guessed to be a DDCOLORKEY low and high pair on shape alone. They are
+   passed here as exactly the source key low and high.
+
+4.  Two draw paths
+
+   +-----------+---------------------------------------------------+
+   | this+0x34 | Path                                              |
+   +===========+===================================================+
+   | -1        | plain maybe_Surface_Blt, source rect to dest rect |
+   +-----------+---------------------------------------------------+
+   | a handle  | a textured quad through FUN_00485e50              |
+   +-----------+---------------------------------------------------+
+
+   The 3D path normalises the source rectangle into UVs against the
+   surface size less DAT_004e4f94, builds a four-corner vertex block and
+   passes the texture handle with a white Color_Pack16(255,255,255). So
+   the same call site draws either a DirectDraw blit or a textured quad
+   depending on whether the surface has a texture handle, and -1 is the
+   sentinel [verified].
+
+   That is the seam a port cares about: 2D drawing is already expressed
+   as a textured quad whenever hardware is available, so the software
+   blit is the fallback rather than the primary path.
+
+5.  The deferred blit queue
+
+   When maybe_g_deferBlits is set the function records the blit instead
+   of issuing it, into four parallel arrays indexed by
+   maybe_g_deferredBlitCount [verified]:
+
+   +------------+-------------+----------------------------------+
+   | Array      | Per entry   | Holds                            |
+   +============+=============+==================================+
+   | 0x005d93d0 | 4 dwords    | the source rect                  |
+   +------------+-------------+----------------------------------+
+   | 0x005d9c28 | 4 dwords    | the destination rect             |
+   +------------+-------------+----------------------------------+
+   | 0x005d63b8 | 0x19 dwords | the DDBLTFX block                |
+   +------------+-------------+----------------------------------+
+   | 0x005d32a0 | 5 dwords    | dest, surface, source, flags, fx |
+   +------------+-------------+----------------------------------+
+
+   The count is capped at 0x60 = 96 and a blit beyond that is silently
+   dropped.
+
+   This identifies the four buffers that maybe_Cdd_ResetBlitQueue zeroes
+   - 0x1e0, 0x180, 0x180 and 0x960 dwords. Every one of those is exactly
+   96 entries of the sizes above, which confirms the cap from the other
+   direction. That function was previously named maybe_Cdd_ClearBuffers
+   because the buffers were unidentified.
+
+6.  What this means for the port
+
+   o The clipping is arithmetic on rectangles and ports unchanged. It
+     does not depend on DirectDraw at all.
+
+   o The colour key becomes an alpha test or a shader compare. It is
+     already computed through the runtime pixel format, so nothing here
+     is hardcoded to 565.
+
+   o The two draw paths collapse into one. Under D3D9 everything is a
+     textured quad, so the -1 branch and maybe_Surface_Blt both
+     disappear.
+
+   o The deferred queue may be worth keeping in spirit. Batching draws
+     is exactly what a modern renderer wants, though 96 fixed slots and
+     four parallel arrays is not the shape to copy.
+
+7.  Open questions
+
+   o What consumes the deferred queue. Something must walk those four
+     arrays and issue the blits; that function has not been found, and
+     maybe_g_deferBlits has no located writer.
+
+   o FUN_00485e50, the textured-quad emitter, is outside dd.cpp and
+     unread. It is the join between this 2D path and the 3D renderer.
+
+   o DAT_004e4f94 is subtracted from both dimensions before the UVs are
+     computed, which looks like a texel-centre or border adjustment.
+
+   o Two of the three error codes the retry loop distinguishes,
+     0x88760096 and 0x887601ae, have not been decoded.

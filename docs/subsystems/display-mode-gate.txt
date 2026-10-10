@@ -1,0 +1,291 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                         THE DISPLAY MODE GATE
+
+
+Abstract
+
+   Where the 16-bit lock is actually enforced. There are TWO gates, they
+   behave differently, and BOTH have been patched in the binary this
+   project analyses - so this note is written against the original
+   bytes, not the decompiler's output.
+
+   The headline finding is that the primary gate is a RETRY LOOP with an
+   Abort/Retry/Ignore dialog, not a refusal to start. The game asks the
+   user to go and change Windows' colour depth, then re-reads the mode.
+
+   +-------------------------------+------------+
+   | Item                          | Address    |
+   +===============================+============+
+   | maybe_Cdd_ValidateDisplayMode | 0x0045a660 |
+   +-------------------------------+------------+
+   | the gate inside Cdd_Init      | 0x0047642d |
+   +-------------------------------+------------+
+   | maybe_g_primaryBitDepth       | 0x004ee9a8 |
+   +-------------------------------+------------+
+   | maybe_g_primaryIsRGB       | 0x004ee9e8    |
+   +-------------------------------+------------+
+   | maybe_g_msg16BitRequired      | 0x0053b8ac |
+   +-------------------------------+------------+
+   | maybe_g_isNarrowMode          | 0x004ee9a4 |
+   +-------------------------------+------------+
+   | message table entry           | 0x004e3938 |
+   +-------------------------------+------------+
+
+Table of Contents
+
+   1. Two gates, two behaviours
+   2. The retry loop
+   3. The gate inside Cdd_Init
+      3.1. What arms it, and why that matters
+   4. The localized message table
+   5. What the lock is actually made of
+   6. What this means for the port
+   7. Open questions
+
+1.  Two gates, two behaviours
+
+   +--------------+-------------------------------+-------------------------+
+   |              | maybe_Cdd_ValidateDisplayMode | Cdd_Init                |
+   +==============+===============================+=========================+
+   | Depth source | GetDisplayMode, live          | maybe_g_primaryBitDepth |
+   +--------------+-------------------------------+-------------------------+
+   | Also checks  | width >= 640                  | nothing                 |
+   +--------------+-------------------------------+-------------------------+
+   | On failure   | modal retry loop              | log + AfxMessageBox     |
+   +--------------+-------------------------------+-------------------------+
+   | Can quit     | App_Abort on Abort            | returns failure         |
+   +--------------+-------------------------------+-------------------------+
+   | Patched byte | 0x0045a7ca                    | 0x0047642d              |
+   +--------------+-------------------------------+-------------------------+
+
+   Both read the SAME localized string through maybe_g_msg16BitRequired,
+   which is independent confirmation that the two gates guard one
+   requirement rather than two different ones [verified].
+
+2.  The retry loop
+
+   maybe_Cdd_ValidateDisplayMode takes one argument, whether to enforce
+   the 640x480 minimum. Main_InitAndParseCommandLine passes 1 at
+   0x00415067; FUN_004329a5 in event.cpp passes 0 at 0x00433361, so the
+   later call re-validates depth only [verified].
+
+   Reconstructed against the ORIGINAL bytes:
+
+       while (true) {
+           DDSURFACEDESC d = {0};
+           d.dwSize  = 0x6c;
+           d.dwFlags = 0x1004;
+           if (GetDisplayMode(&d) != DD_OK) return;
+
+           if (enforceMinResolution)
+               maybe_g_isNarrowMode = (d.dwWidth <= 640);
+
+           if (!enforceMinResolution || d.dwWidth >= 640
+               || g_ddUsingEnumeratedDevice
+               || g_ddUsingDefaultDevice != 1) {
+               if (d.ddpfPixelFormat.dwRGBBitCount == 16)
+                   return;                      /* the only way out */
+               msg = maybe_g_msg16BitRequired;
+           } else {
+               msg = "At least 640x480 mode required";
+           }
+
+           Cdd_MessageBox(msg);                 /* to the log */
+           r = MessageBoxA(hWnd, msg, "MOTO RACER", 0x40112);
+           if (r == 0 || r == IDABORT) App_Abort();
+           /* IDRETRY and IDIGNORE both fall through and loop */
+       }
+
+   0x40112 decodes as MB_ABORTRETRYIGNORE | MB_ICONHAND | MB_DEFBUTTON2
+   | MB_TOPMOST [verified]. Abort quits; Retry and Ignore both re-read
+   the display mode. The loop terminates only when the mode becomes
+   acceptable or the user aborts, which is the 1997 idiom: leave the
+   dialog up, let the user change colour depth in Display Properties,
+   then press Retry.
+
+   The depth is read from ddsd.ddpfPixelFormat.dwRGBBitCount, at 0x48 +
+   0x0c = 0x54 into the DDSURFACEDESC. The decompiler shows it as a bare
+   stack slot rather than a struct field, which is why it reads as an
+   unexplained local.
+
+   The function wraps the dialog in Screen3D_EndFrame and
+   Screen3D_BeginFrame when a frame is open, the same courtesy the error
+   reporters use - see subsystems/dd-errors.txt.
+
+3.  The gate inside Cdd_Init
+
+   Simpler, and it does not loop [verified]:
+
+       if (maybe_g_primaryIsRGB) {
+           if (maybe_g_primaryBitDepth != 16) {
+               Cdd_MessageBox(maybe_g_msg16BitRequired);
+               Cdd_MessageBox("\n");
+               AfxMessageBox(maybe_g_msg16BitRequired, MB_ICONEXCLAMATION, 0);
+               goto fail;            /* Cdd_Init returns failure */
+           }
+       }
+
+   maybe_g_primaryBitDepth and maybe_g_primaryIsRGB are both written
+   by Cdd_InitCapsVariables, the function that derives the runtime RGB
+   shifts and masks from the primary surface - see subsystems/pixel-
+   format.txt. So this gate tests the surface the renderer will actually
+   use, where the retry loop tests the desktop mode.
+
+   ANSWERED. maybe_g_primaryIsRGB (renamed from maybe_g_depthCheckArmed,
+   which was a wrong guess) is not a switch at all - it means the
+   primary surface reported a usable RGB pixel format.
+   Cdd_InitCapsVariables sets it only when the IDirectDraw and the
+   primary surface both exist, GetPixelFormat succeeds, and the returned
+   dwFlags carries DDPF_RGB (0x40). See section 3.1 [verified].
+
+3.1.  What arms it, and why that matters
+
+   maybe_g_primaryIsRGB is set in one place, Cdd_InitCapsVariables at
+   0x00473c65, and only when every one of these holds [verified]:
+
+   +------------------------------------------------+------------+
+   | Condition                                      | Where      |
+   +================================================+============+
+   | DAT_005d922c, the IDirectDraw, is non-null     | 0x00473bc0 |
+   +------------------------------------------------+------------+
+   | DAT_005d8938, the primary surface, is non-null | 0x00473bd0 |
+   +------------------------------------------------+------------+
+   | GetPixelFormat (vtable +0x54) returned 0       | 0x00473bf8 |
+   +------------------------------------------------+------------+
+   | the returned dwFlags has DDPF_RGB (0x40)       | 0x00473c3f |
+   +------------------------------------------------+------------+
+
+   The DDPIXELFORMAT is a local at EBP-0x30 with dwSize preset to 0x20
+   and dwFlags preset to 0x40 before the call. The bit depth and the
+   three colour masks are stored in the same basic block, immediately
+   before the flag is raised.
+
+   So it is not a switch someone can flip to bypass the depth
+   requirement. It means WE HAVE VALID MASKS, and it gates two things at
+   once:
+
+   o the shift and mask derivation loop at 0x00473c7c, which decomposes
+     dwRBitMask, dwGBitMask and dwBBitMask into the g_shr and g_shl
+     globals that subsystems/pixel-format.txt describes
+
+   o the 16-bit depth check in Cdd_Init at 0x00476423
+
+   The consequence is worth stating: a PALETTIZED primary surface skips
+   BOTH. No usable shifts are derived, and the depth requirement is
+   silently waived. That reads like a latent defect rather than a
+   feature, but it is unreachable in practice because
+   Cdd_EnumModesCallback already filters the mode list to DDPF_RGB modes
+   at exactly 16 bpp [inferred - the path was not executed, only read].
+
+   For the port this closes the question rather than opening a door:
+   there is no legitimate bypass hiding in the original. Both gates have
+   to be removed deliberately.
+
+4.  The localized message table
+
+   maybe_g_msg16BitRequired is zero in the static image. It is filled at
+   runtime from a message table, and the entry has a regular shape
+   [verified]:
+
+       0x004e3934   0x000000b1     message id
+       0x004e3938   -> "16 bit screen mode required !"        en
+       0x004e393c   -> "Mode d'ecran 16 bits requis !"        fr
+       0x004e3940   -> "16 Bit-Bildschirmmodus benoetigt!"    de
+       0x004e3944   -> "Richiesta modalita grafica a 16 bit!" it
+       0x004e3948   -> "Requerido modo de pantalla en 16 bits!" es
+       0x004e394c   -> "Det kravs en 16 bitarsskarm"          sv
+       0x004e3950   0x000000b2     the next message id
+
+   Seven dwords, 0x1c bytes: an id then six language pointers, in the
+   order English, French, German, Italian, Spanish, Swedish. The
+   accented forms above are transliterated for this document; the binary
+   holds the real bytes.
+
+   The insert-CD message at 0x004e3d44 has exactly the same shape with
+   id 0xb9, so this is the general localized-message format and not a
+   one-off. Neighbouring ids cover "PROGRAM INCORRECTLY INSTALLED,
+   PLEASE REINSTALL IT." and a windowed-mode-unavailable message.
+
+   Because the table is indexed at runtime, none of these strings
+   carries a direct cross-reference, which is why searching for readers
+   of the string finds nothing.
+
+5.  What the lock is actually made of
+
+   The mission statement calls the game hard-locked to 16-bit colour.
+   Now that the enforcement points are identified, the lock is four
+   separate things and they need separating [verified except where
+   noted]:
+
+   +-------------------------+-------------------------------+--------------------+
+   | Layer                   | Where                         | Removable?         |
+   +=========================+===============================+====================+
+   | desktop depth gate      | maybe_Cdd_ValidateDisplayMode | yes, one branch    |
+   +-------------------------+-------------------------------+--------------------+
+   | surface depth gate      | Cdd_Init                      | yes, one branch    |
+   +-------------------------+-------------------------------+--------------------+
+   | mode enumeration filter | Cdd_EnumModesCallback         | yes, a filter      |
+   +-------------------------+-------------------------------+--------------------+
+   | RGB565 packing          | throughout screen3d\          | NO - the real work |
+   +-------------------------+-------------------------------+--------------------+
+
+   The first three are gates. Somebody has already flipped two of them
+   with two bytes, which is exactly why it is tempting to believe the
+   lock is thin. It is not: the fourth layer is the whole software
+   rasterizer plus palette conversion, blending and texture upload, and
+   no branch flip touches it.
+
+   Worth stating plainly because the patched binary probably STARTS in
+   32-bit colour and then renders incorrectly. That would be a very
+   misleading experiment to run without knowing the gates had been
+   altered [inferred - not yet tested].
+
+6.  What this means for the port
+
+   o Both gates are deleted outright, not relaxed. A D3D9 port picks its
+     own back-buffer format and never asks the desktop what depth it is.
+
+   o The retry loop goes with them. Nothing in a modern port should put
+     up a modal box telling the user to change their colour depth.
+
+   o maybe_g_isNarrowMode survives the gate's removal - it is a genuine
+     renderer input, read by maybe_Screen3D_UpdateScreen, and needs a
+     new source once the width check is gone.
+
+   o The message table is worth keeping as a format. Six languages of
+     user-facing text with stable ids is exactly what a port wants to
+     preserve, even though these two particular messages become dead.
+
+   o Do the rasterizer's 5/6/5 catalogue BEFORE touching either gate.
+     Opening the gates without it produces a build that runs and draws
+     garbage, which is harder to debug than one that refuses to start.
+
+7.  Open questions
+
+   o ANSWERED - see section 3.1. It is not an escape hatch: the flag
+     means the primary surface is RGB rather than palettized, and it
+     gates the mask derivation as well as the depth check.
+
+   o Whether the patched binary actually runs at 32 bpp, and what it
+     looks like. This is directly testable and would measure how much of
+     the lock lives in the rasterizer rather than the gates.
+
+   o The translation unit of maybe_Cdd_ValidateDisplayMode. Its address
+     falls in code-map's guessed pageMainMenu.cpp range, which is
+     clearly wrong for a DirectDraw mode validator. The Cdd_ prefix is
+     by behaviour, not by an anchor.
+
+   o g_ddUsingEnumeratedDevice and g_ddUsingDefaultDevice both appear in
+     the width condition, letting a non-default device skip the 640x480
+     minimum. Why a device choice should waive a resolution floor is not
+     understood.
+
+   o ANSWERED. The caller is the WINDOW PROCEDURE, and the trigger is
+     WM_DISPLAYCHANGE (0x7e), with WM_SYSCOLORCHANGE (0x15) landing on
+     the same instruction at 0x0043335f. The guess was right. So the
+     retry loop has a second way out: the user changes colour depth,
+     Windows broadcasts the change, and the mode is re-validated. The 0
+     argument means depth only - the 640x480 minimum is not re-enforced
+     at runtime. See subsystems/window-proc.txt [verified].

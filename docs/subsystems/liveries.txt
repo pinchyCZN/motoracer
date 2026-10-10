@@ -1,0 +1,257 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                        BIKE LIVERIES
+
+
+Abstract
+
+   A retail grid shows a field of differently-coloured bikes.  They
+   are all the SAME MESH and the same 256x256 page: what differs is
+   which of the page's eight palettes resolves it.
+
+   The colour is not random and it is not a per-rider table.  It is
+   the racer's own INDEX in the roster, and it is carried from the
+   roster builder to the queue on one integer that this project
+   spent a long time calling something else.
+
+Table of Contents
+
+   1. Who gets which colour
+   2. Where the number is kept
+      2.1. The bike select page writes three of the four
+   3. How it reaches the pixels
+   4. The port
+      4.1. The order the port has to get right
+   5. Open questions
+
+1.  Who gets which colour
+
+   maybe_Game_CreateRacers (0x00410b8c) builds the roster.  Its
+   opponent loop is the whole rule [verified]:
+
+       source = bank[0].nSubPageCount ? g_nSelectedBike : -1
+
+       player       Racer_Create(r, 1, 1, source, 0)
+
+       opponent i   r->bikeIndex = 0
+                    if      source == -1        arg = -1
+                    else if i - 1 == source     arg = 0
+                    else                        arg = i - 1
+                    Racer_Create(r, 0, 1, arg, 0)
+
+   and Racer_Create masks the argument with 7.  So, with the player
+   at roster index 1 and the opponents from 2 up:
+
+       player      livery = g_nSelectedBike & 7
+       opponent i  livery = (i - 1) & 7, or 0 when it would have
+                   matched the player's
+
+   THE FIELD CYCLES THROUGH THE EIGHT LIVERIES IN GRID ORDER.  It
+   reads as random on screen only because the grid order is not the
+   running order.
+
+   NOBODY WEARS THE PLAYER'S COLOUR, nearly.  The substitution
+   compares BEFORE the mask, so an opponent whose index reaches
+   i - 1 == 8 while the player is on livery 0 is not caught and
+   does duplicate it.  That is the original's behaviour and the
+   reconstruction keeps it.
+
+   -1 MEANS NOT PALETTED and travels the whole way down.  It is what
+   the roster uses when the bike page reports no sub-pages, and it
+   is what the two cull variants branch on.
+
+   EVERY OPPONENT RIDES BIKE 0.  The loop writes bikeIndex = 0
+   before each Racer_Create, so the AI's carac - its speed, mass and
+   grip - is the first bike's, whatever the player picked.  Only the
+   PLAYER's bikeIndex is g_nSelectedBike.  One mesh is loaded for
+   the whole race, by maybe_Game_LoadBikeMeshes.
+
+2.  Where the number is kept
+
+   On the MODEL INSTANCE, at +0x14c, and a racer has four of them.
+   Racer_Create writes the same value to all four - +0x170, +0x2f4,
+   +0x478 and +0x5fc - with one exception [verified]:
+
+   +--------------+----------------+-----------------------------+
+   | Instance     | Offset in      | Gets the livery             |
+   |              | MR_Racer       |                             |
+   +==============+================+=============================+
+   | 0 body       | +0x0170        | always                      |
+   +--------------+----------------+-----------------------------+
+   | 1 front      | +0x02f4        | only when param_4 != -1     |
+   +--------------+----------------+-----------------------------+
+   | 2 rear       | +0x0478        | only when param_4 != -1     |
+   +--------------+----------------+-----------------------------+
+   | 3 skeleton   | +0x05fc        | always                      |
+   +--------------+----------------+-----------------------------+
+
+   THE WHEELS ARE CONDITIONAL AND THE CONDITION IS THE BIKE FAMILY.
+   Racer_Create opens by forcing param_4 to -1 when
+   g_bikeCarac[bikeIndex].PersoAnim is 1 - the dirt bikes - and
+   every caller passes 0.  So road bikes have coloured wheels and
+   dirt bikes do not.
+
+   INSTANCE 3 IS THE ONE THAT MATTERS.  It has no mesh; its livery
+   is what maybe_Racer_Draw dispatches the POSE ARRAY on, part by
+   part [verified, 0x00461a30] - and the pose array is the bike body
+   AND the rider.  So +0x5fc is the livery you actually see, and
+   +0x170 belongs to an instance holding g_meshSkl that nothing
+   draws as a mesh.
+
+   In a race the distinction is invisible, because Racer_Create
+   writes both from one argument.  Section 2.1 is where it is not.
+
+2.1.  The bike select page writes three of the four
+
+   MenuPage10_BikeSelect_Tick recomputes the livery every frame as
+   the selection spins, and stores it to exactly three addresses
+   [verified, the three MOVs at 0x0044efbb]:
+
+   +--------------+----------------+-----------------------------+
+   | Address      | Racer 1 offset | Instance                    |
+   +==============+================+=============================+
+   | 0x00584a1d   | +0x05fc        | 3, the pose draw            |
+   +--------------+----------------+-----------------------------+
+   | 0x00584715   | +0x02f4        | 1, front wheel              |
+   +--------------+----------------+-----------------------------+
+   | 0x00584899   | +0x0478        | 2, rear wheel               |
+   +--------------+----------------+-----------------------------+
+
+   +0x170 IS NOT AMONG THEM and nothing else writes it either - it
+   has no xref at all, because Racer_Create reaches it through a
+   register.  A reconstruction that colours the bike from +0x170
+   therefore works in a race and shows one fixed colour on the
+   select page, which is exactly the bug this section exists to
+   stop.
+
+   IT DOES NOT REPEAT THE DIRT-BIKE EXCEPTION either.  The page
+   writes all three flat, so a cross bike has coloured wheels here
+   and plain ones in a race.
+
+3.  How it reaches the pixels
+
+   ModelInstance_Draw (0x0048c030) branches on the SIGN and passes
+   the value on [verified]:
+
+       if (livery >= 0)
+           Screen3D_CullAndQueueFaces  (verts, faces, n, livery)
+       else
+           Screen3D_CullAndQueueFacesEx(verts, faces, n, 1)
+
+   and Screen3D_CullAndQueueFaces (0x0049c110) hands it to exactly
+   one place - its submit step [verified]:
+
+       if (bank[face->wBankIndex].nSubPageCount == 0)
+           Screen3D_QueuePrimitive        (face, camZ, verts,
+                                           flags, 0)
+       else
+           Screen3D_QueuePrimitivePaletted(face, camZ, verts,
+                                           livery, flags)
+
+   THAT IS WHAT SETTLES WHAT THE FIELD IS.  It is never compared,
+   never used to choose a mesh and never used to drop detail; it is
+   passed to the paletted queue function in the palette position and
+   nowhere else.  The split is on the BANK - has palettes or does
+   not - and the argument is the selector within it.
+
+   Note the argument order: the palette comes BEFORE the flags in
+   the paletted sibling, and after them in the plain one.
+
+4.  The port
+
+   The reconstruction carried this field as MR_ModelInstance
+   .detailLevel with a note saying it had nowhere to go, and
+   cull_and_queue_faces had only three arguments.  The visible
+   result was a grid of identical bikes: race.c set ONE palette on
+   the bike bank for the whole race and every racer drew through it.
+
+   What the port does now:
+
+   +---------------------------+----------------------------------+
+   | MR_ModelInstance.livery   | was detailLevel                  |
+   +---------------------------+----------------------------------+
+   | MR_Racer.livery  +0x170   | was inside unk_0170[16]          |
+   +---------------------------+----------------------------------+
+   | .liveryFrontWheel +0x2f4  | was inside unk_01cc              |
+   +---------------------------+----------------------------------+
+   | .liveryRearWheel  +0x478  | was inside unk_0350              |
+   +---------------------------+----------------------------------+
+   | .liveryRider      +0x5fc  | was inside unk_0350. THE POSE    |
+   |                           | DRAW USES THIS ONE               |
+   +---------------------------+----------------------------------+
+   | cull_and_queue_faces      | takes the livery, fourth         |
+   +---------------------------+----------------------------------+
+   | queue_primitive_paletted  | Screen3D_QueuePrimitivePaletted  |
+   +---------------------------+----------------------------------+
+   | MR_QueueNode.palette      | the livery, -1 when not paletted |
+   +---------------------------+----------------------------------+
+   | r_set_texture(bank, pal)  | one texture per pair             |
+   +---------------------------+----------------------------------+
+
+   TWO DELIBERATE DIVERGENCES, both in the back end:
+
+   o THE QUEUE NODE HOLDS AN INDEX, NOT A POINTER.  The original
+     stores the palette POINTER at node+0x10 because its span
+     renderer indexes the table per texel.  Ours resolves a palette
+     into RGBA at texture-upload time, so what the draw needs is
+     WHICH palette.  Same four bytes at the same offset.
+
+   o ONE TEXTURE PER BANK AND PALETTE.  Recolouring costs the
+     original nothing; for D3D9 the equivalent is a texture each,
+     built on first use.  A race that shows three liveries builds
+     three.
+
+   race.c assigns the liveries straight after
+   racer_place_from_grid, which memsets the array - a write before
+   it is lost.
+
+4.1.  THE ORDER THE PORT HAS TO GET RIGHT
+
+   The liveries are chosen on whether the bike page carries
+   palettes - bank_get(RACE_BIKE_BANK)->paletteCount > 1 - and
+   race_load_bike is what LOADS that page.  Choosing before it runs
+   finds no palettes, puts -1 on every racer, and draws the whole
+   field in one colour.
+
+   IT LOOKS INTERMITTENT, AND THAT IS THE WORST PART OF IT.  A bank
+   OUTLIVES ITS RACE: the second race of a session finds the
+   previous one's page still resident, reports eight palettes and
+   works.  So the fault shows on the first race after launching,
+   disappears on the retry meant to reproduce it, and appears to
+   belong to whichever bike happened to be selected that time.
+
+   Probed live, with the field all one colour on screen:
+
+       racer 1  bikeIndex 1     livery -1
+       racers 2..7  bikeIndex 0 livery -1
+       bank 28  SPEED\BNK00_00.RAW  indexed, 8 palettes
+
+   - eight palettes present and every racer reading -1, which is
+   only possible if the count was read before the load.
+
+   o AND THE BIKE INDEX IS A RED HERRING HERE.  Opponents all ride
+     bike 0 by design (section 1) while the player rides his own,
+     so "they are all the same bike as me" is about the COLOUR and
+     not the model - every racer draws from one loaded mesh in this
+     port regardless.
+
+5.  Open questions
+
+   o THE KIND-0x2a SUBSTITUTION that Screen3D_QueuePrimitivePaletted
+     applies under g_cfgDetailLevel <= 1 is not reproduced.  It is a
+     detail reduction, not a colour question.  See
+     detail-levels.txt.
+
+   o WHETHER THE SHIPPED PAGE HAS EIGHT PALETTES OR ELEVEN.
+     bank_load reads BNK00_00.1 through .11 as siblings, and the
+     selectors mask with 7.  What the extra three are for is not
+     known.
+
+   o Screen3D_CullAndQueueFacesEx (0x0049b7f0) is still a stub in
+     the port, so the negative-livery path forwards to the plain
+     cull rather than to its own variant.
+
+   o THE NETWORK ROSTER takes a different branch of
+     maybe_Game_CreateRacers, passing the loop index as the livery
+     for every slot including the local player.  Not examined.

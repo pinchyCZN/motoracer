@@ -1,0 +1,1154 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                    THE DIRECT3D TEXTURE UPLOAD PATH
+
+
+Abstract
+
+   The hardware texture path is the most general colour code in the
+   binary. It queries the device for a texture format and converts into
+   whatever it reports: any channel widths, any channel order, with or
+   without alpha [verified]. Nothing here is locked to 565, to 555, or
+   to 16 bits.
+
+   That is a useful result for the mission. The renderer's format
+   problems live in the software rasterizer and the texture bank, not in
+   the D3D upload.
+
+   +----------------------------+------------+---------------------------------------------+
+   | Function                   | Address    | Role                                        |
+   +============================+============+=============================================+
+   | maybe_Cdd_LoadRawToSurface | 0x00477b30 | reads a .RAW into a DirectDraw surface      |
+   +----------------------------+------------+---------------------------------------------+
+   | maybe_D3D_RegisterTexture  | 0x0041aee0 | registers it as a texture; 7 callers        |
+   +----------------------------+------------+---------------------------------------------+
+   | maybe_D3D_UploadTexture    | 0x0041d2b0 | creates the D3D surface and fills it        |
+   +----------------------------+------------+---------------------------------------------+
+   | Color_ConvertToTexFormat   | 0x0041f660 | one texel, surface format to texture format |
+   +----------------------------+------------+---------------------------------------------+
+
+   The chain runs load -> register -> upload. maybe_D3D_UploadTexture
+   has a single caller, maybe_D3D_RegisterTexture.
+
+Table of Contents
+
+   1. The texture format descriptor
+   2. One texel
+   3. Black is the transparent colour
+      3.1. The OTHER loader keys differently, and it is the one
+           the banks use
+   4. Three texel formats
+      4.1. Palette reduction for the 4-bit path
+   5. The third .RAW loader, and the effects atlas
+      5.1. Four filenames are hardcoded
+      5.2. Luminance-keyed translucency
+         5.2.1. What the rectangles actually contain
+         5.2.2. All four bikes, checked
+            5.2.2.1. Only two distinct images exist
+            5.2.2.2. What matches and what differs
+            5.2.2.3. A difference outside both rectangles
+      5.3. The colour space pair
+      5.4. What this means for the port
+   6. Registration, and where the descriptor lives
+      6.1. The descriptor array
+      6.2. Descriptor fields
+      6.3. The dump mislabels two fields
+      6.4. Choosing a format, and the diagnostic dump
+      6.5. The descriptor author is in an undefined function
+   7. Corroboration of the texture bank record
+   8. Texture slots and handles
+      8.1. Fifty slots, six parallel arrays
+      8.2. From a primitive to a handle
+      8.3. The handle is only re-sent when it changes
+      8.4. Freeing
+      8.5. Palettes are a second, parallel slot system
+      8.6. A bank holds sixteen sub-textures
+      8.7. The COM chain per slot
+      8.8. Slots can share a surface
+      8.9. The descriptor is a DDSURFACEDESC with fields appended
+      8.10. How a format is chosen, corrected
+      8.11. The diagnostic dump names the device caps
+         8.11.1. Two of these are load-bearing
+         8.11.2. The memory report
+         8.11.3. The two unprinted caps, and where they all come from
+         8.11.4. A caution about the dump's own labels
+   9. What this means for the port
+   10. Open questions
+
+
+1.  The texture format descriptor
+
+   Color_ConvertToTexFormat takes a descriptor as its second argument.
+   The fields it reads pin the layout [verified] except where noted:
+
+   +--------+------+---------------------------------------------+
+   | Offset | Type | Meaning                                     |
+   +========+======+=============================================+
+   | +0x70  | u32  | non-zero if the format has alpha [inferred] |
+   +--------+------+---------------------------------------------+
+   | +0x74  | u8   | red bits                                    |
+   +--------+------+---------------------------------------------+
+   | +0x78  | u8   | blue bits                                   |
+   +--------+------+---------------------------------------------+
+   | +0x7c  | u8   | green bits                                  |
+   +--------+------+---------------------------------------------+
+   | +0x80  | u32  | alpha bits; tested against 4                |
+   +--------+------+---------------------------------------------+
+   | +0x88  | u8   | red shift                                   |
+   +--------+------+---------------------------------------------+
+   | +0x8c  | u8   | green shift                                 |
+   +--------+------+---------------------------------------------+
+   | +0x90  | u8   | blue shift                                  |
+   +--------+------+---------------------------------------------+
+   | +0x94  | u8   | alpha shift                                 |
+   +--------+------+---------------------------------------------+
+
+   Note the order: red, blue, green for the widths, but red, green, blue
+   for the shifts. Not a transcription error, and worth preserving if
+   the struct is ever declared in Ghidra.
+
+2.  One texel
+
+   ushort Color_ConvertToTexFormat(ushort src, TexFormat *f, int keyBlack)
+   {
+       r = ((src & g_maskR) >> g_shlR) << g_shrR;   // to 8 bits
+       g = ((src & g_maskG) >> g_shlG) << g_shrG;
+       b = ((src & g_maskB) >> g_shlB) << g_shrB;
+
+       if (f->alphaMask == 0 || (r + g + b == 0 && keyBlack == 1))
+           a = 0;
+       else {
+           a = (f->alphaBits == 4) ? 15 : 1;
+           if (r + g + b == 0)
+               b = 1;
+       }
+
+       return (g >> (8 - f->gBits)) << f->gShift
+            | (r >> (8 - f->rBits)) << f->rShift
+            | (b >> (8 - f->bBits)) << f->bShift
+            | a                     << f->aShift;
+   }
+
+   Two conversions back to back: the surface pixel is widened to 8 bits
+   per channel using the g_shr path described in pixel-format.txt
+   section 1.1.2, then narrowed again into the texture's own widths.
+   Going through 8 bits rather than converting directly is what makes it
+   work for any pair of formats.
+
+   The alpha value is written as (-(alphaBits == 4) & 0xe) + 1, which is
+   15 for a 4-bit alpha channel and 1 for a 1-bit one. So the code
+   handles exactly the two alpha depths a DX3-era device would offer,
+   and saturates whichever it gets.
+
+3.  Black is the transparent colour
+
+   This is the part worth knowing before touching anything.
+
+   A texel whose three channels sum to zero is pure black, and pure
+   black is the colour key. When keyBlack is set, such a texel gets
+   alpha 0 and disappears [verified].
+
+   The consequence is that genuine black artwork would vanish, so the
+   code defends against it twice.
+
+   First, in Color_ConvertToTexFormat: when a texel is black but keying
+   is not requested, blue is forced to 1 rather than 0. That is the
+   minimum possible nudge, one step of the least significant channel,
+   and it keeps the texel out of the key without visibly changing it.
+
+   Second, in maybe_D3D_UploadTexture, every palette entry is compared
+   against a floor derived from g_cfgOpaqueBlackLevel and raised to it
+   if all three channels fall below:
+
+   floor  = (g_cfgOpaqueBlackLevel + 1) << (8 - bits)     per channel
+
+   config-globals.txt records -OpaqueBlackLevel<n> at 0x004e4f48 as
+   taking a value that is clamped out of [1..3] to 3, or 0. This is what
+   that setting does: it sets how far a near-black colour is pushed away
+   from the key. Higher values are safer against black vanishing and
+   wash out dark artwork more.
+
+   Palette index 0 is separately and unconditionally transparent: the
+   upload loop writes 0 for a source index of 0 without consulting the
+   palette at all.
+
+3.1.  The OTHER loader keys differently, and it is the one the banks use
+
+   Everything above is maybe_D3D_UploadTexture, reached only when the
+   caller already holds a surface. maybe_D3D_RegisterTexture's other
+   branch - srcSurface == 0, which is what every menu page takes -
+   goes to maybe_D3D_LoadRawToTexture instead, and that function has
+   its own rules [verified, 0x0041c050].
+
+   Which rule applies depends on the .raw's own colour count, not on
+   any argument:
+
+   +--------------------+--------------------------------------------+
+   | colours == 0       | alpha 0 when the texel quantises to black: |
+   | (truecolour)       | r<1<<(8-g_bitsR) && g<.. && b<..           |
+   +--------------------+--------------------------------------------+
+   | colours 1..256     | alpha 0 when the INDEX is 0. The colour is |
+   | (paletted)         | never examined.                            |
+   +--------------------+--------------------------------------------+
+
+   Neither consults keyBlack. On a 565 surface the truecolour test is
+   r<8 && g<4 && b<8 - precisely the texels whose RGB565 word is zero
+   - so a port that has already quantised to 565 tests for zero and is
+   exact, not approximate.
+
+   KEYBLACK RUNS BEFORE THAT TEST AND ONLY EVER PROTECTS. When set it
+   maps (0,255,0) onto black, and raises any texel below the
+   OpaqueBlackLevel floor UP to the floor so it stays opaque. So
+   keyBlack = 1 keys less black than keyBlack = 0, the name reads
+   backwards, and the OpaqueBlackLevel floor described above reaches
+   this path only through it. See texture-banks.txt section 5.2.2.
+
+   EXACTLY ONE CALLER SETS IT: maybe_Cdd_LoadRawToSurface, at
+   0x00478844 [verified]. Its users are the horizon backdrop banks
+   4/5/6, App_Init, Cdd_Init, FUN_00479080 and FUN_004121e0. So on the
+   truecolour path -OpaqueBlackLevel affects the BACKDROP and nothing
+   else; every other truecolour page takes the unconditional black key
+   with no floor.
+
+   All four menu artwork pages examined - TITLEDSI\BNK00_00.RAW,
+   TITLEDSI\BNK00_01.RAW, TITLEMR\BNK00_00.RAW, TITLEGP\BNK00_00.RAW
+   - are mhwanh v4, 256x256, colours = 0, so all four take the
+   truecolour rule.
+
+4.  Three texel formats
+
+   maybe_D3D_UploadTexture branches on the device's palette capability
+   flags, taken from the surface description at +0x4c [inferred]:
+
+   +-------+---------------------------------------+-------------------------+
+   | Value | Meaning                               | Texel                   |
+   +=======+=======================================+=========================+
+   | 0     | no palette support                    | 16-bit direct           |
+   +-------+---------------------------------------+-------------------------+
+   | 9     | DDPCAPS_4BIT + 8BITENTRIES            | 4-bit index, 4 per word |
+   +-------+---------------------------------------+-------------------------+
+   | 0x4c  | DDPCAPS_8BIT + ALLOW256 + 8BITENTRIES | 8-bit index             |
+   +-------+---------------------------------------+-------------------------+
+
+   The direct path converts every texel through
+   Color_ConvertToTexFormat. The two palettised paths build a DirectDraw
+   palette with CreatePalette and write indices instead.
+
+   The 4-bit path is the interesting one. Indices are packed four to a
+   16-bit word, and the writer switches on the low two bits of the
+   destination offset to mask and shift into the right nibble, with
+   masks 0xfff0, 0xff0f, 0xf0ff and 0x0fff.
+
+4.1.  Palette reduction for the 4-bit path
+
+   A 4-bit texture has 16 entries and the source palette has up to 32,
+   so the code quantises [verified]:
+
+   for (pass = 0; pass < 5; pass++) {
+       mask = -8 << pass;              // 0xf8, 0xf0, 0xe0, 0xc0, 0x80
+       quantise all entries with mask;
+       merge entries that are now identical;
+       if (distinct <= 16) break;
+   }
+
+   Each pass throws away one more low bit per channel and re-merges. It
+   stops as soon as sixteen or fewer distinct colours remain, or after
+   five passes. A remap table is then built so texel indices follow the
+   merge.
+
+   That is a real, if crude, colour quantiser, and it only runs on
+   hardware that cannot do 8-bit palettes.
+
+5.  The third .RAW loader, and the effects atlas
+
+   maybe_D3D_LoadRawToTexture at 0x0041c050 is the Dsi_d3d.cpp anchor
+   and a third .RAW loader, distinct from the two in formats/raw-
+   texture.txt. It goes straight from file into a locked D3D texture
+   surface, without the intermediate DirectDraw surface that
+   maybe_Cdd_LoadRawToSurface uses [verified].
+
+   It reads the same 0x20-byte mhwanh header and takes the same
+   descriptor as its third argument, which adds two fields to the layout
+   in section 1:
+
+   +--------+------+---------------------------------+
+   | Offset | Type | Meaning                         |
+   +========+======+=================================+
+   | +0x4c  | u32  | palette capability bits         |
+   +--------+------+---------------------------------+
+   | +0x54  | u32  | bits per pixel: 8, 0x10 or 0x20 |
+   +--------+------+---------------------------------+
+
+   So the descriptor drives three output depths. Each narrows with
+   rounding rather than truncation: a channel is nudged by (1 << (7 -
+   bits)), clamped to 0xff, and only then shifted down. A small quality
+   detail that a reimplementation should copy.
+
+   The palettised path builds its 256-entry palette as TRUE RGB555 and
+   converts from that, which is the interchange pattern already
+   described in pixel-format.txt section 3. It also loads per-circuit
+   palette variants from _1 through _7 sibling files, the same mechanism
+   Bankw_LoadRawTexture uses.
+
+5.1.  Four filenames are hardcoded
+
+   Before converting anything, the loader strcmps the bank's stored
+   source path against four literals [verified]:
+
+       data\SpeedPkt\bnk00_01.raw
+       data\speed\bnk00_01.raw
+       data\ktmcross\bnk00_01.raw
+       data\KTMpkt\bnk00_01.raw
+
+   Those are the four bikes, the same set as the CARAC tables in
+   formats/bpt-carac.txt, and bnk00_01 is page 1 of their texture bank.
+   On a match, two rectangles are armed. Everything outside them is
+   fully opaque; inside them the alpha is special.
+
+   +------------+----------------------+-------------------+
+   | Page width | Rect A (HSV-keyed)   | Rect B (alpha 8)  |
+   +============+======================+===================+
+   | 0x100      | x 222..255, y 0..255 | x 0..119, y 0..40 |
+   +------------+----------------------+-------------------+
+   | 0x80       | x 111..127, y 0..127 | x 0..59, y 0..20  |
+   +------------+----------------------+-------------------+
+
+   The half-size variant is selected by bit 8 of a flag byte in the bank
+   record, and every bound is exactly half. So the rectangles are
+   expressed in page coordinates and scale with the texture.
+
+   Every shipped bnk00_01.raw is 256 wide, so that branch never fires on
+   the stock data. It presumably covers the case where a texture has
+   been halved by the -MaxTextureWidth or -MaxTextureHeight limits
+   documented in subsystems/config-globals.txt [inferred].
+
+5.2.  Luminance-keyed translucency
+
+   Rect B is simple: alpha 8 out of 15, a flat half-transparency.
+
+   Rect A is not. Each texel is converted to HSV by Color_RgbToHsv
+   (0x0041bb20), the alpha is taken from the result, the value component
+   is then scaled by a constant, and Color_HsvToRgb (0x0041bd30)
+   converts back. The stored texel is the brightened colour with a
+   brightness-derived alpha [verified].
+
+   THE TWO CONSTANTS AND THE ROUNDING ARE NOW PINNED, read off
+   0x0041cef7..0x0041cf10 [verified]:
+
+       alpha = (int)(v * 16.0)      0x004d0640, TRUNCATED
+       v     = v * 5.0              0x004d0648
+
+   so the alpha is four bits from the brightness and the value is
+   lifted FIVE-FOLD.  v == 1.0 gives 16, one past the 4-bit range.
+
+   THE OVERFLOW IS DESIGNED.  Color_HsvToRgb clamps each channel at
+   255 and prints "Depassement pour teinte R %d" when it does, so a
+   five-fold lift saturating is the intended behaviour and not
+   something a port should avoid.
+
+   THE HSV PAIR ITSELF IS TEXTBOOK, and its constants say so: 1/255
+   on the way in (0x004d05e8), sector offsets 2 and 4 (0x004d0600,
+   0x004d0608), 60 degrees a sector (0x004d0610), a 360 wrap
+   (0x004d0618) and 1/60 on the way back (0x004d0620).  A grey pixel
+   reports hue 400.0 (0x004d05f8) as an "undefined" sentinel.
+
+   The effect is that brighter pixels are more opaque and the colour is
+   re-saturated to compensate for being blended.
+
+   An earlier draft guessed this was a visor or windscreen. It is not.
+   Extracting SPEED/BNK00_01.RAW settles it.
+
+5.2.1.  What the rectangles actually contain
+
+   bnk00_01.raw is 256 x 256 truecolour and is the bike's particle and
+   effects atlas, not its bodywork. Decoded, it holds white sparks, an
+   orange dirt spray disc, green turf flecks, a brown dirt spray, the
+   two special rectangles, and a large unused teal background
+   [verified].
+
+   +------------+--------+------------+------------------+---------------------------------------------------------+
+   | Region     | Pixels | Pure black | Distinct colours | Content                                                 |
+   +============+========+============+==================+=========================================================+
+   | Rect A     | 8704   | 17.4%      | 215              | eight stacked 34x32 frames of a dust puff, fading light |
+   |            |        |            |                  | to dark across the sequence                             |
+   +------------+--------+------------+------------------+---------------------------------------------------------+
+   | Rect B     | 4920   | 52.2%      | 2                | a bike shadow silhouette                                |
+   +------------+--------+------------+------------------+---------------------------------------------------------+
+   | Background | -      | 0%         | 1                | opaque teal (0, 104, 96)                                |
+   +------------+--------+------------+------------------+---------------------------------------------------------+
+
+   Rect A is a smoke or dust animation, and luminance-keyed alpha is
+   exactly the right treatment for it. The puff dims across its eight
+   frames, so deriving alpha from brightness makes it fade out as it
+   dissipates, while scaling the HSV value keeps the surviving pixels
+   from going muddy. The pure black around each frame is the colour key
+   and cuts the sprite out.
+
+   Rect B is more interesting than it looks. It contains exactly TWO
+   colours: pure black for the surround, and (0, 0, 16) for the shadow
+   body [verified]. The shadow is authored at blue 16 rather than
+   black, and 16 is precisely
+
+       (g_cfgOpaqueBlackLevel + 1) << (8 - bits)
+
+   for level 1 and a 5-bit channel. So the artwork is drawn to sit
+   exactly one step above the colour key, and the OpaqueBlackLevel floor
+   described in section 3 is calibrated against it. That closes the loop
+   on why the setting exists: without it, a near-black shadow either
+   vanishes into the key or has to be drawn lighter than the artist
+   wanted.
+
+   The teal background is opaque and never sampled; it is just atlas
+   padding.
+
+
+5.2.2.  All four bikes, checked
+
+   The rectangles were first verified against SPEED only. Checking the
+   other three shows the hardcoding is sound but lists more files than
+   there are images [verified].
+
+   All four pages are 256 x 256 truecolour, so all four take the full-
+   size rectangle set. The half-size variant in the code never fires for
+   these files.
+
+5.2.2.1.  Only two distinct images exist
+
+   +----------+------------+--------+--------------+
+   | Bike     | Whole file | Rect A | Rect B       |
+   +==========+============+========+==============+
+   | SPEED    | variant 1  | shared | road shadow  |
+   +----------+------------+--------+--------------+
+   | SPEEDPKT | variant 1  | shared | road shadow  |
+   +----------+------------+--------+--------------+
+   | KTMCROSS | variant 2  | shared | cross shadow |
+   +----------+------------+--------+--------------+
+   | KTMPKT   | variant 2  | shared | cross shadow |
+   +----------+------------+--------+--------------+
+
+   SPEED and SPEEDPKT are byte-identical files. KTMCROSS and KTMPKT are
+   byte-identical files. So the four hardcoded paths in section 5.1
+   resolve to two images: one for the road bikes, one for the motocross
+   bikes. The list is per bike DIRECTORY, not per layout.
+
+5.2.2.2.  What matches and what differs
+
+   Rect A, the dust puff sequence, is byte-identical across all four:
+   same 8704 pixels, same 17.4% pure black, same 215 distinct colours,
+   same hash. It is shared artwork and the HSV-keyed path treats every
+   bike the same.
+
+   Rect B differs between the two variants, but only in shape. Both use
+   exactly the same two colours, pure black and (0, 0, 16), and differ
+   in how much of the rectangle the silhouette fills:
+
+   +--------------------------+---------------+------------+----------------------+
+   | Variant                  | Shadow pixels | Pure black | Shape                |
+   +==========================+===============+============+======================+
+   | Road (SPEED, SPEEDPKT)   | 2351          | 52.2%      | longer and wider     |
+   +--------------------------+---------------+------------+----------------------+
+   | Cross (KTMCROSS, KTMPKT) | 1651          | 66.4%      | shorter and narrower |
+   +--------------------------+---------------+------------+----------------------+
+
+   Two shadow silhouettes for two bike body types, both drawn at the
+   same one-step-above-key blue. The calibration described in 5.2.1
+   holds for both.
+
+5.2.2.3.  A difference outside both rectangles
+
+   The two page variants are not identical outside the special regions
+   either. Diffing them gives a bounding box of x 6..217, y 0..105,
+   which is wider than rect B.
+
+   The extra content is on the motocross page: spoked wheels with
+   knobbly tyres, occupying roughly x 130..217, y 0..105, where the road
+   page has only background. Those sprites are ordinary opaque artwork
+   and are not covered by either rectangle [verified].
+
+   So the road and motocross pages are genuinely different atlases that
+   happen to agree on the dust puff and on the position of the shadow,
+   rather than one atlas with a swapped shadow.
+
+
+5.3.  The colour space pair
+
+   +----------------+------------+----------------------------------+
+   | Function       | Address    | Role                             |
+   +================+============+==================================+
+   | Color_RgbToHsv | 0x0041bb20 | max/min, S = (max-min)/max       |
+   +----------------+------------+----------------------------------+
+   | Color_HsvToRgb | 0x0041bd30 | six-sector switch on floor(h/60) |
+   +----------------+------------+----------------------------------+
+
+   Standard textbook HSV, in doubles. Hue is in degrees, with 400.0 used
+   as an undefined-hue sentinel for greys. The inverse clamps each
+   channel to 0xff and complains to stdout when it overflows, in French:
+   "Depassement pour teinte R: %d". Teinte is hue, which is a small
+   confirmation that these were the developers' own colour-space helpers
+   rather than library code.
+
+5.4.  What this means for the port
+
+   The colour conversion here is general and needs no work. The alpha
+   policy is not. Four filenames and two rectangles are compiled into
+   the executable, and a port that drops them will render dust puffs as
+   opaque grey blocks and bike shadows as solid rectangles.
+
+   This is the clearest case so far of artwork knowledge living in code
+   rather than in data. It cannot be recovered from the .RAW files,
+   since nothing in them marks those regions. Any reimplementation has
+   to either keep the hardcoding or move it into an asset side-file.
+
+
+6.  Registration, and where the descriptor lives
+
+   maybe_D3D_RegisterTexture at 0x0041aee0 is the fork between the two
+   texture sources, and reading it locates the format descriptor
+   [verified].
+
+       int maybe_D3D_RegisterTexture(path, bankIdx, subIdx,
+                                     keyBlack, srcSurface)
+
+       slot = bank[bankIdx].texSlot[subIdx];
+       fmt  = &g_texFormats[bank[bankIdx].formatId];
+
+       if (srcSurface == 0)
+           src = maybe_D3D_LoadRawToTexture(path, dst, fmt, ...);
+       else
+           src = maybe_D3D_UploadTexture(srcSurface, dst, fmt, ...);
+
+       src->QueryInterface(IID_IDirect3DTexture, &tex);
+       tex->Load();                  // vtbl +0x18
+       tex->GetHandle(d3ddev, &handles[slot]);   // vtbl +0x10
+       return slot;                  // -1 on any failure
+
+   So the two loaders in sections 4 and 5 are alternatives chosen by
+   whether the caller has a file path or an existing surface, and both
+   receive the same descriptor. keyBlack is passed through to the loader
+   and also recorded as a flag bit in the bank record.
+
+   The QueryInterface GUID at 0x004d16d0 is
+   {2CDCD9E0-25A0-11CF-A31A-00AA00B93356}, IID_IDirect3DTexture, and the
+   two vtable slots used are GetHandle at +0x10 and Load at +0x18, which
+   matches that interface exactly [verified].
+
+   PowerVR diverges here: instead of calling Load it sets a palette on
+   the destination surface. That branch is gated on g_cfgUsePowerVr.
+
+6.1.  The descriptor array
+
+   The descriptor passed everywhere is an element of an array
+   [verified]:
+
+   +------------------+------------+-----------------------------------+
+   | Symbol           | Address    | Meaning                           |
+   +==================+============+===================================+
+   | g_texFormats     | 0x0053bf30 | array of descriptors, stride 0x98 |
+   +------------------+------------+-----------------------------------+
+   | g_texFormatCount | 0x0053be2c | how many the device reported      |
+   +------------------+------------+-----------------------------------+
+   | bank + 0x2d0     | -          | per-bank index into that array    |
+   +------------------+------------+-----------------------------------+
+
+   The array is BSS and reads as all zeros in the static image, which is
+   expected: it is filled at run time from what the Direct3D device
+   reports. The compiler emits the stride as index*0x13 scaled by 8, so
+   the disassembly shows [reg*0x8 + 0x53bf30] rather than a 0x98
+   multiply.
+
+6.2.  Descriptor fields
+
+   Combining the three consumers with the diagnostic dump in section
+   6.4, which prints the fields under the game's own names:
+
+   +--------+------------------+-------------------------------------+------------+
+   | Offset | Name in the dump | Meaning                             | Confidence |
+   +========+==================+=====================================+============+
+   | +0x4c  | -                | palette capability bits             | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x54  | -                | bits per pixel: 8, 0x10, 0x20       | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x6c  | Pal              | non-zero if palettised              | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x70  | AlphaInTexEl     | non-zero if the texel carries alpha | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x74  | R                | red bits                            | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x78  | G                | BLUE bits, see below                | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x7c  | B                | GREEN bits, see below               | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x80  | A                | alpha bits                          | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x84  | Palette n bits   | palette bit depth, 4 or 8           | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x88  | -                | red shift                           | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x8c  | -                | green shift                         | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x90  | -                | blue shift                          | verified   |
+   +--------+------------------+-------------------------------------+------------+
+   | +0x94  | -                | alpha shift                         | verified   |
+   +--------+------------------+-------------------------------------+------------+
+
+6.3.  The dump mislabels two fields
+
+   maybe_Cdd_WriteDdInfo prints +0x74, +0x78, +0x7c and +0x80 with the
+   format string "RGBA %d %d %d %d", in address order. The converters
+   disagree.
+
+   Color_ConvertToTexFormat narrows green by +0x7c and blue by +0x78,
+   and maybe_D3D_LoadRawToTexture independently does the same: it reads
+   the three bytes in file order R, G, B and uses +0x74, +0x7c, +0x78
+   respectively [verified].
+
+   Two independent consumers agree with each other and disagree with the
+   label, so the widths are stored R, B, G, A while the shifts at +0x88
+   to +0x94 are in the natural R, G, B, A order. Anyone reading a
+   DdInfos.tmp from this game has the green and blue widths swapped.
+
+6.4.  Choosing a format, and the diagnostic dump
+
+   maybe_D3D_ChooseTexFormat at 0x0041e3e0 walks the array and returns
+   the best index for a requested descriptor [verified]. Its preferences
+   are informative:
+
+       no palette, no alpha:  return on 16, return on 15, and
+                              otherwise keep the LAST match;
+                              see section 8.10
+       no palette, alpha:     require AlphaInTexEl, prefer
+                              alphaBits of 1 or 4
+       palette:               match palette depth 8 or 4, each
+                              gated by a config global
+
+   The 16-over-15 preference is the engine asking for 565 and settling
+   for 555, which is consistent with everything in subsystems/pixel-
+   format.txt.
+
+   maybe_Cdd_WriteDdInfo at 0x00459680 writes a plain-text report to
+   DdInfos.tmp covering the display mode, the enumerated 16-bit video
+   modes, every texture format, the device capability flags and five
+   categories of video memory from GetAvailableVidMem. Running the game
+   once produces a machine-specific dump that would settle several
+   remaining questions on real hardware.
+
+6.5.  The descriptor author is in an undefined function
+
+   g_texFormatCount has two writers. One is FUN_00419980. The other is
+   at 0x0041ed15, which was not inside any defined function.
+
+   RESOLVED. Defining that region gives FUN_0041e8f0, 2496 bytes, which
+   writes the D3D device pointer (0x0053be00), the device index
+   (0x0053be30), the chosen format index (0x0053be24) and the format
+   count, so it is the D3D device and format initialisation [verified].
+   It has no callers and is reached as a callback.
+
+   The nearest preceding function, FUN_0041e8db, spans only eight bytes,
+   so roughly 0x0041e8e3 to 0x0041f660 is code that Ghidra disassembled
+   but never assigned to a function. That region almost certainly holds
+   the EnumTextureFormats callback that fills the array [inferred].
+
+   Note this is a DIFFERENT defect from the split functions in ghidra-
+   db-repairs.txt. Those were a defined stub plus a defined orphan; this
+   is code in no function at all, the same shape as the pageProtocol.cpp
+   anchors noted in dd-primary-surface.txt. The repair script does not
+   detect it, because it looks for fall-through between two defined
+   functions.
+
+
+7.  Corroboration of the texture bank record
+
+   maybe_D3D_UploadTexture indexes bank fields at 0x004f95e0 and
+   0x004f9620 with a stride of 0x338 bytes, which is 824.
+
+   That is the third independent confirmation of the 824-byte bank
+   record, after Load3dfAndMap in formats/mesh-3df-map.txt section 6.1
+   and maybe_Cdd_LoadRawToSurface. Three unrelated functions agreeing on
+   a struct size is about as solid as this gets without running the
+   game.
+
+8.  Texture slots and handles
+
+   Section 6 covers how a texture is loaded and how its handle is
+   obtained. This section covers where the handle LIVES and how a
+   primitive finds it at draw time [verified].
+
+8.1.  Fifty slots, six parallel arrays
+
+   Cd3d_Ctor at 0x00419520 zeroes six arrays of 0x32 = 50 entries in
+   succession. They are the texture slot table, one entry each:
+
+   +-----------------------+------------+---------------------------+------------+
+   | Array                 | Address    | Holds                     | Confidence |
+   +=======================+============+===========================+============+
+   | g_texHandles          | 0x0053c538 | the D3D texture handle    | verified   |
+   +-----------------------+------------+---------------------------+------------+
+   | g_texSurfaces         | 0x0053bb40 | IDirectDrawSurface        | verified   |
+   +-----------------------+------------+---------------------------+------------+
+   | g_texSlotKind         | 0x0053bc18 | 1 own surface, 2 duplicate| verified   |
+   +-----------------------+------------+---------------------------+------------+
+   | g_texTextures         | 0x0053df48 | IDirect3DTexture          | verified   |
+   +-----------------------+------------+---------------------------+------------+
+   | g_texSurfaces2        | 0x0053be68 | IDirectDrawSurface2       | verified   |
+   +-----------------------+------------+---------------------------+------------+
+   | g_texPalettes         | 0x0053bd30 | IDirectDrawPalette        | verified   |
+   +-----------------------+------------+---------------------------+------------+
+
+   Fifty is therefore the hard ceiling on simultaneously resident
+   hardware textures, fixed at compile time with no growth path.
+
+8.2.  From a primitive to a handle
+
+   A primitive names a texture bank, not a texture. The lookup is two
+   levels and both are in D3D_EmitTriangle [verified]:
+
+       slot   = g_bankTexSlots[bank * 0xce + sub];
+       handle = g_texHandles[slot];
+
+   g_bankTexSlots at 0x004f9550 is not a standalone array. It is the
+   field at offset +0x250 inside the 824-byte bank record, whose base is
+   g_bankRecords at 0x004f9300, and 0xce ints is exactly 0x338 bytes. So
+   the expression walks bank records and then indexes the sub-texture
+   within one.
+
+   The bank index is bounds-checked against 0x2c, giving 45 banks, and a
+   slot of -1 means the sub-texture was never registered - in which case
+   the emitter writes handle 0, meaning untextured.
+
+   That two-level shape is the same one section 7 confirms from
+   maybe_D3D_UploadTexture, and it is a fourth independent sighting of
+   the 824-byte record.
+
+8.3.  The handle is only re-sent when it changes
+
+   D3D_EmitTriangle caches the last handle it emitted in a global that
+   D3D_BeginExecuteBuffer resets to -100 at the start of every buffer. A
+   STATERENDER carrying D3DRENDERSTATE_TEXTUREHANDLE is emitted only
+   when the handle differs, and emitting one also closes the current
+   triangle batch and opens a new header. See subsystems/d3d-execute-
+   buffers.txt section 3.2.
+
+   So texture changes are the only thing that breaks a batch, and the
+   engine is implicitly sorting by texture to keep batches long.
+
+8.4.  Freeing
+
+   D3D_FreeTextureSlot at 0x004196d0 measures the surface before
+   releasing it, calling GetSurfaceDesc at vtable +0x58 with dwSize 0x6c
+   and dwFlags 0xa = DDSD_HEIGHT|DDSD_WIDTH, and subtracts width times
+   height from a running texture-memory total. A global selects asking
+   the driver for free video memory instead [verified].
+
+   It then Releases the three interfaces, zeroes the handle and the
+   kind, and decrements the live-texture count. Note that it tracks
+   PIXELS, not bytes: the total is width times height with no multiply
+   by the texel size.
+
+8.5.  Palettes are a second, parallel slot system
+
+   The sixth array is not part of the texture slot. It is indexed
+   separately and holds IDirectDrawPalette objects [verified].
+
+   +--------------------+-------------+-----------------------------------------+
+   | Symbol             | Address     | Meaning                                 |
+   +====================+=============+=========================================+
+   | g_texPalettes      | 0x0053bd30  | IDirectDrawPalette per palette slot, 50 |
+   +--------------------+-------------+-----------------------------------------+
+   | g_texPaletteCount  | 0x0053bb28  | live entries                            |
+   +--------------------+-------------+-----------------------------------------+
+   | g_bankTexSlots     | bank +0x250 | texture slot per sub-texture            |
+   +--------------------+-------------+-----------------------------------------+
+   | g_bankPaletteSlots | bank +0x2e0 | palette slot per sub-texture            |
+   +--------------------+-------------+-----------------------------------------+
+
+   Both loaders create palettes the same way: IDirectDraw::CreatePalette
+   at vtable +0x14 writes straight into g_texPalettes[slot], then
+   IDirectDrawSurface::SetPalette at vtable +0x7c attaches it to the
+   texture's surface. The palette index is stored in the bank record
+   0x90 bytes after the texture index, and -1 means unused in both.
+
+   So a sub-texture has two independent resources: a texture slot
+   carrying the surface and the D3D handle, and a palette slot carrying
+   the DirectDraw palette. They are allocated, indexed and released
+   separately, and the loader rotates a palette counter modulo 8 as it
+   goes.
+
+8.6.  A bank holds sixteen sub-textures
+
+   D3D_FreeBankTextures at 0x0041e4c0 releases everything one bank
+   holds, and its loop count settles a number this project had only
+   bounded before: it runs exactly 0x10 times [verified].
+
+   So a bank has SIXTEEN sub-textures, not the 36 that the gap between
+   the two fields would allow. The two arrays are 16 entries each, 64
+   bytes apart within the 0x90 spacing, and the rest of that space
+   belongs to something else.
+
+   The same release loop appears a second time in FUN_00401ab0, over a
+   different object whose two arrays sit at +0x258 and +0x2e8 - the same
+   0x90 apart, the same 16 iterations. Whether that object is the bank
+   record reached through a different base or a similarly shaped sibling
+   has not been established.
+
+8.7.  The COM chain per slot
+
+   D3D_AllocTextureSlot at 0x0041b0f0 builds three objects per slot,
+   each derived from the one before, which is what the six arrays are
+   for [verified]:
+
+       IDirectDraw::CreateSurface        -> g_texSurfaces[slot]
+         QI IID_IDirectDrawSurface2      -> g_texSurfaces2[slot]
+           QI IID_IDirect3DTexture       -> g_texTextures[slot]
+             GetHandle                   -> g_texHandles[slot]
+
+   So the two arrays this document previously carried as guesses are the
+   middle and top of that chain. Everything after creation uses the
+   SURFACE2 interface, not the original: SetColorKey with DDCKEY_SRCBLT
+   for the black key, and SetPalette on the PowerVR path. The original
+   IDirectDrawSurface is kept only to be measured and released.
+
+   The slot count is confirmed a second way here. D3D_AllocTextureSlot
+   finds a free slot by scanning g_texTextures for the first NULL,
+   bounded at 0x0053e010, and 0x0053df48 plus 50 times 4 is exactly
+   0x0053e010.
+
+8.8.  Slots can share a surface
+
+   g_texSlotKind is not a mystery flag. A slot is created one of two
+   ways [verified]:
+
+   +------+-------------------------------+------------------------------+
+   | Kind | How                           | Meaning                      |
+   +======+===============================+==============================+
+   | 1    | IDirectDraw::CreateSurface    | the slot owns its surface    |
+   +------+-------------------------------+------------------------------+
+   | 2    | IDirectDraw::DuplicateSurface | shares the bank's first slot |
+   +------+-------------------------------+------------------------------+
+
+   The duplicate path is taken for 8-bit and 4-bit palettised banks
+   after the first sub-texture: every sub-texture of such a bank aliases
+   the same pixel memory and differs only in its palette. That is why
+   palettes are a separate slot system with their own index - see
+   section 8.5 - and it is the reason the engine can afford 16 sub-
+   textures per bank against only 50 texture slots.
+
+   It also explains the one branch in D3D_FreeTextureSlot that had no
+   explanation: the surface is measured only when the kind is not 2,
+   because a duplicate shares its memory with the original and counting
+   it again would inflate the texture-memory total.
+
+8.9.  The descriptor is a DDSURFACEDESC with fields appended
+
+   Section 6 left the first 0x6c bytes of the 0x98-byte descriptor
+   unidentified, guessing it was a DDSURFACEDESC. It is, and both
+   maybe_D3D_ChooseTexFormat and D3D_AllocTextureSlot prove it
+   [verified].
+
+   D3D_AllocTextureSlot copies 0x1b dwords, exactly 0x6c bytes, out of a
+   chosen format and then overwrites four fields before calling
+   CreateSurface. Every constant it writes decodes:
+
+   +--------+-------------+----------------------------------------------+
+   | Offset | Value       | DDSURFACEDESC field                          |
+   +========+=============+==============================================+
+   | +0x00  | 0x6c        | dwSize, and 108 is sizeof(DDSURFACEDESC)     |
+   +--------+-------------+----------------------------------------------+
+   | +0x04  | 0x1007      | dwFlags: CAPS | HEIGHT | WIDTH | PIXELFORMAT |
+   +--------+-------------+----------------------------------------------+
+   | +0x08  | height      | dwHeight                                     |
+   +--------+-------------+----------------------------------------------+
+   | +0x0c  | width       | dwWidth                                      |
+   +--------+-------------+----------------------------------------------+
+   | +0x68  | | 0x4005000 | ddsCaps.dwCaps                               |
+   +--------+-------------+----------------------------------------------+
+
+   0x1007 is DDSD_CAPS 1, DDSD_HEIGHT 2, DDSD_WIDTH 4 and
+   DDSD_PIXELFORMAT 0x1000. 0x4005000 is DDSCAPS_TEXTURE 0x1000,
+   DDSCAPS_VIDEOMEMORY 0x4000 and DDSCAPS_ALLOCONLOAD 0x4000000. Four
+   independent constants all landing on their documented values is not a
+   coincidence.
+
+   maybe_D3D_ChooseTexFormat confirms the pixel format block from the
+   other side. It tests +0x4c against 0x40 and matches +0x54 exactly,
+   which in a DDSURFACEDESC are DDPIXELFORMAT.dwFlags against DDPF_RGB
+   and DDPIXELFORMAT.dwRGBBitCount.
+
+   So the layout is settled:
+
+   +----------------+-------------------------------------------------------+
+   | Range          | Contents                                              |
+   +================+=======================================================+
+   | +0x00 to +0x47 | DDSURFACEDESC head: size, flags, height, width, pitch |
+   +----------------+-------------------------------------------------------+
+   | +0x48 to +0x67 | DDPIXELFORMAT, dwFlags at +0x4c, bit count at +0x54   |
+   +----------------+-------------------------------------------------------+
+   | +0x68 to +0x6b | DDSCAPS                                               |
+   +----------------+-------------------------------------------------------+
+   | +0x6c to +0x97 | the game's own derived fields                         |
+   +----------------+-------------------------------------------------------+
+
+   Which also explains why the game's fields start at 0x6c: they were
+   appended to the DirectDraw structure rather than interleaved.
+
+8.10.  How a format is chosen, corrected
+
+   CORRECTION. This document and the function's own comment described
+   the RGB search as preferring 16 bits and accepting 15 as a fallback.
+   Reading the branch order shows that is not what happens [verified]:
+
+       sum = red + blue + green;
+       if (sum == 16) return i;      /* take it */
+       best = i;                     /* remember, ANY depth */
+       if (sum == 15) return i;      /* take it */
+
+   Both 16 and 15 return immediately, so neither is a fallback. The
+   assignment sits BETWEEN the two tests, so any format that passes the
+   DDPF_RGB and bit-count gates becomes the running candidate whatever
+   its depth, and the LAST such format wins if no 16 or 15 is ever
+   found.
+
+   The practical effect on period hardware is the same, because a device
+   offering a 16-bit texture format returns it on the first pass. The
+   difference only shows on a device that offers neither 16 nor 15,
+   where the engine takes the last RGB format enumerated rather than
+   refusing.
+
+8.11.  The diagnostic dump names the device caps
+
+   Cdd_WriteDdInfo at 0x00459680 writes DdInfos.tmp. Its value to this
+   project is not the file, which needs real hardware to be interesting,
+   but the FORMAT STRINGS: they are the developers' own names for
+   structures this project had only numbered [verified].
+
+   The largest is a fifteen-line capability report, and pairing its
+   lines with the arguments pushed gives fourteen names for the per-
+   device capability table, stride 0x194.
+
+   BASE CORRECTED. This section originally gave the table base as
+   0x0053c750 and numbered the fields from +0x00 there. That is where
+   the CAPS BLOCK starts, not where the record starts. The record base
+   is 0x0053c600 [verified]: D3D_EnumDeviceCallback computes
+   devCount * 0x194 and does LEA EBX,[EAX + 0x53c600] at 0x0041f2e5,
+   then writes the caps through EBX+0x150 upward.
+
+   So every offset in the table below is +0x150 higher in the real
+   record. The names are unaffected; only the base was wrong. Corrected
+   layout, with the three fields the original section did not cover:
+
+   +--------+---------------------------+
+   | Offset | Name                      |
+   +========+===========================+
+   | +0x050 | the D3DDEVICEDESC         |
+   +--------+---------------------------+
+   | +0x12c | GUID or name, 0x20 bytes  |
+   +--------+---------------------------+
+   | +0x14c | IsHardware                |
+   +--------+---------------------------+
+   | +0x150 | DoesLines - caps start    |
+   +--------+---------------------------+
+   | +0x190 | MaxVertexCount            |
+   +--------+---------------------------+
+
+   The array holds at most SIXTEEN devices [verified]:
+   D3D_EnumDeviceCallback increments g_devCount and returns
+   CMP EDX,0x10 / SETNZ, so enumeration stops at 16. And
+   0x0053c600 + 16 * 0x194 is 0x0053df40, which lands exactly on the
+   next named global at 0x0053df48 - an independent confirmation of
+   both the base and the count.
+
+   Applied in the DB as MR_D3DDevice[16] at 0x0053c600. Consumers now
+   read MR_D3DDevice_ARRAY_0053c600[g_devIndex].nDoesAlphaFlatBlend
+   rather than &g_devDoesAlphaFlatBlend + g_devIndex * 0x194.
+
+   The original offsets, which are correct RELATIVE TO THE CAPS BLOCK
+   at 0x0053c750, follow:
+
+   +--------+---------------------------+
+   | Offset | Name                      |
+   +========+===========================+
+   | +0x00  | DoesLines                 |
+   +--------+---------------------------+
+   | +0x04  | DoesTextures              |
+   +--------+---------------------------+
+   | +0x08  | DoesTexturesTransparency  |
+   +--------+---------------------------+
+   | +0x0c  | DoesTexturesPow2          |
+   +--------+---------------------------+
+   | +0x10  | DoesTexturesSquareOnly    |
+   +--------+---------------------------+
+   | +0x14  | HasZBuffer, not printed   |
+   +--------+---------------------------+
+   | +0x18  | Renders16Bit, not printed |
+   +--------+---------------------------+
+   | +0x1c  | DoesAlphaFlatStippled     |
+   +--------+---------------------------+
+   | +0x20  | DoesAlphaFlatBlend        |
+   +--------+---------------------------+
+   | +0x24  | DoesColorFlatRgb          |
+   +--------+---------------------------+
+   | +0x28  | DoesFilter                |
+   +--------+---------------------------+
+   | +0x2c  | DoesBlendSrcColor         |
+   +--------+---------------------------+
+   | +0x30  | DoesBlendInvSrcColor      |
+   +--------+---------------------------+
+   | +0x34  | DoesBlendSrcAlpha         |
+   +--------+---------------------------+
+   | +0x38  | DoesBlendInvSrcAlpha      |
+   +--------+---------------------------+
+   | +0x3c  | DoesClamping              |
+   +--------+---------------------------+
+
+   The dump's fifteenth line, DoesDithering, is not from this table. It
+   reads DAT_004e4f14 and tests it against -1, so it reports the
+   engine's dither setting rather than a device capability.
+
+8.11.1.  Two of these are load-bearing
+
+   Naming them explains code that was previously opaque [verified].
+
+   DoesClamping decides the size of every render-state batch.
+   D3D_EmitRenderStates sets its wCount to 12, or to 13 when
+   DoesClamping is set, and emits an extra D3DRENDERSTATE_TEXTUREADDRESS
+   in that case. The "12 or 13" recorded in subsystems/d3d-execute-
+   buffers.txt section 2 was exactly this: a device that supports
+   clamping gets one more state per batch.
+
+   DoesTextures gates allocation outright. D3D_AllocTextureSlot returns
+   -1 immediately when it is clear, so a device that cannot texture gets
+   no slots at all.
+
+   DoesAlphaFlatStippled is consulted in D3D_DrawScene for one primitive
+   kind, 0x44.
+
+8.11.2.  The memory report
+
+   The memory section calls IDirect3D2::GetAvailableVidMem five times,
+   OR-ing a base flag with one DDSCAPS each, and every constant decodes
+   [verified]:
+
+   +---------+------------------------+-----------+
+   | Flag    | DDSCAPS                | Label     |
+   +=========+========================+===========+
+   | 0x1000  | DDSCAPS_TEXTURE        | Textures  |
+   +---------+------------------------+-----------+
+   | 0x0040  | DDSCAPS_OFFSCREENPLAIN | Offscreen |
+   +---------+------------------------+-----------+
+   | 0x0200  | DDSCAPS_PRIMARYSURFACE | Primary   |
+   +---------+------------------------+-----------+
+   | 0x20000 | DDSCAPS_ZBUFFER        | Z-Buffer  |
+   +---------+------------------------+-----------+
+   | 0x0080  | DDSCAPS_OVERLAY        | Overlay   |
+   +---------+------------------------+-----------+
+
+   So the game reports free and total video memory per surface class,
+   which on a 1997 card with a few megabytes was the number that decided
+   whether the textures fit.
+
+8.11.3.  The two unprinted caps, and where they all come from
+
+   D3D_EnumDeviceCallback at 0x0041f2b0 is the D3DEnumDevicesCallback.
+   It copies the whole D3DDEVICEDESC into the per-device record at +0x00
+   and then reduces it to the flat booleans, so every capability has a
+   traceable origin [verified].
+
+   That identifies the two the dump never prints:
+
+   +-------+--------------+----------------------------------------------------+
+   | Caps  | Name         | Derived from                                       |
+   +=======+==============+====================================================+
+   | +0x14 | HasZBuffer   | dwDeviceZBufferBitDepth != 0, desc +0xa0           |
+   +-------+--------------+----------------------------------------------------+
+   | +0x18 | Renders16Bit | dwDeviceRenderBitDepth & 0x400 DDBD_16, desc +0x9c |
+   +-------+--------------+----------------------------------------------------+
+
+   Renders16Bit is quietly the most interesting flag in the table. The
+   engine is locked to 16-bit colour throughout, and this is where it
+   asks the hardware whether that is possible.
+
+   The layout is fixed by arithmetic rather than assumption. dpcTriCaps
+   sits at desc +0x64 and D3DPRIMCAPS is 56 bytes, so it ends at +0x9c -
+   exactly where the two bit-depth fields begin. Every mask then decodes
+   against the documented enums:
+
+   +----------------------+-------------------+-------------------------------------------------+
+   | Field                | Mask              | Enum value                                      |
+   +======================+===================+=================================================+
+   | dwTextureCaps        | 1, 2, 8, 0x20     | PERSPECTIVE, POW2, TRANSPARENCY, SQUAREONLY     |
+   +----------------------+-------------------+-------------------------------------------------+
+   | dwShadeCaps          | 2, 0x1000, 0x2000 | COLORFLATRGB, ALPHAFLATBLEND, ALPHAFLATSTIPPLED |
+   +----------------------+-------------------+-------------------------------------------------+
+   | dwSrcBlendCaps       | 4, 8, 0x10, 0x20  | SRCCOLOR, INVSRCCOLOR, SRCALPHA, INVSRCALPHA    |
+   +----------------------+-------------------+-------------------------------------------------+
+   | dwTextureFilterCaps  | 2                 | LINEAR                                          |
+   +----------------------+-------------------+-------------------------------------------------+
+   | dwTextureAddressCaps | 4                 | CLAMP                                           |
+   +----------------------+-------------------+-------------------------------------------------+
+   | dwRasterCaps         | 1, 0x400, 0x800   | DITHER, the two ANTIALIASSORT bits              |
+   +----------------------+-------------------+-------------------------------------------------+
+
+   Fourteen masks landing on their documented meanings, against a
+   structure whose size independently places the fields, is conclusive.
+
+   The callback derives three more values the dump never shows.
+   TEXTUREMAPBLEND is 2 MODULATE when dwTextureBlendCaps allows it and 1
+   DECAL otherwise; ANTIALIAS comes from the two sort bits; and the
+   dither setting is forced off when DITHER is absent, which is the real
+   source of the dump's DoesDithering line. It also copies
+   dwMaxVertexCount to caps +0x40, which is what maybe_D3D_InitDevice
+   clamps the execute buffer's vertex capacity against.
+
+   It returns false after 16 devices, so 16 is the enumeration ceiling.
+
+8.11.4.  A caution about the dump's own labels
+
+   The cap the report calls DoesTextures is D3DPTEXTURECAPS_PERSPECTIVE,
+   not a can-this-device-texture flag [verified]. A device without it
+   gets no texture slots at all, because D3D_AllocTextureSlot returns -1
+   on that bit - which is defensible behaviour but not what the label
+   says.
+
+   That is the second mislabel found in this dump, after the RGBA widths
+   in section 6.3. The format strings are excellent evidence for what
+   fields ARE, and unreliable evidence for what they MEAN.
+
+9.  What this means for the port
+
+   Nothing in this path needs replacing for format reasons. It already
+   converts into an arbitrary target layout, and a modern API would
+   simply be told to accept 8888.
+
+   What does need replacing is everything around it, because the
+   descriptor is filled in from Direct3D Immediate Mode device
+   capabilities, and the surfaces are DirectDraw. The conversion logic
+   is worth keeping as a reference for what the artwork actually means;
+   the plumbing is not.
+
+   Two behaviours must be preserved or the artwork breaks:
+
+   o Black is transparent. A port that ignores this will draw black
+   rectangles where sprites should be cut out. o Palette index 0 is
+   transparent regardless of its colour.
+
+10.  Open questions
+
+   o NARROWED. The array is g_texFormats at 0x0053bf30, stride 0x98,
+     count g_texFormatCount. The code that fills it is at 0x0041ed15,
+     inside an undefined function region; see section 6.5. Defining that
+     region is the next step and would close this.
+   o RESOLVED. Rect A is an eight-frame dust puff, rect B a bike shadow
+     drawn at exactly one OpaqueBlackLevel step above the colour key.
+     See section 5.2.1.
+   o ANSWERED. It is a DDSURFACEDESC, 0x6c bytes, with DDPIXELFORMAT at
+     +0x48 and DDSCAPS at +0x68; the game's own fields begin at +0x6c.
+     See section 8.9.
+   o PARTLY ANSWERED without hardware. The dump's format strings name
+     fourteen device capabilities and five memory classes; see section
+     8.11. Running it on real hardware would still be worth doing for
+     the VALUES, particularly which texture formats a period card
+     offers.
+   o The 4-bit quantiser merges by exact match after masking. Whether
+     the five-pass limit can leave more than 16 colours, and what
+     happens if it does, has not been checked.
+

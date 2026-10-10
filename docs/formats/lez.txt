@@ -1,0 +1,290 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          THE .LEZ IMAGE FORMAT
+
+
+Abstract
+
+   A .LEZ file is an 8-bit palettised image under an LZ77 compressor.
+   It is what the menu uses for photographs and full-screen art: track
+   loading screens, circuit maps, bike photos.
+
+   The format is fully decoded [verified]. Everything below was read
+   out of Lez_LoadFile (0x0043e700) and Lez_Decode (0x0043eb00), then
+   checked against the 143 .LEZ files under decomp/DATA/extracted/ -
+   every one decompresses to exactly the size its header declares, and
+   every one's inner dimensions match its outer header.
+
+   A reconstruction is in src/lez.c.
+
+Table of Contents
+
+   1. The compressed container
+   2. The compressor
+      2.1. The bit reader
+      2.2. Why it has to be reproduced exactly
+   3. The image inside
+      3.1. The palette is BGR
+      3.2. Indices past the palette
+   4. What the engine does with it
+   5. Verification
+   6. Open questions
+
+
+1.  The compressed container
+
+   All fields little-endian [verified].
+
+   +--------+------+--------------------------------------------------+
+   | Offset | Size | Field                                            |
+   +========+======+==================================================+
+   | 0x00   |  4   | magic, 'LEZ1' = 0x315A454C                       |
+   +--------+------+--------------------------------------------------+
+   | 0x04   |  4   | uncompressed size, in bytes                      |
+   +--------+------+--------------------------------------------------+
+   | 0x08   |  4   | file offset of the MATCH TOKEN stream, u16 each  |
+   +--------+------+--------------------------------------------------+
+   | 0x0c   |  4   | file offset of the LITERAL BYTE stream           |
+   +--------+------+--------------------------------------------------+
+   | 0x10   |  4   | height in the low 16 bits, width in the high 16  |
+   +--------+------+--------------------------------------------------+
+   | 0x14   |  .   | the CONTROL BITSTREAM, u32 words, runs to the    |
+   |        |      | end                                              |
+   +--------+------+--------------------------------------------------+
+
+   THREE STREAMS, INTERLEAVED BY A FOURTH. The control words are read
+   sequentially from 0x14; each control bit selects whether the next
+   item comes from the literal stream or the match stream, and those
+   two are read from their own offsets. So the streams are contiguous
+   runs, not interleaved records - the file is three separate blocks
+   that advance independently.
+
+   Offset 0x10 is the only part of the compressed header the game reads
+   before decompressing: Lez_LoadFile stores the two halves straight
+   into MR_Sprite.height and MR_Sprite.width. The same dimensions
+   appear again inside the decompressed data, and in all 143 shipped
+   files the two agree.
+
+
+2.  The compressor
+
+   LZ77 with a 10-bit window. One control bit per item, MOST
+   SIGNIFICANT FIRST [verified]:
+
+       bit 1  ->  copy one byte from the literal stream
+       bit 0  ->  read a u16 token from the match stream:
+
+                      distance = token & 0x03ff        1 .. 1023
+                      length   = (token >> 10) + 3     3 .. 66
+
+                  and copy that many bytes from that many bytes back in
+                  the OUTPUT produced so far.
+
+   Decoding stops when the output reaches the declared uncompressed
+   size. There is no end marker.
+
+   THE COPY MUST BE BYTE BY BYTE. A distance shorter than the length is
+   legal and common - it is how a run is encoded - so the copy overlaps
+   itself and each byte written becomes a source byte for a later one
+   in the same token. memcpy or memmove would be wrong.
+
+2.1.  The bit reader
+
+   The control word is consumed with the shift-until-zero idiom, which
+   is worth spelling out because it is not obvious from the decompiled
+   C:
+
+       bits = first_control_word
+       cf   = bits >> 31          /* the first bit */
+       bits = (bits << 1) | 1     /* sentinel in bit 0 */
+
+       ... use cf ...
+
+       cf   = bits >> 31
+       bits = bits << 1
+       if (bits == 0) {           /* the sentinel fell out: refill */
+           d    = next_control_word
+           bits = (d << 1) | cf
+           cf   = d >> 31
+       }
+
+   The 1 shifted in at the start is a sentinel. Because it is the only
+   bit below the data, the word becoming zero is exactly the signal
+   that all 32 payload bits have been used - no counter is needed. On
+   refill the bit just extracted is shifted into the new word's bit 0,
+   taking the sentinel's place.
+
+   In x86 that whole thing is ADD reg,reg for the shift, JNZ for the
+   test, and ADC reg,reg for the refill, which is why the decompiled
+   form is full of CARRY4.
+
+2.2.  Why it has to be reproduced exactly
+
+   The three streams have no framing of their own. A single misread
+   control bit takes a literal where a match was meant, and from that
+   point both stream pointers are wrong - the output is not corrupt at
+   one pixel, it is garbage from there on.
+
+   That makes this format easy to get subtly wrong and easy to verify:
+   either the whole file decodes to exactly the declared size or the
+   read is broken. Section 5 leans on that.
+
+
+3.  The image inside
+
+   The decompressed block is a small header, a palette, then one byte
+   per pixel [verified].
+
+   +--------+------+--------------------------------------------------+
+   | Offset | Size | Field                                            |
+   +========+======+==================================================+
+   | 0x00   |  5   | unidentified                                     |
+   +--------+------+--------------------------------------------------+
+   | 0x05   |  2   | palette entry count, i16, UNALIGNED              |
+   +--------+------+--------------------------------------------------+
+   | 0x07   |  5   | unidentified                                     |
+   +--------+------+--------------------------------------------------+
+   | 0x0c   |  2   | width, i16                                       |
+   +--------+------+--------------------------------------------------+
+   | 0x0e   |  2   | height, i16                                      |
+   +--------+------+--------------------------------------------------+
+   | 0x10   |  2   | unidentified; 0x0808 and 0x0008 both seen        |
+   +--------+------+--------------------------------------------------+
+   | 0x12   | n*3  | palette, three bytes per entry, BLUE FIRST       |
+   +--------+------+--------------------------------------------------+
+   | 0x12   | w*h  | pixels, one palette index each, top-down, no row |
+   | + n*3  |      | padding                                          |
+   +--------+------+--------------------------------------------------+
+
+   THERE IS TRAILING DATA after the pixels, and it is not image data.
+   Every shipped file ends with the ASCII string "UEVISION-XFILE." - a
+   tool signature, presumably from whatever produced these. Its length
+   varies, 318 bytes in most files and 1109 in some. The engine never
+   looks at it, and neither should a reader: the pixel run ends at
+   width * height and the rest is padding.
+
+3.1.  The palette is BGR
+
+   Entries are three bytes in the order BLUE, GREEN, RED. The engine
+   converts each to the surface format as it goes:
+
+       pal[i] = (b >> g_shrB) << g_shlB |
+                (g >> g_shrG) << g_shlG |
+                (r >> g_shrR) << g_shlR
+
+   which is the run-time mask machinery of subsystems/pixel-format.txt,
+   so the same file works whether DirectDraw handed back 565 or 555.
+   src/lez.c is fixed at 565 and the conversion collapses to a
+   constant.
+
+   The conversion is done IN PLACE, over the palette itself: three
+   bytes are read per entry and two written, so the write pointer never
+   catches the read pointer. Neat, and unnecessary for us.
+
+   A palette count of ZERO means a 256-level greyscale ramp, which
+   Lez_Decode builds into g_lezDefaultPalette rather than reading from
+   the file. No shipped file uses it.
+
+3.2.  Indices past the palette
+
+   Nothing stops a pixel from holding an index greater than the palette
+   count, and the engine does not check. It converts only the entries
+   the file declares, so a larger index samples whatever bytes happen
+   to follow the palette in the decompressed block - which is pixel
+   data.
+
+   Files with a short palette do exist: SMALLMAP.LEZ ships with 201
+   entries in ILE01 and 160 in ILE02. Whether any of their pixels
+   actually index past the end has not been checked; src/lez.c builds
+   all 256 entries and leaves the surplus black, so the question does
+   not arise there. That is a deliberate divergence and is marked as
+   one in the source.
+
+
+4.  What the engine does with it
+
+   Loading is split in two, and the split matters.
+
+   Lez_LoadFile (0x0043e700) reads the whole COMPRESSED file into a
+   buffer and stores it in MR_Sprite.lezImage, taking only the
+   dimensions from offset 0x10. It does not decompress. It also stores
+   the file size into MR_Sprite +0x34, which identifies a field
+   structs/MR_Sprite.txt had listed as unknown.
+
+   Lez_Decode (0x0043eb00) runs on FIRST DRAW, from Sprite_Draw, when
+   MR_Sprite.bitmap is still null. It decompresses, converts the
+   palette, expands the indices to 16 bpp, and caches the result in
+   MR_Sprite.bitmap.
+
+   o SO A MENU PAGE THAT LOADS A .LEZ AND NEVER DRAWS IT PAYS ONLY THE
+     FILE READ. That is presumably the point of the split.
+
+   o THE EXPANDED BUFFER IS 16-BYTE ALIGNED BY HAND: it is allocated
+     0x13 bytes larger than needed, the pointer is rounded up, and the
+     original allocation is stashed in the dword just before it. Any
+     free of a Lez_Decode result has to recover that, not free the
+     rounded pointer.
+
+   o KIND 4 IS DIFFERENT. A sprite of kind 4 does not get a
+     width x height buffer; it gets a fixed 0x10000 bytes, and each of
+     128 source rows is written twice. That is the scrolling menu
+     background of structs/MR_Sprite.txt section 3.
+
+     THE RESULT IS 256 WIDE BY 128 TALL, not 128x256 as this said.
+     0x10000 bytes at two bytes a pixel is 32768 pixels, and
+     maybe_Sprite_DrawWave indexes rows at a stride of 0x200 bytes =
+     256 pixels, so there are 128 of them. The doubling is
+     HORIZONTAL: each 128-pixel row is written twice side by side.
+
+     o WHICH IS THE WHOLE POINT. A horizontal scroll offset of 0..127
+       can then read 128 contiguous pixels starting anywhere in the
+       row without a wrap test in the inner loop. Doubling vertically
+       would buy nothing, because the draw already wraps the row
+       index with a mask.
+
+     src/lez.c still does not implement it; src/sprite.c does the
+     doubling in sprite_load instead, which produces the identical
+     buffer. Recorded as a deliberate difference of placement.
+
+
+5.  Verification
+
+   The decoder was written against the two functions and then run over
+   every .LEZ under decomp/DATA/extracted/ - 143 files [verified]:
+
+   o all 143 decompress to exactly the size declared at offset 0x04,
+     with the control, literal and match streams all landing in bounds.
+     Section 2.2 explains why that is a strong result rather than a
+     weak one.
+
+   o all 143 have inner width and height at 0x0c and 0x0e matching the
+     outer header at 0x10.
+
+   o ILE01/LOAD.LEZ decodes to a recognisable 640x480 image - the
+     "Speed Bay" track loading screen - with correct colours, which is
+     what pins the palette byte order down as BGR rather than RGB.
+     Getting that backwards would have swapped the sky from blue to
+     orange, not produced a subtle tint.
+
+   640x480 for a loading screen is a useful cross-check on its own: it
+   is the design resolution the rest of the menu is authored against.
+
+
+6.  Open questions
+
+   o Bytes 0x00..0x04, 0x07..0x0b and 0x10..0x11 of the image header.
+     0x10 holds 0x0808 in most files and 0x0008 in SMALLMAP, which
+     smells like bit depths, but nothing reads them.
+
+   o The trailing "UEVISION-XFILE." block. Length varies; contents past
+     the string not examined.
+
+   o Whether any shipped file indexes past its palette. See 3.2.
+
+   o Kind 4, the 128x128 to 128x256 doubling path. Read, not
+     reimplemented.
+
+   o The compressor side. Nothing needs it, but the window is only 10
+     bits and the length field 6, which is a small enough encoding that
+     a round-trip test would be cheap if a file ever had to be rebuilt.

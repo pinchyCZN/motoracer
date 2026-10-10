@@ -1,0 +1,420 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       COMMENT DEFECTS IN src/
+
+
+Abstract
+
+   The standing checks the rule 16 comment sweep runs against every
+   file, and WHAT EACH OF THEM IS BLIND TO.  That last part is the
+   reason this document exists: every blind spot below cost real
+   time to find and would cost it again.
+
+   THIS IS EVIDENCE, NOT CRITERIA.  CLAUDE.md rule 16 says what a
+   comment has to earn to stay; this says how to go looking.
+
+   THE DEFECT CLASSES THEMSELVES ARE IN THE JOURNAL - section 1 says
+   why.  Progress and per-file state likewise, per rule 16.1.
+
+Table of Contents
+
+   1. The defect catalogue - moved to the journal
+      1.1. What a whole-file sweep actually finds
+   2. The standing audits
+      2.1. Orphaned comments - a title-line check
+         2.1.1. Stacked ORIGIN tags
+      2.2. ORIGIN tags
+      2.3. Stripped apostrophes
+      2.4. Claims that a callee is missing
+      2.5. Escapes expanded by the script that wrote the comment
+   3. Writing a note without committing the defect
+
+1.  The defect catalogue
+
+   IT LIVES IN THE JOURNAL, not here:
+
+       python tools/journal.py defect              by frequency
+       python tools/journal.py defect show SLUG    guidance + sightings
+       python tools/journal.py defect hit SLUG --file F --note "..."
+
+   40 classes and their sightings.  The ORDER IS MAINTAINED BY THE
+   TOOL - rule 16 asks for them by frequency and that was a hand-kept
+   ordering until the table existed.
+
+   WHY IT MOVED.  A class and its sightings were one paragraph, so
+   every new instance lengthened the class: 40 classes averaged 19
+   lines each, 755 in all, and this file grew 924 -> 1107 lines in a
+   single sweep.  That is the defect the sweep exists to remove,
+   committed by the document that catalogues it.  A sighting is now a
+   defect_hit row and the guidance never moves.
+
+   WHAT STAYS HERE is what survives a purge of the journal: the
+   measurement below, and the standing audits in section 2 with what
+   each tool is blind to.
+
+1.1.  What a whole-file sweep actually finds
+
+   MEASURED OVER trk.c, fifteen blocks, 2460 -> 2482 lines.  NINE of
+   the fifteen turned up a false statement about the BINARY, and
+   every one was caught by checking an address.  None was caught by
+   reading the prose, and several of the worst read most confidently
+   - the wrong ones cite figures, name functions and carry
+   [verified].
+
+   THE FILE GREW.  Eleven ORIGIN tags and six divergence markings
+   went in, both keep-categories, and the comment percentage rose
+   0.6 points across a sweep that deleted more prose than it wrote
+   in every block that was not tagging.  A SWEEP THAT ONLY SHRINKS A
+   FILE HAS NOT CHECKED ANYTHING - the checking is what adds the
+   attributions back.
+
+   THE RATIO IS NOT THE MEASURE.  trk.c entered the sweep as the
+   leanest file in the tree at 32.7 per cent and still held nine
+   false claims.  A low percentage means the prose is short, not
+   that it is true.
+
+2.  The standing audits
+
+2.1.  Orphaned comments - a title-line check
+
+   The commonest defect in every file swept so far is a comment
+   sitting above the WRONG declaration.  Both halves are well-formed
+   C, and a reader assumes the comment above a function is about it.
+
+       python tools/orphan_check.py src/trk.h
+       python tools/orphan_check.py --all
+
+   For every block comment whose FIRST line names a function, the
+   next declaration should be that function.  It matches on the title
+   line only - a comment body legitimately mentions other functions,
+   and matching those gives four false hits for every real one.
+
+   BEFORE DELETING AN ORPHAN, FIND ITS SUBJECT.  A comment separated
+   from its declaration is one defect; deleting it when the
+   declaration is still there and undocumented makes two.  race.h's
+   lap-total note had drifted four declarations away from
+   race_lap_count, and was removed as an orphan before anyone
+   checked that race_lap_count had no comment of its own.
+
+   The test is the same one this check uses: read the title line,
+   then look for that name nearby.  If it exists and is bare, the
+   fix is to MOVE the comment, not to cut it.
+
+   THE PROSE LIST IS ALSO A BLIND SPOT.  A block titled "The cursor,
+   in design space" is skipped before its declaration is ever looked
+   for, because "The" opens a sentence rather than naming a function
+   - and that block sat 48 lines above s_cursorX with two functions
+   between them.  The filter is right (matching prose titles gives
+   four false hits per real one) and the consequence is that
+   PROSE-TITLED ORPHANS ARE FOUND ONLY BY READING.  They are the
+   reason the sweep is manual.
+
+   IT LOOKS PAST A RUN OF #defines.  A function's own constants
+   legitimately sit between its comment and its declaration, and
+   racer.h and race.c both do that; stopping at the first
+   declaration reported them as orphans.
+
+   IT IS BLIND TO ORIGIN-TITLED BLOCKS, and that is where this
+   project puts its best comments.  The title test skips a first
+   line beginning "ORIGIN" as prose, so a 30-line block headed
+   "ORIGIN maybe_Racer_Draw @ ..." can caption the wrong function
+   and never be reported - which is exactly what racerdraw.c's
+   two-skeleton-walks block was doing, 120 lines from
+   racerdraw_part_walks.  Worth teaching the tool to read the
+   SECOND line when the first is an ORIGIN tag.
+
+   THE SEARCH WINDOW IS 40 LINES AND THAT MATTERS, though not for
+   the reason it looks.  The window bounds how far the tool hunts
+   for A declaration, not for the RIGHT one: trk.h's worst orphan
+   reported at 59 lines and its real declaration was 144 lines
+   away, stranded under two #defines at the very foot of the file.
+   The tool flags the mismatch; finding where the declaration
+   actually went is still the reader's job.
+
+   racer.h had THREE by that test after the hand sweep had already
+   caught five more by eye, which is the argument for running it
+   rather than reading for it.  It is now clean; race.c was fixed by
+   hand before the check existed and should be re-run.
+
+   TWO CLASSES OF FALSE POSITIVE, both seen on physics.h:
+
+   o a FORWARD DECLARATION between the comment and its function -
+     "struct MR_Racer;" - which is correct placement.  Skip
+     struct/union/enum/typedef one-liners.
+   o a title naming the ORIGINAL where the declaration carries the
+     port's name, eg maybe_Gearbox_SpeedToEngine above
+     physics_speed_to_engine, or Trk_WrapSegmentIndex above
+     trk_wrap_segment_index.  Inherent; check by eye.  Two of the
+     three standing hits tree-wide are this.
+
+   physics.h had ONE real orphan by the refined test, plus one
+   stacked pair - see below.  It is clean now, as is racer.h.
+   trk.h is down to the original-name false positive alone.  96
+   stand tree-wide, which is the untouched backlog.
+
+   THE CHECK WAS BLIND TO CRLF FILES UNTIL 2026-09-30, and 28 of
+   src/'s 102 files are CRLF in the worktree.  Splitting on "
+"
+   alone left a "
+" on every line; the scanner then read the bare
+   "/*" opener as the title, because "
+" is truthy, and skipped the
+   block without ever seeing the real title line.  The count went
+   from 67 to 97 when that was fixed, so roughly a third of this
+   backlog had never been reported.
+
+   A TOOL THAT REPORTS ZERO IS A CLAIM, NOT A RESULT.  trk.c read
+   clean through five sweep blocks while holding a stranded header.
+
+
+2.1.1.  Stacked ORIGIN tags
+
+   TWO TAGS AGAINST ONE DECLARATION, so the upper belongs to no
+   function.  orphan_check reports these too.  The title check above
+   cannot see them: its scan for the next declaration steps over
+   comment lines and finds the right one, and both halves are
+   well-formed.
+
+   FOUR IN trk.c, every one with its own function further down and
+   UNTAGGED - Trk_GroundHeightAt ninety lines below its tag,
+   maybe_Trk_BuildSegmentPlanes, the DrawZones list half, and
+   Trk_SurfaceAtPoint.  The fix is 2.1's: find the subject and move
+   the block, never cut it.
+
+   IT IS THE APPEND-ABOVE DEFECT AT FUNCTION SIZE.  A new function's
+   block goes in above the existing one instead of below it, which is
+   rule 14.2 failing on whole blocks rather than on sentences.
+
+   REQUIRING BOTH BLOCKS TO CARRY AN ORIGIN IS WHAT MAKES THE CHECK
+   USABLE.  Flagging any comment pair under an ORIGIN reports 34
+   across the tree, nearly all of them the ordinary shape: a tag
+   block, then a short note on the first statement.  Demanding two
+   tags leaves 9, and all 9 examined so far were real.
+
+   A SECOND, MILDER SHAPE IS REPORTED SEPARATELY: a BARE one-line
+   ORIGIN leaning against a prose block whose own opening line
+   already names the function and its address.  One fact, twice,
+   three lines apart.  25 tree-wide; clip.c, font.c and trk.c's
+   AnimDecor_Load are typical.  The fix is to fold the tag in as the
+   block's first line, which is what menu.c's pages needed.
+
+   THE TWO CLASSES WANT DIFFERENT FIXES, so the tool labels them
+   differently.  A two-tag hit means a block is STRANDED and its
+   function is elsewhere - move it.  A lone-tag hit means the fact is
+   DUPLICATED - merge it.  Calling both "belongs to no function"
+   sends the second one to the wrong repair.
+
+   MIND THE BANNERS.  A section banner is often a RUN of one-line
+   comments, so its ==== rule is in neither block of the pair and the
+   check has to scan the whole contiguous comment run.  Without that
+   every banner in hud.c and trk.c reports as a stacked pair.
+
+
+2.2.  ORIGIN tags
+
+       python tools/origin_audit.py [FILE ...]      default src/*.c
+
+   489 functions tree-wide have no ORIGIN tag within 40 lines above
+   them; 14 remain in race.c.  A long block comment can push a real
+   tag past the window, so a report is a prompt to LOOK, not proof.
+
+   A FILE MAY DECLARE ITSELF OURS ONCE, AT THE TOP, and the tool
+   then reports no per-function gaps in it.  agent.c is 54
+   functions of debug pipe with no original anywhere; tagging each
+   one "NONE - ours" would restate one fact 54 times, which is
+   14.1's duplication in its purest form.  The declaration must be
+   in the file's FIRST comment block - a tag further down is that
+   function's, not the file's.
+
+   TAGS THAT ARE PRESENT ARE STILL SHAPE-CHECKED, so a transcribed
+   function added to such a file still has to carry its own, and
+   autopilot.c's choice to tag all sixteen anyway stays valid.  It
+   is no longer required.
+
+   TAG THEM AS THE SWEEP REACHES THEM, AND ONLY WHEN THE ORIGIN CAN
+   BE ESTABLISHED.  Writing "NONE - ours" on a function that turns
+   out to have an original is worse than leaving it blank, because
+   rule 13 makes that claim load-bearing.  Where only the enclosing
+   function is known, name it and describe the site in words rather
+   than inventing an offset.
+
+   THE TAGS THAT EXIST ARE THE LIKELIER DEFECT.  Three of menu.c's
+   six pre-existing tags were wrong, against none of its 104 gaps.
+   The tool now shape-checks an adjacent tag, and three shapes
+   recur:
+
+   o AN ORIGIN NAMING A GLOBAL, NOT A FUNCTION.  Eight across five
+     files, and all eight are the same thing: an ACCESSOR over a
+     static gets tagged with the variable the original keeps the
+     value in - "ORIGIN g_nRaceOverHud @ 0x00509ba0", "ORIGIN
+     DAT_00504ea0", "ORIGIN 0x0053f78c".  The original has no such
+     function; it reads the global inline.  The tag is NONE - ours,
+     with the global named in the sentence after it.
+
+   o AN ADDRESS INSIDE THE BODY RATHER THAN THE ENTRY.  Menu_SetPage
+     was tagged @ 0x0040a000; the entry is 0x00409f70.  NOT
+     CHECKABLE OFFLINE - resolve the address in the DB.  A tag that
+     survives a reimport under a different name is the whole point,
+     so the address has to be the one the DB will hand back.
+
+   o A NAMED FUNCTION WITH NO ADDRESS AT ALL, which rule 13 forbids
+     precisely because the name is ours and revisable.
+
+   DECOMPILE THE CANDIDATE BEFORE WRITING "NONE - ours", and expect
+   ONE decompile to settle SEVERAL of our functions: the original
+   keeps in one handler what the port splits into helpers.
+   MenuPage06_RaceSelect_Tick turned out to hold the selection walk,
+   the lap digits, the art-idle scan and the map/photo load - four
+   p6_ helpers that each read like our own plumbing.  The same
+   reading corrected a tag written the batch before, where
+   p10_start_tween had been marked ours and Enter does exactly what
+   it does.
+
+   BEFORE TAGGING A HELPER AS A SLICE OF ITS CALLER, GET_XREFS_TO
+   THE FUNCTION IT CALLS.  trk.c's rd_mesh was about to be tagged
+   "Trk_Load, the per-mesh read"; the xrefs to Trk_ReadFace name
+   Trk_ReadMesh @ 0x00422a20, a whole function of its own.  A port
+   helper that looks like a fragment of a big loader is often a
+   whole original function, because the original factored it the
+   same way and only the DB's naming hid that.
+
+   A SITE CAN BE RECOVERED FROM A DATA ADDRESS THE COMMENT ALREADY
+   CITES.  Where a slice's block quotes a format string or a
+   constant, xrefs to that address name the referencing function and
+   the instruction inside it - which settled two of menu.c's.  NAME
+   SIMILARITY IS NOT EVIDENCE: menu_set_cursor looks like
+   Menu_ApplyCursor and is unrelated, and menu_hit_test is
+   Menu_UpdateHover rather than the Menu_HitTest it is named after.
+
+
+2.3.  Stripped apostrophes
+
+   Three instances in race.c read "the ORIGINAL S", "this frame s"
+   and "MOTO s -326.70" - a curly quote that lost its character in a
+   transliteration pass rather than being mapped.
+
+   asciify --check CANNOT SEE THIS: the result is still valid ASCII,
+   it is just missing a letter.  Grep for a lone " s " after an
+   identifier when sweeping a new file.
+
+
+2.4.  Claims that a callee is missing
+
+   GREP THE FILE FOR THE PHRASES, every sweep:
+
+       not transcribed | not written | still to import
+       no port equivalent | is not yet | [open - FUN_
+       not wired | not decoded | nothing yet | neither is
+       yet | nothing is | does not | no .* yet
+
+   THE CLAIM NEED NOT CARRY A TAG, and the last five phrases are
+   there because of that.  Three of menu.c's four stale claims
+   were untagged prose - "THE 26.3998 IS NOT DECODED" twenty lines
+   above the function that decodes it, "Nothing is editable yet
+   and nothing is stored" over a page whose every row cycles and
+   whose leave calls options_save, and "NOT WIRED YET" on an
+   indicator whose sibling half was wired.  An audit that greps
+   for [open] finds none of them.
+
+   For each hit, look for the SYMBOL and then for a CALL to it.
+   Both, in that order - a function that exists but is never
+   called makes the claim half true and wants rewording, not
+   deleting.  Use an unfiltered grep for the call: a pipeline that
+   trims its output once hid a live call site and nearly had a
+   working function recorded as dead.
+
+   WHY THIS CLASS HIDES.  The claim attaches to code that still
+   looks provisional, and filling in a stub does not touch the
+   caller - so nothing ever prompts a re-read.  It went five
+   blocks running in racer.c, and in one of them five separate
+   comments asserted the same dead claim about one function.
+
+   A WRITTEN CORRECTION DOES NOT FIND THE COPIES.  Five places
+   spoke about trk.c's per-segment decor lists: trk.h and
+   trk_draw_segment_decor recorded that the fields ARE parsed, and
+   trk_draw's own prop loop, race.c's call site and
+   racer-draw-pipeline.txt still said they were not.  So the
+   correction had been written TWICE and the error survived THREE
+   times, in the same tree, for however long.
+
+   WHEN A CLAIM OF ABSENCE TURNS OUT FALSE, GREP THE TREE FOR IT
+   BEFORE FIXING THE ONE IN FRONT OF YOU - src/ and docs/ both.
+   Fixing the local copy is what produces this state.
+
+2.5.  Escapes expanded by the script that wrote the comment
+
+   A comment applied through a generator carries a backslash escape
+   that the generator expanded.  Three sightings: an ORIGIN tag whose
+   @ became a TAB, and two asset names in race.c where \t became a
+   real tab, so one read ile01<TAB>imatak__1.bin for
+   ile01\timatak__1.bin.
+
+   NEITHER CHECK SEES IT.  asciify counts a tab as four columns and
+   is otherwise content; retab governs only the leading run, so a
+   tab after the "*" of a comment is legal to both.  The ORIGIN
+   audit misses the first case for the opposite reason - the tag no
+   longer matches the pattern that would have audited it.
+
+       grep -nP '^[ \t]*\*.*[^ \t]\t' src/*.c src/*.h
+
+   A tab after a non-blank in a comment line is nearly always this.
+   Run it after any sweep applied by a script, and build replacement
+   strings so the substitution character cannot occur in the payload
+   - chr(64) is @, which is the one character an ORIGIN tag needs.
+
+
+3.  Writing a note without committing the defect
+
+   The sweep has twice put into its own notes the thing it was
+   removing from src/.  Both times a reader caught it, not the
+   sweep.
+
+   A NUMBER IN A TITLE IS A CLAIM ABOUT THE ROWS UNDERNEATH.  A
+   heading saying "in four files" over a table of five, and a
+   comment header saying "TWO HOLES, BOTH MARKED" over a function
+   whose body already resolved one of them, are the same defect.
+   Both counts were typed from memory of the material rather than
+   counted off it.  RE-COUNT WHENEVER EITHER SIDE CHANGES - and
+   note that the second of those survived a sweep whose whole
+   purpose was to find stale claims.
+
+   AFTER A SCRIPTED EDIT, READ THE SEAM - the lines either side of
+   the replacement.  asciify and retab both PASS on a duplicated
+   paragraph, so a heading prepended without deleting the old
+   opening leaves two openings and every check stays quiet.
+
+   A CHECK FOR THIS WAS TRIED AND IS NOT KEPT.  Detecting a
+   duplicated RUN of lines is cheap and works - three or more
+   consecutive lines repeated nearby - but it only finds the case a
+   reader already spots.  The restatement form, where the
+   duplicate is a paraphrase rather than a copy, defeated every
+   heuristic tried: around 85 false positives across docs/, and a
+   check that cries wolf is worse than none.  THIS CLASS IS FOUND
+   BY READING.
+
+   A COMMENT THAT CITES ITS NEIGHBOUR BREAKS WHEN THE NEIGHBOUR
+   GOES.  Deleting a measured table orphaned the sentence below it
+   that read "the sign is measured - see the table above".  Grep a
+   block for "above" and "below" before removing anything from it.
+
+   GREP docs/ BEFORE DRAFTING A REPLACEMENT, not after.  The first
+   question about a long block is not how to shorten it but whether
+   its home already exists.  A 31-line block was compressed to 24 by
+   hoisting its generalisation - a real improvement, and the wrong
+   move: racers.txt held the whole thing, and the answer was 11
+   lines and a pointer.
+
+   GREP A PHRASE BEFORE ADDING IT, TOO.  The sweep wrote the same
+   paragraph into two headers two blocks apart, having composed it
+   fresh both times.  The check that finds duplication when
+   deleting finds it when writing, and costs the same.
+
+   A POINTER EARNS ITS PLACE ONLY WHEN THE TARGET SAYS SOMETHING
+   THE SENTENCE DOES NOT.  Four "see X" references were added while
+   repointing dead ones, every one to material the sentence already
+   carried.  A pointer that adds nothing is one more thing to keep
+   true.
+
+   WHEN THE CLAIM IS "NOTHING CALLS THIS", THE GREP HAS TO BE THE
+   UNFILTERED ONE.  See 2.4.

@@ -1,0 +1,1440 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       THE RACE HUD
+
+
+Abstract
+
+   Everything the race draws over itself that is not the counter:
+   the BEST LAP block, the TIME banner and its countdown, the
+   position, the lap list and the multiplayer scoreboard.
+
+   THE STATIC TEXT IS NOT TEXT.  "BEST LAP", "TIME" and "POS" are
+   single GLYPHS of a Pal font whose characters are whole words, so
+   the code draws a one-character string and gets a banner.  That is
+   why they cannot be found by searching for their words.
+
+   The counter - the speedometer and rev counter - is a separate
+   subsystem; see hud-counter.txt.
+
+Table of Contents
+
+   1. The entry path and the countdown gate
+   2. The fonts
+   3. The Sprites banner sheet
+   4. Alignment: flag 8 is right, not left
+      4.1. And the coordinates are HALVED in small mode
+   5. The upper-right stack
+      5.1. BEST LAP
+      5.2. TIME and the countdown
+      5.3. POS
+   6. The colour table
+   7. The port
+      7.1. Where the time limit comes from
+      7.2. The racer callout - the caption over the ghost's head
+      7.2.1. The badge is the LIVE standing, not racer+0x2f85
+      7.2.2. Every HUD position reader is indexed by
+             g_viewedRacerIndex
+      7.3. The split delta against the ghost
+      7.4. The lap list, upper left
+   8. THE SPRITE BANNERS - GAME OVER, TIMEOUT, and the rest
+      8.1. STYLE 4 - APPEAR IN PLACE, THEN SLIDE OUT
+         8.1.1. TIMEOUT IS A TEXT BANNER, NOT A SPRITE ONE
+         8.1.2. The banner sprite registry
+      8.2. The blink is a per-frame toggle, not a timer
+   9. Open questions
+
+1.  The entry path and the countdown gate
+
+   maybe_Game_RenderFrame calls TWO HUD functions, not one, and they
+   are near-copies of each other [verified]:
+
+   +------------+-----------------------------------------------+
+   | 0x004804d0 | lap list, then BEST LAP + scoreboard in time  |
+   |            | attack, else TIME + total time                |
+   +------------+-----------------------------------------------+
+   | 0x004806e0 | the same, plus BEST LAP unconditionally in    |
+   |            | solo, and the gear-hint bar                   |
+   +------------+-----------------------------------------------+
+
+   Both open with FUN_004817a0, which counts the active racers into
+   DAT_004dc100 - read live as 12, and the "12" of "12/12".
+
+   Both then reach the HUD through Hud_DrawFrame 0x00413410, and it
+   is ONE branch around the WHOLE dispatcher [verified]:
+
+       if (g_bPreRace) { Hud_DrawCountdown(...); return; }
+       Hud_DrawInRace(...);
+
+   So while the grid counts down NONE of the upper-right stack is
+   drawn - not TIME, not POS, not the lap list, not the scoreboard.
+   Hud_DrawCountdown 0x00413030 draws the N LAPS banner, the falling
+   counter and GET READY in their place, and FUN_00482830 - best lap
+   - is the one block common to both, with case 1 on the grid and
+   case 0 in the race.  The bottom-right instrument cluster is in
+   neither and is visible throughout.
+
+   o SO A POSITION COMPUTED DURING THE COUNTDOWN IS NEVER SEEN, and
+     a wrong one there is not a standings fault to chase.
+
+   Hud_DrawInRace 0x00413180 then dispatches on the viewed racer's
+   raceState at racer+0x2de5.  States 2 and 3 - finished or out -
+   draw best lap in solo or the scoreboard in network and return.
+
+   THE RETURN IS THE POINT, AND THE PORT USED TO MISS IT.  Past the
+   line there is no TIME countdown, no POS and no lap list: the whole
+   in-race readout goes away and the best-lap block is left alone on
+   screen.  Ours kept drawing all three over a bike that had stopped
+   racing, with a countdown nothing acts on.  hud_race_over is the
+   arm; the time, pos and lap-list overlay rects go quiet with it, or
+   the composite copies the stale bands they used to occupy.
+
+   raceState 3 TAKES THE SAME ARM AS 2.  Timed out and finished look
+   identical here; what separates them is the standings bucket and
+   the pose, not the HUD.
+
+   THE NETWORK ARM IS NOT TRANSCRIBED.  FUN_00482f00 at 0x00482f00
+   draws a scoreboard instead of the best lap when g_nSoloMode is 0.
+   [open]
+
+   AND THE END-OF-RACE READOUT IS NOT IN THIS FUNCTION AT ALL, which
+   is worth knowing before looking for it here.  Hud_DrawInRace just
+   STOPS drawing; something else starts, one level up.
+
+1.1.  THE HUD DISPATCHER, AND THE POST-RACE BRANCH
+
+   FUN_004806e0 is the caller.  It recounts the active racers
+   (FUN_004817a0, which is what fills DAT_004dc100) and then chooses:
+
+       neither post-race flag set
+           DAT_0052c238 == 0    Hud_DrawFrame - the in-race HUD
+           otherwise            a widget, and the network scoreboard
+       DAT_00509ba0 or DAT_00542a20 set, SOLO
+           two widgets, the BEST LAP block, and then either
+             FUN_00481970   the finishing-position readout
+             Hud_DrawLapList when finishPosition is 0..2, raceState
+                            is 2 and g_meshFinal has faces - the
+                            PODIUM case
+
+   BOTH FLAGS ARE NOW NAMED [verified].  g_nRaceOverHud
+   (0x00509ba0) is the LOCAL half and g_nRaceOverNet (0x00542a20)
+   the remote one; either sends the dispatcher down the finished
+   branch.
+
+   g_nRaceOverHud IS SET AT 0x0047eb04, inside
+   maybe_Race_UpdateProgress, on the frame the local racer's
+   lapCounter reaches g_nRaceLaps:
+
+       if (racer == local && racer->lapCounter == g_nRaceLaps) {
+           DAT_005429b0 = 0;
+           if (g_nSoloMode != 0)  g_nRaceOverHud = 1;
+           else                   FUN_00456c80(..., raceClockMs);
+       }
+
+   so solo raises the flag and network posts a time instead, the
+   peer's acknowledgement arriving later as g_nRaceOverNet - which
+   is written only by one case of the packet dispatcher
+   FUN_00455280, at 0x004556bd.  A solo port needs only the first.
+
+   IT IS NOT raceState, and the difference is not academic.
+   raceState 2 is per-racer and is what buckets the standings; this
+   is one global about the LOCAL racer, and it is the only thing the
+   dispatcher tests.
+
+   THE PORT SUBSTITUTED raceState AND IT LOOKED RIGHT.  The two go
+   true on the same frame for the local racer, so a finished race
+   behaved.  What it also did was let the finishing-position readout
+   draw from the moment the player crossed the START line - the
+   readout's own inner gates are only "has raced at all" and "has
+   some clock on it", and the branch that is supposed to keep it off
+   the screen for the whole race is this flag.  race_over_hud() in
+   race.c now carries it.
+
+1.2.  FUN_00481970 - "1st", "2nd", "3rd", "4th" - THE FALLBACK
+
+   READ 1.3 FIRST.  This block is not what a player normally sees
+   at the end of a race; it is what is drawn when the 3D plaque
+   does not fire.
+
+   THE SUFFIX IS A GLYPH, NOT A STRING.  The format at 0x004f1044 is
+   "%d%c/" and the character is picked by position:
+
+       0 -> ':'    1 -> ';'    2 -> '<'    3 and up -> '='
+
+   so the face carries st, nd, rd and th at 0x3a..0x3d and the code
+   never spells them.  A port that wrote "1st" would need four
+   strings and would draw the wrong glyphs.
+
+   AND THE TRAILING SLASH IS THE WORD "POS".  0x2f is not a solidus
+   in this face; it is 375 pixels wide against 43 for a suffix and
+   26 to 61 for a digit, which is the tell - a face whose widths run
+   26..375 has a glyph that is a whole word.  Drop it and the
+   readout still draws perfectly, just without the word, which
+   reads as a font fault rather than a missing character.
+
+   THE POSITION COMES FROM TWO PLACES, BY STATE.  A racer with
+   raceState 2 uses the finishPosition it was handed when it
+   crossed; anyone else is asked live through
+   maybe_Race_FinishingPosition.  They differ, and deliberately: the
+   live answer moves as the field comes home behind you and the
+   stored one does not.
+
+   Menu_DrawText is handed x 0, y 0x19, font 5 and align 0xc2.
+
+   AND Menu_DrawText IS NOT Font_DrawText.  The two decode
+   DIFFERENT flag layouts - Text_ApplyAlignment 0x00417900 against
+   Font_ApplyAlignment 0x00492c20 - so 0xc2 cannot be read with the
+   race HUD's scheme, which is what the rest of this document
+   describes (section 4).  A port that routes this block through
+   the race-HUD aligner is using the wrong decoder on the right
+   number.
+
+   ONE MORE GATE, and it is inert: the draw is wrapped in
+
+       if (maybe_Widget_QueryById(DAT_004e9884, 0) == 0) { ... }
+
+   DAT_004e9884 is zero, nothing writes it, and the lookup RETURNS
+   EARLY on a zero id - so the test always passes.  Its neighbours
+   0x004e987c and 0x004e9880 are zero too, and the calls above that
+   take them are Widget_DestroyById: the finished branch TEARS DOWN
+   the in-race widgets, it does not draw any.  The widget array at
+   0x0053ba68 is 48 null slots in a running game, verified live.
+
+   THE FACE IS FINALPOS.FNT, and the glyph range settles it without
+   resolving the font id at all.  Read out of the shipped files it
+   is chars 0x2f..0x3d - POS at 0x2f, the digits 0x30..0x39, and
+   exactly the four suffixes - and nothing else in FONTES covers
+   that range.  HiRes is 39 tall; the LowRes twin is the same range
+   at 19.
+
+   IT IS A Pal FACE, NOT AntiAlias8.  It carries 256 palette
+   entries, and formats/fnt.txt's rule is that a palette block
+   means the game declares the face as Pal - the AntiAlias8 and
+   Direct faces have none.  Loaded as AntiAlias8Transp the glyphs
+   come out grey where retail draws them green, because the shaded
+   blit ignores the palette the file brought with it.  The Pal
+   class has no set_colors hook at all, so the colour is the
+   file's and a caller cannot tint it.
+
+   A FACE WITHOUT THE GLYPH DRAWS NOTHING AND SAYS NOTHING.
+   font_draw_text SKIPS a character the face does not carry rather
+   than substituting one, so this block drawn with the GET READY
+   face produced an empty screen that was indistinguishable from the
+   block never running - it took a hook on the function to show it
+   was being called at all.  The POS number hid behind POSTIMEL.FNT
+   the same way (section 5.1).  When a text block draws nothing,
+   suspect the face before the logic.
+   The racing arm picks one of TWO position blocks, by MODE
+   [verified]:
+
+   +----------------------------------+---------------------------+
+   | !solo || nSelectedMode != 0      | Hud_DrawTimeAndPos        |
+   | || nTimeAttack                   | 0x00482380, TIME and POS  |
+   +----------------------------------+---------------------------+
+   | otherwise                        | Hud_DrawPosOnly           |
+   |                                  | 0x00482620, POS alone     |
+   +----------------------------------+---------------------------+
+
+   A plain solo race at nSelectedMode 0 therefore gets NO TIME
+   COUNTDOWN AT ALL, and Hud_DrawPosOnly further requires raceState
+   != 0 and DAT_004dc100 > 1 - so alone on the track it draws
+   nothing either.
+
+   BOTH ARMS ARE TRANSCRIBED, hud.c hud_time_and_pos picking
+   between them.  Hud_DrawPosOnly is its own function, not a
+   variant of the other: its base y is the 0x55 the dispatch passes
+   as the fourth argument, so banner, number and field land at 90,
+   115 and 137 rather than 150, 150 and 171.  The one structural
+   difference is that the number's inset is measured from the "/N"
+   field, not from the banner.
+
+   AND THE MODE TEST IS NOT ONLY A HUD MATTER.  The same
+   g_nSelectedMode 0 that suppresses the countdown also suppresses
+   the TIME LIMIT ITSELF - practice is never timed out.  See
+   racers.txt 9.8.3.
+
+   WHY PRACTICE USUALLY DRAWS NO POSITION AT ALL.  DAT_004dc100 is
+   the count of ACTIVE racers, recomputed by FUN_004817a0, and
+   practice has exactly ONE of them: it is given one opponent, but
+   that is the GHOST in slot 2 and maybe_Game_InitRace clears its
+   active flag unless a recorded lap exists (racers.txt 9.5).  So
+   Hud_DrawPosOnly's `1 < DAT_004dc100` fails and the block is
+   skipped.  With time attack on the other arm is taken instead,
+   and Hud_DrawTimeAndPos has no such test - hence "1/1".
+
+1.3.  THE REAL END-OF-RACE DISPLAY IS A 3D MESH
+
+   Race_DrawFinalPlaque (0x0047b7a0) draws the giant 1ST/2ND/3RD,
+   and it is NOT part of the HUD at all: it is called
+   unconditionally from maybe_Game_RenderFrame at 0x004802bd and
+   queues MESHES through Screen3D_QueuePrimitive.
+
+       if (g_meshFinal[0].faceCount == 0) return;
+       place = -1;
+       if (g_nSelectedMode != 0 &&
+           0 <= racers[viewed].finishPosition < 3 &&
+           racers[viewed].raceState == 2)
+           place = racers[viewed].finishPosition;
+
+   so PRACTICE NEVER GETS IT, and neither does fourth or worse.
+   Those are exactly the cases the dispatcher hands to FUN_00481970
+   instead (1.2), and the dispatcher's podium test is the same four
+   terms - which is why the two never both appear.
+
+   Race_LoadFinalMeshes (0x0047b600) loads four per track from
+   <track>\final\: "1rst", "2nd", "3rd" and "Laureat", each a
+   .3df/.map pair, through Load3dfAndMap.  The assets ship -
+   DATA\ILE01\FINAL\1RST.3DF and the same under every ileNN - so
+   this is authored art, not a generated overlay.
+
+   IT FORCES PROJECTION ZOOM 1.0 for the two queues and restores
+   the caller's afterwards, which is what makes the plaque read as
+   screen-filling rather than as an object out in the world;
+   g_cfgDetailLevel is forced to 3 and restored the same way.
+   Laureat (the wreath) is queued flat at depth 16.0 behind the
+   number at 13.0, the number on a matrix that spins with a phase
+   in _DAT_004f0c40 while DAT_004f0c3c eases the approach down to
+   2500.0 and then bobs on a sine.  Nothing draws until
+   DAT_004f0c3c passes 768.0.
+
+   THE ANIMATION CONSTANTS, all read out of the image:
+
+   +--------------+------------+--------------------------------+
+   | Address      | Value      | What                           |
+   +==============+============+================================+
+   | 0x0047d5f8   | 16000.0    | starting z, set at race init   |
+   +--------------+------------+--------------------------------+
+   | 0x004d18f0   | -80.0      | fly-in rate                    |
+   +--------------+------------+--------------------------------+
+   | 0x004d18e8   | 2504.0 (d) | clamp test, a hair above rest  |
+   +--------------+------------+--------------------------------+
+   | 0x004d18f4   | 2500.0     | rest z                         |
+   +--------------+------------+--------------------------------+
+   | 0x004d18f8   | 4.0        | bob rate                       |
+   +--------------+------------+--------------------------------+
+   | 0x004f0c44   | 128.0      | bob amplitude, set at init     |
+   +--------------+------------+--------------------------------+
+   | 0x004d18e0   | pi/200 (d) | spin, radians per dt unit      |
+   +--------------+------------+--------------------------------+
+   | 0x004d1918   | 0x4000/2pi | radians -> cos table index     |
+   +--------------+------------+--------------------------------+
+   | 0x004d18fc   | -30.0      | fly-out rate                   |
+   +--------------+------------+--------------------------------+
+   | 0x004d1904   | 768.0      | below this nothing draws       |
+   +--------------+------------+--------------------------------+
+
+   (d) marks a double.  The spin works out at 40.96 index units per
+   dt unit, so 400 dt units to the turn - FOUR SECONDS at 60fps.
+
+   THE PORT IMPLEMENTS IT, in race.c: race_load_final_meshes,
+   race_final_place and race_draw_final_plaque, called from
+   race_draw_3d where the original calls it from
+   maybe_Game_RenderFrame.  race_final_place is the single
+   predicate both displays consult, so the plaque and the text
+   fallback cannot both appear; the original instead repeats the
+   four terms in the dispatcher's podium test.
+
+   THE g_zBufferEnabled ARM IS NOT COSMETIC, which is the easy
+   mistake to make about it.  Pinning both meshes' invZ to 1.0
+   leaves the queue's BUCKETS to order them, so the wreath at depth
+   16.0 always paints behind the number at 13.0.  Depth-tested on
+   real z instead, the wreath's bob carries it from 2372 to 2628 -
+   straight through the number, which sits at a fixed 2500 - and
+   the two intersect on every cycle.  The port ignores invZ, so it
+   gets the same result the map does: its own pass with the depth
+   test off.
+
+   AND THE PORT HAS TO CULL IT ITSELF.  Queueing a primitive
+   directly - which is what buys the fixed depths - goes round
+   cull_and_queue_faces, where the port's winding test lives, so
+   every back face of the plaque drew and a rotating number read as
+   its own inside-out shell.  The original needs no such step: its
+   rasterizer drops a back-facing triangle at fill time, which is
+   why it can queue these meshes whole.  Same problem and same fix
+   as the counter plate - hud-counter.txt 8.
+
+   THE BANK INDICES NEED REBASING IN THE PORT AND NOT IN THE
+   ORIGINAL.  The plaque .maps name bank 19, which is a real track
+   page - BNK00_19.RAW, the last of the twenty - so the original
+   can take it as absolute.  This port loads the track's twenty at
+   RACE_TRK_BANK_BASE to leave the menu's pages alone, so every
+   index out of a track .map shifts with them, exactly as
+   trk_rebase_banks does for the track's own meshes.  Untreated the
+   plaque draws a REAL texture, just the wrong one - 19 lands on
+   track page 11 - so it does not read as a missing step.
+
+   faceKindSelect IS 1 HERE and 0 everywhere else in the port.
+   Race_LoadFinalMeshes is the only caller that passes it, and with
+   a non-zero face bank it upgrades the face kinds to the
+   quality-tier-2 variants 0x10, 0x26 and 0x27.
+
+   DAT_00504eac, the fly-out trigger, is never set in the port:
+   Input_OnKeyDown raises it at 0x00431533 but Hud_DrawMap reads it
+   too, so it is not the plaque's own flag and guessing at it would
+   change the map.  [open - what DAT_00504eac means]
+
+2.  The fonts
+
+   FUN_004816c0 loads seven at race start and keeps them in a block
+   at 0x004f0d64.  Font_Get swaps each id for its LowRes twin when
+   SmallFonts is set, so the id in the call is the HiRes member.
+
+   +------------+----+---------------+------------------+---------+
+   | Global     | id | Name          | File             | Class   |
+   +============+====+===============+==================+=========+
+   | 0x004f0d64 | 20 | PosHiRes      | HIRES\POSTIME    | Direct  |
+   +------------+----+---------------+------------------+---------+
+   | 0x004f0d68 |  7 | TimeHiRes     | HIRES\POSTIME    | Direct  |
+   +------------+----+---------------+------------------+---------+
+   | 0x004f0d6c |  4 | ChronoHiRes   | HIRES\CHRONO     | Direct  |
+   +------------+----+---------------+------------------+---------+
+   | 0x004f0d70 |  5 | MotoHiRes     | HIRES\MOTO       | Pal     |
+   +------------+----+---------------+------------------+---------+
+   | 0x004f0d74 | 11 | SpritesHiRes  | HIRES\SPRITES    | Pal     |
+   +------------+----+---------------+------------------+---------+
+   | 0x004f0d78 | 14 | GameMsgHiRes  | HIRES\POSTIME +  | AA8T    |
+   |            |    |               | HIRES\POSTIMEL   |         |
+   +------------+----+---------------+------------------+---------+
+   | 0x004f0d7c |  6 | PlayerHiRes   | HIRES\NAME       | Pal     |
+   +------------+----+---------------+------------------+---------+
+
+   THE FILE COLUMN WAS BY ELIMINATION AND THAT WAS WRONG.  It assumed
+   twelve LowRes/HiRes font pairs map one-to-one onto eleven pairs of
+   files plus MSG - so every file got used exactly once, and Pos was
+   handed the only leftover, POSTIMEL.
+
+   TWO FONT IDS CAN NAME ONE FILE.  Read out of the live font
+   objects, Pos and Time are two separate MR_Font allocations with
+   IDENTICAL width tables - 25 at 0x20, 1 across 0x21..0x2f, 23
+   across 0x30..0x39 - and glyphHeight 17.  That is LOWRES\POSTIME
+   exactly, for both.
+
+   AND THE SAME MISTAKE WAS IN THIS TABLE.  Font 14 was given
+   HIRES\MSG by the same elimination.  Read live off g_fontTable,
+   id 14 carries TWO faces - HiRes\PosTime for the digits and
+   HiRes\PosTimeL for the letters - and HIRES\MSG belongs to id 12,
+   Messages, which this table does not list because the race HUD
+   does not load it.  See structs/MR_Font.txt.
+
+   o AND POSTIMEL HAS NO DIGITS.  It is 'A'..'Z', 26 glyphs from
+     0x41.  font_draw_text skips a character the face does not
+     carry, so a position number drawn through it renders NOTHING -
+     silently, with its banner and its "/12" still showing.  That is
+     what the elimination cost.
+
+   o WHICH ID POSTIMEL BELONGS TO is still unknown.  Read the live
+     object rather than eliminating.  [open]
+
+3.  The Sprites banner sheet
+
+   HIRES\SPRITES.FNT is a Pal face, 35 glyphs from 'A', 33 tall.
+   Rendered with its own palette [verified]:
+
+   +-----+-------+----------------------------------------------+
+   | Ch  | Width | What it is                                   |
+   +=====+=======+==============================================+
+   | A   |    46 | "POS", small, RED                            |
+   +-----+-------+----------------------------------------------+
+   | B   |   132 | "LAP TIME"                                   |
+   +-----+-------+----------------------------------------------+
+   | C   |   138 | "BEST LAP"                                   |
+   +-----+-------+----------------------------------------------+
+   | D   |   103 | "TIME"                                       |
+   +-----+-------+----------------------------------------------+
+   | E   |    94 | "POS", large, white                          |
+   +-----+-------+----------------------------------------------+
+   | F-M |    24 | eight chequered-flag squares                 |
+   +-----+-------+----------------------------------------------+
+   | N-] |    18 | sixteen dots                                 |
+   +-----+-------+----------------------------------------------+
+   | ^   |    19 | "R"                                          |
+   +-----+-------+----------------------------------------------+
+   | _   |   269 | "EXTENDED TIME"                              |
+   +-----+-------+----------------------------------------------+
+   | `   |   187 | "WRONG WAY"                                  |
+   +-----+-------+----------------------------------------------+
+   | a   |   168 | "FINAL LAP"                                  |
+   +-----+-------+----------------------------------------------+
+   | b   |   224 | "CHECK POINT"                                |
+   +-----+-------+----------------------------------------------+
+   | c   |   152 | "TIME OUT"                                   |
+   +-----+-------+----------------------------------------------+
+
+   So a call like Font_DrawText(Sprites, "D", ...) draws the word
+   TIME.  The one-character strings live at 0x004f104c ("D"),
+   0x004f1064 ("A"), 0x004f106c ("E"), 0x004f1090 ("["), 0x004f1094
+   ("C") and 0x004f10dc ("B").
+
+4.  Alignment: flag 8 is right, not left
+
+   Every draw in the upper-right block passes flags 8, which
+   Font_ApplyAlignment (0x00492c20) reads as
+
+       x = g_viewWidth - x - textWidth
+
+   so the x in the call is an INSET FROM THE RIGHT EDGE, not a
+   position.  Flag 0x21, which the counter uses, means no alignment
+   at all.  See hud-counter.txt 6.3 for the whole ladder.
+
+4.1.  And the coordinates are HALVED in small mode
+
+   Font_DrawTextInternal halves x and y before it aligns them
+   [verified, 0x00493a5c]:
+
+       if ((!g_menu || !g_menu->active) && param_1 == 0 &&
+           (g_cfgSmallFonts || g_cfgScreenMode != 2))
+           x /= 2;  y /= 2;
+
+   param_1 is the internal draw's first argument and THE TWO
+   WRAPPERS DISAGREE ABOUT IT: FUN_00493e60 and Font_DrawText pass 0
+   and halve, FUN_00493fe0 passes 1 and does not.  The race HUD uses
+   the first and the counter the second - which is why the counter
+   carries its own half-size layout column and this block does not.
+
+   HALVE FIRST, THEN ALIGN.  The alignment subtracts from the full
+   viewport width either way, so halving afterwards would drag a
+   right-aligned string into the middle of the screen.
+
+   MEASURED IN A RUNNING MOTO.  A hook just past the alignment call
+   at 0x00493c51, capturing the two in/out coordinates and the flag
+   word [verified]:
+
+   +--------------------+-------+-------+-------+
+   | What               |   x   |   y   | flags |
+   +====================+=======+=======+=======+
+   | BEST LAP banner    |  573  |    2  |   8   |
+   +--------------------+-------+-------+-------+
+   | its row            |  572  |   12  |   8   |
+   +--------------------+-------+-------+-------+
+   | TIME banner        |  586  |   45  |   8   |
+   +--------------------+-------+-------+-------+
+   | the countdown      |  596  |   57  |   8   |
+   +--------------------+-------+-------+-------+
+   | POS banner         |  617  |   75  |   8   |
+   +--------------------+-------+-------+-------+
+   | the position       |  615  |   85  |   8   |
+   +--------------------+-------+-------+-------+
+
+   45 and 57 against the 0x5a and 0x73 the code passes - exactly
+   halved, with 115/2 truncating to 57.  That run was SmallFonts on,
+   which is how MotoRacer ships.
+
+   o SO THE ONLY WAY TO COMPARE THIS BLOCK AGAINST RETAIL IS WITH
+     MATCHING SmallFonts.  At large fonts the whole block doubles -
+     different face, different coordinates - and the two layouts are
+     not scaled copies of each other.
+
+   THE RULE THAT FALLS OUT, and it has bitten twice:
+
+       an AUTHORED constant   divide by the divisor to get pixels
+       a MEASURED width       already in pixels, do not divide
+       an inset BUILT from a measured width, passed back through
+                              the draw   MULTIPLY by the divisor
+                              so the halving cancels
+
+   The original does that last one itself - `if (smallFonts ||
+   screenMode != 2) x *= 2` at 0x00482d1c, right before it draws the
+   best-lap time.  Reading it as an odd special case rather than as
+   this rule is what cost a round: the time landed on top of the
+   right half of the name, because an inset measured in final pixels
+   was halved a second time.
+
+   o AND ANYTHING THAT NEEDS TO KNOW WHERE THE TEXT LANDED HAS TO
+     APPLY THE SAME HALVING.  The port's overlay composite did not,
+     and with small fonts on the whole block vanished: the text moved
+     to y 45..73 while the rectangle being composited stayed at
+     86..153.  Nothing drew and nothing said why.  font.h exposes
+     font_layout_divisor so there is one copy of the condition.
+
+5.  The upper-right stack
+
+   All coordinates are insets from the right edge and rows from the
+   top.
+
+5.1.  BEST LAP
+
+   IT IS A LIST, NOT A LINE.  FUN_00482830 is one do-while that runs
+   THREE times in a race, feeding a different SOURCE into the same
+   row each pass [verified]:
+
+   +------+-------------------------------------------------------+
+   | Case | Source                                                |
+   +======+=======================================================+
+   | 0    | the best lap held by any racer this session           |
+   +------+-------------------------------------------------------+
+   | 1    | the record at 0x00581118, name +0, time +0xf5         |
+   +------+-------------------------------------------------------+
+   | 4    | the record at param_2 (0x005d25b0), same layout       |
+   +------+-------------------------------------------------------+
+
+   The third pass clears bVar5 and ends the loop.  The countdown
+   passes param_1 = 1, which skips the loop and draws case 1 alone -
+   so the grid shows one row and the race up to three.
+
+   o A SOURCE WITH NO TIME DRAWS NO ROW.  Each case tests its time
+     against the 0x7f7f7f7f sentinel first, so the list grows as
+     records appear rather than reserving space.
+
+   o IT IS NOT ONE ROW PER LAP, and the symmetry with the lap list
+     invites exactly that reading.  The left block stacks a row per
+     LAP COMPLETED; this one stacks a row per SOURCE, and there are
+     only ever three.  Two rows in a finished four-lap race is
+     correct: the session best and the track record, with case 4
+     empty because nothing writes it.
+
+   o THE CHRONO FONT IS SHARED WITH THE LAP LIST and the lap list
+     draws first.  It leaves the font GREEN after highlighting a
+     best lap, so a BEST LAP block that does not set its own colour
+     inherits green times for the rest of the race.  The original
+     restores the colour immediately after its green row instead,
+     0x00483c4e.
+
+   o THE ROW PITCH IS g_fontTable[6]->glyphHeight + 4, 0x00482d4e -
+     the Player face, read at run time rather than a constant, so a
+     LowRes face packs the rows tighter.
+
+   o THE TWO CORNERS ARE SYMMETRIC BY DESIGN.  The BEST LAP banner
+     is at (0, 5) right-aligned and the lap list's at (2, 5) left,
+     and both stack rows downward from there.
+
+
+   FUN_00482830, and the block that shows the standing best lap.
+
+       Sprites "C" = "BEST LAP"   at (0, 5)
+       then per row, from y = 27, stepping by fontHeight + 4:
+         Player  the rider's name  at (0, y - 2)
+         Chrono  "%02d:%02d:%02d"  at (right of the name, y)
+
+   THE SHIFT ON THE NAME IS CHOOSING A COLOUR.  NAME.FNT is 128
+   glyphs from 0x20 and carries the alphabet THREE TIMES.  It is a
+   Pal face with a 256-entry palette [verified, palette read out of
+   the file]:
+
+   +-------------+-----------+-------------------------------------+
+   | Range       | Indices   | Colour                              |
+   +=============+===========+=====================================+
+   | 0x40..0x5f  | 1, 5..11  | WHITE, index 7 is 255,255,255,      |
+   |             |           | shaded to light red                 |
+   +-------------+-----------+-------------------------------------+
+   | 0x60..0x7f  | 2..7      | AMBER                               |
+   +-------------+-----------+-------------------------------------+
+   | 0x80..0x9f  | 11..15    | RED 255,0,0 fading to BLACK         |
+   +-------------+-----------+-------------------------------------+
+
+   and the draw adds a constant to every byte first [verified,
+   0x00482bd0]:
+
+       the track record   += '@'   the red-to-black bank
+       an AI              += ' '   AMBER
+       the local player   unchanged, WHITE
+
+   o THE BASE BANK IS WHITE, NOT RED.  An earlier note here called
+     it red, which makes the player's own name and the track
+     record's sound like the same colour when they are opposite
+     ends of the face.  The DIGITS the lap list draws through this
+     same face - '1' is 0x31 - use the same white family, which is
+     why the two corners match when a name is unshifted and do not
+     when it is not.
+
+   o SO THE UNREADABLE BAR NEXT TO THE TIME IS THE DARK-RED BANK.
+     It is the art, not a drawing fault.
+
+   o AND THE PAD CHARACTER IS '@' BECAUSE 0x40 IS FULL WIDTH in this
+     face - the slot before 'A'.  Every other filler glyph is one
+     pixel, so padding with anything else would change the width.
+
+   THREE SOURCES, tried in order when the caller passes 0 in solo:
+
+   +---+---------------------------------------------------------+
+   | 0 | the racer currently holding the best lap - a qsort over |
+   |   | every active racer's bestLapMs (+0x2de1), with the      |
+   |   | winner's playerName (+0x2dd4)                           |
+   +---+---------------------------------------------------------+
+   | 1 | a record at 0x00581118 with its time at 0x0058120d -    |
+   |   | the track's standing best, from outside the race        |
+   +---+---------------------------------------------------------+
+   | 4 | a session best at the caller's record + 0xf5            |
+   +---+---------------------------------------------------------+
+
+   0x7f7f7f7f IS "NO TIME YET" in all three - FUN_00411010 fills the
+   tables with it at race start, and every reader tests against it
+   rather than against zero.
+
+5.2.  TIME and the countdown
+
+   FUN_00482380, the first half.
+
+       Sprites "D" = "TIME"  at (8, 0x5a)     y = 90
+       Time    "%02d"        at (8, 0x73)     y = 115
+
+   The number is g_raceTimer in whole seconds, or the literal "00"
+   once the timer has gone negative.
+
+   IT FLASHES, AND THE COLOUR IS THE URGENCY [verified]:
+
+   +--------------------------+---------+----------+-------------+
+   | Condition                | digits  | banner   | blink mask  |
+   +==========================+=========+==========+=============+
+   | g_extendedTimeMs >= 4000 | yellow  | yellow   | always      |
+   +--------------------------+---------+----------+-------------+
+   | timer < 0                | red     | red      | & 1         |
+   +--------------------------+---------+----------+-------------+
+   | seconds < 3              | red     | red      | & 2         |
+   +--------------------------+---------+----------+-------------+
+   | seconds < 10             | orange  | white    | & 4         |
+   +--------------------------+---------+----------+-------------+
+   | otherwise                | green   | white    | always      |
+   +--------------------------+---------+----------+-------------+
+
+   A frame counter at 0x004f0e1c is incremented and ANDed with the
+   mask, so & 1 is every other frame, & 2 is two on two off and & 4
+   is four on four off - the readout flashes faster the less time is
+   left.
+
+   g_extendedTimeMs (0x00519fec) IS THE CHECKPOINT BONUS BANNER
+   TIMER.  maybe_Race_UpdateProgress sets it to 5000 at the same
+   instant it adds the bonus to g_raceTimer, and maybe_Game_Tick
+   counts it down by the frame delta.  So for the first second after
+   a checkpoint the whole TIME readout turns yellow and stops
+   flashing, and FUN_00483860 shows the "EXTENDED TIME" banner for
+   the full five.
+
+5.3.  POS
+
+   FUN_00482380, the second half, drawn only when the finishing
+   position is valid.
+
+       Sprites "A" = "POS", red   at (0,   0x96)   y = 150
+       Pos     "%d" the position  at (w+8, 0x96)
+       Chrono  "<%d" the field    at (8,   0xab)   y = 171
+
+   '<' is a glyph of the Chrono face, and the string is the "/12":
+   the number is DAT_004dc100, the count of active racers.  The
+   position number is drawn in the Pos face, which is why it is
+   larger than the "/12" beside it.
+
+6.  The colour table
+
+   A run of RGB triples at 0x004f0dd4, four bytes each, which the
+   whole HUD indexes by address [verified]:
+
+       0x004f0dd4  255,255,255  white     0x004f0de8  255,255,0  yellow
+       0x004f0dd8    0,  0,  0  black     0x004f0dec  255,  0,0  red
+       0x004f0ddc  127,127,127  grey      0x004f0df0    0,  0,255 blue
+       0x004f0de0    0,255,255  cyan      0x004f0df4    0,255,0  green
+       0x004f0de4  255,  0,255  magenta   0x004f0df8   19,188,5  green
+                                          0x004f0dfc  255,160,0  orange
+                                          0x004f0e00   43, 50,0  olive
+
+   THEY DO NOTHING TO A Pal FACE.  Slot 0 stores the pair and slot 1
+   rebuilds the LUT, and the Pal builder ignores the stored colours
+   and reads the face's own 256-entry palette.  So the set_colors
+   call before a Sprites draw is inert, and the banner's colour is
+   in the art.
+
+7.  The port
+
+   src/hud.c, alongside the counter.  Delivered in chunks.
+
+   AN OVERLAY RECT IS A PROMISE THAT hud_draw RAN THIS FRAME.
+   Every hud_*_overlay_rect tells main.cpp to lift a box out of
+   the overlay buffer onto the finished frame, and only hud_draw
+   ever refills that buffer - menu.c calls it while race_ready()
+   and not otherwise.  A rect reported on a frame where the draw
+   did not run promotes whatever pixels were left in the buffer,
+   which is the last frame that DID draw.
+
+   That is not hypothetical.  QUIT RACE closes the in-race menu
+   and starts a page transition, the race ticks on for those few
+   frames, and race_post_race_tick re-raises the post-race prompt
+   - so s_open was still 1 after the race was freed.  Nothing
+   drew it and the compositor lifted it anyway: a trimmed ghost
+   of the REPLAY YES/NO box sat on the top 5 page until something
+   else opened the menu.  Trimmed because the rect is recomputed
+   live while the pixels are stale, and the two menu modes have
+   different row counts.
+
+   Re-raising every frame is the ORIGINAL's shape and is not the
+   bug - FUN_00412a50's state 0 calls FUN_00437b70 on every pass
+   and it is a no-op while the prompt is open.  The bug is the
+   window where our race outlives the player's decision to
+   leave.  race_free now closes the menu, hud_prompt_open carries
+   hud_menu_open's race_ready test, and hud_menu_overlay_rect
+   carries it too so the rect and the draw cannot disagree again.
+
+   A CACHED RECT HAS A SECOND WAY TO GO STALE, and the racer
+   callout is the only element that caches one - its rectangle is
+   the union of wherever the riders projected this frame, so unlike
+   every other provider it cannot be recomputed from state.  It
+   therefore needs the race_ready test AND a per-frame
+   invalidation, and the clear belongs in hud_draw rather than in
+   hud_draw_racer_callouts: four conditions sit between the two -
+   the HUD hidden, the race over, the mode not qualifying, a null
+   camera - and any of them skips the draw on a frame where
+   hud_draw itself still runs.
+
+   Carrying neither, the caption lingered on the top 5 page exactly
+   as the prompt had, with s_calloutRectOk 1 and the rect still at
+   (423,200)-(478,218) read live on that page.
+
+   +---------------------------+----------------------------------+
+   | font_draw_text_aligned    | Font_ApplyAlignment, whole.      |
+   | font.c                    | Needed by every draw here        |
+   +---------------------------+----------------------------------+
+   | hud_draw_time             | FUN_00482380's first half, 5.2   |
+   +---------------------------+----------------------------------+
+   | hud_time_overlay_rect     | its composite rectangle          |
+   +---------------------------+----------------------------------+
+   | hud_draw_best_lap         | FUN_00482830 case 0, 5.1         |
+   +---------------------------+----------------------------------+
+   | hud_draw_pos              | FUN_00482380's second half, 5.3  |
+   +---------------------------+----------------------------------+
+   | race_update_progress      | maybe_Race_UpdateProgress, a     |
+   |                           | skeleton - see the open question |
+   +---------------------------+----------------------------------+
+   | race_compute_standings    | Race_ComputeStandings, whole     |
+   +---------------------------+----------------------------------+
+   | race_finishing_position   | 0x00459f50, whole                |
+   +---------------------------+----------------------------------+
+   | race_clock                | a SEAM, and it returns NULL      |
+   +---------------------------+----------------------------------+
+
+   THE CLOCK IS WIRED.  race.c owns an MR_RaceClock, resets it at
+   load and steps it beside race_tick_all; race_clock() hands it to
+   the HUD.
+
+7.1.  Where the time limit comes from
+
+   FIVE PLACES, and only the last of them is obvious.
+
+   +------------------------+--------------------------------------+
+   | The grid countdown     | 6000 ms, a literal at 0x0041129d     |
+   +------------------------+--------------------------------------+
+   | The clock enable       | (g_nSoloMode != 0), 0x00410206 -     |
+   |                        | the same test that sets g_bPreRace   |
+   +------------------------+--------------------------------------+
+   | The checkpoint index   | segment+0xd8, the port's linkA.      |
+   |                        | 0xffff on an ordinary segment        |
+   +------------------------+--------------------------------------+
+   | The checkpoint time    | segment+0xda, the port's linkB -     |
+   |                        | but see below                        |
+   +------------------------+--------------------------------------+
+   | The difficulty bonus   | 25000, 20000, 15000 at 0x00515fe0.   |
+   |                        | Network adds a flat 120000 instead   |
+   +------------------------+--------------------------------------+
+
+   THE .trk's OWN CHECKPOINT TIMES ARE DEAD DATA.  Trk_Load walks the
+   segments and, for every one whose linkA is not 0xffff, OVERWRITES
+   linkB from a table at 0x00509228 that the LEVEL.BPT reader filled
+   from TimeCheckPoint[] [verified, 0x0040dfbd].
+
+       ile01.trk   segments 0, 319, 539, times 30, 30, 30
+       ile01 LEVEL.BPT           TimeCheckPoint 15000, 15000, 13000
+       running MOTO, segment 0   15000
+
+   o SO A RECONSTRUCTION THAT TRUSTS THE .trk GETS A THIRTY
+     MILLISECOND RACE.  The file's numbers look like seconds from an
+     older authoring pass and nothing reads them.
+
+   o AND THE START LINE IS CHECKPOINT 0.  Its linkB is the initial
+     limit; the others are the bonuses maybe_Race_UpdateProgress adds
+     on the way past.
+
+   THE LIMIT ITSELF, at 0x0047dd67:
+
+       if ((short)startSegment->linkA < 0)   no limit at all
+       else timer = startSegment->linkB + bonus[difficulty]
+
+   The negative gate never fires on shipped data - every start
+   segment carries 0 - but it is the difference between a timed race
+   and an untimed one.
+
+   ile01 at difficulty 1 therefore runs 15000 + 20000 = 35000 ms,
+   which is what a paused MOTO reads back part way through.
+
+7.2.  The racer callout - the caption over the ghost's head
+
+   Hud_DrawRacerCallouts (0x00483670).  Ported.
+
+   A two-line caption drawn at a racer's PROJECTED head position
+   with a pointer glyph underneath - a speech-bubble tag, fixed in
+   size, moving across the screen as the rider moves.  Reached from
+   Hud_DrawInRace at 0x0041329e and only when
+
+       g_nSoloMode == 0                       a network game, or
+       g_nSelectedMode == 0 && g_nTimeAttack  practice + time attack
+
+   so IN SOLO THE ONLY THING IT EVER LABELS IS THE GHOST.
+
+   It loops from racer 1 by 0x3209 and skips three cases: the racer
+   being viewed, racer+0x68 clear, and racer+0x00 clear.  Never
+   labelling g_viewedRacerIndex is why you see a tag on the ghost
+   and none on yourself.
+
+   THE ANCHOR IS THE HEAD, not the bike.  The position is taken
+   relative to the camera eye with +125.0 added to Y - 0x004d1a20,
+   a float - and FUN_004818a0 then projects it, returning 0 when it
+   is off screen.  That is why the caption VANISHES at distance
+   instead of sticking to the edge.
+
+   THE TEXT, built at 0x0048377a:
+
+       sprintf(buf, "%c^%s\<LF>]", FinishingPosition() + 0x29,
+               racer+0x2dd4)
+
+   0x004f10bc is that format, and every punctuation character in it
+   is a GLYPH INDEX rather than punctuation - the same convention
+   the lap list uses for ':' ';' '<' and "[]" (see 7.4):
+
+   +--------+-----------------------------------------------------+
+   | Piece  | What it is                                          |
+   +========+=====================================================+
+   | %c     | position + 0x29, so place 0 is ')' - a BADGE glyph  |
+   +--------+-----------------------------------------------------+
+   | ^      | the frame glyph before the name                     |
+   +--------+-----------------------------------------------------+
+   | %s     | racer+0x2dd4, playerName                            |
+   +--------+-----------------------------------------------------+
+   | \      | the frame glyph after it                            |
+   +--------+-----------------------------------------------------+
+   | <LF>   | a real 0x0a - the caption is TWO LINES              |
+   +--------+-----------------------------------------------------+
+   | ]      | the POINTER, alone on line two                      |
+   +--------+-----------------------------------------------------+
+
+   X centres on the pointer - projX - glyphWidth[0x5d]/2, where
+   0x5d is ']' - and Y is projY - glyphHeight - [0x005d893c], which
+   reads 0 live.  Font DAT_004f0d70, draw flags 0x21.
+
+   THE COORDINATES ARE DEVICE PIXELS AND MUST NOT BE HALVED.  The
+   draw goes through FUN_00493f60, and that wrapper hands
+   Font_DrawTextInternal param_1 = 1 - which is exactly the flag
+   that skips the layout divisor at 0x00493a5c.  Going through an
+   aligned entry point that applies the divisor puts the caption in
+   the upper left of the screen; flag 0x21 is no alignment anyway,
+   so the plain draw is the faithful call.
+
+   THE TEXT IS IN THE RIDER'S OWN COLOUR.  FUN_00459240 takes the
+   racer INDEX and returns entry 0xc6 of his livery palette - 0xf0
+   on tracks past the third - out of bank 0, indexed by racer+0x170.
+   0x0e39 is the fallback when the racer has no livery or that
+   palette is absent.  0x004837b0 then unpacks it into the font's
+   fore colour through the run-time 565 masks and 0x004837c4
+   rebuilds the LUT over 1..255.  So a caption is never a fixed
+   colour, and a port that omits the lookup gets whatever the Pal
+   face brought.
+
+   o IT IS BEHIND THE FOCUS GATE.  Living inside Hud_DrawInRace puts
+     it behind FUN_004804d0's [this+0xc] test, so it disappears with
+     TIME, POS, BEST LAP and the lap list when the window loses
+     focus, while the instrument cluster and the map - drawn further
+     up the frame path - stay up.  That grouping is the quickest way
+     to tell which HUD block a missing element belongs to.
+
+   THE PORT IMPLEMENTS IT, in hud.c:
+
+   +---------------------------+---------------------------------+
+   | hud_draw_racer_callouts   | Hud_DrawRacerCallouts           |
+   +---------------------------+---------------------------------+
+   | hud_project_world_point   | FUN_004818a0                    |
+   +---------------------------+---------------------------------+
+   | HUD_FONT_MOTO 1           | Font_Get(5), MotoHiRes's twin   |
+   +---------------------------+---------------------------------+
+
+   and three things had to come with it:
+
+   o race.c NOW PUBLISHES THE CAMERA.  race_camera_view and
+     race_camera_eye hand out the view matrix and the post-boom eye
+     that race_draw_3d built, because the HUD runs after it has
+     returned and dropped its locals.  The original reads them off
+     the camera record instead.
+
+   o font.c NOW BREAKS LINES ON 0x0a, in both font_draw_text and
+     font_text_width.  It did neither, so the pointer would have
+     drawn inline after the name instead of underneath.  Both halves
+     of the original do it - FUN_00493490 at 0x004936a9 and
+     Font_MeasureText at 0x00492b7e.  What is NOT reproduced is the
+     original re-aligning each line by re-measuring the remainder
+     (0x00493708); ours carries the starting x, which agrees for
+     flag 0x21 and differs for centred multi-line text. [open]
+
+   o IT IS THE FIRST HUD ELEMENT THAT MOVES, and that needed a new
+     piece of plumbing.  Our HUD draws into an overlay buffer and
+     main.cpp uploads only the RECTANGLES each element declares -
+     every other one is at a fixed place, so a fixed rect served.
+     A callout with no rect reaches the screen only where it happens
+     to overlap another element's and then stops for good once the
+     rider's projected position moves clear, which reads as a timer
+     and is neither a timer nor a distance cull.
+     hud_callout_overlay_rect publishes the union of the captions
+     drawn that frame.  The original needs none of this: it draws
+     into the one DirectDraw surface.
+
+   o Y COMES OFF TWICE AND BOTH ARE ONE LINE.  0x0048374c lifts by
+     one glyphHeight (plus [0x005d893c], which reads 0) and
+     0x004837c8 then subtracts the MEASURED height - but the measure
+     is called with Font_MeasureText's LAST ARGUMENT SET, and that
+     is a stop-at-newline flag: the height starts at one glyphHeight
+     and the loop BREAKS at the 0x0a instead of accumulating
+     (0x00492b10).  So the measure is one line however many the
+     caption draws, and the total lift is two.
+
+     Measured live off a paused MOTO: MotoHiRes has glyphHeight 9 at
+     font+0xa18 and glyphWidth[']'] 10 at font+0x78c, so the caption
+     sits 18 px above the projected head and 5 px left of it.
+     Taking the measure as the full block lifts it 27 and opens a
+     gap; taking only the first subtraction puts the tick on the
+     rider's back.
+
+   o THE CALLOUT SITS INSIDE OUR !hud_race_over() BLOCK, where the
+     original draws it BEFORE its race-over return - so a viewer who
+     has finished keeps their callouts in retail and loses them
+     here. [deliberate divergence]
+
+   o THE GHOST'S CAPTION READS "COMPUTER" [verified live].  Hooked
+     at 0x00483742 in a running MOTO: three consecutive hits with
+     ESI 2 and EDI 0x00587692 - racer 2 + 0x68 - formatting
+     "COMPUTER", Y stepping 234, 233, 233 as the ghost pulled away.
+     maybe_Game_CreateRacers gives every non-human racer that name
+     and nothing redirects this at the ghost record's "SHADOW", so
+     the tag is the generic AI name.
+
+7.2.1.  The badge is the LIVE standing, not racer+0x2f85
+
+   The %c of the caption format is maybe_Race_FinishingPosition
+   plus 0x29, called per racer at 0x0048377a [verified: the plate
+   at 0x00483670 spells the sprintf out, and an xref sweep of
+   racer+0x2f85 does not list Hud_DrawRacerCallouts at all].
+
+   SO IT IS NOT THE finishPosition FIELD, and that distinction is
+   the whole behaviour.  racer+0x2f85 is written in exactly four
+   places: Racer_Ctor and maybe_Game_InitRace set it to 7,
+   maybe_Race_UpdateProgress sets it at 0x0047eb98 when a racer
+   CROSSES THE LINE, and the net dispatch stores a received one at
+   0x0045551b.  Nothing updates it while the race runs.
+
+   Reading the field therefore pins every badge to its initial
+   value until somebody finishes - which is what the port did, and
+   it read as a position that never changed.  The standings are
+   recomputed every frame (race_compute_standings, after
+   race_update_progress), so the live lookup costs nothing.
+
+7.2.2.  Every HUD position reader is indexed by g_viewedRacerIndex
+
+   0x00508834, written by maybe_Game_CreateRacers and read by
+   Hud_DrawTimeAndPos, Hud_DrawPosOnly, Hud_DrawLapList,
+   Hud_DrawMap, Hud_DrawInRace and the callout loop [verified, an
+   xref sweep].  Hud_DrawTimeAndPos pushes it straight into
+   FinishingPosition at 0x0048251b - a GLOBAL, not a literal 1.
+
+   The port had 1 hardcoded at five sites, which is invisible in
+   solo because the local racer IS slot 1.  On a network guest it
+   is not: every one of them showed the HOST's standing, so both
+   machines agreed on a position that was only ever true for one
+   of them.  race_viewed_index is the seam now.
+
+   The lap-time window had the same defect - s_race_lapTimes was
+   indexed 1 * RACE_LAP_SLOTS - so a guest read the host's splits
+   too.
+
+7.3.  The split delta against the ghost
+
+   Race_RecordCheckpointSplit (0x00412e50) builds it and
+   Hud_DrawLapList draws it from DAT_005dbc70.  NOT IMPLEMENTED in
+   the port.
+
+   At every checkpoint the racer's elapsed time (racer+0x2ddd) is
+   stored into racer+0x2f89[i] - the same 48 splits Ghost_Save
+   writes into the ghost file's 0xf9 record - and then compared
+   against the REFERENCE record at 0x00581018.  That record is
+   "SHADOW" plus 48 splits for a time-attack ghost, or the leader's
+   name and splits in a network game, which the function copies in
+   itself from g_anStandings[0].
+
+   Two tests gate the comparison: the record's first byte is not
+   0x7f, the empty marker, and its split for this checkpoint is
+   neither 0 nor 0x7f7f7f7f.  So nothing is shown until the ghost
+   has actually reached that checkpoint.
+
+   +------------------+--------------------+----------------------+
+   | Address          | Format             | When                 |
+   +==================+====================+======================+
+   | 0x004dbed0       | " %02d:%02d;%02d"  | dead level           |
+   +------------------+--------------------+----------------------+
+   | 0x004dbec0       | "-%02d:%02d;%02d"  | by the sign of       |
+   +------------------+--------------------+----------------------+
+   | 0x004dbeb0       | "+%02d:%02d;%02d"  | mySplit - reference  |
+   +------------------+--------------------+----------------------+
+
+   o THE SEPARATORS ARE GLYPHS, NOT PUNCTUATION, the same as the
+     lap list's own "%02d:%02d;%02d" - the Chrono face draws a
+     divider where ':' and ';' sit.  See 7.4.
+
+   o THE NUMBER IS THE GAP, NOT A LAP TIME.  MenuTools_SplitTimeMs
+     is handed the ABSOLUTE delta at 0x00412fbf, which is
+     [0x004f0e00] after its NEG.  The decompiler renders that
+     argument as the reference split instead, which reads as an
+     absolute clock and is wrong.
+
+   o IT IS CLEARED EVERY CHECKPOINT and rebuilt only when the two
+     tests pass, so it is blank at the start of a lap.  Read back
+     from a paused MOTO on the grid, DAT_005dbc70 is all zero
+     while the ghost is on screen - which is why it cannot be
+     whatever marker a ghost carries before the first checkpoint.
+
+7.4.  The lap list, upper left
+
+   Hud_DrawLapList (0x00483860).  Read out of the DISASSEMBLY, not
+   the decompiler: it formats through MFC CString::Format, whose
+   arguments do not survive, and its draw coordinates ride in
+   registers.
+
+   +--------------------+---------------+-------+--------+---------+
+   | Element            | Font          |   x   |   y    | Flags   |
+   +====================+===============+=======+========+=========+
+   | "B" banner         | Sprites, 11   |   2   |   5    | 0x21    |
+   +--------------------+---------------+-------+--------+---------+
+   | "%d<%d" counter    | Chrono, 4     | out+10|   5    | 0x21    |
+   +--------------------+---------------+-------+--------+---------+
+   | " NN]" row number  | Player, 6     |   0   | 25+16n | 0x21    |
+   +--------------------+---------------+-------+--------+---------+
+   | the lap time       | Chrono, 4     |  0x3c | 25+16n | 0x21    |
+   +--------------------+---------------+-------+--------+---------+
+   | "[]" record mark   | Player, 6     |  0xc0 | 25+16n | 0x21    |
+   +--------------------+---------------+-------+--------+---------+
+
+   o THE SEPARATORS ARE GLYPHS, NOT PUNCTUATION.  The formats are
+     "%02d:%02d;%02d" (0x004f1098) for a completed lap, "00:00;00"
+     (0x004f10b0) for one not yet run, and "%d<%d" (0x004f10d4) for
+     the counter - so ':' ';' and '<' index whatever those faces
+     draw in those slots.  Reading them as ASCII prints "1<4" where
+     the game shows a divider.
+
+   o THE WINDOW IS THE LAST THREE LAPS while racing - first is
+     lapCounter - 2 - and the WHOLE race once finished.
+
+   o THE ROW NUMBER IS SPACE-PADDED BY HAND, 0x00483ca7: the format
+     is " %c%c]" and the tens character is a literal space below
+     ten.  "%2d]" would have given a different column.
+
+   o THE COUNTER IS CLAMPED, 0x00483a1a: lapCounter + 1 but never
+     past the lap total, so the last lap reads 4<4 rather than 5<4.
+
+   o THE BEST LAP ROW TURNS GREEN once the race is over and there is
+     more than one lap - Font_SetForeColour from 0x004f0df4 onto the
+     Chrono font and back again (0x00483b91).
+
+   g_lapTimes is at 0x005db290, indexed [racerIndex * 8 + lap].
+
+
+8.  THE SPRITE BANNERS - GAME OVER, TIMEOUT, and the rest
+
+   WRONG WAY, FINAL LAP, CHECKPOINT, TIMEOUT and GAME OVER all
+   come out of one builder, Widget_ShowSprites at 0x00418160.
+
+   ONLY GAME OVER IS ACTUALLY DRAWN AS A SPRITE.  The other
+   four ask for keys that DAT_004dc180 never registered and
+   fall through to a Sprites-font glyph instead - see 8.1.2.
+
+   GAME OVER is reconstructed as hud_banner_gameover in
+   src/hud.c: element 0 only, cut out of its page once and
+   resolved through the page's own palette.  Element 1, the
+   248x16 high-resolution strip, is [open] - FUN_00416430
+   places the elements and has not been read, and the two
+   offsets the call passes are both (0, 0).
+
+   +------------+---------------------------+------------------+
+   | Helper     | Banner                    | Widget id at     |
+   +============+===========================+==================+
+   | 0x00481af0 | TIMEOUT, blinking         | 0x004e9858       |
+   +------------+---------------------------+------------------+
+   | 0x00481c50 | FINAL LAP                 | -                |
+   +------------+---------------------------+------------------+
+   | 0x00481db0 | WRONG WAY                 | 0x004e986c       |
+   +------------+---------------------------+------------------+
+   | 0x00482120 | GAME OVER                 | 0x004e987c       |
+   +------------+---------------------------+------------------+
+
+   TIMEOUT USES VISIBILITY MODE 3, which is the BLINK mode -
+   the same one GET READY uses - where GAME OVER uses mode 0.
+   That is the flashing, and it is a parameter rather than
+   anything the banner does itself.
+
+   TIMEOUT WILL NOT RESTART ITSELF: it calls Widget_QueryById
+   first and builds nothing if its widget is already up, which
+   is what stops the blink resetting every frame of the window.
+
+   IT SHARES ITS WIDGET SLOT WITH THE CHECKPOINT BANNER -
+   0x004e9858 is destroyed by the checkpoint sweep and reused
+   here.  GAME OVER destroys BOTH the checkpoint and the
+   wrong-way widgets before building its own.
+
+   THE SPRITES COME IN PAIRS, one LOW-RESOLUTION and one HIGH.
+   The builder takes a vararg list of 4-dword records and picks
+   record[1] instead of record[0] when g_cfgScreenMode is 2 and
+   small fonts are off, so 640x480 gets DIFFERENT ART rather
+   than the same art scaled up.  All three screen modes are
+   4:3; the split is resolution, and the sprite names say so -
+   GameOver1_HR and GameOver2_HR against Game_over_LR.
+
+       GAME OVER   2 records: {9, 7} and {0, 8}
+       TIMEOUT     1 record:  {0, 0}
+
+   Read live, and both widgets were caught being created - 322
+   for TIMEOUT as the clock crossed zero and 323 for GAME OVER
+   500 ms later.  [verified - live]
+
+8.1.  STYLE 4 - APPEAR IN PLACE, THEN SLIDE OUT
+
+   widget+0x14 is the ANIMATION STYLE, set from Widget_Init's
+   param_7.  Widget_StepAnimation moves a widget only for
+   styles 1 and 2; 0, 3 and 4 do not move it.
+
+   THAT IS NOT THE WHOLE STORY, and reading only the stepper
+   gives the wrong answer.  Widget_TickAll (FUN_00418790)
+   walks the 0x30 slots every frame and PROMOTES a style when
+   its lifetime runs out:
+
+       expired and style 3  ->  restart the clock, style 1
+                                (fly to a target)
+       expired and style 4  ->  duration = 0, style 2
+                                (accelerate away)
+
+   So STYLE 4 MEANS 'SIT STILL, THEN LEAVE'.  The banner is
+   motionless for its whole lifetime and only then starts
+   moving - which is exactly what it looks like on screen and
+   is invisible from the stepper alone.
+
+   THE PROMOTION FILLS IN DEFAULTS, and they matter:
+
+       direction (+0x58,+0x5c) still (0,0)  ->  dirY = 1, down
+       velocity  (+0x40) still 0            ->  1.0
+
+   and it zeroes the duration so the widget cannot expire
+   twice.  What kills it instead is Widget_IsAlive's bounds
+   test - once it is entirely off screen it is destroyed.
+
+   GAME OVER: 3000 ms still, then direction (2, 0) with an
+   initial velocity of 2.0 and an acceleration of 5.0 - out
+   to the RIGHT, accelerating.  The two doubles pair up as
+   low/high halves: Widget_Init's param_14/param_15 are the
+   velocity at +0x40 and param_16/param_17 the acceleration
+   at +0x38.
+
+8.1.1.  TIMEOUT IS A TEXT BANNER, NOT A SPRITE ONE
+
+   FUN_00481af0 has two branches on DAT_004dc180:
+
+       0    the sprite builder, style 0 - static, vanishes
+       1    Menu_DrawText, mode 3 and STYLE 4 with the same
+            2.0 and 5.0 - blinks, then slides out
+
+   Read live, DAT_004dc180 is 1, so the banner seen in play
+   is the TEXT one and it does slide.  Reading only the
+   sprite branch says it is static and that is the wrong
+   branch.  [verified - live]
+
+   GAME OVER DESTROYS THE TIMEOUT WIDGET when it appears -
+   Widget_DestroyById on 0x004e9858, which is immediate and
+   does not animate.  So the two do not overlap by accident;
+   whichever is on screen when the other arrives is removed.
+
+   FUN_00482120 ALSO HAS A SECOND BRANCH on its first
+   argument - non-zero goes to FUN_00482030, which
+   FUN_004806e0 uses with 0x20.  The end-of-time path passes
+   0.  Unread.  [open]
+
+
+   ALL FOUR GLYPH BANNERS ARE THE SAME CALL.  Each helper has
+   the two branches above and the live one builds a ONE-
+   CHARACTER string in maybe_g_msgScratch and hands it to
+   Menu_DrawText with an identical argument tail - font 0xb,
+   flags 0x42, visibility 3, animation style 4, direction
+   (2, 0), velocity 2.0, acceleration 5.0, colours 0x004f0dec
+   over 0x004f0dd8.  Only four values differ:
+
+   +------------+------------+-------+-----+------+------------+
+   | Helper     | Banner     | Glyph | ms  | Mask | Widget id  |
+   +============+============+=======+=====+======+============+
+   | 0x00481af0 | TIME OUT   | 'c'   |2000 |   2  | 0x004e9858 |
+   +------------+------------+-------+-----+------+------------+
+   | 0x00481c50 | FINAL LAP  | 'a'   |  ?  |   ?  |      ?     |
+   +------------+------------+-------+-----+------+------------+
+   | 0x00481db0 | WRONG WAY  | '`'   |4000 |   4  | 0x004e986c |
+   +------------+------------+-------+-----+------+------------+
+   | CHECKPOINT | CHECK POINT| 'b'   |  ?  |   ?  | 0x004e9858 |
+   +------------+------------+-------+-----+------+------------+
+
+   THE MASK IS THE BLINK RATE AND IT COUNTS FRAMES, not time -
+   Widget_Init's param_8 lands in +0x98 with +0x90 left at 0,
+   which selects the frame-counting arm of the mode-3 test:
+   visible while (counter & mask) != mask.  So mask 2 is two
+   frames on and two off, and mask 4 is four and four - WRONG
+   WAY blinks at HALF the rate TIME OUT does.
+
+   A MASK OF 1 IS NOT A FASTER BLINK, IT IS NO BLINK.  It
+   toggles every frame, which at any modern frame rate reads as
+   a dimmer banner rather than a flashing one.  This is a trap
+   the port walked into: 1 looks like the obvious value for
+   'blink as fast as possible' and neither banner uses it.
+
+   TIME OUT AND CHECK POINT SHARE WIDGET 0x004e9858, which is
+   why the checkpoint sweep destroying it is what lets the
+   timeout banner build.
+
+8.1.2.  The banner sprite registry
+
+   FUN_00480930 registers every banner sprite, and it is where
+   the ids come from.  Three texture pages, all in DESIGN.BKF:
+
+       TEXTS\LOWRES.RAW     33568 bytes
+       TEXTS\HIRES.RAW      66336
+       TEXTS\GAMEOVER.RAW   66336
+       TEXTS\TEMP.ACT         768   a 256x3 palette
+
+   DAT_004dc180 PICKS HIRES OR LOWRES ART - it is NOT a
+   text-or-sprite switch, which is what it looks like from
+   FUN_00481af0 alone:
+
+       0   ten HiRes sprites and nine LowRes ones -
+           Extended, Time, Wrong_way, TimeOut, Final_lap,
+           CheckPoint, Missed, Logo and both GameOvers
+       1   ONLY TWO - GameOver2_HR and Game_over_LR
+
+   SO AT 1 THERE IS NO TIMEOUT SPRITE AT ALL, and that is why
+   FUN_00481af0 falls through to Menu_DrawText and the
+   Sprites-font glyph.  The banner is a font character because
+   the sprite was never registered, not because it was
+   authored as text.  [verified - live, DAT_004dc180 is 1]
+
+   THE THREE GAME OVER IDS, read out of the live bank tables
+   and matched to their registration:
+
+   +-----+------------------+--------------------+----------+
+   | Key | Page             | Rect               | Size     |
+   +=====+==================+====================+==========+
+   |  7  | GameOver.RAW     | (0,89)-(255,255)   | 256x167  |
+   +-----+------------------+--------------------+----------+
+   |  8  | HiRes.RAW        | (0,98)-(247,113)   | 248x16   |
+   +-----+------------------+--------------------+----------+
+   |  9  | LowRes.RAW       | (0,15)-(255,127)   | 256x113  |
+   +-----+------------------+--------------------+----------+
+
+   The extents come out as [9]-[7]+1 and [10]-[8]+1 on the
+   bank entry, which is how FUN_00418160 measures them.
+
+   THE BANNER PASSES TWO RECORDS, {9, 7} and {0, 8}, and each
+   is {lowRes, hiRes, x, y}.  maybe_DdBank_FindSprite opens
+   with a test on its argument and returns NULL for id 0, so:
+
+       320/512     ONE sprite, key 9, 256x113
+       640x480     TWO, keys 7 and 8
+
+   SMALL FONTS FORCES THE LOW-RESOLUTION PAIR even at 640x480 -
+   the test is g_cfgScreenMode == 2 && g_cfgSmallFonts == 0, the
+   same one the counter and Font_Get make.
+
+8.2.  The blink is a per-frame toggle, not a timer
+
+   The sprite draw at 0x00417080 tests visibility only for
+   modes 3 and 4, and there are two mechanisms:
+
+       +0x90 != 0   on for (now - start) % (2*p) < p
+       +0x90 == 0   ++counter(+0x94), on when
+                    (counter & mask(+0x98)) != mask
+
+   TIMEOUT takes the SECOND with mask 1, so it toggles every
+   frame - a flash tied to the frame rate rather than to
+   time.  Widget_Init is what puts it there: its param_8 of
+   1 lands in +0x98 and +0x90 stays 0.
+
+   GAME OVER is mode 0, so the test is skipped and it is
+   simply always drawn.
+
+9.  Open questions
+
+   o FONT_DRAWTEXT'S SEVENTH ARGUMENT IS THE END X OF THE DRAWN
+     TEXT - the post-alignment x plus the measured width, in real
+     pixels.  MEASURED, not inferred: a hook on 0x00483a2f caught
+     EBX at 0x4d, 77, with the lap-list banner drawn at x 1
+     (authored 2, halved by SmallFonts) and the Sprites glyph 'B'
+     66 wide.  1 + 66 + 10 = 77.
+
+     THE 10 IS NOT HALVED AND NEITHER IS THE WIDTH.  Only the
+     banner's own x is authored.  The consumer, FUN_00493f60, passes
+     1 to Font_DrawTextInternal and so does NOT halve - which is
+     what lets 77 be a real coordinate.
+
+     This was the open question behind both the lap counter's x and
+     the BEST LAP time's.
+
+   o THE SECOND BLINK MASK.  The banner's test reads EBX, which the
+     decompiler lost at 0x00482438.  The structure says it is the
+     same mask as the digits, and the port assumes so.
+
+   o THE NAME SHIFT of 5.1 needs NAME.FNT rendered out before the
+     BEST LAP block can be reproduced faithfully.
+
+   o WHAT maybe_Race_UpdateProgress STILL OWES.  A SKELETON of it is
+     in race.c.  Live: the segment delta, the accumulator, the
+     high-water mark, the checkpoint sweep, the line crossing, the
+     lap close-out, the best-lap scan and the finish.  Marked and
+     not transcribed, each with its address: the wrong-way warning
+     (0x0047e67d), the FINAL LAP banner and jingle (0x0047e8b7), the
+     track-record write FUN_00458310 (0x0047eb0d), the ILLEGAL
+     VERSION overlay (0x0047e8e1), and every network and ghost arm.
+
+     THE LINE CROSSING IS THE WRAP ITSELF, 0x0047e4c8: a delta that
+     had to be pulled back up by a whole lap of segments is a racer
+     stepping from the last segment to the first.  It is tested
+     BEFORE the accumulator moves, against
+     trackTotalProgress == progressHigh - so reversing over the line
+     and crossing again cannot buy a second lap.
+
+     THE FIRST CROSSING IS NOT A LAP.  Leaving the grid takes
+     raceState 0 -> 1 and counts nothing; only crossings in state 1
+     increment lapCounter.
+
+     THE BEST LAP RESCANS every completed lap rather than comparing
+     the one just finished - which is how a bestLapMs starting at
+     the 0x7f7f7f7f sentinel gets filled with no special case for
+     lap one.  IT MUST START AT THAT SENTINEL: left at 0 it reads as
+     a perfect lap nothing can beat.
+
+   o AI RACERS CLOSE OUT LAPS TOO, and the gate is
+     local == i || (soloMode && (humanPlayer || DAT_004ea4c4)).
+     DAT_004ea4c4 reads 1 live, and every racer this port builds has
+     soloMode 1, so the whole field passes - which is why retail
+     shows COMPUTER against the best lap within a lap or two.
+     [open - what sets DAT_004ea4c4]
+
+   o THE COUNTDOWN DISPLAY is transcribed.  Hud_DrawCountdown
+     0x00413030 puts up the number - seconds/2 + 1, so 4, 3, 2, 1
+     over six seconds - fading in over each step, GET READY blinking
+     below it until the last two seconds, and the N LAPS banner
+     across the top.
+
+     ONLY THE BANNER MOVES.  The digits and GET READY are
+     Widget_ShowText widgets, and that helper passes a constant zero
+     for the animation style, the direction, the velocity and the
+     acceleration - so nothing built through it can move.  The
+     banner goes through Menu_DrawText directly and below two
+     seconds takes animation style 2, direction (0, 1) and
+     acceleration 0.2, which accelerates it off the bottom of the
+     screen.  See in-race-menu.txt 6.2.3.
+
+   o THE LAP COUNT reaches the port through race_lap_count(), taken
+     from the track table's default in race_load.  The original's
+     g_nRaceLaps is set by the race setup page, which does not exist
+     here yet, so the default is the only value there is.
+
+   o THE COLOUR OF THE COUNTDOWN IS RED ON BLACK, from the fixed
+     argument tail Widget_ShowText passes.  Hud_DrawCountdown sets
+     pFontGameMsg's colours to (245,255,12) on (200,200,0) first and
+     TextWidget_Draw saves and restores them around the draw, so
+     they never reach the screen.  Either vestigial or read by
+     something else. [open]
+
+   o THE LAP LIST at top left, FUN_00483860, and the multiplayer
+     scoreboard, FUN_00482f00, are read but not transcribed.

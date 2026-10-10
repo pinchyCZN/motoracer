@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mrhook": {
+      "type": "stdio",
+      "command": "C:\\Program Files\\Python310\\python.exe",
+      "args": [
+        "N:\\DEV\\MOTORACER\\tools\\bridge_mcp_mrhook.py"
+      ],
+      "env": {}
+    }
+  }
+}

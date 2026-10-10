@@ -1,0 +1,67 @@
+[Unit]
+# MotoRacer netplay relay.  See README-relay.txt section 8.
+#
+#   install to  /etc/systemd/system/mracer-relay.service
+#   then        systemctl daemon-reload
+#               systemctl enable --now mracer-relay
+#               journalctl -u mracer-relay -f
+#
+# Edit User, WorkingDirectory and the --bind address before enabling.
+Description=MotoRacer netplay relay
+Documentation=file:/opt/mracer-relay/README-relay.txt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# NOT root.  The relay binds 27500, which is above 1024, so it needs
+# no capability at all:  adduser --system --no-create-home mracer
+User=mracer
+Group=mracer
+
+WorkingDirectory=/opt/mracer-relay
+# -u keeps the log unbuffered, so journalctl shows a line as it happens
+# rather than in 4 KB bursts.
+#
+# BIND DELIBERATELY.  127.0.0.1 exposes nothing and pairs with an SSH
+# tunnel from the client; 0.0.0.0 is public and wants a firewall rule.
+ExecStart=/usr/bin/python3 -u relay.py --port 27500 --bind 127.0.0.1
+
+# IT HAS NO STATE TO LOSE.  Rooms live in memory and the clients
+# reconnect, so a restart costs an interrupted race and nothing else.
+Restart=always
+RestartSec=2
+
+# Crash-looping on a bad argument should stop, not spin for ever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mracer-relay
+
+# It reads one .py and writes nothing, so it can be locked down hard.
+# No ReadWritePaths is deliberate - add one only if that stops being
+# true.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Ten times what it has ever used; a leak gets killed and restarted
+# rather than taking the box with it.
+MemoryMax=128M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

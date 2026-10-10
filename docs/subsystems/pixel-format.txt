@@ -1,0 +1,1542 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+           THE 16-BIT PIXEL FORMAT AND WHERE IT IS HARDCODED
+
+
+Abstract
+
+   The mission calls for cataloguing every hardcoded 5/6/5 shift and
+   mask in screen3d\. Doing that turned up something more useful than a
+   list: the engine is not actually an RGB565 renderer.
+
+   Internally it is uniformly 5 bits per channel, laid out to sit on a
+   565 surface:
+
+   bit   15 14 13 12 11 | 10  9  8  7  6 | 5 | 4  3  2  1  0
+   field  R  R  R  R  R |  G  G  G  G  G | - | B  B  B  B  B
+
+   Red occupies the same bits it would in 565. Green is 5 bits at shift
+   6, which is the top 5 bits of the 6-bit green field a real 565
+   surface expects. Bit 5, green's least significant bit, is never
+   written.
+
+   So the game writes 555 data into a 565 buffer and lets the hardware
+   read green one bit short. That is a deliberate simplification, not a
+   bug: it lets one set of 5-bit arithmetic serve every channel
+   [inferred].
+
+   This matters more than a mask inventory would. Porting is not a
+   matter of widening green to 6 bits in a few places; the 5-bit
+   assumption is structural, and the surrounding code is in places
+   already general enough to not care.
+
+Table of Contents
+
+   1. Three tiers, not one
+      1.1. Tier 1: the DirectDraw layer is already general
+         1.1.1. g_bitsR has one writer and two incompatible readers
+         1.1.2. The 8-bit conversion path: g_shrR/G/B
+            1.1.2.1. Consumers
+            1.1.2.2. A second .RAW loader
+      1.2. Tier 2: field positions derived, 5-bit widths assumed
+      1.2.9. A 16-bit dependency outside screen3d\
+      1.3. Tier 3: the rasterizer patches its own instruction stream
+         1.3.1. What is patched and what is not
+            1.3.1.1. The second loop is the specialised one
+            1.3.1.1.1. There are TWO literal constants, not one
+         1.3.1.2. What SpanBlend2 does differently
+         1.3.2. The dirty flag, and why it is not a bug
+      1.3.3. SpanCopyTexels patches for a different reason
+         1.3.3.1. Rotated fixed point
+         1.3.3.2. The reason it must patch is register pressure
+      1.3.4. What the blend actually computes
+      1.3.5. One reason behind all three patching loops
+            1.3.2.1. How spans are actually dispatched
+            1.3.2.2. The protocol holds
+            1.3.2.3. What this means for the port
+      1.4. Why the constants are sorted
+         1.4.1. Two constant sets, one per loop
+         1.4.2. The sort never actually does anything
+   2. The packer and the blenders
+      2.1. The D3D vertex colour path, added after a boundary repair
+   3. True RGB555 is an interchange value, not an asset format
+      3.1. The conversion chain
+      3.2. The helper
+      3.3. Where the hardcoded layout actually gets used
+      3.4. The D3D path negotiates its own format
+      3.5. Not to be confused with the .trk readers
+   4. What this means for the port
+   5. Open questions
+
+
+1.  Three tiers, not one
+
+   The colour code falls into three tiers, and only the third is a real
+   obstacle.
+
+   +------+-------------------------------------------------------+--------------+
+   | Tier | Behaviour                                             | Porting cost |
+   +======+=======================================================+==============+
+   | 1    | Derives everything from the DirectDraw pixel format   | none         |
+   +------+-------------------------------------------------------+--------------+
+   | 2    | Derives field positions but assumes 5-bit fields      | moderate     |
+   +------+-------------------------------------------------------+--------------+
+   | 3    | Hardcodes the layout, or patches it into its own code | high         |
+   +------+-------------------------------------------------------+--------------+
+
+1.1.  Tier 1: the DirectDraw layer is already general
+
+   Cdd_InitCapsVariables at 0x00473ba0, in screen3d\dd.cpp, is
+   completely format-agnostic [verified]. It calls GetPixelFormat on the
+   primary surface and derives, per channel, by scanning the mask:
+
+   g_maskR/G/B    0x004ee9d0 / d4 / d8   straight from DDPIXELFORMAT
+   g_shlR/G/B     0x004ee9c4 / c8 / cc   count of trailing zeros
+   g_bitsR/G/B    0x004ee9ac / b0 / b4   width of the run of ones
+   g_shrR/G/B                            8 - bits, for 8-bit sources
+
+   Nothing here assumes 555, 565 or anything else. It would derive the
+   right answer for 888 too.
+
+   ADDRESS CORRECTED. An earlier version of this section gave the entry
+   as 0x00473c00, which is 96 bytes inside the function. The entry is
+   0x00473ba0 and the body runs to 0x00473d83, which is consistent with
+   the two instruction addresses cited in section 1.1.1 [verified].
+
+   The DDPIXELFORMAT it fills is the standard one, and every field it
+   reads lands where the SDK puts it [verified]: dwSize 0x20 written in,
+   dwFlags at +0x04 tested for DDPF_RGB, dwRGBBitCount at +0x0c, and the
+   three masks at +0x10, +0x14 and +0x18.
+
+   These globals have 33 to 44 xrefs each, so a large part of the engine
+   does consult them.
+
+   The best example of a consumer using them correctly is the rectangle
+   fade in FUN_0049a5a0, which scales a pixel with
+
+   p = ((maskR & v) * s >> 8) & maskR
+     | ((maskG & v) * s >> 8) & maskG
+     | ((maskB & v) * s >> 8) & maskB
+
+   That is correct for any 16-bit layout. Its fast half-brightness path,
+
+   p = (v >> 1) & ~((1 << (shlR - 1)) | (1 << (shlG - 1)))
+
+   is also general: shifting right by one bleeds each field's low bit
+   into the field below, and clearing bit shlR-1 and shlG-1 removes
+   exactly the two bits that received it. Blue needs no fixup because
+   nothing sits below it. Code of this quality could be left alone.
+
+   One oddity in the same function turns out to be a real bug in the
+   game. Its loop bounds and ramp divisor read g_bitsR as a pixel
+   distance, not as a bit count: the edge fade runs over g_bitsR pixels
+   and scales by (distance * 0x100) / g_bitsR [verified].
+
+   An earlier version of this note suspected two variables sharing
+   0x004ee9ac, with Ghidra merging them. That is wrong. The address
+   holds one dword with exactly one writer.
+
+1.1.1.  g_bitsR has one writer and two incompatible readers
+
+   Checked at the instruction level rather than through the decompiler,
+   because symbol overlap was the competing hypothesis:
+
+   +-----------------------------------------+-------+---------------------------------+
+   | Access to 0x004ee9ac                    | Count | Reading                         |
+   +=========================================+=======+=================================+
+   | Cdd_InitCapsVariables, 0x00473d05 WRITE | 1     | red channel bit width           |
+   +-----------------------------------------+-------+---------------------------------+
+   | Cdd_InitCapsVariables, 0x00473d44 READ  | 1     | derives g_shrR = 8 - bits       |
+   +-----------------------------------------+-------+---------------------------------+
+   | Colour code, seven functions            | 16    | bit width, correct              |
+   +-----------------------------------------+-------+---------------------------------+
+   | maybe_Screen3D_FadeRect                 | 25    | pixel distance and IDIV divisor |
+   +-----------------------------------------+-------+---------------------------------+
+
+   Every access is MOV or IDIV on dword ptr [0x004ee9ac]. There is no
+   byte-sized alias, no adjacent address, and no second symbol. The
+   single write is MOV dword ptr [0x004ee9ac],ESI, immediately after the
+   loop that counts the run of ones in g_maskR. So the variable is
+   unambiguously the red channel bit width, and the fade is simply
+   reading the wrong global [verified].
+
+   The xref counts settle the point arithmetically. g_bitsR reports 43
+   against 18 for g_bitsG and 17 for g_bitsB, an asymmetry that first
+   suggested an overlap. The fade accounts for exactly 25 of them, and
+   43 - 25 = 18, which is g_bitsG's count exactly. Remove the misuse and
+   the three channels are symmetric.
+
+   Why it shipped: g_bitsR is 5 on every display mode the game supports,
+   since red is five bits in both 555 and 565. A five-pixel soft border
+   and a divisor of five look entirely reasonable, so the bug has no
+   visible symptom. It would only show on a surface with a different red
+   width, which the 16-bit lock prevents from ever occurring.
+
+   One hazard worth noting. The divisor is an IDIV on a global. After a
+   successful Cdd_InitCapsVariables g_bitsR is at least 1, because
+   g_shlR is defined as the position of the first set bit so the
+   counting loop always runs once. Before that call it is 0, being BSS,
+   and the IDIV would fault. Whether the fade can be reached in that
+   state has not been traced [guess].
+
+   For a port: this is a one-line fix, but it must be a deliberate one.
+   Replacing g_bitsR here with a literal 5 preserves current behaviour
+   exactly. Leaving it as the red bit width makes the fade width depend
+   on the destination format, which is almost certainly not what anyone
+   intended.
+
+1.1.2.  The 8-bit conversion path: g_shrR/G/B
+
+   Cdd_InitCapsVariables also derives a third triple, at 0x004ee9b8,
+   0x004ee9bc and 0x004ee9c0, each written exactly once:
+
+       g_shrR = 8 - g_bitsR
+       g_shrG = 8 - g_bitsG
+       g_shrB = 8 - g_bitsB
+
+   These exist for one job: converting between 8-bit-per-channel
+   components and the surface format. Two small functions in dd.cpp are
+   the canonical pair, and both are completely format-agnostic
+   [verified]:
+
+       // Color_Pack888ToSurface, 0x00473a90
+       ushort pack(r, g, b)
+       {
+           return ((r & 0xff) >> shrR) << shlR
+                | ((g & 0xff) >> shrG) << shlG
+                | ((b & 0xff) >> shrB) << shlB;
+       }
+
+       // Color_Unpack888FromSurface, 0x00473b30
+       void unpack(ushort p, char *r, char *g, char *b)
+       {
+           *r = ((p & maskR) >> shlR) << shrR;
+           *g = ((p & maskG) >> shlG) << shrG;
+           *b = ((p & maskB) >> shlB) << shrB;
+       }
+
+   Note this is a different family from Color_Convert555ToSurface in
+   section 3.2. That one takes a packed 555 word; these take and produce
+   separate 8-bit components. Both families are tier 1 and need no
+   porting work.
+
+1.1.2.1.  Consumers
+
+   The three globals are always read together, which is itself evidence
+   they are a unit. Eleven functions read them directly, inlining the
+   same arithmetic rather than calling the helper, and eight more call
+   Color_Pack888ToSurface. Color_Unpack888FromSurface has a single
+   caller.
+
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | Function                              | Sites | Translation unit      | Role                                  |
+   +=======================================+=======+=======================+=======================================+
+   | maybe_Cdd_LoadRawToSurface 0x00477b30 | 7     | screen3d\dd.cpp       | loads a .RAW into a DirectDraw        |
+   |                                       |       |                       | surface                               |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | FUN_0041d2b0                          | 5     | Dsi_d3d.cpp           | not examined                          |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | FUN_00494bb0                          | 3     | unattributed          | not examined                          |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | Lez_Decode 0x0043eb..                 | 2     | menu\bitmap.cpp       | sprite and TGA decode                 |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | FUN_00478990                          | 2     | screen3d\dd.cpp       | not examined                          |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | Color_Pack888ToSurface 0x00473a90     | 1     | screen3d\dd.cpp       | the canonical packer                  |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | Color_Unpack888FromSurface 0x00473b30 | 1     | screen3d\dd.cpp       | the canonical unpacker                |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | Bitmap_LoadFile 0x0043e647            | 1     | menu\bitmap.cpp       | menu bitmap load                      |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | FUN_0041f660                          | 1     | Dsi_d3d.cpp           | not examined                          |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | FUN_00490a90                          | 1     | unattributed          | not examined                          |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+   | FUN_004af570                          | 1     | screen3d\screen3d.cpp | not examined                          |
+   +---------------------------------------+-------+-----------------------+---------------------------------------+
+
+   The distribution is the useful part. Every consumer is a loader, a
+   decoder or a conversion helper. None is in the rasterizer inner
+   loops, which is consistent with the picture in section 1.3: 8-bit
+   components appear on the way in from disk and never during drawing.
+
+1.1.2.2.  A second .RAW loader
+
+   The heaviest consumer, at 0x00477b30, turns out to be a .RAW loader
+   distinct from Bankw_LoadRawTexture. It reads the same 0x20-byte big-
+   endian mhwanh header documented in formats/raw-texture.txt, with
+   width at +0x08, height at +0x0a and colour count at +0x0c, and
+   handles the same truecolour and palettised split [verified].
+
+   The difference is the destination. Bankw_LoadRawTexture fills a
+   memory bank page for the software rasterizer; this one creates a
+   DirectDraw surface, locks it, converts into it, and registers the
+   result as a texture bank entry for hardware. Its lock-failure path
+   carries the dd.cpp assert at line 3648, which is what makes this
+   function the TU anchor.
+
+   It then walks an array of 0x4e-byte records, samples up to ten pixels
+   along two edges, unpacks each with the 888 unpack arithmetic,
+   averages, and repacks into record fields +0x46 and +0x48. Averaged
+   edge colours, presumably for a border or mipmap-like fallback
+   [guess].
+
+   Incidentally it corroborates the texture bank record size derived
+   from a completely different function. It indexes bank fields with a
+   stride of 0xce dwords and copies the source filename into the record
+   with a stride of 0x338 bytes. 0xce dwords is 824 bytes, and 0x338 is
+   824. That matches the record layout in formats/mesh-3df-map.txt
+   section 6.1 exactly, from an independent site [verified].
+
+
+1.1.3.  The depth is measured, then used once to refuse
+
+   Cdd_InitCapsVariables also captures the true bit depth -
+   dwRGBBitCount into maybe_g_primaryBitDepth at 0x004ee9a8. The engine
+   therefore KNOWS at runtime how many bits a pixel has.
+
+   It uses that knowledge exactly once. The global has two references in
+   the whole binary [verified]:
+
+   +-----------------------+--------+-----------------------+
+   | Function              | Access | Purpose               |
+   +=======================+========+=======================+
+   | Cdd_InitCapsVariables | write  | from dwRGBBitCount    |
+   +-----------------------+--------+-----------------------+
+   | Cdd_Init              | read   | the 16-bit depth gate |
+   +-----------------------+--------+-----------------------+
+
+   That read is the surface depth gate - one of the two sites patched in
+   our copy of MOTO.EXE. So the measured depth is consulted solely to
+   decide whether to run, and never afterwards to decide how to address
+   a pixel.
+
+   This sharpens what the 16-bit lock actually is. The CHANNEL
+   arithmetic is derived throughout - here, in
+   maybe_Color_BuildHalveMask (section 12.8.1 of rasterizer-
+   pipeline.txt), in Color_Convert555ToSurface (section 53) and in
+   maybe_Screen3D_FadeRect. What is hardcoded is the pixel WIDTH, and it
+   is hardcoded as a literal 2 and as ushort pointers, not as a channel
+   layout:
+
+   +-------------------------+---------------------------------------+
+   | Site                    | Construct                             |
+   +=========================+=======================================+
+   | Screen3D_BeginFrame     | g_frameBuffer += (...) * 2            |
+   +-------------------------+---------------------------------------+
+   | Screen3D_EndFrame       | dst = base + (offset + x0) * 2        |
+   +-------------------------+---------------------------------------+
+   | the Walk family         | g_scanlineOffset[y] * 2, stride * 2   |
+   +-------------------------+---------------------------------------+
+   | every span filler       | dst = rowPtr + left * 2, ushort *     |
+   +-------------------------+---------------------------------------+
+   | maybe_Screen3D_FadeRect | the same                              |
+   +-------------------------+---------------------------------------+
+   | Font_DrawTextInternal   | bits + (stride * y + x) * 2           |
+   +-------------------------+---------------------------------------+
+   | Cdd_LockOffScreen       | stride = lPitch >> 1, bytes to pixels |
+   +-------------------------+---------------------------------------+
+
+   The font renderer is worth listing separately because it is outside
+   screen3d\ entirely - text is blitted by direct pointer arithmetic
+   into a locked surface, with the same two-bytes-per-pixel
+   assumption. A port that fixes the rasterizer and forgets
+   menu\ text will draw garbled menus on a correct 3D scene.
+
+   So the barrier is narrower than a repacking problem and broader than
+   a mode-set problem: it is an ADDRESSING assumption. A port that
+   changes the pixel stride and the pointer types gets the channel
+   arithmetic for free, because that half already reads its layout from
+   DirectDraw at startup.
+
+   o Worth reflecting in CLAUDE.md, whose summary of the lock calls the
+     fourth layer 'RGB565 packing ... baked into the software
+     rasterizer, palette conversion, blending and texture upload'.
+     Blending and palette conversion are NOT baked - they are derived.
+     The rasterizer's pixel addressing is.
+
+
+1.2.  Tier 2: field positions derived, 5-bit widths assumed
+
+   FUN_004a4c30 builds the shift and mask constants the rasterizer inner
+   loops use. It reads g_maskR/G/B, g_shlR/G/B and g_bitsR/G/B, sorts
+   the three channels by position with qsort, and computes about
+   eighteen derived values.
+
+   It is parameterised on where the fields are and hardcoded on how wide
+   they are. Every mask it builds is of the form
+
+   0x1f << (something)
+
+   and the arithmetic is full of 5-bit constants: - 5, 0x10 -, 0x15 -,
+   0x20 -. Widening a channel means revisiting all of it.
+
+   It also writes two literals that ignore the pixel format entirely
+   [verified]:
+
+   DAT_00624b48 = 0xf800f800     a dual-pixel red mask, 565 red position
+   DAT_00625770 = 0x1f0000
+
+   The first is not academic. It is patched directly into a rasterizer
+   inner loop; see below.
+
+1.2.9.  A 16-bit dependency outside screen3d\
+
+   This note is organised around screen3d\, on the reasonable
+   assumption that the depth assumptions live in the rasterizer. One
+   does not.
+
+   Sprite_Draw at 0x0043ede0, in menu/bitmap.cpp, is the entire 2D menu
+   blitter and it is hardcoded to 16 bits per pixel [verified]. Every
+   pixel it moves is a u16, every source and destination stride is
+   multiplied by 2, and its colour key is the literal texel value 0. It
+   writes straight into g_frameBuffer through g_frameStridePx - no
+   span buffer, no queue, no rasterizer.
+
+   It has four inner loops: opaque copy, colour-keyed copy, and
+   stippled versions of both that draw every other pixel with the start
+   column alternating per row, giving 50 per cent screen-door
+   transparency.
+
+   o IT IS NOT FORMAT-AGNOSTIC THE WAY THE SPAN FILLERS ARE. Section
+     12.7 of rasterizer-pipeline.txt observes that the texel copier
+     never decomposes a colour, so nothing in it assumes 5/6/5 - only
+     the width. The same is true here, and the same caveat applies:
+     the WIDTH is the dependency, and it is pervasive.
+
+   o THE STIPPLE IS NOT A BLEND. Modes 2 and 3 do not read the
+     destination at all. Replacing them with alpha blending changes
+     the appearance; reproducing them needs the parity of the
+     destination row.
+
+   o SO A 32-BIT PORT MUST TOUCH menu/bitmap.cpp, not just screen3d\.
+     See structs/MR_Sprite.txt section 5.
+
+   The sibling path does go through the renderer:
+   Screen3D_QueueScreenQuad at 0x00485e50 builds a screen-space quad
+   and submits it via Screen3D_QueuePrimitive, and that is what
+   maybe_Cdd_DrawSurface and maybe_Screen3D_FadeRect use. Two separate
+   2D paths, no shared code.
+
+   AND EVERY FONT GOES THROUGH THE SAME QUAD.  All eight glyph
+   drawers call Screen3D_QueueScreenQuad - Font_DrawGlyph
+   (0x00493100), FontMoto (0x00495d50), FontPal (0x00495840),
+   FontShaded (0x00494bb0), FontShadedTransp (0x00495280),
+   FontDirectTrame (0x00492d20), FontCustomColor (0x00494170) and
+   FontCustomColorTrame (0x00494590).  So ALL TEXT IN THE GAME is
+   screen quads submitted to the 3D queue, which is why a font page
+   that fails to bind does not simply vanish - it draws a run of
+   solid quads where the glyphs should be.
+
+1.2.10.  The solid-fill bars take their colour from the shifts
+
+   The widget bars drawn by FUN_004174f0 are given their colour as
+
+       0x1f << g_shlR      full red
+       0x1f << g_shlG      green at 5 of its 6 bits
+
+   built at the call site, FUN_004173d0 - the draw slot (+0x10) of
+   the vtable at 0x004d0560.  Two overlaid rectangles, the red one
+   gated on the object's +0x14 being 1.
+
+   SO THE COLOUR IS NOT A CONSTANT, IT IS DERIVED, and the literal
+   0x1f is a FIVE-BIT field width.  Green has six bits in 5/6/5, so
+   this already under-drives green by one bit in the original; on a
+   format whose shifts are not 11/5/0 the pair stops being red and
+   green at all.  A port must build these from the live channel
+   masks rather than carrying the expression across.
+
+   Read live from a paused MOTO on the grid: the one widget alive at
+   race start is the countdown bar, 209 by 24 at (2, 454), vtable
+   0x004d0560.  See in-race-menu.txt 849 for the other place these
+   shifts are used arithmetically rather than as a format.
+
+
+1.3.  Tier 3: the rasterizer patches its own instruction stream
+
+   This is the finding that changes how the renderer has to be
+   approached.
+
+   Three inner loops in screen3d\screen3d.cpp are self-modifying. They
+   hold placeholder immediates of 0x12345678, and on entry, guarded by a
+   dirty flag, they write the real values from the FUN_004a4c30 table
+   directly into their own instruction bytes before running.
+
+   HOW THOSE BYTES BECOME WRITABLE was left open here for a long time -
+   .text is normally PAGE_EXECUTE_READ and the patch would fault.
+   Screen3D_MakeSpanCodeWritable at 0x004af3f0 is the answer, and it is
+   one call [verified]:
+
+       VirtualProtect(&DAT_004a2ec0, 0xc051, PAGE_EXECUTE_READWRITE, &old);
+
+   0x004a2ec0 through 0x004aef10 is 49,233 bytes and brackets the
+   span-filler bank exactly; all three self-patching fillers fall
+   inside it. The function has NO CALLERS - its only reference is a
+   function pointer at 0x004db148 in the C++ static-initializer table
+   the CRT walks before main. So the bank is RWX from process start,
+   unconditionally, whether or not the software rasterizer is ever
+   used.
+
+   For the port this changes nothing, because the plan already drops
+   the three self-modifying fillers, but it does close the question of
+   how they worked - and it confirms a 64-bit rebuild could not keep
+   them even if it wanted to. Relocations, code layout and W^X all
+   forbid patching immediates this way.
+
+   +--------------+-------------------+---------------------------+
+   | Function     | Placeholder sites | Colour arithmetic         |
+   +==============+===================+===========================+
+   | FUN_004a4dc0 | 8                 | yes, with hardcoded masks |
+   +--------------+-------------------+---------------------------+
+   | FUN_004a4f30 | 8                 | yes                       |
+   +--------------+-------------------+---------------------------+
+   | FUN_004a5ab0 | 12                | none, pure texel copy     |
+   +--------------+-------------------+---------------------------+
+
+   The mechanism, from FUN_004a4dc0 [verified]:
+
+   004a4dc4  MOV EAX,[0x00624b50]     ; dirty flag
+   004a4dcb  JNZ 0x004a4e92           ; go patch
+   ...
+   004a4e92  MOV EAX,[0x0062436c]
+   004a4e9d  MOV [0x004a4e25],EAX     ; overwrite the immediate at 004a4e24
+   004a4ea2  MOV byte ptr [0x004a4e23],BL   ; overwrite a shift count
+   ...
+   004a4f1c  MOV [0x00624b50],EAX     ; EAX = 0, clear the flag
+   004a4f21  JMP 0x004a4dd1           ; re-enter the loop
+
+   Every patch target lands exactly on an immediate operand: 0x004a4e25
+   is the immediate of AND EAX,0x12345678 at 0x004a4e24, 0x004a4e23 is
+   the imm8 of SHL EDX,0x12 at 0x004a4e21, and so on. Shift counts are
+   patched as well as masks.
+
+   Two consequences follow, and both are practical:
+
+   1. A static constant search cannot find these masks. They are not in
+      the image; 0x12345678 is. Any catalogue built by grepping for
+      0xf800 will silently miss the hottest code in the renderer.
+   2. Ghidra's decompilation of these three functions is not
+      trustworthy. The pseudocode is full of 0x12345678 and 0xedcba987
+      because the decompiler is reading placeholders as real values.
+      Read the disassembly, not the decompiler output.
+
+1.3.1.  What is patched and what is not
+
+   An earlier version of this section read the unpatched constants as
+   source-format assumptions and labelled 0xf800 hardcoded 565 red. That
+   was wrong, and the qsort in Screen3D_BuildPixelConstants is what
+   explains why. See 1.4.
+
+   The loop does not work on the pixel in its stored layout at all. It
+   first spreads the three channels into a fixed 32-bit intermediate, so
+   that one multiply can scale all three at once, then packs the result
+   back. The unpatched constants describe that intermediate, not the
+   framebuffer [verified]:
+
+       spread word:  bits 31..27  top channel
+                     bits 15..11  middle channel
+                     bits  4..0   bottom channel
+
+   The patched shifts are what move an arbitrary source layout into
+   those fixed slots. Which source channel lands in which slot is
+   decided by the sort, by bit position, not by name.
+
+   +----------+--------------------+--------------+--------------------------+
+   | Address  | Instruction        | Patched from | Role                     |
+   +==========+====================+==============+==========================+
+   | 0x4a4e21 | SHL EDX,0x12       | 0x00655d04   | middle channel to bit 11 |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e24 | AND EAX,imm32      | 0x0062436c   | bottom channel mask      |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e29 | SHL EBP,0x12       | 0x00655d28   | top channel to bit 27    |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e2c | AND EDX,0xf800     | not patched  | middle spread slot       |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e34 | MOV AX,[ECX*2+imm] | 0x00625758   | texture base             |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e3c | AND EBP,0xf8000000 | not patched  | top spread slot          |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e44 | MOV EDX,imm32      | 0x00655cf4   | saturation constant      |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e4b | AND EAX,0x1f       | not patched  | 5-bit texel intensity    |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e50 | SHL EDX,0x12       | 0x00709368   | repack                   |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e55 | SHR EBP,0x12       | 0x0060d3c8   | repack                   |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e58 | AND EAX,imm32      | 0x0065da38   | repack mask              |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e5d | SHR EAX,0x5        | not patched  | 5-bit field width        |
+   +----------+--------------------+--------------+--------------------------+
+   | 0x4a4e60 | AND EBP,imm32      | 0x00708bd8   | repack mask              |
+   +----------+--------------------+--------------+--------------------------+
+
+   The saturation constant proves the reading.
+   Screen3D_BuildPixelConstants computes DAT_00655cf4 as DAT_0062436c -
+   0x7ff0800. On the shipped layout that is 0x1f - 0x07ff0800, which as
+   unsigned is 0xF800F81F: exactly all three spread slots filled. SUB
+   EDX,EBP then complements the spread pixel against full white, which
+   is the blend [verified].
+
+   So the unpatched constants are one design decision, not four separate
+   obstacles. The loop is locked to five bits per channel, which the
+   spread slot widths and the 0x1f texel mask both encode. It is not
+   locked to any particular channel order or to 565.
+
+1.3.1.1.  The second loop is the specialised one
+
+   maybe_Screen3D_SpanBlend2 has a single unpatched colour constant, AND
+   EAX,0x1f at 0x4a4fb0. But its MOV EDX,imm32 at 0x4a4fab is patched
+   from DAT_00624b48, which Screen3D_BuildPixelConstants sets to the
+   literal 0xf800f800, ignoring the pixel format entirely.
+
+   That is a genuine 565 constant reaching an inner loop through a slot
+   that looks parameterised, and it is the clearest single thing to fix.
+   Do not assume a patched immediate is format-derived; check what wrote
+   the global.
+
+   Screen3D_SpanCopyTexels has no colour arithmetic at all. It copies
+   16-bit texels verbatim and patches only the texture base and the UV
+   interpolator steps, so it is format-agnostic by construction.
+
+1.3.1.1.1.  There are TWO literal constants, not one
+
+   Screen3D_BuildPixelConstants writes exactly two immediates to memory,
+   and both go to maybe_Screen3D_SpanBlend2 [verified]:
+
+   +------------+------------+------------+------------------+
+   | Written at | Global     | Value      | Read by          |
+   +============+============+============+==================+
+   | 0x004a4d7c | 0x00625770 | 0x1f0000   | SpanBlend2, only |
+   +------------+------------+------------+------------------+
+   | 0x004a4d99 | 0x00624b48 | 0xf800f800 | SpanBlend2, only |
+   +------------+------------+------------+------------------+
+
+   The section above records the second and not the first. Both are
+   literals that ignore the runtime pixel format, both are loaded in
+   SpanBlend2's patch block and burned into its inner loop, and neither
+   has any other reader anywhere in the binary - confirmed by cross-
+   reference and by a raw scan of .text, which finds each address
+   exactly twice, once at the write and once at the load.
+
+   0x1f0000 is 31 shifted left by 16 - a five-bit field at bit 16, which
+   is the same five-bit assumption as 0xf800 expressed at a different
+   position. It is patched into the AND EAX,imm32 at 0x004a4fba, one of
+   the repack masks.
+
+   o So SpanBlend2 carries the 565 assumption in THREE places, not two:
+     the saturation constant, this mask, and the two-slot spread
+     structure of section 1.3.1.2.2. Any one of them alone would be a
+     constant to re-derive; together they mean the loop has to be
+     rewritten.
+
+   o It also sharpens the contrast section 1.4.2 draws.
+     Screen3D_BuildPixelConstants sorts the channels defensively so the
+     code survives a BGR surface, and in the same function hands two
+     hardcoded constants to a loop that could not survive one. The
+     generality and the hardcoding are not in different places - they
+     are eleven instructions apart.
+
+
+1.3.1.2.  What SpanBlend2 does differently
+
+   The 0xf800f800 claim above is confirmed at instruction level -
+   Screen3D_BuildPixelConstants contains MOV dword ptr [0x00624b48],
+   0xf800f800 as a literal, and maybe_Screen3D_SpanBlend2 is its only
+   reader [verified]. Two other differences from SpanBlend1 are worth
+   recording, because the section above distinguishes the two loops only
+   by that constant.
+
+1.3.1.2.1.  It is additive
+
+   The tail of the loop [verified]:
+
+       004a4fc2  MOV BP, word ptr [EDI]     ; re-read the destination
+       004a4fc5  OR  EAX, EDX               ; the repacked product
+       004a4fc7  ADD EAX, EBP               ; ADD it to the destination
+
+   SpanBlend1 repacks and stores; SpanBlend2 repacks and then ADDS the
+   result to the destination pixel. That is the behavioural difference
+   between the two blends, and it is not visible from the patch table at
+   all.
+
+   o Note the destination is loaded TWICE per pixel - once at 0x004a4f88
+     to be spread, and again at 0x004a4fc2 to be added. The second load
+     gets the pixel in its packed form, which the first has already
+     destroyed by spreading. Two loads of the same address per pixel is
+     the price of not having a register to keep the original in, which
+     is the register pressure of section 1.3.5 showing up as a reload.
+
+1.3.1.2.2.  Two spread slots, not three
+
+   SpanBlend1 spreads the destination into three slots at bits 31..27,
+   15..11 and 4..0. SpanBlend2 builds only two [verified]:
+
+       AND EBP, <mask>   SHL EBP, 0x12
+       AND EDX, <mask>   SHL EDX, 0x12
+       OR  EBP, EDX
+
+   and its saturation constant is 0xf800f800 - the same 16-bit value in
+   both halves of a dword, which is exactly the shape of a two-slot
+   spread saturating at 0xf800 in each. So the constant and the channel
+   count agree with each other.
+
+   That makes the hardcoding worse than a stray literal. A two-slot
+   spread with a doubled 0xf800 is a 565 layout expressed twice over -
+   in the constant, and in the number of slots the loop builds. Widening
+   the destination format would need the loop restructured, not just the
+   constant re-derived.
+
+   o Which two channels they are is not established. The two masks are
+     patched, so the answer is in whatever writes them, and the sort of
+     section 1.4 means the slots are assigned by bit position rather
+     than by name. Worth settling before anyone tries to widen this
+     loop.
+
+
+1.3.1.3.  SpanBlend2's patch table in full
+
+   Reading the whole patch block at 0x004a4fec to 0x004a507b pairs every
+   load with its store, so each of the thirteen sites can be traced to a
+   source [verified]:
+
+   +--------------------+------+-------------------+------------------+
+   | Loop instruction   | Site | Source            | Kind             |
+   +====================+======+===================+==================+
+   | AND EBP, imm32     | 4f91 | 0x00624b04        | computed         |
+   +--------------------+------+-------------------+------------------+
+   | SHL EBP, imm8      | 4f97 | 0x00625780        | computed         |
+   +--------------------+------+-------------------+------------------+
+   | AND EDX, imm32     | 4f9a | 0x00624af8        | computed         |
+   +--------------------+------+-------------------+------------------+
+   | SHL EDX, imm8      | 4fa0 | 0x00625778        | computed         |
+   +--------------------+------+-------------------+------------------+
+   | MOV AX,[ECX*2+imm] | 4fa5 | g_texBase         | per batch        |
+   +--------------------+------+-------------------+------------------+
+   | MOV EDX, imm32     | 4fac | 0x00624b48        | LITERAL f800f800 |
+   +--------------------+------+-------------------+------------------+
+   | SHL EDX, imm8      | 4fb9 | 0x006d20d4        | computed         |
+   +--------------------+------+-------------------+------------------+
+   | AND EAX, imm32     | 4fbb | 0x00625770        | LITERAL 1f0000   |
+   +--------------------+------+-------------------+------------------+
+   | SHR EAX, imm8      | 4fc1 | 0x00709364        | computed         |
+   +--------------------+------+-------------------+------------------+
+   | ADD ESI, imm32     | 4fcb | g_texStepV ror 13 | per triangle     |
+   +--------------------+------+-------------------+------------------+
+   | ADC EBX, imm32     | 4fd1 | steps combined    | per triangle     |
+   +--------------------+------+-------------------+------------------+
+   | ADC CL, imm8       | 4fda | g_texStepU ror 13 | per triangle     |
+   +--------------------+------+-------------------+------------------+
+   | CMP EDI, imm32     | 4fdd | the row end       | per span         |
+   +--------------------+------+-------------------+------------------+
+
+   'Computed' means Screen3D_BuildPixelConstants stores a REGISTER there
+   - a value it derived from the runtime format - as against the two it
+   stores as immediates.
+
+1.3.1.3.1.  The breakage is two slots, not the loop
+
+   Seven of the nine colour constants are properly derived. The spread
+   half is entirely parameterised - both masks and both shifts come from
+   the format. So does the repack's pair of shifts. Only two slots were
+   never wired up [verified]:
+
+   +-------------------+--------------------+----------+
+   | Half of the loop  | Mask               | Shift    |
+   +===================+====================+==========+
+   | spread, channel 1 | computed           | computed |
+   +-------------------+--------------------+----------+
+   | spread, channel 2 | computed           | computed |
+   +-------------------+--------------------+----------+
+   | repack            | LITERAL 0x1f0000   | computed |
+   +-------------------+--------------------+----------+
+   | saturation        | LITERAL 0xf800f800 | n/a      |
+   +-------------------+--------------------+----------+
+
+   That is why the loop looks parameterised on a first pass and is not:
+   the machinery to derive these two exists, is used for their immediate
+   neighbours, and simply was not applied to them. It reads as an
+   oversight rather than a design decision.
+
+   o Which makes the fix small and well-defined. Derive 0x1f0000 and
+     0xf800f800 the way 0x00624b04 and 0x00624af8 are derived, and this
+     loop becomes format-agnostic like SpanBlend1. That is a smaller job
+     than section 1.3.1.2.2 implied - the two-slot STRUCTURE still fixes
+     the channel count, but the constants stop fighting it.
+
+   o It also revises the ranking in section 1.3.1.1. The problem is not
+     that SpanBlend2 is a hardcoded loop; it is that two of its thirteen
+     patch sites bypass a derivation the other eleven use.
+
+1.3.1.3.2.  One combined constant
+
+   The ADC EBX site at 0x004a4fd1 is worth a note. The patch block
+   builds its value from BOTH steps [verified]:
+
+       MOV EBX, g_texStepU   ROR EBX, 0xd
+       MOV ECX, g_texStepV   ROR ECX, 0xd
+       MOV BL, CL                       ; U's high 3 bytes, V's low byte
+       MOV [0x004a4fd1], EBX
+
+   So one ADC advances the packed coordinate in both axes at once, using
+   a constant whose upper bytes came from the U step and whose low byte
+   came from the V step. It is the same rotated-fixed-point idea as
+   section 1.3.3.1, folded one step further.
+
+   The block ends by clearing the dirty flag at 0x00624b50 and jumping
+   back to 0x004a4f41, which is the behaviour section 1.3.2 records for
+   the two blend loops and not for SpanCopyTexels.
+
+
+1.3.1.4.  SpanBlend1's patch table, and the exact parallel
+
+   Tracing SpanBlend1's block at 0x004a4e92 the same way gives its
+   thirteen sites, and the result is unambiguous [verified]:
+
+   +---------------------+------------+---------------------+-----------------+
+   | Loop instruction    | Site       | Source              | Kind            |
+   +=====================+============+=====================+=================+
+   | SHL EDX, imm8       | 4e23       | 0x00655d04          | computed        |
+   +---------------------+------------+---------------------+-----------------+
+   | AND EAX, imm32      | 4e25       | 0x0062436c          | computed        |
+   +---------------------+------------+---------------------+-----------------+
+   | SHL EBP, imm8       | 4e2b       | 0x00655d28          | computed        |
+   +---------------------+------------+---------------------+-----------------+
+   | AND EDX, 0xf800     | -          | not patched         | fixed slot      |
+   +---------------------+------------+---------------------+-----------------+
+   | MOV AX,[ECX*2+imm]  | 4e38       | g_texBase           | per batch       |
+   +---------------------+------------+---------------------+-----------------+
+   | AND EBP, 0xf8000000 | -          | not patched         | fixed slot      |
+   +---------------------+------------+---------------------+-----------------+
+   | MOV EDX, imm32      | 4e45       | 0x00655cf4          | computed        |
+   +---------------------+------------+---------------------+-----------------+
+   | AND EAX, 0x1f       | -          | not patched         | texel intensity |
+   +---------------------+------------+---------------------+-----------------+
+   | SHL EDX, imm8       | 4e52       | 0x00709368          | computed        |
+   +---------------------+------------+---------------------+-----------------+
+   | SHR EBP, imm8       | 4e57       | 0x0060d3c8          | computed        |
+   +---------------------+------------+---------------------+-----------------+
+   | AND EAX, imm32      | 4e59       | 0x0065da38          | computed        |
+   +---------------------+------------+---------------------+-----------------+
+   | AND EBP, imm32      | 4e62       | 0x00708bd8          | computed        |
+   +---------------------+------------+---------------------+-----------------+
+   | the step trio       | 4e71/77/80 | g_texStepU/V ror 13 | per triangle    |
+   +---------------------+------------+---------------------+-----------------+
+
+   EVERY patched colour constant in SpanBlend1 is computed. Not one is a
+   literal. The three unpatched constants are the fixed intermediate
+   slots section 1.3.1 describes, which are deliberately invariant - the
+   patched shifts are what move an arbitrary source layout into them.
+
+1.3.1.4.1.  Blend2's two literals have computed counterparts in Blend1
+
+   Setting the two loops side by side by ROLE rather than by address
+   shows the literals are not filling a gap in the derivation. The
+   derivation exists, and Blend1 uses it for exactly those roles
+   [verified]:
+
+   +--------------+-----------------------------------+---------------------+
+   | Role         | SpanBlend1                        | SpanBlend2          |
+   +==============+===================================+=====================+
+   | saturation   | 0x00655cf4, computed              | 0x00624b48, LITERAL |
+   +--------------+-----------------------------------+---------------------+
+   | repack mask  | 0x0065da38 + 0x00708bd8, computed | 0x00625770, LITERAL |
+   +--------------+-----------------------------------+---------------------+
+   | spread masks | computed                          | computed            |
+   +--------------+-----------------------------------+---------------------+
+   | all shifts   | computed                          | computed            |
+   +--------------+-----------------------------------+---------------------+
+
+   So for both of SpanBlend2's hardcoded constants there is a same-role
+   constant in SpanBlend1 that Screen3D_BuildPixelConstants derives
+   properly - and section 1.3.1 records that it computes 0x00655cf4 from
+   0x0062436c by a formula. The saturation for a two-slot spread is
+   obtainable the same way.
+
+   o That settles what kind of defect this is. It is not an unfinished
+     generalisation, because the general version exists eleven
+     instructions away in the same function and is used by the sibling
+     loop. Two slots were left behind when the second blend was written
+     or modified [inferred, and the parallel is exact].
+
+   o It also makes the port fix concrete rather than a research task:
+     compute SpanBlend2's saturation the way 0x00655cf4 is computed, and
+     its repack mask the way 0x0065da38 and 0x00708bd8 are. No new
+     derivation has to be invented.
+
+   Both blocks end identically - clear the dirty flag at 0x00624b50,
+   jump back to the loop top - and both build the ADC constant by
+   rotating the U step and substituting the V step's low byte with MOV
+   BL,CL. The two loops are the same design, and one of them is two
+   constants short.
+
+
+1.3.1.5.  The saturation derivation, and how to apply it to Blend2
+
+   The formula section 1.3.1 records is two fragments in
+   Screen3D_BuildPixelConstants, forty bytes apart [verified]:
+
+       004a4cad  MOV  EDX, 0x1f
+       004a4cb7  LEA  ECX, [EBX - 5]        ; EBX = a channel's shl+bits
+       004a4cba  SHL  EDX, CL
+       004a4cbe  MOV  [0x0062436c], EDX     ; the bottom-slot mask
+       ...
+       004a4d1c  SUB  EDX, 0x7ff0800
+       004a4d33  MOV  [0x00655cf4], EDX     ; the saturation
+
+   So saturation = (0x1f << (shl + bits - 5)) - 0x07ff0800.
+
+1.3.1.5.1.  Why 0x07ff0800
+
+   The magic number is a subtraction standing in for an OR. Its two's
+   complement is the answer [verified]:
+
+   +----------------------------+------------------------+
+   | Expression                 | Value                  |
+   +============================+========================+
+   | -0x07ff0800 as unsigned    | 0xF800F800             |
+   +----------------------------+------------------------+
+   | the two UPPER spread slots | bits 31..27 and 15..11 |
+   +----------------------------+------------------------+
+   | 0x1f - 0x07ff0800          | 0xF800F81F             |
+   +----------------------------+------------------------+
+   | all THREE slots filled     | the same               |
+   +----------------------------+------------------------+
+
+   So the subtraction assembles 'all spread slots at maximum' out of a
+   fixed constant for the top two and a computed mask for the bottom
+   one. SUB EDX,EBP then complements the spread pixel against that
+   white, which is the blend.
+
+1.3.1.5.2.  Blend2's literal is the same expression with the bottom term dropped
+
+   0xF800F800 is exactly -0x07ff0800 - the derivation with the computed
+   term omitted, which is right for a loop that builds only two slots.
+   Equivalently it is Blend1's saturation minus the bottom-slot mask,
+   and both of those are globals that already exist [verified]:
+
+       0xF800F81F - 0x1F = 0xF800F800
+       DAT_00655cf4 - DAT_0062436c
+
+   So the fix needs no new derivation and no new constant. Either
+   compute it as 0 - 0x07ff0800 by the same route the sibling uses, or
+   subtract the two globals.
+
+1.3.1.5.3.  A correction: on the shipped modes the literal is CORRECT
+
+   Sections 1.3.1.3 and 1.3.1.4 called the two literals a defect without
+   saying when it bites. Working the arithmetic out shows the
+   distinction is narrower than those sections imply [verified]:
+
+   +-------------------------+------------+-----------------+----------------+
+   | Bottom channel          | shl+bits-5 | Blend1 computes | Blend2 literal |
+   +=========================+============+=================+================+
+   | 5 bits, all three modes | 0          | 0xF800F81F      | consistent     |
+   +-------------------------+------------+-----------------+----------------+
+   | 8 bits, a 32-bit target | 3          | 0xF800F8F8      | WRONG          |
+   +-------------------------+------------+-----------------+----------------+
+
+   The derivation is sensitive to the bottom channel's WIDTH, not its
+   position. Every mode the game supports has a five-bit bottom channel,
+   so the shift is always zero and Blend1's computed value is always
+   0xF800F81F. Blend2's literal is numerically right on all of them.
+
+   o So this is a LATENT defect, not an active one, and that is why it
+     survived. The loop is not producing wrong pixels today. It would
+     produce wrong pixels the moment a destination format with wider
+     channels appeared - which is exactly the change this project exists
+     to make.
+
+   o It also means the literal cannot be caught by testing against the
+     shipped game. Only reading the derivation and comparing shows it,
+     which is an argument for cataloguing format assumptions by
+     provenance rather than by observed behaviour.
+
+
+1.3.2.  The dirty flag, and why it is not a bug
+
+   DAT_00624b50 is set to 1 by fifteen functions across 0x0049dde0 to
+   0x004af130 and read by the three self-patching loops. Two of them
+   clear it after patching; Screen3D_SpanCopyTexels does not.
+
+   The first pass flagged that asymmetry as a possible latent bug: if a
+   clearing loop ran first, the copy loop would skip its patch block and
+   run with a stale texture base. Tracing it shows the protocol is sound
+   and the omission is only a missed optimisation [verified].
+
+1.3.2.1.  How spans are actually dispatched
+
+   The three loops have no callers. Nothing references 0x004a5ab0 at
+   all. They are reached through a function-pointer table at 0x004f1a70,
+   sixteen bytes per record:
+
+       +0x00  u32   primitive kind; the slot this record belongs in
+       +0x04  u32   pipeline index: 0, 4, 5, 6 or 7
+       +0x08  u32   1 for the loops that clear the flag, else 0
+       +0x0c  ptr   the span function
+
+   CORRECTION. An earlier version of this note read that second field as
+   a group of 4 or 6, and read the table straight out of the binary.
+   Both were wrong. The table is SCATTERED BY KEY at startup: the static
+   bytes are a dense source list, and each record is moved to slot
+   [kind] with unused slots filled with -1. The static record order
+   therefore says nothing about which kind a record serves. See
+   subsystems/rasterizer-pipeline.txt section 3.
+
+   The second field is a pipeline index into a second table at
+   0x004f1ee0, scattered the same way, which selects the primitive setup
+   function and edge walkers. Index 0 is short-circuited and calls the
+   span function directly.
+
+   Two functions walk it. FUN_004aef20 is the per-primitive dispatcher,
+   which also stashes the chosen span function in DAT_00655d08 and an
+   edge-walker in DAT_006d20bc. FUN_004af130 is a deferred batch
+   flusher, and its shape is what settles the question:
+
+       do {
+           if (queueDepth == 0) return;
+           DAT_00624b50 = 1;                    <-- once per BATCH
+           ...pop batch: texture base, UV steps...
+           fn = spanTable[kind].fn;             <-- one fn per batch
+           do {
+               ...pop span: row, x0, x1, interpolator starts...
+               (*fn)();
+           } while (--count);
+       } while (true);
+
+   Three things follow. The flag is set unconditionally at the top of
+   every batch, before anything else. A batch resolves exactly one span
+   function, outside the inner loop, so every span in a batch calls the
+   same code. And the values that get patched, the texture base and the
+   UV steps, are set in the outer loop and are therefore constant for
+   the whole batch.
+
+   The fourteen writers of that flag have since been identified: they
+   are the primitive emitters and their relatives, and they raise it
+   because they have just changed the texture base. The layer above
+   them, from Screen3D_DispatchPrimitive down to the emitters, is mapped
+   in subsystems/rasterizer-pipeline.txt.
+
+   The per-span values are not patched at all. The row pointer, the x
+   bounds and the interpolator starts are written to globals by the
+   inner loop and read straight out of them by each loop's prologue.
+   Only per-batch quantities are ever burned into the instruction
+   stream.
+
+1.3.2.2.  The protocol holds
+
+   The decisive check is whether a patched value can change without the
+   flag being set. It cannot. Cross-referencing every writer of the
+   texture base DAT_00625758 against the flag setters:
+
+   +-----------------------------------------------+-------+
+   | Measure                                       | Count |
+   +===============================================+=======+
+   | Functions that write DAT_00625758             | 13    |
+   +-----------------------------------------------+-------+
+   | Of those that also set DAT_00624b50           | 13    |
+   +-----------------------------------------------+-------+
+   | Where the flag write precedes the value write | 13    |
+   +-----------------------------------------------+-------+
+
+   The two flag setters that do not write the texture base, FUN_004a34f0
+   and FUN_004a4350, set it conservatively before dispatching
+   indirectly.
+
+   So the flag means may be stale, and the invariant is that it is
+   raised before any patched value changes. Under that invariant
+   patching more often than necessary is always safe and patching less
+   often is the only error. Clearing the flag is an optimisation;
+   leaving it set is merely conservative.
+
+   Screen3D_SpanCopyTexels therefore re-runs its thirty-instruction
+   patch block on every span of a batch instead of once. It never reads
+   stale data. Whether that costs anything depends on the spans-per-
+   batch ratio, which has not been measured.
+
+1.3.2.3.  What this means for the port
+
+   This is the answer the first pass needed: the patch is per-batch, not
+   per-format and not per-span. A replacement does not have to preserve
+   any self-modification. Hoisting the per-batch constants into locals
+   or parameters at the top of a batch loop reproduces the semantics
+   exactly, because that is already what the patching achieves.
+
+1.3.3.  SpanCopyTexels patches for a different reason
+
+   Sections 1.3.1 and 1.3.2 describe the two SpanBlend loops, whose
+   patched constants are channel shifts and masks.
+   Screen3D_SpanCopyTexels at 0x004a5ab0 patches twenty sites and none
+   of them is a colour constant. Its loop body, with the placeholders as
+   they sit in the image [verified]:
+
+       004a5b13  ADD  ECX, 0x12345678      ; u fraction
+       004a5b19  ADC  BL,  0x12            ; carry into u integer
+       004a5b1c  ADD  EDX, 0x12345678      ; v fraction
+       004a5b22  ADC  BH,  0x12            ; carry into v integer
+       004a5b25  ROL  EAX, 0x10
+       004a5b28  MOV  AX, [EBX*2 + 0x12345678]   ; the texel
+
+   Six instructions per pixel, no shifts, no masks, and no address
+   computation beyond a scaled index.
+
+1.3.3.1.  Rotated fixed point, and why the carry lands where it does
+
+   The two step values are rotated before being patched in - visible
+   immediately above the patch block [verified]:
+
+       004a5b88  ROR  EBX, 0xd        ; g_texStepU
+       004a5b91  ROR  ECX, 0xd        ; g_texStepV
+
+   The interpolants are 19.13 fixed point, so rotating right by thirteen
+   puts the FRACTION in the high bits and the integer part in the low
+   ones. Accumulating that rotated value with ADD makes the fraction
+   overflow out of bit 31 exactly when the texel coordinate should
+   advance, and the ADC that follows adds that carry straight into an
+   integer byte.
+
+   Those integer bytes are BL and BH - the low and high halves of EBX -
+   so EBX holds (v_int << 8) | u_int, which is a packed coordinate into
+   a 256 x 256 texture. That is why the fetch is a bare MOV AX, [EBX*2 +
+   base]: the index is already assembled, and the * 2 is the 16-bit
+   texel size folded into the addressing mode.
+
+   o Compare the ordinary fillers of rasterizer-pipeline.txt section 30,
+     which compute ((v & 0xffffe01f) >> 5) + (u >> 13) & 0xffff per
+     pixel. This loop reaches the same texel with two ADDs and two ADCs.
+
+1.3.3.2.  The reason it must patch is register pressure
+
+   Every general-purpose register is spoken for [verified]:
+
+   +----------+------------------------------------------------+
+   | Register | Holds                                          |
+   +==========+================================================+
+   | EAX      | the pixel pair being assembled, rotated by ROL |
+   +----------+------------------------------------------------+
+   | EBX      | the packed texel index, BL = u int, BH = v int |
+   +----------+------------------------------------------------+
+   | ECX      | the u fraction                                 |
+   +----------+------------------------------------------------+
+   | EDX      | the v fraction                                 |
+   +----------+------------------------------------------------+
+   | EDI      | the destination pointer                        |
+   +----------+------------------------------------------------+
+   | ESI      | the loop counter                               |
+   +----------+------------------------------------------------+
+
+   With ESP and EBP unavailable, there is no register left to hold the
+   texture base or either step. They have nowhere to live except the
+   instruction stream, and that - not any colour-format concern - is why
+   this particular loop rewrites itself.
+
+   The twenty sites are five immediates - base, u step, u step's integer
+   byte, v step, v step's integer byte - written into four unrolled
+   copies of the body. The patch block ends with JMP back to the top of
+   the function so the freshly patched code runs immediately.
+
+   o For the port this one is easy and the reasoning is worth keeping:
+     on any register set with more than eight general registers the
+     constants simply live in registers, and the loop is a transcription
+     with no patching. The elegance is a workaround for a constraint
+     that no longer exists.
+
+   o The placeholders really are 0x12345678 and 0x12 in the shipped
+     image, which is how section 1.3 could catalogue the patch sites at
+     all. Unpatched code is meant to be obvious.
+
+
+1.3.4.  What the blend actually computes
+
+   Section 1.3.1 explains the spread-and-repack machinery of
+   maybe_Screen3D_SpanBlend1 without saying what it is in aid of. The
+   loop body gives it [verified]:
+
+       MOV AX, [EDI]                  ; the DESTINATION pixel
+       ...spread its three channels to bits 31..27, 15..11, 4..0...
+       MOV AX, [ECX*2 + <texBase>]    ; the texel
+       MOV EDX, <saturation>
+       SUB EDX, EBP                   ; saturation - spread(dest)
+       AND EAX, 0x1f                  ; texel's low 5 bits
+       MUL EDX                        ; EDX:EAX = intensity * that
+       ...repack from both halves of the 64-bit product...
+
+   So it is a read-modify-write blend: it loads the destination pixel,
+   spreads it, subtracts it from a saturation constant, and scales the
+   result by an INTENSITY taken from the low five bits of the texel.
+
+   o The texel is not used as a colour here. Only its bottom five bits
+     are read, as a scalar. That makes this filler a modulation pass - a
+     light or shadow map applied to what is already on screen - rather
+     than a texture draw.
+
+   o The spread layout of section 1.3.1 exists precisely so that ONE 32
+     x 32 to 64 multiply scales all three channels at once without them
+     carrying into each other. The channels sit far enough apart that
+     the products do not overlap, and the repack pulls them out of both
+     halves of EDX:EAX. That is the whole reason for the odd
+     intermediate format.
+
+1.3.5.  One reason behind all three patching loops
+
+   Sections 1.3.1 and 1.3.3 describe two different KINDS of patched
+   constant - format-derived shifts and masks in the blends, addressing
+   constants in the copy. The reason any of them is an immediate rather
+   than a register is the same in all three [verified]:
+
+   +----------------+-----------------------------------------+
+   | Loop           | Registers in use                        |
+   +================+=========================================+
+   | SpanCopyTexels | EAX EBX ECX EDX EDI ESI                 |
+   +----------------+-----------------------------------------+
+   | SpanBlend1     | EAX EBX ECX EDX EBP EDI, ESI as counter |
+   +----------------+-----------------------------------------+
+   | SpanBlend2     | the same shape                          |
+   +----------------+-----------------------------------------+
+
+   Every general-purpose register is live in each loop, and with ESP
+   unavailable there is nowhere left to keep a constant. Patching is not
+   a colour-format technique and not a texture-addressing technique - it
+   is what a hand-written x86 inner loop does when it has run out of
+   registers.
+
+   o That is worth separating from WHAT is patched, which does differ
+     between the two families and is what sections 1.3.1 and 1.3.3
+     catalogue. The values are specific to each loop; the reason is
+     general.
+
+   o And it settles the port question uniformly. On a register set with
+     more than eight general registers, all three loops hold their
+     constants in registers and none needs to rewrite itself. The self-
+     modification is a consequence of the target, not of the algorithm,
+     so nothing about the rendering behaviour is lost by dropping it.
+
+
+1.4.  Why the constants are sorted
+
+   Screen3D_BuildPixelConstants copies the nine pixel-format globals
+   into three 12-byte records and qsorts them before computing anything:
+
+       record[0]  = { g_maskR, g_shlR, g_bitsR }
+       record[1]  = { g_maskG, g_shlG, g_bitsG }
+       record[2]  = { g_maskB, g_shlB, g_bitsB }
+       qsort(record, 3, 12, Screen3D_CmpChannelByShift)
+
+   The comparator at 0x004a4c00 reads field +4, the shift, and returns 1
+   when a is below b. The inverted sign makes it a DESCENDING sort, so
+   afterwards record[0] is the channel occupying the highest bits and
+   record[2] the lowest [verified].
+
+   That is the whole reason for the sort. The constants it produces are
+   keyed by field POSITION, not by channel name, which is exactly what
+   the spread-and-multiply trick in 1.3.1 needs: the top source channel
+   goes to spread bit 27, the middle to 11, the bottom to 0, whatever
+   colours those happen to be.
+
+1.4.1.  Two constant sets, one per loop
+
+   The function emits sixteen derived globals in two disjoint groups,
+   and each group feeds exactly one span loop. Every one of the sixteen
+   has precisely one writer and one reader [verified].
+
+   +-------------+-----------------------------------------+------------------------------------------+------------+
+   | Group       | Computed from                           | Globals                                  | Consumer   |
+   +=============+=========================================+==========================================+============+
+   | Positional  | the sorted records                      | 0x0062436c, 0x0065da38, 0x00708bd8,      | SpanBlend1 |
+   |             |                                         | 0x00655d04, 0x0060d3c8, 0x00709368,      |            |
+   |             |                                         | 0x00655d28, 0x00655cf4                   |            |
+   +-------------+-----------------------------------------+------------------------------------------+------------+
+   | Per-channel | g_bitsR/G and g_shlR/G directly,        | 0x00624af8, 0x00624b04, 0x00625778,      | SpanBlend2 |
+   |             | unsorted                                | 0x00625770, 0x00625780, 0x006d20d4,      |            |
+   |             |                                         | 0x00624b48, 0x00709364                   |            |
+   +-------------+-----------------------------------------+------------------------------------------+------------+
+
+   So the two blend loops were written against two different
+   philosophies. SpanBlend1 is channel-order agnostic by construction.
+   SpanBlend2 reads red and green by name and takes a hardcoded
+   0xf800f800, so it assumes the shipped layout.
+
+1.4.2.  The sort never actually does anything
+
+   On every display mode the game supports the channels are already in
+   descending position order: red 11, green 6, blue 0 in the framebuffer
+   layout, or 10, 5, 0 in true 555. Sorting descending returns them
+   unchanged. The qsort is a no-op in practice [verified].
+
+   It earns its place only on a surface DirectDraw reports with the
+   channels reversed, a BGR layout, where blue occupies the high bits.
+   Such surfaces do exist. The code was written to survive one, and on
+   this hardware never has to.
+
+   That makes it defensive generality that never fires, and it sits
+   oddly beside the hardcoded 0xf800f800 handed to the other loop, which
+   would break on exactly the surface the sort defends against. The
+   generality is real but incomplete [inferred].
+
+   For a port this is good news rather than bad. SpanBlend1's structure
+   already separates where a channel is from how wide it is, and only
+   the width is fixed. Rewriting it against a modern API means keeping
+   the spread-and-multiply idea, or discarding it for per-channel
+   arithmetic that a modern compiler vectorises anyway, and neither
+   needs the sort.
+
+
+2.  The packer and the blenders
+
+   FUN_0045a2e0 is the engine's RGB-to-pixel packer, called from
+   fourteen sites across the menu, player and screen3d code [verified]:
+
+   clamp r to 0..0x1f
+   clamp g to 0..0x3f
+   clamp b to 0..0x1f
+   return (g << 6) | (r << 11) | b
+
+   The shifts confirm the layout at the top of this note. The green
+   clamp does not. Green has only five bits available at shift 6, so a
+   value above 0x1f puts its top bit at bit 11, which is red's least
+   significant bit.
+
+   Callers passing 5-bit green are unaffected. Callers passing 6-bit
+   green tint the pixel red. FUN_0049a5a0 calls it with (0xff, 0xff,
+   0xff), which clamps to (0x1f, 0x3f, 0x1f) and yields 0xffdf: the
+   collision at bit 11 is harmless there only because red is already
+   saturated.
+
+   The clamp should almost certainly be 0x1f to match the layout
+   [inferred]. Flagged rather than asserted: it is possible the 0x3f was
+   deliberate for a green field that was once six bits.
+
+   FUN_00497e40 is the counterpart and the largest concentration of
+   hardcoded colour code in the binary: eleven unrolled blend variants,
+   each extracting channels with
+
+   red    (v >> 11) & 0x1f
+   green  v & 0x7c0            kept in place
+   blue   v & 0x1f
+
+   It never consults g_maskR or any other pixel-format global. All
+   eleven sites must be rewritten for any other layout. Its only callers
+   are FUN_0049c590 and FUN_0049ca70.
+
+2.1.  The D3D vertex colour path, added after a boundary repair
+
+   This site was missing from the first version of this note, and the
+   reason is worth recording. FUN_00485e50 had been split by Ghidra into
+   a stub and an orphaned body. The instruction sweep that built this
+   catalogue did find AND EBP,0xf800 at 0x0048608f, but it sat inside
+   the orphan, decompiled to noise, and was triaged as unrelated to
+   colour.
+
+   Repaired, it reads [verified]:
+
+       c = ((((alpha & 0x3f | 0xffffff80) << 0x10 | rgb & 0xf800) << 3
+             | rgb & 0x7c0) << 2 | rgb & 0x1f) << 3
+
+   The masks are the framebuffer layout: 0xf800 red, 0x7c0 green, 0x1f
+   blue. Tracing the shifts, the three channels finish at bits 19-23,
+   11-15 and 3-7, which is each 5-bit value left-aligned in its own
+   byte, with alpha in the top byte. It converts the engine's 5-5-5
+   colour to ARGB8888.
+
+   FUN_00485e50 builds Direct3D execute-buffer vertices, and D3D vertex
+   colours are ARGB8888, so the target format is not a choice this code
+   made [inferred]. It is a third destination alongside the DirectDraw
+   surface and the negotiated texture format, and it must be rewritten
+   with the rest of the D3D path rather than adapted.
+
+   The related constant 0x3e000 is used as a default vertex colour at
+   0x00485542, 0x004865bf and 0x0049b270. Read as ARGB8888 that is
+   r=0x03, g=0xe0, b=0x00. Not yet explained.
+
+   The general lesson is in docs/ghidra-db-repairs.txt: a static
+   constant search finds the instructions, but a split function makes
+   them impossible to interpret. Repair boundaries before cataloguing.
+   Seventy-one functions were affected, so other notes written before
+   that repair may be similarly incomplete.
+
+3.  True RGB555 is an interchange value, not an asset format
+
+   This was the open question left by the first pass: four functions
+   mask with 0x7c00 and 0x3e0, which is red at bit 10 and green at bit
+   5, a different layout from the framebuffer one. The guess recorded
+   then was that this is the stored asset format. That guess was wrong.
+
+   True RGB555 is a transient value built and immediately taken apart
+   again inside colour conversion [verified]. Nothing on disk is stored
+   in it.
+
+3.1.  The conversion chain
+
+   FUN_00401160, the .RAW texture loader in bankw.Cpp, shows the whole
+   thing in one place. Its truecolour path reads three bytes per pixel
+   and packs them:
+
+       SHR AL,3 / AND AX,0x1f / SHL AX,0xa      red   -> bit 10
+       SHR DL,3 / AND DX,0x1f / SHL DX,0x5      green -> bit 5
+       SHR CL,3 / AND CX,0x1f                   blue  -> bit 0
+       OR DX,AX / OR DX,CX                      true RGB555
+
+   and then, forty bytes later, pulls that same value apart again at
+   0x401395 and 0x4013b9 and rebuilds it in the destination format.
+   Packing to 555 and immediately unpacking it is redundant work: it is
+   what two inlined helpers look like when the compiler does not see
+   across them.
+
+   So the chain is:
+
+       RGB888 on disk  ->  >>3 per channel  ->  true RGB555
+                       ->  destination format
+
+   Assets are RGB888, either three bytes per pixel or eight-bit indices
+   into an RGB888 palette. The 555 stage exists only because the
+   conversion helper takes a packed 16-bit argument [inferred].
+
+3.2.  The helper
+
+   FUN_00402020 in bankw.Cpp and FUN_0043e1c0 in menu\bitmap.cpp are
+   byte-for-byte the same function, duplicated across two translation
+   units [verified]:
+
+       ushort Convert555ToSurface(ushort src)
+       {
+           return ((src & 0x3e0)  >> 5)  << (bitsG + shlG - 5) & maskG
+                | ((src & 0x7c00) >> 10) << (bitsR + shlR - 5) & maskR
+                | ( src & 0x1f)          << (bitsB + shlB - 5) & maskB;
+       }
+
+   This is tier 1 code. The destination comes entirely from the
+   DirectDraw globals, and the shift (bits + shl - 5) left-aligns a
+   5-bit source inside a destination field of any width. Only the source
+   is fixed at five bits, which is honest, because the source genuinely
+   is 555.
+
+   FUN_00402020 has 13 callers, in frame3d.cpp, player.cpp and
+   screen3d.cpp. It is the engine-wide colour entry point and would not
+   need changing for a wider destination format.
+
+3.3.  Where the hardcoded layout actually gets used
+
+   One branch in FUN_00401160 answers the question the first pass could
+   not [verified]. At 0x004018f1, building a texture palette:
+
+       004018f1  MOV ECX,[0x004dc06c]     g_rendererReady
+       004018fd  JZ  0x00401926           not ready -> parameterised
+       004018ff  MOV ECX,[0x004dc070]     g_rendererMode
+       00401907  JNZ 0x00401926           mode != 0 -> parameterised
+       00401909  MOV CX,[EBP-0x12]
+       0040190d  SHL CX,0x6               green << 6
+       00401911  SHL DI,0xb               red   << 11
+       00401915  OR CX,DI
+       00401918  OR CX,AX                 | blue
+
+   subsystems/renderer-mode.txt records g_rendererMode as 0 for hardware
+   and 1 for software. So the hardcoded 5-5-5 layout is taken when
+   hardware rendering is active, and the parameterised path when it is
+   not.
+
+   That is the reverse of what the first pass assumed. The hardcoded
+   layout is the format handed to the 3D hardware, not a software-
+   rasterizer detail. The software path asks DirectDraw what the surface
+   looks like and converts to match; the hardware path writes one fixed
+   layout.
+
+   Both still contain hardcoding, in different places, so this does not
+   shrink the porting job. It relocates it: the fixed layout belongs to
+   the texture upload path, while the self-modifying span loops in
+   section 1.3 are a separate problem in the software rasterizer.
+
+3.4.  The D3D path negotiates its own format
+
+   FUN_0041c050, the Dsi_d3d.cpp anchor, builds true RGB555 the same way
+   at 0x41cb03 and 0x41cb8b, then unpacks it at 0x41cc34 and 0x41cc4b
+   into four variable shifts at 0x41cc96, 0x41cc9f, 0x41ccab and
+   0x41ccb7 [verified].
+
+   Four channels, not three, and every shift is a run-time CL rather
+   than a literal. This is conversion into a D3D texture format with
+   alpha, negotiated from the device rather than from the primary
+   surface.
+
+   Since confirmed and followed through. The whole hardware texture path
+   converts into a device-reported descriptor with arbitrary channel
+   widths, order and alpha depth [verified]. It is the most general
+   colour code in the binary and needs no work for format reasons.
+   Written up separately in subsystems/d3d-textures.txt, including the
+   black-is-transparent colour key, which a port must preserve.
+
+3.5.  Not to be confused with the .trk readers
+
+   frame3d.cpp has six SHR reg,0xb sites between 0x00422be0 and
+   0x00423240, in the .trk face readers. Those are NOT this layout:
+   FUN_00423240 pairs the shift with AND CX,0x7c0 and AND EAX,0x1f,
+   which is the framebuffer layout [verified].
+
+   formats/trk.txt previously labelled that RGB555. Its extraction
+   formula was correct but the label was not; it has been corrected.
+
+4.  What this means for the port
+
+   The renderer is in better shape than the mission statement assumes.
+   The DirectDraw layer is already format-agnostic, and a meaningful
+   fraction of the drawing code consults the derived globals rather than
+   literals.
+
+   The real work is:
+
+   1. Replace the three self-modifying loops. They cannot be ported
+      mechanically, and they cannot even be read reliably from the
+      decompiler. Rewriting them against a modern API removes the
+      self-modification, the qsort and the spread-and-multiply in one
+      move.
+   2. Rewrite maybe_Screen3D_BlendVariants (0x00497e40) and its eleven
+      unrolled variants. These are the largest concentration of
+      genuinely hardcoded colour code in the binary.
+   3. Fix the 5-bit assumption in Screen3D_BuildPixelConstants, or
+      delete it along with the loops it feeds.
+   4. Decide whether to keep the internal 5-bit representation. Keeping
+      it is much less invasive and costs one bit of green, which is what
+      ships today anyway.
+
+   Order matters less than the following, which section 1.4 made clear.
+   Only two things in the whole span chain are genuinely locked to the
+   shipped 565-ish layout: DAT_00624b48, which
+   Screen3D_BuildPixelConstants sets to the literal 0xf800f800 and hands
+   to SpanBlend2, and the per-channel constants that same loop reads by
+   name. Everything else is locked only to five bits per channel, which
+   is a much weaker constraint and one a port can simply keep.
+
+   The 16-bit lock itself is a mode-enumeration filter, not a rendering
+   constraint. This note previously pointed at subsystems/renderer-
+   mode.txt for it, which was wrong - that note is about the renderer
+   mode globals and never covered the lock. It is in subsystems/dd-
+   init.txt section 2.2, and the guess made here is confirmed: the
+   filter is one equality against 0x10 in the EnumDisplayModes callback
+   at 0x00477160.
+
+   Nothing found here requires a 16-bit display; it requires a 16-bit
+   intermediate buffer, which a modern port can allocate for itself and
+   convert on present.
+
+5.  Open questions
+
+   o RESOLVED. Neither is an asset format. Assets are RGB888; true
+     RGB555 is a transient value inside the conversion helper. See
+     section 3.
+   o RESOLVED. .trk face colour uses the framebuffer layout, not true
+     RGB555; formats/trk.txt has been corrected.
+   o RESOLVED. Not a bug. The flag is raised once per batch before any
+     patched value changes, so leaving it set is conservative and safe.
+     See section 1.3.2.
+   o RESOLVED. The sort keys the constants by field position rather than
+     channel name, which is what SpanBlend1's spread-and-multiply needs.
+     It is a no-op on every supported mode and only matters for a BGR
+     surface. See section 1.4.
+   o RESOLVED. g_shrR/G/B convert between 8-bit components and the
+     surface format, in both directions. Eleven direct consumers, all
+     loaders or decoders, none in the rasterizer. See section 1.1.2.
+   o RESOLVED, and it was far wider than the eleven noticed here: 71
+     game functions were split, not eleven, and all are repaired. See
+     ghidra-db-repairs.txt. One consequence landed in this note - the
+     D3D vertex colour site in section 2.1 was missed the first time
+     because it sat inside an orphaned body.

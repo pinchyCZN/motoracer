@@ -1,0 +1,809 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                   THE .SKL SKELETON AND .ROT POSE
+
+
+Abstract
+
+   A .SKL is the articulated bike-and-rider model: a bone tree, one
+   shared vertex pool, and a run of that pool owned by each bone. A
+   .ROT is ONE POSE for that tree - not an animation clip - so the
+   twelve .rot files a bike manifest names are twelve stances rather
+   than twelve sequences.
+
+   Both decode completely. All three shipped skeletons consume to the
+   byte and their vertex runs partition the pool exactly.
+
+   The loader is Skl_Load at 0x00462c60 in player.cpp. It reads with
+   plain fread through File_ReadU16 (0x00458d40) and File_ReadFloat
+   (0x00458d70) - there is no .bpt masking on these files.
+
+Table of Contents
+
+   1. The .SKL layout
+      1.1. Two vertex formats, chosen by a sign
+      1.2. The face record
+      1.3. The trailing group
+   2. The tree, and what it describes
+   3. The .ROT layout
+   4. Verification
+      4.1. The decisive check: against the game's own output
+   5. The bike manifest, the two skeleton slots and the LODs
+      5.1. Slot 1, and what mHand turned out to be
+         5.1.1. The prediction, and the measurement
+         5.1.2. mHand is the rider's HANDS
+         5.1.3. The first-person prediction was WRONG
+         5.1.4. What actually selects block 1
+         5.1.5. So what is mHand for
+         5.1.6. It fires, and a poke cannot make it fire
+         5.1.7. Which branch raises the flag - measured
+         5.1.8. The state: a timed animation, speed being killed
+         5.1.9. So it is the crash, not the wheelie
+      5.2. The LODs are meshes, not skeleton slots
+      5.3. The pocket bikes are the same rider on a smaller bike
+      5.4. The remap table confirms the runtime tree
+   6. Open questions
+
+
+1.  The .SKL layout
+
+   +--------------------+------------------------------------------+
+   | i16 memberCount    | NEGATIVE selects the float vertex form   |
+   |                    | and the real count follows               |
+   | i16 parent[n]      | -1 for the root                          |
+   | i16 remap[n]       | float form only                          |
+   | i16 vertexCount    |                                          |
+   | vertex[vertexCount]| float x,y,z * 3.5  or  i16 x,y,z * 10.0  |
+   | member[n]          | see below                                |
+   | i16 tailFaceCount  |                                          |
+   | face[tailFaceCount]|                                          |
+   +--------------------+------------------------------------------+
+
+   and each member is
+
+   +--------------------+------------------------------------------+
+   | origin             | float x,y,z * 3.5  or  i16 x,y,z         |
+   | i16 firstVertex    | into the shared pool                     |
+   | i16 vertexCount    |                                          |
+   | i16 faceCount      |                                          |
+   | face[faceCount]    |                                          |
+   +--------------------+------------------------------------------+
+
+   EIGHTEEN MEMBERS IS THE LOADER'S OWN CEILING. Above 0x12 it prints
+   "%d members: Fichier moto invalide" through the assert path and
+   carries on with a corrupt read [verified]. All three shipped
+   skeletons use seventeen.
+
+1.1.  Two vertex formats, chosen by a sign
+
+   The first word is read as a SIGNED short. If it is negative the
+   file stores floats and the real member count is the next word;
+   otherwise the counts are int16. The two carry different scales,
+   3.5 and 10.0, applied as the file is read.
+
+   All three shipped skeletons are the float form, so the int16 arm
+   is transcribed from the loader and not exercised by any data we
+   have.
+
+   o THE REMAP TABLE IS ONLY IN THE FLOAT FORM, and a reader that
+     skips it has every subsequent offset wrong. The original uses it
+     to order members while building its linked tree; the parent list
+     already describes the same tree, so a reconstruction can read
+     and discard it.
+
+1.2.  The face record
+
+   Thirty-six bytes, and always five index/u/v triples whatever the
+   count says:
+
+   +----------------+-------------------------------------------+
+   | i16 n          | 3 or 4, the real vertex count             |
+   | i16 kind       | 3 or 4 as well; 335 of 340 faces say 3    |
+   | i16 colour     | 5-6-5                                     |
+   | 5 x            | i16 vertexIndex, i16 u, i16 v             |
+   +----------------+-------------------------------------------+
+
+   SLOT n REPEATS SLOT 0 to close the polygon and the remaining slots
+   are -1. So a triangle stores indices A B C A -1 and a quad stores
+   A B C D A.
+
+   The indices address the SHARED pool, not the member's own run, so
+   a face on one bone can reference a vertex owned by another. u and v
+   are texel coordinates over a 256x256 page in the same units the
+   .map files use.
+
+   o THE FACES CARRY NO BANK INDEX. They are all relative bank 0, and
+     the caller's base bank applies the same way it does for a .map -
+     for a bike that is bnk00_00.raw.
+
+1.3.  The trailing group
+
+   After the last member comes one more i16 count and one more run of
+   faces. The loader writes it into slot memberCount, one past the end
+   of the member array, so it belongs to no bone and never moves. On
+   SPEED it is 91 of the 340 faces - the largest single group in the
+   file.
+
+   IT IS DRAWN, AND IT NEEDS NO MATRIX. maybe_Racer_Draw's face loop
+   runs memberCount+1 times against the same transformed-vertex base
+   the member loop filled, so these faces index vertices the members
+   already moved. Every one of them spans two or more members - they
+   are the glue stitching the rigid parts together, which is also the
+   test that settles whether the part matrix is applied forward or
+   inverted. See racers.txt 9.64.
+
+2.  The tree, and what it describes
+
+   SPEED\CORPS.SKL, and KTMCROSS is identical in shape:
+
+       parent = [-1, 0, 1, 0, 3, 0, 5, 6, 7, 6, 9, 6, 11, 12, 11, 11, 15]
+
+   +----+--------+--------+-------+------------------------------+
+   | Id | Parent | Verts  | Faces | Reading                      |
+   +====+========+========+=======+==============================+
+   |  0 | root   |  0..70 |    90 | the frame                    |
+   |  1 | 0      |     -  |     0 | a pivot, no geometry         |
+   |  2 | 1      | 71..94 |    24 | the fork or front wheel      |
+   |  3 | 0      | 95..106|     6 |                              |
+   |  4 | 3      |     -  |     0 | a pivot                      |
+   |  5 | 0      |     -  |     0 | the rider root, a pivot      |
+   |  6 | 5      |107..115|     6 | the hips - three children    |
+   |  7 | 6      |116..119|     2 | left thigh                   |
+   |  8 | 7      |120..129|    12 | left shin                    |
+   |  9 | 6      |130..133|     2 | right thigh                  |
+   | 10 | 9      |134..143|    12 | right shin                   |
+   | 11 | 6      |144..164|    20 | the chest - three children   |
+   | 12 | 11     |165..171|     2 | left upper arm               |
+   | 13 | 12     |172..185|    17 | left forearm                 |
+   | 14 | 11     |186..218|    36 | the head                     |
+   | 15 | 11     |219..224|     1 | right upper arm              |
+   | 16 | 15     |225..239|    19 | right forearm                |
+   +----+--------+--------+-------+------------------------------+
+
+   The limb reading is [inferred] from the tree shape and the vertex
+   counts; the tree itself, the runs and the counts are [verified].
+
+   THE RUNS PARTITION THE POOL EXACTLY. Each member's firstVertex is
+   the previous member's first plus its count, and the last run ends
+   at vertexCount - 240 on SPEED, 255 on both KTM banks. That is what
+   makes this a RIGID bind: every vertex belongs to exactly one bone
+   and there are no weights to blend.
+
+3.  The .ROT layout
+
+   +----------------+-------------------------------------------+
+   | char magic[4]  | "ROT" and a NUL                           |
+   | i16 hdr[3]     | NOT AN ANGLE TRIPLE - see below           |
+   | 17 x           | i16 rx, i16 ry, i16 rz                    |
+   +----------------+-------------------------------------------+
+
+   112 bytes = 4 + 6 + 17*6, and every .rot the game ships is exactly
+   that size. Seventeen triples, one per member of corps.skl.
+
+   *** THE THREE i16 AFTER THE MAGIC ARE A HEADER, AND READING THEM
+       AS MEMBER 0'S ANGLES SHIFTS THE WHOLE POSE BY ONE BONE ***
+
+   This document and src/skl.c both had it wrong, and the error is
+   invisible by inspection because BOTH READINGS FILL 112 BYTES
+   EXACTLY: 4 + 18*6 and 4 + 6 + 17*6 are the same number. Nothing
+   about the file size, a trailing-bytes check or a decode that "runs
+   clean" can tell them apart.
+
+   Rot_Load (0x0045b340) settles it [verified]. It reads the four
+   magic bytes, compares them against "ROT", then does THREE separate
+   two-byte reads before entering its triple loop, and the loop is
+   bounded at 0x14 = 20, not 18:
+
+       fread(magic, 1, 4, f)     ; strcmp against "ROT"
+       fread(h0, 2, 1, f)
+       fread(h1, 2, 1, f)        ; the header - discarded
+       fread(h2, 2, 1, f)
+       loop: fread(rx), fread(ry), fread(rz)
+             store as float * 0x3f5921fb54442d18
+
+   *** THE SCALE IS 2*pi/0x1000, AND A .ROT TURN IS 4096 ***
+
+   That double is 0x3f5921fb54442d18 = 0.0015339807878856412, which
+   is 2*pi/0x1000 - NOT 2*pi/0x4000. So a .rot angle is FOUR TIMES
+   the trig index it resembles, and the .rot unit and the engine unit
+   are different in the same program.
+
+   THIS DOCUMENT AND src/skl.c BOTH SAID 0x4000, and the reason is
+   worth recording: the constant was READ OFF RATHER THAN COMPUTED.
+   0x3f5921fb54442d18 shares its mantissa with pi/2, so it looks like
+   a familiar number at a glance, and 2*pi/0x4000 was the expected
+   answer. Its exponent is ten below pi/2's, not twelve. Recognising
+   a bit pattern is not the same as evaluating it.
+
+   A runtime capture settled it in one line: every angle in a racer's
+   part records is exactly 4x the int16 in the file.
+
+   *** AND A POSE IS INDEXED BY PART, NOT BY MEMBER ***
+
+   Rot_ApplyToRacer (0x0045b480) copies pose triple i to PART i, and
+
+       part = remap[member]
+
+   where remap is the .skl's own index table - the one section 1
+   describes and this project used to read and discard. So member i
+   wears angle[remap[i]]. Indexing by member poses the wrong bone: on
+   corps.skl it puts the fork angles on the wheels.
+
+   *** AND THE COMPOSITION IS parent * local ***
+
+   Skl_BuildPartMatrices (0x00463d90) composes the incoming parent
+   matrix on the LEFT. The opposite order is exact at a root and
+   drifts with depth, which is a nasty failure to spot by eye: a
+   capture reproduced parts 0 to 4 perfectly and was out by 0.36 at
+   the third level.
+
+   WITH ALL THREE RIGHT, staticPied reproduces the game's own
+   per-part matrices to 0.0004 over every part but one - the
+   precision of the capture itself. tools/skl_pose_diff.py --parts
+   now names it at 0.00043 with the next candidate at 0.539.
+
+   THE ONE EXCEPTION IS PART 15, RoueAV, the front wheel:
+   maybe_Racer_Draw poses it separately at 0x00460f94 from the
+   steering, and it is the single outlier at 6.4 units of
+   translation. Not yet reproduced.
+
+   WHAT THE HEADER HOLDS IS OPEN. It reads as a small vec3 and it is
+   constant across an archive rather than per pose: every SPEED and
+   SPEEDPKT pose carries (-7, 19, -70) and every KTMPKT pose (-7, 22,
+   -74), while SPEEDPKT\saut carries (0, 30, 0). A root offset or a
+   bounding hint [guess]. Rot_Load reads it and does not store it.
+
+   The angles are the game's own fixed point, a full turn over
+   TRIG_TABLE_SIZE (0x4000), the same units trig.h documents.
+
+   THE POSES DIFFER WHERE YOU WOULD EXPECT. static, staticPied and
+   staticHaut share the frame's first three triples and diverge in the
+   rider; gauche differs from static at member 3, the steering; saut
+   differs from the first triple onwards.
+
+   CAUTION - THE PARAGRAPHS BELOW WERE WRITTEN AGAINST THE OLD, WRONG
+   OFFSET AND THE OLD, WRONG UNIT. Every index in them is off by one,
+   every angle is a quarter of its real value, and they index by
+   member where the game indexes by part. The CONCLUSION they reach -
+   that staticPied is the bike-select pose, one foot down and one on
+   the peg - turns out to be right, which is a fair warning that
+   arriving at the right answer is not evidence the reasoning held.
+   Re-derive before citing any number.
+
+   staticPied is "static feet", and the DATA SAYS WHICH FEET. Its two
+   legs are not symmetric: the left thigh is rotated hard and the left
+   shin left nearly straight, while the right stays folded.
+
+   +-----------------+---------------+---------------+
+   | Pose            | Left shin     | Right shin    |
+   +=================+===============+===============+
+   | static          |  808          | -1082         |
+   | staticPied      |  254          |  -467         |
+   +-----------------+---------------+---------------+
+
+   In static both shins are strongly bent - both feet on the pegs. In
+   staticPied the left leg extends and the right stays bent, which is
+   ONE FOOT DOWN AND ONE ON THE PEG [verified from the angles], and it
+   matches what retail shows on the bike select screen. So the name is
+   not "both feet down" and the file is the right one for that page.
+
+4.  Verification
+
+   tools/skl.py.
+
+   python tools/skl.py --info  PATH     members, tree and runs
+   python tools/skl.py --check PATH ... decode and report leftovers
+   python tools/skl.py --pose  PATH     dump a .rot
+
+   All three shipped skeletons report "ok, 0 left" and their runs end
+   exactly at the vertex count. A layout error would show up as either
+   leftover bytes or a run that does not reach the end, and both were
+   seen while the format was being worked out.
+
+4.1.  The decisive check: against the game's own output
+
+   tools/skl_pose_diff.py poses SPEED\CORPS.SKL and compares the
+   result vertex-for-vertex with the 240 vertices the ORIGINAL
+   computed, dumped from a running game by tools/mrhook.
+
+   python tools/skl_pose_diff.py CORPS.SKL mrcapture.txt
+
+   IT AGREES TO 0.0001 UNITS over 240 vertices [verified,
+   runtime-capture.txt section 6]. That is one test confirming four
+   separate things at once, none of which had better evidence than an
+   argument before:
+
+   o the member tree, run partition and vertex order;
+   o the 3.5 load scale on the float form;
+   o the re-centring on the root joint;
+   o and the rigid-skin transform, v' = (v - origin) * R + origin.
+
+   IT IS A MIRROR OF src/skl.c, NOT AN INDEPENDENT IMPLEMENTATION.
+   src/ cannot be run - rule 9 - so the Python repeats the same maths,
+   including mat34_from_euler and the 0x4000-entry cosine table. A
+   disagreement between the two is a bug in the Python. What makes the
+   test meaningful is the third party: the captured vertices come from
+   the game, and neither implementation had seen them.
+
+   IT DOES NOT IDENTIFY WHICH POSE A RACER IS IN, and a first attempt
+   to use it that way was wrong. The run above also reported that the
+   identity beat every shipped .rot by two orders of magnitude, and
+   that was read as "the bike-select page applies no pose".
+
+   THE COMPARISON WAS AGAINST THE BIND POOL. maybe_Racer_Draw keeps
+   ONE shared bind pool per LOD and transforms a slice of it per body
+   part, by a matrix in the racer record - it never writes posed
+   vertices back. So g_meshSkl[lod].vertices is the bind pose by
+   construction and matching it proves only that both sides read the
+   same file. See runtime-capture.txt section 6.0.
+
+   THE 0.0001 IS THE TELL, not the result. Agreement that exact over
+   240 vertices means a file was compared with itself; a genuine
+   runtime comparison carries the game's own arithmetic in it.
+
+   To identify a pose, point the tool at the PER-PART MATRICES
+   instead: pose the skeleton with a candidate .rot, compose the same
+   member transforms, and compare those against the dumped records.
+
+5.  The bike manifest, the two skeleton slots and the LODs
+
+   Everything about which skeleton goes where is in the bike
+   manifest - the FileMoto named by the level script - and
+   tools/bpt.py --records reads it straight out of a stock disc
+   [verified]:
+
+   +-------+-------------------------------+------------------------+
+   | Idx   | MOTOSPD.BPT                   | What                   |
+   +=======+===============================+========================+
+   |  0,1  | data\speed\bnk00_0N.raw       | texture banks          |
+   +-------+-------------------------------+------------------------+
+   |   2   | data\speed\corps.skl          | SKELETON SLOT 0        |
+   +-------+-------------------------------+------------------------+
+   |   3   | data\speed\corps.skl          | SKELETON SLOT 1        |
+   +-------+-------------------------------+------------------------+
+   |  4-7  | rouear/roueav .3df .map       | the two wheels         |
+   +-------+-------------------------------+------------------------+
+   |  8,9  | medium\corps .3df .map        | LOD 1 - a MESH         |
+   +-------+-------------------------------+------------------------+
+   | 10,11 | kawalow\kawalow .3df .map     | LOD 2                  |
+   +-------+-------------------------------+------------------------+
+   | 12,13 | kawavlow\kawa_vlw .3df .map   | LOD 3                  |
+   +-------+-------------------------------+------------------------+
+   | 14,15 | guidon .3df .map              | THE HANDLEBARS         |
+   +-------+-------------------------------+------------------------+
+   | 16,17 | cockpit .3df .map             | the first-person view  |
+   +-------+-------------------------------+------------------------+
+   | 18..  | static.rot, gauche.rot, ...   | the stances            |
+   +-------+-------------------------------+------------------------+
+
+5.1.  Slot 1, and what mHand turned out to be
+
+   INDEX 2 AND INDEX 3 ARE THE SAME FILE on the Speed bike. Not a
+   similar file - the identical path, written twice.
+
+   Racer_Create loads index 3 into slot 1 and index 2 into slot 0,
+   so on a Speed bike THE RACER LOADS corps.skl TWICE, into two
+   2,000-byte blocks. That is why a live dump shows block 1 with
+   bit-identical joint pivots and vertex ranges to block 0, and it
+   is why structs/MR_RacerPart.txt called two skeletons with
+   identical pivots "a coincidence worth distrusting". It was not a
+   coincidence and it was not two skeletons.
+
+   THE KTM NAMES A REAL SECOND SKELETON: mHand\corps.skl, 17,122
+   bytes against corps.skl's 17,266, and the two differ on exactly
+   three parts.
+
+5.1.1.  The prediction, and the measurement
+
+   Written down BEFORE the reading was taken: on a KTM bike block 1
+   should differ from block 0, 255 vertices instead of 240, with
+   part 1 carrying 40 vertices and 41 faces instead of 58 and 64.
+
+   Read live on the off-road track with the race paused at the grid
+   [verified]:
+
+   +------+---------------------+---------------------+
+   | Part | block 0, corps.skl  | block 1, mHand      |
+   +======+=====================+=====================+
+   |   0  | 60 verts, 95 faces  | 60 verts, 95 faces  |
+   +------+---------------------+---------------------+
+   |   1  | 58 verts, 64 faces  | 40 verts, 41 faces  |
+   +------+---------------------+---------------------+
+   |  11  |  4 verts,  0 faces  | 13 verts, 16 faces  |
+   +------+---------------------+---------------------+
+   |  14  |  4 verts,  0 faces  | 13 verts, 17 faces  |
+   +------+---------------------+---------------------+
+   | rest | identical           | identical           |
+   +------+---------------------+---------------------+
+
+   ALL SEVENTEEN PARTS MATCH THEIR FILE ON EVERY COUNT, in both
+   blocks, and the implied vertex pools are 255 and 255. Block 0
+   carries non-zero angles and block 1 is entirely unposed.
+
+   o SO THE TRACK PICKS THE BIKE MODEL, NOT THE BIKE MENU. The
+     racer's bike index at +0x78 read 0 on the off-road track, the
+     same value it holds on the tarmac one, while the skeleton
+     changed completely. FileMoto is index 7 of the LEVEL script -
+     see formats/level-spt.txt - so the eight selectable bikes are
+     eight caracs and eight liveries over whatever model the track
+     names. That matches the observation that the dirt bikes "all
+     look the same with just different colours".
+
+5.1.2.  mHand is the rider's HANDS
+
+   Parts 11 and 14 are the ends of the two arm chains - part 9 ->
+   10 -> 11 and part 9 -> 13 -> 14. In the KTM's main skeleton they
+   hold four vertices and ZERO FACES: invisible stubs. In mHand
+   they hold thirteen vertices and sixteen or seventeen faces each.
+
+   INVISIBLE STUBS BECOME VISIBLE GEOMETRY, ON EXACTLY THE TWO
+   PARTS AT THE ENDS OF THE ARMS. Together with part 1, the fork
+   and handlebar group, dropping from 58 vertices to 40, that is a
+   first-person kit: you get your own hands and less of the bike's
+   front end. The manifest agrees - guidon.3df and cockpit.3df sit
+   at indices 14 to 17, right after the LOD meshes.
+
+   o THE SPEED BIKE DOES NOT NEED ONE. Its main skeleton already
+     carries 14 and 15 vertices with 17 and 19 faces on parts 11
+     and 14 - the street rider's hands are modelled all the time.
+     Only the motocross rider drops them and loads them back from
+     a second file. [verified]
+
+   o WHICH IS WHY THE NAME IS mHand AND NOT A LOD. It has FEWER
+     polygons on the bike and MORE on the rider, which no level of
+     detail ever does.
+
+   o THAT PREDICTION WAS TESTED AND IT FAILED - see 5.1.3. The
+     camera is not what selects block 1.
+
+5.1.3.  The first-person prediction was WRONG
+
+   Section 5.1.2 predicted that if mHand were the first-person
+   skeleton, block 1 would be posed while the cockpit camera was
+   active. It was tested and it is not.
+
+   Switched to the first-person cockpit view on the same KTM, same
+   race [verified]:
+
+   o BLOCK 1 CAME BACK BYTE-IDENTICAL to the third-person reading,
+     every angle still zero;
+   o racer+0x638 still 0;
+   o block 0 still posed, and its angles had MOVED between the two
+     readings - part 4's X went 5.721 to 5.733 - so the game was
+     live and updating. The null result is a real null, not a
+     frozen process.
+
+   THE CAMERA HAS NOTHING TO DO WITH IT.
+
+5.1.4.  What actually selects block 1
+
+   One instruction, at 0x0045e30f inside maybe_Racer_UpdatePose
+   [verified]:
+
+       EAX = [ESI + 0x319d]
+       TEST EAX,EAX
+       JZ   skip
+       [ESI + 0x638] = 1
+   skip:
+       EDI = [ESI + 0x638]
+
+   AND IT IS THE ONLY PATH TO SLOT 1 IN A RACE.
+   maybe_Racer_SelectLod (0x0045f1b0) writes 0, 2, 3 and 4 into
+   +0x638 and never 1, so the LOD ladder does not reach the second
+   block; Racer_Create writes 1 once while loading and puts it back
+   to 0.
+
+   racer+0x319d is a RIDER ANIMATION STATE:
+
+   +----------+------------------------------------------------+
+   | set to 1 | 0x0045d9ec, 0x0045da1f, 0x0045da60, 0x0045db44,|
+   |          | 0x0045e1b7, 0x0045e2b9 - all in                |
+   |          | maybe_Racer_UpdatePose, each immediately after |
+   |          | an Anim_BlendAngleFrames call on a particular  |
+   |          | stance; and 0x00468c7d in FUN_004683e0         |
+   +----------+------------------------------------------------+
+   | set to 0 | the top of FUN_0045e940, the ordinary ground   |
+   |          | tick, and 0x0046bfa8                           |
+   +----------+------------------------------------------------+
+
+   Cleared by the normal update and raised by particular stances -
+   so it is per-frame, and it reads 0 whenever the bike is just
+   being ridden. It read 0 in both captures.
+
+   o Anim_BlendAngleFrames (0x0045b4e0) IS THE STANCE BLENDER, and
+     naming it was the by-product. It takes two frames of the form
+     {int count; float angle[count][3]}, lerps by t, and wraps each
+     result into one turn by adding or subtracting 2*pi - which is
+     why a stored angle can read as 6.24 rather than -0.04. The
+     buffers at 0x0051d2a8, 0x0051d584 and 0x0051da48 all start
+     with a count of 17. [verified]
+
+5.1.5.  So what is mHand for
+
+   The evidence lines up but does not close:
+
+   o mHand ADDS HANDS AND SIMPLIFIES THE BARS. Parts 11 and 14 -
+     the ends of the two arm chains - go from 4 vertices and ZERO
+     faces to 13 vertices with 16 and 17 faces, while part 1, the
+     fork and handlebar group, drops from 58 vertices to 40.
+     [verified]
+
+   o ONLY THE KTM HAS ONE, and the KTM manifest is ALSO the only
+     one carrying the twelve extra stunt animations named
+     sautdelire. [verified]
+
+   o THE FLAG THAT SELECTS IT IS RAISED BY PARTICULAR STANCES.
+     [verified]
+
+   A rider whose hands leave the bars during a stunt needs hands to
+   draw, and hidden ones the rest of the time because the bar
+   geometry covers them. That reading fits all three facts and
+   nothing has confirmed it. [inferred]
+
+   o THE SPEED BIKE NEVER NEEDS THE TRICK. Its main skeleton
+     carries 14 and 15 vertices with 17 and 19 faces on parts 11
+     and 14 at all times. [verified]
+
+5.1.6.  It fires, and a poke cannot make it fire
+
+   THE POKE DOES NOT WORK, and the reason is structural. Writing 1
+   to racer+0x319d with SET_MEM, held over 60 frames, came back
+   was=0 now=0, and both +0x319d and +0x638 read 0 afterwards.
+   FUN_0045e940 and FUN_0046bf80 both clear the flag at the TOP of
+   the frame's physics tick, so a held write loses the race every
+   time. Hold is a race, not a lock - the same lesson the lean
+   flicker taught.
+
+   A TRACE HOOK ON 0x0045e30f DID FIRE. Eight hits, on the local
+   player, during a lap that included a wheelie and a crash
+   [verified]:
+
+   +-----+---------+---------+------------------+
+   | hit | +0x2dac | +0x2db8 | +0x124 speed     |
+   +=====+=========+=========+==================+
+   | 1,2 |    2    |    1    |  8.167 m/s       |
+   | 3,4 |    0    |    1    |  7.398 m/s       |
+   | 5,6 |    0    |    1    |  6.698 m/s       |
+   | 7,8 |    0    |    1    |  6.046 m/s       |
+   +-----+---------+---------+------------------+
+
+   o THE BIKE WAS ON THE GROUND THROUGHOUT. +0x2db8 is 1 in all
+     eight, so whatever this state is, it is NOT being airborne.
+     That kills the first guess - a stunt in mid-air.
+
+   o THE SPEED DECAYS BY A CONSTANT FACTOR. 7.398/8.167 = 0.9058,
+     6.698/7.398 = 0.9054, 6.046/6.698 = 0.9027. That is not
+     braking, it is a per-frame multiply, and both physics ticks
+     contain exactly such a line - racer[0x124] *= _DAT_004d0ff0.
+     So the state coincides with the speed being damped rather
+     than driven.
+
+   o THE HITS COME IN PAIRS AT TWO STACK DEPTHS, ESP 0x0019fae8
+     and 0x0019fb58. The same racer's pose is updated twice per
+     frame from two different call sites. Unexplained.
+
+   o WHICH LEAVES WHEELIE AND CRASH UNSEPARATED, because the lap
+     contained both and the 8-hit budget filled in four frames.
+     The next run hooks the SETTER sites instead - 0x0045d9ec,
+     0x0045da1f, 0x0045da60 and 0x0045db44 - so the game names the
+     branch rather than leaving it to be inferred from a speed
+     curve.
+
+5.1.7.  Which branch raises the flag - measured, not guessed
+
+   Six sites write racer+0x319d. Four fit in the hook slots at a
+   time, so it took two runs [verified]:
+
+   +-----------------+---------------------------+-----------------+
+   | Site            | Function                  | Fired?          |
+   +=================+===========================+=================+
+   | 0x0045d9ec      | maybe_Racer_UpdatePose    | NO              |
+   | 0x0045da1f      | maybe_Racer_UpdatePose    | NO              |
+   | 0x0045da60      | maybe_Racer_UpdatePose    | NO              |
+   | 0x0045db44      | maybe_Racer_UpdatePose    | NO              |
+   | 0x0045e1b7      | maybe_Racer_UpdatePose    | NO              |
+   | 0x0045bd0a      | FUN_0045bb30              | NO              |
+   | 0x0045e2b9      | maybe_Racer_UpdatePose    | YES, twice a    |
+   |                 |                           | frame           |
+   | 0x00468c7d      | FUN_004683e0              | YES, once a     |
+   |                 |                           | frame           |
+   +-----------------+---------------------------+-----------------+
+
+   Each run was a lap with a wheelie and a crash. Six of the eight
+   sites never fire at all in ordinary play - they belong to states
+   nothing in these runs entered.
+
+   0x0045e2b9 IS THE PROXIMATE CAUSE. It sits 0x4c bytes before the
+   read at 0x0045e305 in the SAME function and the same pass, so the
+   flag it raises is the one that selects block 1 a moment later.
+   0x00468c7d fires earlier in the frame and would be overwritten by
+   the clear at the top of the next tick.
+
+   o AND THE TABLE LEAD WAS CORRECTLY DROPPED. 0x0045e1b7 reads the
+     flag out of a 16-byte-stride table at 0x00580d08 indexed by
+     racer+0x3065. Read live, field +0x00 is ZERO in every
+     populated entry, so that site can only ever write 0 - and it
+     never fired. The prediction and the measurement agreed.
+
+5.1.8.  The state: a timed animation with the speed being killed
+
+   The branch that reaches 0x0045e2b9 computes a progress fraction
+   and eases with a sine [verified]:
+
+       t = (T - racer[0x30d5]) / T * K        ESP+0x14 holds T
+       clamp t to [-1, +1]
+       w = -sin(t * 0x004d0eb0 + 0x004d0e60)
+       Anim_BlendAngleFrames(dst, A, 0x0051e1e8, w)
+       racer[0x319d] = 1
+
+   o racer+0x30d5 IS AN ANIMATION TIMER, counted against a duration
+     in a stack slot. New field.
+
+   o 0x0051e1e8 IS A POSE FRAME BUFFER - it holds the count 17 like
+     every other one. Read live outside the state it is all zeros.
+
+   o AN FPU COMPARE AT 0x0045e24b JUMPS STRAIGHT TO 0x0045e2b9,
+     skipping the blend but still raising the flag. So both arms of
+     the branch use the hand skeleton.
+
+   THE CAPTURED STATE, both runs, every hit [verified]:
+
+   +---------------------+------------------------------------------+
+   | racer+0x2db8        | 1 - ON THE GROUND, in all 16 hits        |
+   +---------------------+------------------------------------------+
+   | racer+0x124         | decaying by EXACTLY 0.9 per frame        |
+   +---------------------+------------------------------------------+
+
+   Run 2's speeds were 21.789, 19.615, 17.654 and 15.893 m/s, whose
+   ratios are 0.9002, 0.9000 and 0.9002. Run 1's were 8.167, 7.398,
+   6.698 and 6.046 - ratios 0.9058, 0.9054, 0.9027, the same
+   constant blurred by a frame boundary.
+
+5.1.9.  So it is the crash, not the wheelie
+
+   Both runs contained a wheelie AND a crash, so the runs alone do
+   not separate them. The captured state does [inferred, but the
+   two facts are verified and each rules one way]:
+
+   o A WHEELIE DOES NOT COST 10 PER CENT OF YOUR SPEED PER FRAME.
+     Losing a tenth every frame is a bike being stopped, not
+     ridden.
+
+   o AND +0x2db8 WAS 1 THROUGHOUT, so the bike was never airborne -
+     which rules out the mid-air stunt reading that section 5.1.5
+     leaned toward.
+
+   A timed, sine-eased rider animation, played on the ground while
+   the speed is killed at 0.9 a frame, with a skeleton whose only
+   additions are the rider's HANDS. That is a fall: the rider comes
+   off, his hands leave the bars, and hands that were hidden under
+   the handlebar geometry now have to be drawn.
+
+   o WHAT WOULD SETTLE IT OUTRIGHT is one run that crashes without
+     a wheelie, or a capture of racer+0x30d5 and the pose buffer
+     while the state is live so the stance can be named from the
+     .rot it was loaded from. Neither has been done.
+
+5.2.  The LODs are meshes, not skeleton slots
+
+   Indices 8 to 13 are three .3df MESHES - medium, low and very low
+   - with their own texture maps. They are not skeletons and they
+   do not go in the pose array.
+
+   THAT MATTERS FOR racer+0x638. It is written with a LOD index by
+   maybe_Racer_Draw and read as a skeleton slot by Racer_Create, and
+   a distant AI racer was observed holding 4 - which looked like a
+   bug, because slot 4 of the pose array is empty. With the manifest
+   in hand the reading is ordinary: a racer close enough to
+   articulate uses a skeleton block, and a racer far enough away is
+   drawn as one of the three fixed meshes instead. Only 0 and 1 ever
+   index the pose array.
+
+   o AND IT EXPLAINS THE FIVE SLOTS. Two skeletons plus three
+     meshes is five levels of detail, and the array was dimensioned
+     for the whole ladder even though three rungs of it never land
+     there. [inferred]
+
+5.3.  The pocket bikes are the same rider on a smaller bike
+
+   SPEEDPKT\CORPS.SKL is 15,502 bytes - THE SAME SIZE as
+   SPEED\CORPS.SKL - with the same 17 members, the same parent
+   list, the same remap table, the same 240 vertices, the same 340
+   faces and the same per-member vertex runs. Only the coordinates
+   differ [verified].
+
+   Comparing the two vertex pools splits cleanly at the bone
+   boundary:
+
+   +---------------------+-------+--------------------------------+
+   | Vertices            | Count | Pocket vs full-size            |
+   +=====================+=======+================================+
+   | 0..106  the BIKE    |  107  | UNIFORMLY SCALED. x and y span |
+   |                     |       | ratios both 0.5643, z 0.5685   |
+   +---------------------+-------+--------------------------------+
+   | 107..239 the RIDER  |  133  | RIGIDLY TRANSLATED by          |
+   |                     |       | (0, -22.13191, -12.97232)      |
+   +---------------------+-------+--------------------------------+
+
+   THE RIDER'S TRANSLATION IS EXACT. Over all 133 vertices the x
+   delta is 0.000000, and the y and z deltas vary by 0.00002 and
+   0.000007 - single-precision rounding and nothing else. The rider
+   is not scaled at all, in any axis.
+
+   o SO THE ARTISTS SHRANK THE BIKE TO 56 PER CENT AND MOVED THE
+     SAME RIDER DOWN 22 UNITS AND BACK 13 TO SIT ON IT. That is
+     exactly what a real person on a minibike looks like, and it is
+     why the pose reads correctly: the rider's proportions and every
+     stance in the .rot files still apply unchanged, because the
+     rider geometry is untouched.
+
+   o AND IT IS THE SAME ANSWER FROM THE OTHER SIDE. Section 5's
+     manifest shows SpeedPkt naming its own corps.skl rather than
+     reusing the full-size one, so this is a separate authored file
+     that happens to be the same model - not a runtime scale. There
+     is no scale factor to find in the code, and looking for one
+     would have been wasted work.
+
+   o FactorPocket, THE 0.95 FLOAT IN THE LEVEL SCRIPT, IS THEREFORE
+     NOT A SIZE. Whatever it tunes, it is not this. See
+     formats/level-spt.txt 2.6.
+
+5.4.  The remap table confirms the runtime tree
+
+   Both files carry the identical remap:
+
+       member  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16
+       part    0  1 15  2 16  3  4  5  6  7  8  9 10 11 12 13 14
+
+   Read against the runtime pose array that is an exact match on
+   every count [verified]: member 2 has 24 vertices and 24 faces and
+   becomes part 15, RoueAV; member 5 has none and becomes part 3,
+   Pilote; member 14 has 33 and 36 and becomes part 12. The runtime
+   tree in structs/MR_RacerPart.txt was derived from live pointers
+   with no knowledge of this table, and the two agree.
+
+6.  Open questions
+
+   o THE SECOND FACE FIELD. It is 3 or 4 like the first and is 3 on
+     335 of SPEED's 340 faces. Skl_Load passes it to FUN_00462c30 and
+     Prim_SetKind, so it selects a primitive kind rather than a count.
+
+   o RESOLVED - THE ORIGINS ARE JOINT POSITIONS IN MODEL SPACE, not
+     offsets in the parent frame, and the bind vertices are already
+     posed. So a member transform rotates about its own joint:
+
+         v' = (v - origin) * R + origin
+            = v * R + (origin - origin * R)
+
+     THE TEST IS THE IDENTITY POSE. With every angle zero, R is the
+     identity and the translation term is zero, so the model is left
+     exactly as the file holds it. Treating the origin as a
+     translation instead moves every bone by its own joint and every
+     child by the accumulated joints of its whole chain, so the
+     deeper a limb sits the further it flies - the posed bounding box
+     comes out 183 x 442 x 569 against a bind box of 105 x 183 x 203.
+     With the rotate-about-joint form the posed box is 105 x 183 x
+     203, the bind size to the unit.
+
+     That was found by building it the other way first. It looked
+     like it sounds: a rider with stretched arms, torso and neck
+     floating above a bike whose front end had run away forward. A
+     format whose identity pose destroys the model is not a plausible
+     format, and that check would have caught it before it was ever
+     drawn.
+
+   o AND THE MODEL IS RE-CENTRED ON THE ROOT JOINT after loading -
+     every vertex moved so member 0's origin is at zero [verified,
+     racers.txt section 6]. Invisible on the body alone and essential
+     the moment anything is placed beside it: the wheel offsets are
+     measured from the racer position, and after this that position
+     and the root joint are the same point.
+
+   o THE COLOUR PATH. Skl_Load resolves each face colour against bank
+     0's palette, taking one branch when all four UVs are equal and
+     another when the bank has sub-pages. The reconstruction keeps the
+     5-6-5 word and lets the ordinary flat-colour rule apply.
+
+   o THE int16 VERTEX FORM is transcribed and untested; no shipped
+     file uses it.

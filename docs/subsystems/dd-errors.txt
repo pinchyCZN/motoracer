@@ -1,0 +1,117 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                       THE ERROR REPORTER FAMILY
+
+
+Abstract
+
+   Five printf-style message-box functions in screen3d\dd.cpp, differing
+   only in severity and in whether the user can quit from them. Naming
+   them was cheap - they are told apart by their window title and their
+   MessageBox flags alone - and they close out the error-handling
+   picture this project has been assembling.
+
+Table of Contents
+
+   1. The five
+   2. What they have in common
+   3. Correcting the record on error handling
+   4. Open questions
+
+1.  The five
+
+   +-------------------+------------+-------------------------+-------------+-----------------+
+   | Function          | Address    | Title                   | Buttons     | Can quit        |
+   +===================+============+=========================+=============+=================+
+   | Cdd_ErrorContinue | 0x00472030 | Error in game           | Yes / No    | via ConfirmQuit |
+   +-------------------+------------+-------------------------+-------------+-----------------+
+   | Cdd_WarningCancel | 0x00472210 | Warning of game         | OK / Cancel | via ConfirmQuit |
+   +-------------------+------------+-------------------------+-------------+-----------------+
+   | Cdd_Warning       | 0x004723c0 | Warning of game         | OK / Cancel | no              |
+   +-------------------+------------+-------------------------+-------------+-----------------+
+   | Cdd_FatalError    | 0x00472590 | Moto Racer              | OK          | always          |
+   +-------------------+------------+-------------------------+-------------+-----------------+
+   | Cdd_ConfirmQuit   | 0x00472710 | Abort game confirmation | Yes / No    | on Yes          |
+   +-------------------+------------+-------------------------+-------------+-----------------+
+
+   The MessageBox flags decode straightforwardly [verified]:
+
+   +---------+-----------------------------------------------------+
+   | Flags   | Decodes as                                          |
+   +=========+=====================================================+
+   | 0x10014 | MB_YESNO | MB_ICONHAND | MB_SETFOREGROUND           |
+   +---------+-----------------------------------------------------+
+   | 0x10031 | MB_OKCANCEL | MB_ICONEXCLAMATION | MB_SETFOREGROUND |
+   +---------+-----------------------------------------------------+
+   | 0x10030 | MB_OK | MB_ICONEXCLAMATION | MB_SETFOREGROUND       |
+   +---------+-----------------------------------------------------+
+   | 0x10024 | MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND       |
+   +---------+-----------------------------------------------------+
+
+   Cdd_ErrorContinue appends "Do you want to continue ?" to the caller's
+   message and returns 0 when the user says yes, so the caller carries
+   on. Cdd_Warning and Cdd_WarningCancel are the same function to within
+   one branch - only the second can reach the quit confirmation.
+   Cdd_FatalError never returns.
+
+   All five report "Error : Button unknown (%d) pressed" if MessageBox
+   returns something they do not expect, which is a diagnostic nicety
+   worth keeping in a port.
+
+2.  What they have in common
+
+   Every one of them is variadic - _vsprintf into a 384-byte stack
+   buffer - and substitutes "Unknown error" when the format produces
+   nothing [verified].
+
+   More interestingly, every one wraps the dialog in frame management so
+   the box is actually visible over a DirectDraw surface:
+
+       if (a frame is open)  Screen3D_EndFrame(1, 0)
+       if (fullscreen)       IDirectDraw::FlipToGDISurface()
+       MessageBoxA(...)
+       if (it was open)      Screen3D_BeginFrame(1, 0)
+
+   FlipToGDISurface is the DirectDraw call that puts the GDI surface
+   back in front so a window can be drawn over an exclusive-mode
+   display. A port that keeps these dialogs needs an equivalent, or
+   needs to stop using exclusive mode - which is the plan anyway.
+
+3.  Correcting the record on error handling
+
+   subsystems/game-object.txt section 6.1 concluded from App_Shutdown's
+   47 call sites that "there is no error recovery anywhere in this game"
+   and that every failure ends the process. That reading is too strong,
+   and this family is why.
+
+   Three of the five reporters can RETURN to their caller.
+   Cdd_ErrorContinue exists precisely so a caller can report a problem
+   and carry on if the user agrees. Cdd_Warning cannot quit at all. So
+   the engine has a graded severity scheme - warn, warn with an escape,
+   error but continue, fatal - and only the last reaches App_Shutdown
+   unconditionally [verified].
+
+   Combined with the three independent surface-loss recoveries in
+   subsystems/dd-present.txt, the accurate statement is narrower: ASSET
+   LOADING failures are fatal, because those 44 call sites are
+   overwhelmingly Bitmap_LoadFile, Lez_LoadFile and menu resource paths.
+   Runtime display failures are not.
+
+   That distinction matters for the port. A missing file killing the
+   process is defensible and easy to keep; a lost surface killing it
+   would not be, and does not happen.
+
+4.  Open questions
+
+   o Which callers use Cdd_ErrorContinue rather than Cdd_FatalError.
+     That list is the real map of what this engine considers
+     recoverable.
+
+   o FUN_00499ed0, called by all five around the dialog, is
+     unidentified. It takes a flag and a zero and is also called by the
+     Screen3D layer.
+
+   o Cdd_Warning and Cdd_WarningCancel are near-duplicates, 462 and 417
+     bytes. Whether the difference is deliberate or a copied function
+     that drifted has not been established.

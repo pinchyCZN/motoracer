@@ -1,0 +1,331 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      RELEASES, BUILDS AND PROVENANCE
+
+
+Abstract
+
+   A survey of six USA MotoRacer CD images against the copy this
+   project analyses. It answers three questions that had been open or
+   assumed: which build we are working on, what "mr320" means, and
+   where our DATA folder came from.
+
+   The short answers. THREE DIFFERENT BUILDS exist across this
+   material, with three different source roots. OUR BINARY IS 3.22 AND
+   NONE OF THE SIX CDs CONTAIN IT. Our DATA is a US install with the
+   3.20 patch applied, two tracks no CD here ships, and one file
+   carrying modified bike statistics.
+
+Table of Contents
+
+   1. The material
+   2. Three builds, three source roots
+      2.1. What "mr320" actually means
+      2.2. What the 2.47 CD build does not have
+   3. Two DATA sets across six discs
+   4. Where our DATA came from
+      4.1. The 3.20 patch is applied
+      4.2. Two tracks no disc here ships
+      4.3. SPEED.BKF carries modified bike statistics
+   5. What this changes for the project
+   6. Open questions
+
+
+1.  The material
+
+   Six unpacked CD data tracks under B:\motoinstall, gathered from
+   Internet Archive images of the USA release. Each carries DATA,
+   DIRECTX, DISK1 and a setup, and one is a later re-release with an
+   autorun shell, Adobe Acrobat, EA registration and a Patch3.20
+   folder.
+
+   +--------------------+-------+----------------------------------+
+   | Folder             | Size  | Notes                            |
+   +====================+=======+==================================+
+   | usa                | 162M  |                                  |
+   +--------------------+-------+----------------------------------+
+   | usa_alt            | 162M  |                                  |
+   +--------------------+-------+----------------------------------+
+   | usa_alt2           | 162M  |                                  |
+   +--------------------+-------+----------------------------------+
+   | usa_19970721       | 169M  |                                  |
+   +--------------------+-------+----------------------------------+
+   | USA_19970721_alt   | 169M  |                                  |
+   +--------------------+-------+----------------------------------+
+   | usa_rerelease_alt  | 211M  | autorun shell, Patch3.20         |
+   +--------------------+-------+----------------------------------+
+
+   The game executable is not loose on any disc. It lives inside
+   DISK1\data.z, an InstallShield 3.x archive - magic 13 5D 65 8C -
+   of about 76 MB. The executable is STORED rather than compressed in
+   it, so it can be carved out directly by following the MZ header and
+   summing the section table.
+
+
+2.  Three builds, three source roots
+
+   +---------+---------+-------------------------+-----------+---------+
+   | Version | Bytes   | Source root             | Date      | Where   |
+   +=========+=========+=========================+===========+=========+
+   | 2.47    | 1083392 | D:\Projects\Moto238\    | -         | in      |
+   |         |         |                         |           | data.z, |
+   |         |         |                         |           | all six |
+   +---------+---------+-------------------------+-----------+---------+
+   | 3.20    | 1133056 | C:\Dev\Projects\Moto\   | 19 Dec 97 | Patch   |
+   |         |         |                         |           | 3.20\   |
+   |         |         |                         |           | Moto.ex_|
+   +---------+---------+-------------------------+-----------+---------+
+   | 3.22    | 1133056 | D:\Dsed\mr320\          | 09 Jul 98 | OURS    |
+   +---------+---------+-------------------------+-----------+---------+
+
+   All three carry THE SAME THIRTEEN translation-unit names - Dsi_d3d,
+   animDecor, event, frame3d, player, menu\{menu, bitmap, menuTools,
+   pageMainMenu, pageProtocol}, screen3d\{screen3d, dd, bankw} - and
+   differ only in the root they hang off [verified]. So the file
+   structure recorded in code-map.txt holds across every build here.
+
+   Moto.ex_ is NOT compressed despite the underscore convention: it is
+   a plain PE, and 3.20 and 3.22 happen to share a byte size while
+   differing in 90.5 per cent of their bytes. Same size, different
+   build - the size is an artefact of section alignment, not evidence
+   of kinship.
+
+   Version resources, which is how the three were separated:
+
+       2.47   FileDescription "MotoRacer Game"
+       3.20   FileDescription "MotoRacer Executable. Full Direct3d
+              version"
+       3.22   the same as 3.20
+
+2.1.  What "mr320" actually means
+
+   CLAUDE.md carried this as a guess: "mr320 reads as MotoRacer v3.20
+   [guess] - confirm against the version resource in .rsrc". Confirmed,
+   and the answer is not the obvious one.
+
+   OUR BINARY'S VERSION RESOURCE SAYS 3.22, NOT 3.20 [verified]. And
+   the build that actually shipped as 3.20 was compiled from
+   C:\Dev\Projects\Moto\, a different root on a different drive.
+
+   So mr320 is not this build's version. It is a WORKING-COPY OR BRANCH
+   NAME taken from the 3.20 release, on a machine where the tree sat at
+   D:\Dsed\, and our 3.22 was built out of it some seven months after
+   3.20 shipped [inferred - the naming and the dates support it, and
+   nothing in the binaries states it].
+
+   The "Dsed" reading as Delphine Software stands, and gains a little
+   support: it appears only in the latest of the three roots, which is
+   what a studio-internal path looks like next to the generic
+   C:\Dev\Projects\Moto\ of the release build.
+
+2.2.  What the 2.47 CD build does not have
+
+   Probing the carved 2.47 executable for strings this project relies
+   on [verified]:
+
+   +----------------------------+---------+
+   | String                     | 2.47    |
+   +============================+=========+
+   | D3DERR...                  | present |
+   +----------------------------+---------+
+   | "16 bit screen mode..."    | present |
+   +----------------------------+---------+
+   | "Couldn't LoadLibrary      | ABSENT  |
+   | DDraw"                     |         |
+   +----------------------------+---------+
+   | 3Dfx                       | ABSENT  |
+   +----------------------------+---------+
+   | PowerVR                    | ABSENT  |
+   +----------------------------+---------+
+   | ILLEGAL VERSION            | ABSENT  |
+   +----------------------------+---------+
+
+   So the retail 2.47 has Direct3D and the colour-depth gate but NO
+   3Dfx or PowerVR detection, no dynamic DDRAW load, and none of the
+   nag overlay. The "Full Direct3d version" of the 3.x line is a
+   substantially different renderer, which is what its own readme
+   claims: it draws the whole game in 3D polygons where the retail
+   version mixed 3D with 2D surfaces.
+
+   Its section layout differs from ours too - .text 0x00401000 with
+   virtual size 0xc5809 against our 0xce5xx - so addresses in this
+   project do not transfer to it.
+
+
+3.  Two DATA sets across six discs
+
+   The six discs carry only TWO distinct DATA folders [verified by
+   hashing every file]:
+
+   +---------+------------------------------------+-------+
+   | Group   | Discs                              | Files |
+   +=========+====================================+=======+
+   | A       | usa_19970721, USA_19970721_alt     |    50 |
+   +---------+------------------------------------+-------+
+   | B       | usa, usa_alt, usa_alt2,            |    45 |
+   |         | usa_rerelease_alt                  |       |
+   +---------+------------------------------------+-------+
+
+   They differ in exactly six files. Group A adds MENUFR.BKF,
+   MENUGR.BKF, MENUIT.BKF, MENUSP.BKF and MENUSW.BKF, and its MENU.BKF
+   is larger - 4,057,688 against 4,029,397. Everything else is
+   byte-identical.
+
+   So group A is the multi-language build and group B is
+   English-only, and the difference is entirely menu art. The "alt"
+   images are duplicates of one another, not variants.
+
+
+4.  Where our DATA came from
+
+   Ours is GROUP B, plus four things [verified]:
+
+   +----------------------------------+------------------------------+
+   | Difference                       | Explanation                  |
+   +==================================+==============================+
+   | design.bkf, fontes.bkf,          | the 3.20 patch, applied      |
+   | fonts.bpt                        |                              |
+   +----------------------------------+------------------------------+
+   | ILE10.BKF, ILE10\ILE10.TRK,      | two tracks no disc here      |
+   | ILE11.BKF, ILE11\ILE11.TRK       | ships                        |
+   +----------------------------------+------------------------------+
+   | CHAMPA01.BPT, CHAMPB01.BPT,      | table variants that go with  |
+   | CHAMPC01.BPT, LIST01.BPT         | them [inferred]              |
+   +----------------------------------+------------------------------+
+   | BESTSCOR.DAT, CONFIG.BPT,        | written by playing; and one  |
+   | DELPHINE.ERR, "Copy of Copy of   | obvious hand-made backup     |
+   | CONFIG.BPT"                      |                              |
+   +----------------------------------+------------------------------+
+
+   Our MENU.BKF matches group B exactly, which is what puts the install
+   in the English-only lineage rather than the multi-language one.
+
+4.1.  The 3.20 patch is applied
+
+   Patch3.20 ships four payload files - Moto.ex_, design.bkf,
+   fontes.bkf and fonts.bpt. Our copies of the latter three are
+   BYTE-IDENTICAL to the patch and differ from every disc [verified].
+
+   Our executable is 3.22 rather than the patch's 3.20, so the install
+   was patched at least once and then had a later executable dropped
+   over it.
+
+4.2.  Two tracks no disc here ships
+
+   ILE10 and ILE11 - bank and track both - are present in our DATA and
+   in none of the six discs. data-files.txt section 3 already noted the
+   consistent gap at ILE07; the gap at 10 and 11 on the retail discs is
+   new information.
+
+   The four "01"-suffixed .BPT files appear alongside them and nowhere
+   else. LIST.BPT is the track list and CHAMPA/B/C are championship
+   tables, so LIST01 and CHAMPx01 read as updated versions of those
+   admitting the extra circuits [inferred - the .bpt for LIST does not
+   decode cleanly, so this rests on the naming and the co-occurrence].
+
+   That is the shape of an official add-on track pack rather than
+   anything a player would assemble. Not established from these files
+   alone.
+
+4.3.  SPEED.BKF carries modified bike statistics
+
+   This one matters and it is not cosmetic.
+
+   Our SPEED.BKF is the same size as the disc's and differs in 1252
+   bytes. Taking it apart [verified]:
+
+   o the directory - 62 entries, every name, offset and size - is
+     IDENTICAL
+
+   o 61 of the 62 member payloads are byte-identical
+
+   o all 62 name fields differ in the PADDING AFTER THE NUL. The disc's
+     copies carry leftover heap junk there; ours are zeroed. So our
+     file was REPACKED by something that cleared the padding, which no
+     other .BKF of ours shows
+
+   o ONE member differs: CARAC2.BPT, 292 bytes, 12 bytes changed
+
+   CARAC2.BPT decodes cleanly through tools/bpt.py, and every changed
+   value moves the same way:
+
+   +-------+-----------+-----------+
+   | Index | Ours      | Disc      |
+   +=======+===========+===========+
+   | 1     | 100       | 50        |
+   +-------+-----------+-----------+
+   | 2     | 100       | 75        |
+   +-------+-----------+-----------+
+   | 18    | 110       | 80        |
+   +-------+-----------+-----------+
+   | 19    | 116       | 100       |
+   +-------+-----------+-----------+
+   | 20    | 0.0026    | 0.003     |
+   +-------+-----------+-----------+
+   | 36    | 10500     | 10000     |
+   +-------+-----------+-----------+
+   | 37    | 60        | 15        |
+   +-------+-----------+-----------+
+   | 39    | 20        | 2         |
+   +-------+-----------+-----------+
+
+   Seven values raised and one lowered, in a file the copy-protection
+   is already known to tamper with - Carac_Load subtracts 1.0 from
+   every bike's NbSpeed when g_protectionPassed is 0, see
+   subsystems/copy-protection.txt. This is a bike-statistics edit: a
+   trainer, a cheat, or a compensation for the protection penalty.
+
+   WHICH, IS NOT ESTABLISHED. What is established is that our
+   SPEED.BKF is not stock.
+
+
+5.  What this changes for the project
+
+   o CLAUDE.md's mr320 guess is resolved, and the answer corrects the
+     natural reading: our build is 3.22 and mr320 is a branch name.
+     Section 2.1.
+
+   o THE DATA FOLDER IS CONTAMINATED TOO, not just the executable.
+     CLAUDE.md warns that the seven patched sites in MOTO.EXE already
+     misled three documents; the same caution now applies to
+     decomp/DATA. Any conclusion drawn from CARAC2.BPT - bike speeds,
+     handling, the protection penalty - would be a conclusion about
+     somebody's edit.
+
+     The rest of the folder is clean: every other file either matches a
+     disc byte-for-byte, matches the 3.20 patch byte-for-byte, or is
+     an obvious runtime file.
+
+   o THE ASSET WORK IS UNAFFECTED. src/assets.c reads archives that are
+     byte-identical to the retail discs, so nothing in the renderer,
+     the menu resources or the geometry rests on the modified file.
+
+   o A CLEAN REFERENCE NOW EXISTS. B:\motoinstall\usa\DATA is a stock
+     group B install, and the carved 2.47 executable is a stock retail
+     binary. Either can settle a "is this ours or theirs" question
+     without guesswork.
+
+
+6.  Open questions
+
+   o Where ILE10, ILE11 and the four "01" tables came from. An add-on
+     pack is the obvious reading and is not established.
+
+   o Whether a 3.22 build was ever distributed publicly, or whether
+     ours came from somewhere else. Seven months after 3.20, with
+     assert strings still compiled in, is an unusual shape for a
+     retail patch.
+
+   o What the twelve changed bytes in CARAC2.BPT were meant to achieve.
+     The values are decoded but their meanings are not - the .bpt
+     format is positional and unnamed.
+
+   o The GOG and Steam re-releases, which the project owner mentions
+     and which are not in this material. If they carry a later build
+     again, the version list in section 2 is incomplete.
+
+   o LIST.BPT does not decode cleanly through tools/bpt.py - the
+     generator desynchronises - where CARAC2.BPT does. Worth a look,
+     since the track list is exactly the file that would confirm
+     section 4.2.

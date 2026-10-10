@@ -1,0 +1,58 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                             MR_STRUCTNAME
+
+
+Abstract
+
+   Size: 0x?? [verified|inferred] - how you know (allocation size, array
+   stride, last field + width) Allocated at: 0x004????? Freed at:
+   0x004????? Ghidra type applied: no Belongs to: subsystem / original
+   translation unit
+
+   One or two lines: what this object represents in the game and who
+   owns it.
+
+Table of Contents
+
+   1. Fields
+   2. Relationships
+   3. Accessors
+   4. Open questions
+
+
+1.  Fields
+
+   +--------+------+-------+--------+------------+---------------------------------------+
+   | Offset | Size | Type  | Name   | Confidence | Evidence                              |
+   +========+======+=======+========+============+=======================================+
+   | 0x00   | 4    | int   | field0 | verified   | compared against 0..7 at 0x00412000   |
+   +--------+------+-------+--------+------------+---------------------------------------+
+   | 0x04   | 4    | float | posX   | inferred   | same math as the two following floats |
+   +--------+------+-------+--------+------------+---------------------------------------+
+   | 0x08   | 4    | ?     | -      | unknown    | never observed                        |
+   +--------+------+-------+--------+------------+---------------------------------------+
+
+   Keep rows for unexamined gaps. A hole you have named is a hole
+   someone can fill.
+
+2.  Relationships
+
+   o Pointed to by: MR_Other at +0x2C
+   o Points to: ...
+   o Array of N at 0x00???????, stride 0x??
+
+3.  Accessors
+
+   Functions that read or write this struct, with what they touch:
+
+   +------------+----------------+--------------+
+   | Address    | Name           | Touches      |
+   +============+================+==============+
+   | 0x004????? | Subsystem_Verb | +0x00, +0x04 |
+   +------------+----------------+--------------+
+
+4.  Open questions
+
+   o What is 0x40..0x60?

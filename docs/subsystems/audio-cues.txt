@@ -1,0 +1,2189 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      AUDIO CUES: THE TWO ENTRY POINTS
+
+
+Abstract
+
+   The game asks for sound in exactly two ways, through two functions
+   that sit one after the other in the binary and take
+   similar-looking pairs of small integers. One plays a SAMPLE by
+   number; the other plays a RED BOOK CD TRACK. Confusing them cost
+   several sessions, so this note names both, records what their
+   arguments mean, and lists every call site read so far.
+
+   THIS NOTE COVERS THE FIXED CUE TABLE ONLY. A track's own
+   ambient sounds are not cues at all - they are a script with
+   ids assigned at load, and they have their own note:
+   object-sounds.txt.
+
+Table of Contents
+
+   1. The two functions
+      1.1. Snd_PlayCue - samples, by number
+      1.2. CdAudio_PlayTrackCue - music, by track
+      1.3. Snd_QueueDelayedCues - a voice line, later
+      1.4. The menu speech bank, all eleven
+   2. Why they were confused
+   3. Cues identified
+      3.1. Samples
+      3.2. CD tracks
+   4. What the reconstruction wires
+      4.1. The back end is XAudio2
+      4.2. The handle layer, and why audio_cue is not enough
+      4.3. Pausing, and the one rule that is not obvious
+   5. The handle table and what loads it
+      5.1. The path the loaders build
+      5.2. The six pair tables
+      5.3. The cue names
+      5.4. The two entries that look unloadable, and are
+           not
+      5.5. The race bank seam, and what picks which one
+   6. The samples are WAV files with a cipher over them
+   7. Open questions
+   8. The announcer, and none of it is implemented
+      8.1. Snd_QueueVoice - the 8-slot ring
+      8.2. Every announcer line in the game
+      8.3. The countdown does not use the queue
+      8.4. The cue id decides voice or sfx
+      8.5. Remarks about your place
+      8.6. What the port has
+      8.6a. The end-of-time sequence
+      8.7. The voice pool must be able to rebind
+   9. Master volume is the Windows mixer
+   11. THE CD AUDIO MAP - every track call in the game
+      11.1. The eleven starts
+      11.2. There is exactly ONE stop
+      11.3. The track a race asks for comes out of the level
+      11.4. What this means for the reconstruction
+  10. maybe_Snd_TickRacer - the per-racer engine and effects
+      mixer
+      9.1. The voice API, five methods on the sound manager
+      9.2. The per-racer audio record
+      9.3. riderStateBits is an event word, and this is its
+           decoder
+      9.4. Two engine banks, chosen by the bike
+      9.5. The surface class
+      9.6. Rand stream 4, and why that matters
+      9.7. The skid voice
+      9.8. The five arguments, and the two the caller
+           computes
+      9.9. The engine note
+      9.10. The idle loop, and why a stopped bike is not
+            silent
+      9.11. Snd_TickRace - the driver, and how AI racers get
+            heard
+      9.12. The throttle blip, and why it is not the rev bump
+      9.13. Open
+      9.14. The wheelie landing thud, cue 0x13
+      9.15. What the port's racer_audio_tick still does NOT play
+
+1.  The two functions
+
+   +------------+--------------------------+------------------------+
+   | Address    | Name                     | What it plays          |
+   +============+==========================+========================+
+   | 0x004049f0 | Snd_PlayCue              | a SAMPLE, DirectSound  |
+   +------------+--------------------------+------------------------+
+   | 0x00404990 | CdAudio_PlayTrackCue     | a CD TRACK, via MCI    |
+   +------------+--------------------------+------------------------+
+
+   Both take two small integers. Neither takes a filename, a handle,
+   or an asset name. That is what makes the call sites transcribable
+   before any audio back end exists.
+
+1.1.  Snd_PlayCue - samples, by number
+
+       voice = Snd_PlayCue(soundId, flags)
+
+   A table at 0x00519ff8 turns soundId into a handle, which goes to
+   the player at 0x00423fd0 with flags, and then to a volume call at
+   0x00424030. Returns -1 when nothing started.
+
+   THE ID SPACE IS SPLIT IN TWO, and not where you would guess: ids
+   0x2f..0x5c are one group and EVERYTHING ELSE is the other. Each
+   group has its own enable flag, its own volume and its own
+   last-played id [verified]:
+
+   +-------------------+------------+------------+------------------+
+   | Group             | enable     | volume     | last id played   |
+   +===================+============+============+==================+
+   | <0x2f or >0x5c    | 0x004db664 | 0x004db658 | 0x00502710       |
+   +-------------------+------------+------------+------------------+
+   | 0x2f..0x5c        | 0x004db668 | 0x004db654 | 0x00502898       |
+   +-------------------+------------+------------+------------------+
+
+   SETTLED IN SECTION 5.2: the 0x2f..0x5c group is SPEECH. Both
+   tables whose entries land in that range are gated on 0x004db668
+   and both load from a Voices directory, so 0x004db668 is
+   g_nCfgVoicesEnabled with volume 0x004db654, and 0x004db664 /
+   0x004db658 are the sfx pair.
+
+   THE FLAGS ARE THREE BITS, DECODED AT THREE DIFFERENT DEPTHS,
+   which is why reading Snd_PlayCue alone makes it look like one.
+   It decodes bit 2 and passes the word on untouched [verified]:
+
+   +------+---------------+--------------------------------------+
+   | Bit  | Meaning       | Decoded in                           |
+   +======+===============+======================================+
+   | 0x01 | loop          | FUN_00440ec0, which passes it        |
+   |      |               | straight to Play as DSBPLAY_LOOPING  |
+   +------+---------------+--------------------------------------+
+   | 0x02 | polyphony     | FUN_00441a40 - duplicate the buffer  |
+   |      |               | rather than restart a busy one       |
+   +------+---------------+--------------------------------------+
+   | 0x04 | no retrigger  | Snd_PlayCue - drop the call when     |
+   |      |               | soundId is the group's last id       |
+   +------+---------------+--------------------------------------+
+
+   AND THE PLAY IS ALWAYS PRECEDED BY A REWIND. FUN_00440ec0 calls
+   SetCurrentPosition(0) before Play, so a cue fired again WITHOUT
+   bit 1 restarts from the beginning rather than layering - which
+   is the behaviour bit 2 exists to suppress for a cue asked for
+   every frame.
+
+   An id outside 0..0xff on the outer branch raises a MESSAGE BOX -
+   "Invalid sound handle 0x%08x in p..." - rather than failing
+   silently. The inner branch merely rejects -1.
+
+1.2.  CdAudio_PlayTrackCue - music, by track
+
+       CdAudio_PlayTrackCue(track, mode)
+
+   Selects a track with CdAudio_SelectTrack (0x004b18e0), stores mode
+   at g_cdAudio+0x1c, and plays with CdAudio_PlayTrack (0x004b19f0).
+   Both callees end in mciSendCommandA and carry the error strings
+   "MCI_STATUS error in selectTrack" and "MCI_SET/MCI_PLAY error in
+   playTrack", so this is red book audio off the game disc and there
+   is nothing to decode or mix.
+
+   TRACK 0 MEANS RANDOM, not silence: CdAudio_SelectTrack picks
+   rand() % trackCount + 1 for 0, and treats -1 as "leave whatever is
+   playing alone". Anything else is clamped to 1..trackCount.
+
+   MODE IS TWO INDEPENDENT BITS, read out of CdAudio_PlayTrack's own
+   tests rather than guessed [verified]:
+
+   +-----------+-------------------------------------------------+
+   | bit 0 (1) | do not restart if this track is already playing |
+   | bit 1 (2) | repeat when it ends                             |
+   +-----------+-------------------------------------------------+
+
+1.3.  Snd_QueueDelayedCues - a voice line, later
+
+       Snd_QueueDelayedCues(count, delayMs, soundId, ...)
+
+   0x00404e10, and it is VARIADIC: an int count followed by that many
+   (delayMs, soundId) PAIRS. It walks eight slots of 100 bytes at
+   0x00504244, takes the first free one, and appends up to eight
+   pairs to it [verified].
+
+   ALL FOUR CALLERS PASS A COUNT OF 1, so the group form is never
+   used for what it can do:
+
+   +----------------------------+-----------------+----------------+
+   | Caller                     | Call            | Voice          |
+   +============================+=================+================+
+   | MenuPage03_MainMenu_Enter  | 1, 600, 0x57    | makurchc       |
+   | MenuPage05_ModeSelect_Ent  | 1, 600, 0x54    | selectmd       |
+   | MenuPage06_RaceSelect_Ente | 1, 600, 0x53    | selerace       |
+   | MenuPage15_NameEntry_Enter | 1, 600, 0x36    | entrname       |
+   +----------------------------+-----------------+----------------+
+
+   Every one is a single line 600 ms out, which is about when that
+   page's slide-in finishes.
+
+   ONLY PAGE 6 GATES ITS LINE. MenuPage06_RaceSelect_Enter tests
+   g_nSelectedMode (0x004dc094) against 2 at 0x00448086 and jumps
+   the queue call when it matches, so CHAMPIONSHIP GETS NO
+   "select race" VOICE. The other three queue unconditionally.
+
+1.4.  The menu speech bank, all eleven
+
+   Bank B at 0x004db780 is eleven {name, id} pairs loaded from
+   Voices\Menu\ when voices are on. Read straight out of the table
+   [verified]:
+
+   +------+-----------+---------------------------------------+
+   | Id   | File      | Where it is used                      |
+   +======+===========+=======================================+
+   | 0x36 | entrname  | page 15, name entry                   |
+   | 0x52 | slctrans  |                                       |
+   | 0x53 | selerace  | page 6, race select                   |
+   | 0x54 | selectmd  | page 5, mode select                   |
+   | 0x55 | playsolo  | page 3, SOLO                          |
+   | 0x56 | playlink  | page 3, LINK                          |
+   | 0x57 | makurchc  | page 3, on entry                      |
+   | 0x58 | letsgo    |                                       |
+   | 0x59 | cngrecor  |                                       |
+   | 0x5a | cngratim  |                                       |
+   | 0x5b | yutrygan  | the podium                            |
+   +------+-----------+---------------------------------------+
+
+   The ids are contiguous from 0x52 apart from entrname at 0x36.
+   THAT IS STILL SPEECH: 0x36 falls inside the 0x2f..0x5c range
+   section 1.1 gives, so it is gated on the voices flag and
+   volume like the other ten. It is only the numbering that is
+   discontiguous.
+
+2.  Why they were confused
+
+   MenuPage25_DsiLogo_Enter ends with CdAudio_PlayTrackCue(0x0d, 0).
+   While the function was unnamed, that was recorded as "a sound or
+   music trigger [guess] - the same shape as the 0x29 the menu hover
+   plays", and page 25's missing SHATTER SOUND was assumed to be it.
+
+   It is not. It is the intro music. The shatter is sample 0x2a and
+   it is fired from Menu_Tick, in a different subsystem, three
+   functions away.
+
+   o TWO FUNCTIONS THAT TAKE (small int, small int) AND SIT NEXT TO
+     EACH OTHER WILL BE CONFLATED unless something says otherwise.
+     The tell was available without any deep reading: follow the
+     callee once and mciSendCommandA is right there. "Same shape" is
+     an observation about a call site, never about what it does.
+
+3.  Cues identified
+
+3.1.  Samples
+
+   FIXED IDS ONLY. Anything at 0x5d or above on a track that
+   ships a SOUND.BPT belongs to the object-sound script and is
+   NOT a constant - see object-sounds.txt 3.
+
+   +------+-------------------------+--------------------------------+
+   | Id   | What                    | Call site                      |
+   +======+=========================+================================+
+   | 0x29 | menu hover click        | Menu_UpdateHover    0x00409a1c |
+   +------+-------------------------+--------------------------------+
+   | 0x2a | valide - the CONFIRM    | Menu_Tick           0x00409d65 |
+   |      | cue, over the shatter   |                                |
+   +------+-------------------------+--------------------------------+
+   | 0x2d | bike races past, title  | Page14 Enter        0x00446b30 |
+   +------+-------------------------+--------------------------------+
+   | 0x5b | podium                  | Page24 Enter        0x00452e3b |
+   +------+-------------------------+--------------------------------+
+
+   All four pass flags 0, so none of them uses the retrigger guard.
+
+   THE HOVER CUE IS EDGE-TRIGGERED and only on the entering edge
+   [verified, 0x00409a0c..0x00409a1c]:
+
+       if (newIdx != oldIdx) {
+           oldIdx = newIdx;
+           if (newIdx != -1) Snd_PlayCue(0x29, 0);
+           needsRedraw = 1;
+       }
+
+   Moving OFF a button changes the index to -1 and makes no sound.
+
+   THE SHATTER CUE FIRES WITH THE ARM, NOT THE REQUEST.
+   Menu_BeginTransition (0x0040c4a0) makes no sound call at all.
+   Menu_Tick plays 0x2a inside the branch that stamps transitionStart
+   and transitionEnd, one instruction before it clears
+   g_nTransitionRequested at 0x00409d6a. The request and the arm are
+   a frame apart - see menu-pages.txt section 4.3.1 - so putting the
+   cue on the request would play the glass a frame before the glass
+   exists.
+
+   17 other Snd_PlayCue sites are not yet attributed - 21 in all.
+   Pages 3, 6 and 10 have two, two and four respectively; pages 9,
+   15 and 24 one each; and six non-menu functions the rest.
+
+   o CORRECTION: an earlier version of this line said Menu_Tick has
+     a second cue. It does not - it has exactly one, the 0x2a above.
+
+   THERE IS ONE EXPLICIT STOP IN THE WHOLE BINARY, and it is not a
+   Snd_PlayCue at all: MenuPage25_DsiLogo_Leave calls CdAudio_StopCue
+   (0x004049e0) at 0x00453bff, which issues MCI_STOP and clears the
+   repeat flag [verified]. Every other page just asks for its own
+   track and lets the request replace whatever was playing.
+
+   o IT IS THERE BECAUSE THE INTRO CAN BE SKIPPED. Track 13 starts
+     with mode 0, so it plays once and never loops; without the stop
+     it would still be sounding under the title page when page 14
+     asks for track 3.
+
+3.2.  CD tracks
+
+   +--------+------+--------------------------------+-------------+
+   | Track  | Mode | Call site                      | Address     |
+   +========+======+================================+=============+
+   | 3      |  3   | MenuPage03_MainMenu_Enter      | 0x004426f5  |
+   +--------+------+--------------------------------+-------------+
+   | 3      |  2   | MenuPage14_Title_Enter         | 0x00446b27  |
+   +--------+------+--------------------------------+-------------+
+   | 0x0d   |  0   | MenuPage25_DsiLogo_Enter       | 0x00453b61  |
+   +--------+------+--------------------------------+-------------+
+   | 0x0b   |  0   | MenuPage24_Podium_Enter        | 0x00452e32  |
+   +--------+------+--------------------------------+-------------+
+   | 0x0c   |  0   | MenuPage24_Podium_Enter        | 0x00452e44  |
+   +--------+------+--------------------------------+-------------+
+
+   Six more sites - pages 5, 6, 7, 8, maybe_Game_InitRace and
+   FUN_0048aca0 - are not yet read.
+
+   PAGES 3 AND 14 SHARE TRACK 3 and differ only in bit 0. The title
+   page restarts it; the main menu does not. So the menu music is
+   meant to run continuously across the title-to-menu move, which is
+   a design fact recoverable from a single bit.
+
+   PAGE 24 BRANCHES on a value compared against 2: greater takes
+   track 0x0b and also fires sample 0x5b, less-or-equal takes 0x0c
+   and no sample. Placing against finishing position is the obvious
+   reading and is NOT established. Note the mode argument 0 is pushed
+   BEFORE the branch and shared by both arms.
+
+   PAGE 25's mode is ESI, whose last write is XOR ESI,ESI at
+   0x00453ab2 - so 0, and the intro jingle plays once.
+
+4.  What the reconstruction wires
+
+   src/audio.h mirrors the originals - audio_cue and
+   audio_music_cue - and these are the call sites [src/menu.c,
+   src/glass.c, src/hud.c, src/racer.c]:
+
+   +--------------------------+---------------------------------------+
+   | menu_init                | audio_load_bank(AUDIO_BANK_MENU)      |
+   | page25_enter             | audio_music_cue(0x0d, once)           |
+   | page25_leave             | audio_music_stop()                    |
+   | page14_enter             | audio_music_cue(3, loop), then        |
+   |                          | audio_cue(0x2d)                       |
+   | page14 hover, on the     | audio_cue(0x29)                       |
+   | entering edge            |                                       |
+   | glass_update, at the arm | audio_cue(0x2a)                       |
+   +--------------------------+---------------------------------------+
+   | page10 START             | audio_cue(0x2b or 0x2c), then         |
+   |                          | audio_cue(0x58), then HOLDS the page  |
+   |                          | for the longer of the two - see 4.4   |
+   +--------------------------+---------------------------------------+
+   | race_load                | audio_load_bank by the bike's         |
+   |                          | PersoAnim - see 5.5                   |
+   +--------------------------+---------------------------------------+
+   | hud_menu_open            | audio_cue(0x03) and audio_cue(0x29)   |
+   +--------------------------+---------------------------------------+
+   | hud_prompt_open          | audio_stop_all(), then the same pair  |
+   +--------------------------+---------------------------------------+
+   | hud_menu_on_key, both    | audio_cue(0x29)                       |
+   | selection arms           |                                       |
+   +--------------------------+---------------------------------------+
+   | racer_audio_tick         | audio_voice_start(gear cue, LOOP |    |
+   |                          | POLY) and a retune every frame        |
+   +--------------------------+---------------------------------------+
+
+   THE IN-RACE MENU MAKES TWO SOUNDS ON OPEN, not one [verified].
+   InGameMenu_OpenEscape plays 0x03 at 0x00436446, and at its tail
+   it reads the DEFAULT ROW's enter callback back out and calls it
+   directly - that is InGameMenu_OnRowEnter (0x00436150), which
+   plays 0x29. So the menu arrives with the open sound and the
+   selection landing on CONTINUE.
+
+   THE SELECTION IS WHAT SOUNDS, NOT THE KEY. The cue hangs off
+   each row's widget rather than off the input, so it fires
+   whether the row was reached by key or by pointer - and
+   InGameMenu_OnRowLeave (0x004361c0) is silent, so there is no
+   sound on the way out of a row.
+
+   BOTH ARE ONE-SHOTS AND THAT IS WHY THEY SURVIVE THE PAUSE the
+   same frame raises - 4.3. Nothing exempts the menu.
+
+   THE POST-RACE QUESTION CUTS RATHER THAN PAUSES. FUN_00437b70
+   calls Snd_StopAll (0x00424020, on to Csample_StopAll) before
+   its 0x03, because there is no race to resume into.
+
+
+   PAGES 25 AND 14 ARE NOW COMPLETE, checked by listing every callee
+   of all six handlers rather than by grepping for what was expected
+   [verified]:
+
+   +----------------------------+------------------------------------+
+   | MenuPage25_DsiLogo_Enter   | CdAudio_PlayTrackCue only          |
+   | MenuPage25_DsiLogo_Tick    | none                               |
+   | MenuPage25_DsiLogo_Leave   | CdAudio_StopCue                    |
+   | MenuPage14_Title_Enter     | CdAudio_PlayTrackCue, Snd_PlayCue  |
+   | MenuPage14_Title_Tick      | none                               |
+   | MenuPage14_Title_Leave     | none                               |
+   +----------------------------+------------------------------------+
+
+   o THE INTRO MUSIC IS RED BOOK, NOT A SAMPLE. Page 25 has no
+     Snd_PlayCue callee at all, in any of its three handlers, so
+     there is no sample anywhere in the intro. Its only sound is
+     CD track 13.
+
+   o THE TITLE MUSIC AND THE DRIVE-BY START TOGETHER because they are
+     literally consecutive calls - 0x00446b27 and 0x00446b30, the
+     last two instructions of Enter before the epilogue.
+
+   o THE SHATTER SOUND IS NOT PAGE 25's. Its Tick has no audio callee;
+     0x2a comes from Menu_Tick, which every page goes through.
+
+   A fifth call site is the bank load: Menu_LoadResources calls
+   Snd_LoadMenuBank, mirrored as audio_load_bank(AUDIO_BANK_MENU) in
+   menu_init. IT NOW LOADS - tables C and B are transcribed into
+   audio.c and decoded through wave_load, filling the 256-entry
+   handle table. The race banks still only set the bank, because
+   nothing loads a level yet; see section 5.5.
+
+   WIRING THE CALLS AHEAD OF THE BACK END IS THE POINT. A cue that
+   was never wired is invisible; a cue that fires into a stub shows
+   up in the log the moment somebody looks. It also means the sample
+   ids sit in the source next to the code that triggers them, where
+   they can be checked, rather than in a table nobody reads.
+
+   THE MUSIC WILL BE SILENT EVEN WITH A BACK END, on a stock
+   install - it was on the disc, not in DATA. src/audio.h records
+   that as a real limit of CLAUDE.md rule 10 rather than a bug.
+
+4.1.  The back end is XAudio2
+
+   src/audio.c holds every decision - the sample store, the bank
+   table, the voice pool, the cue dispatch, the volumes and the
+   retrigger guard - and is C. src/xa2.cpp holds the COM calls and
+   nothing else, behind the C surface in src/xa2.h.
+
+   THE SPLIT IS FORCED BY THE SDK HEADER. xaudio2.h carries an
+   #ifndef __cplusplus block of IXAudio2_* vtable macros, so the
+   API is meant to be reachable from C, but the header will not
+   compile as C - two lines see to that, and audio.c's banner has
+   both and why neither can be worked around. It is therefore
+   CLAUDE.md rule 11's COM exemption, pared to the COM alone.
+
+   THE ORIGINAL'S BUFFER IS TWO THINGS IN XAUDIO2. An
+   IDirectSoundBuffer fuses the samples with the playback state;
+   XAudio2 splits them into a caller-owned PCM block and a source
+   voice over it. Two consequences:
+
+   o THE PCM IS OURS TO KEEP. Csample_Load GlobalFrees its copy
+     after CreateSoundBuffer because DirectSound took ownership;
+     XAudio2 does not copy, so the block must outlive playback.
+     The port holds it for the bank's lifetime, which is what
+     makes a cue cost no I/O and no decode.
+
+   o THE DUPLICATE CHAIN BECOMES A VOICE POOL. FUN_00441a40's
+     DuplicateSoundBuffer walk exists to get a second playback
+     state over the same samples, which is a second source voice
+     and needs no duplication step.
+
+   A voice carries one format, and the MENU BANK ALONE SHIPS FOUR
+   RATES - 5000, 16000 and 22050 Hz across Menu\, and 11025 Hz for
+   every one of the eleven Voices\Menu\ samples. So the pool is
+   keyed by format, and the mastering voice takes the device's own
+   rate rather than picking a winner among four.
+
+   FAILURE IS SILENT AND IS NOT AN ERROR. xa2_open returns 0 with
+   a logged reason when there is no device, no xaudio2_9.dll, or
+   the endpoint is held exclusively; audio_ready stays 0 and every
+   cue is dropped, which is the path the stub already took.
+
+
+4.2.  The handle layer, and why audio_cue is not enough
+
+   audio_cue is fire and forget - it starts a sample and the caller
+   never hears of it again.  That is the whole of the menu, and it
+   is not enough for a race, which has to hold a looping voice open
+   for as long as the bike runs and retune it every frame.
+
+   So the port has the second interface the original has, the five
+   methods of section 9.1:
+
+   +--------------------------+------------------------------------+
+   | Port                     | Original                           |
+   +==========================+====================================+
+   | audio_voice_start        | maybe_Snd_StartVoice    0x00423fd0 |
+   +--------------------------+------------------------------------+
+   | audio_voice_stop         | Snd_StopVoice           0x00424000 |
+   +--------------------------+------------------------------------+
+   | audio_voice_set_volume   | Snd_SetVolume           0x00424030 |
+   +--------------------------+------------------------------------+
+   | audio_voice_set_freq     | maybe_Snd_SetFrequency  0x00424050 |
+   +--------------------------+------------------------------------+
+   | audio_voice_set_pan      | maybe_Snd_SetPan        0x00424070 |
+   +--------------------------+------------------------------------+
+
+   A HANDED-OUT VOICE IS OWNED and the cue layer will not recycle
+   it, so it stays valid until audio_voice_stop.  Without that a
+   cue on the same sample would seize the engine's voice and the
+   next retune would drive somebody else's sound.
+
+   TWO THINGS DIFFER FROM DIRECTSOUND, both in the port's favour
+   only because they are stated:
+
+   o FREQUENCY IS ABSOLUTE HERTZ IN THE INTERFACE, as DirectSound's
+     was, and becomes a RATIO inside - XAudio2 wants a multiple of
+     the source's own rate.  The division happens where the rate is
+     known, in audio.c, so xa2.cpp stays free of policy.
+
+   o THE RATIO CEILING IS FIXED WHEN A VOICE IS CREATED and above
+     it XAudio2 CLAMPS SILENTLY.  The default is 2.0 and the game
+     reaches 1.81 - ROULEMAN.WAV at 11025 Hz driven to 20000 - so
+     the port asks for 4.0.  A note that stops rising with no error
+     is a bad way to find this out.
+
+   PAN attenuates the far channel rather than splitting the signal,
+   which is what DirectSound does: a 0.5/0.5 matrix would drop
+   every centred sound by 6 dB, and the loaders centre everything.
+   The curve is linear in amplitude rather than in decibels; the
+   endpoints and the centre agree.
+
+
+4.3.  Pausing, and the one rule that is not obvious
+
+   FUN_00441e80 (0x00441e80) is the global pause, reached through
+   FUN_00424090 on the sound manager.  InGameMenu_OpenEscape calls
+   it at 0x00436446, one instruction before its own Snd_PlayCue(3).
+
+   ONLY LOOPING SAMPLES ARE PAUSED [verified].  The loop tests
+   GetStatus for PLAYING and the sample's flag word for BIT 0 - the
+   loop bit - and skips everything else.  A one-shot already in the
+   air runs to completion.
+
+   That is what makes the pause cue work.  The escape menu pauses
+   the game and THEN fires cue 3, and the cue is heard because it
+   is not a loop.  Nothing special-cases the menu; the rule does it.
+
+   THE RESUME RESTARTS EACH LOOP FROM THE BEGINNING.  It calls
+   Csample_Play, which does SetCurrentPosition(0) before Play, so
+   every engine note jumps back to the top of its sample rather
+   than continuing.  On a short engine loop that is a seam rather
+   than a glitch, but it is a seam.
+
+   AND THAT IS WHY AMBIENCE SURVIVES A PAUSE.  Retail's gulls and
+   surf keep going while the engine stops, which looks like a
+   special case and is not: the ambient samples are not in any of
+   the six cue tables and are fired as one-shots, so the loop rule
+   simply never reaches them.  A port that paused the whole mixer
+   instead - XAudio2's StopEngine would - would silence them too
+   and be LESS faithful, not more.
+
+   THE PORT KEEPS THE FIRST RULE AND BREAKS THE SECOND, on purpose.
+   audio_set_paused pauses exactly the same set of voices, but
+   XAudio2 can stop a source voice WITHOUT discarding its buffer -
+   Stop with no FlushSourceBuffers - so Start resumes on the sample
+   it stopped on.  Same voices, no seam.  race.c sets it from
+   hud_menu_active OR tm_paused every frame - the escape menu is
+   the original's pause and SPACE is ours, and both stop the race,
+   so both have to stop the engine.  The call is idempotent.
+
+
+5.  The handle table and what loads it
+
+   g_nSndHandles at 0x00519ff8 is 256 ints, indexed by the cue id
+   Snd_PlayCue takes. BSS; -1 means empty. Snd_ResetHandleTable
+   (0x00403c70) fills all 0x100 entries with -1, and both loaders
+   repeat that fill before they start. Snd_LoadSample returns -1 on
+   failure and the player drops a -1 handle, so an id that never
+   loaded is silently inaudible rather than a crash.
+
+   TWO LOADERS FILL IT [verified]:
+
+   +---------------------+------------+---------------------------+
+   | Snd_LoadMenuBank    | 0x00403f90 | sole caller               |
+   |                     |            | Menu_LoadResources        |
+   +---------------------+------------+---------------------------+
+   | Snd_LoadRaceBank    | 0x004044c0 | 0x00408b30, 0x00410d70;   |
+   |                     |            | argument picks the bike   |
+   +---------------------+------------+---------------------------+
+
+5.1.  The path the loaders build
+
+   Both build a filename by concatenation, five pieces:
+
+       "data\sfx\"
+       + (g_cfgWave16Bits ? "16_Bits\" : "8_Bits\")
+       + <category>
+       + <name from the table>
+       + ".wav"
+
+   The 8/16-bit choice is a whole parallel tree, not a format flag -
+   SFX.BKF carries both, 125 members each.
+
+   The categories are "Menu\", "Voices\Menu\", "Voices\", "Divers\",
+   "Ktm\" and "Ninja\".
+
+5.2.  The six pair tables
+
+   Each is an array of {const char *name; int id;}, stride 8. The
+   loops start on the ID field and read the name at [-1], which is
+   why a naive dump lands four bytes out.
+
+   +-----+------------+-------+---------------+---------------------+
+   | Tbl | Address    | Count | Category      | Loaded by           |
+   +=====+============+=======+===============+=====================+
+   | A   | 0x004db680 |  30   | Voices\       | race, if voices on  |
+   | B   | 0x004db780 |  11   | Voices\Menu\  | menu, if voices on  |
+   | C   | 0x004db7d8 |   7   | Menu\         | menu                |
+   | D   | 0x004db810 |  18   | Divers\       | race                |
+   | E   | 0x004db8a0 |  16   | Ktm\          | race, arg != 0      |
+   | F   | 0x004db920 |  11   | Ninja\        | race, arg == 0      |
+   +-----+------------+-------+---------------+---------------------+
+
+   o THE ID DECIDES THE GROUP, THE TABLE DECIDES THE FILE, and they
+     are independent. This is what settles section 1.1's open
+     question: ids 0x2f..0x5c are SPEECH. Both voices tables are
+     gated on the same flag Snd_PlayCue tests for that range, and
+     both load from a Voices directory. So 0x004db668 is
+     g_nCfgVoicesEnabled and 0x004db654 its volume; 0x004db664 and
+     0x004db658 are the sfx pair.
+
+   o THE SAME ID IS REUSED ACROSS BANKS. 0x28 deplett and 0x29
+     select load from "Menu\" in the menus and from "Divers\" in a
+     race; 0x03 continue likewise. A cue id only means something
+     together with whichever bank is resident, which is worth
+     knowing before anybody builds a global id-to-file map.
+
+5.3.  The cue names
+
+   Menu\ (table C) - the menu bank, and where every cue this project
+   has wired comes from:
+
+       0x28  deplett     0x29  select      0x2a  valide
+       0x2b  goktm       0x2c  goninja     0x2d  title
+       0x03  continue
+
+   So the three identified in section 3.1 are:
+
+       0x29 = select.wav   the hover click
+       0x2a = valide.wav   plays as the glass shatters
+       0x2d = title.wav    the bike that races past on page 14
+
+   o 0x2a IS NAMED "valide", NOT "glass". Menu_Tick plays it whenever
+     a transition ARMS, and every page change arms the glass, so it
+     is the CONFIRM sound and the shatter is what happens to be on
+     screen while it plays. There is no glass-named sample anywhere
+     in SFX.BKF - nothing matching verre, vitre, glass, casse, bris
+     or break among 250 members. At 44162 bytes it is the largest
+     menu cue bar title.wav, which is at least consistent with a
+     shatter, but the name is the evidence and the name says
+     confirm.
+
+   Divers\ (table D) - race ambience and surfaces:
+
+       0x01 bip1      0x02 bip2      0x06 chckpvox  0x03 continue
+       0x28 deplett   0x29 select    0x2e pause     0x0a derap
+       0x1a brake1    0x1b brake2    0x12 crash     0x11 rouleman
+       0x14 wterdeb   0x15 wterpas   0x16 wterfin   0x17 gravier
+       0x18 glace     0x19 herbe
+
+   Ktm\ (E, 16) and Ninja\ (F, 11) - the bike itself. Ktm carries
+   five gears and three landing samples; Ninja one landing and a
+   suspension. The extra five are what makes motocross a different
+   bank rather than the same bank retuned.
+
+   Voices\ (A, 30) is race speech - the 3/2/1/go countdown,
+   wrongway, finlap, newrecor and so on. Voices\Menu\ (B, 11) is
+   menu speech - entrname, selerace, playsolo, letsgo.
+
+5.4.  The two entries that look unloadable, and are not
+
+   Between table A (Voices\, ends 0x004db770) and table B
+   (Voices\Menu\, starts 0x004db780) sit two more pairs:
+
+       0x004db770   podium1   id 0x04
+       0x004db778   podium2   id 0x05
+
+   READ BY EYE, table A looks 32 entries long and those two look
+   like Voices\ entries naming files that exist only under Menu\ -
+   a silent load failure shipping since 1997. THAT READING IS
+   WRONG, and it is recorded here because it is the one a reader
+   arrives at independently.
+
+   A TABLE'S EXTENT IS ITS LOADER'S BOUND, NOT ITS APPARENT SIZE
+   [verified]. Every loop starts on the ID field and compares
+   against a hard address:
+
+   +---------------------+------------+------------+-------------+
+   | Loop                | First id   | Bound      | Entries     |
+   +=====================+============+============+=============+
+   | A  Voices\          | 0x004db684 | 0x004db774 | 30          |
+   | B  Voices\Menu\     | 0x004db784 | 0x004db7dc | 11          |
+   | C  Menu\            | 0x004db7dc | 0x004db814 | 7           |
+   +---------------------+------------+------------+-------------+
+
+   So the Voices\ loop stops at CMP EBX,0x4db774 (0x00404959),
+   thirty entries ending on 0x51 wouaou, and never reaches
+   podium1. The two pairs belong to Snd_LoadPodiumBank
+   (0x00404310), which loads them from Menu\ - where both files
+   exist - on entry to the podium page. Its sole caller is
+   MenuPage24_Podium_Enter.
+
+   Likewise table B ends on 0x5b yutrygan. The deplett/0x28 that
+   appears to follow it is table C's FIRST entry, loaded from
+   Menu\.
+
+   o THERE IS NO SILENT LOAD FAILURE IN ANY OF THE FOUR MENU-SIDE
+     LOADERS. Every entry every loop reaches names a file that is
+     in SFX.BKF at the path the loader builds.
+
+
+5.5.  The race bank seam, and what picks which one
+
+   Everything the reconstruction plays today is the MENU bank. The
+   race bank has never been asked for, and this section records
+   where it would be, because that is the next thing gameplay
+   needs.
+
+   THE ARGUMENT IS THE BIKE, NOT THE TRACK [verified]. The smaller
+   of Snd_LoadRaceBank's two callers is 0x00410d70, and it is four
+   lines long:
+
+       maybe_Loader_ReportStep("Init WAV samples ...")
+       Snd_LoadRaceBank(g_bikeCarac[g_nSelectedBike].PersoAnim)
+
+   PersoAnim is the same field page 10 uses to choose the engine
+   start sample - (PersoAnim == 0) + 0x2b - so ONE field selects
+   both the bike's engine cue and its whole sample bank. That is
+   the road/dirt split: Ninja against Ktm, which section 5.1 lists
+   as two of the six categories.
+
+   o SO AUDIO_BANK_RACE_NINJA / _KTM ARE SELECTED BY THE BIKE,
+     and race.c now does it: race_load reads the selected bike's
+     persoAnim beside race_load_bike, which is the same seam the
+     original uses.
+
+   o AND IT IS A LOADING STEP. The call sits behind a caption
+     report, so the race bank is loaded during the page 1 stall
+     with the loading screen up - see menu-pages.txt 7.1. That is
+     the seam: the same place that will drive the lodanim blink.
+
+   THE RACE MUSIC TRACK COMES FROM THE LEVEL SCRIPT. The last key
+   0x00427e80 reads out of "%sLevel.Spt" is AudioTrack, stored to
+   0x004db67c [verified]. So a race's CD track is per level and
+   read from data rather than chosen in code - which matters for
+   the port, since section 4 already records that music cannot come
+   off a stock install at all.
+
+   THE RETURN IS ONE SEAM AND IT IS Menu_SetPage.  The original
+   reloads the menu bank from Menu_LoadResources, which
+   Menu_SetPage calls on EVERY page change, so entering any menu
+   page restores it.  menu_set_page does the same.
+
+   WITHOUT IT THE SYMPTOM IS WRONG, THEN SILENT - not a failure,
+   and nothing is logged.  The menus run on the resident race
+   bank, where the ids that happen to exist resolve to the wrong
+   sample and the rest resolve to nothing:
+
+       0x29   hover/activate   Divers\select, not Menu\select
+                               - so the buttons still click
+       glass shatter           absent - the page transition is
+                               silent
+       every menu voice        absent - the announcer is gone
+
+   A MENU WHOSE BUTTONS CLICK AND WHOSE EVERYTHING ELSE IS QUIET
+   IS THIS BUG, and the one-line check is audio_current_bank().
+   It was reached by the continue menu's NO, which goes straight
+   to page 6 rather than through page 9.
+
+5.6.  Snd_SetFrequency has a WINDOW, and it skips outside it
+
+   maybe_Snd_SetFrequency (0x00424050) forwards to
+   Csample_SetFrequency (0x00441dc0), whose guard is four
+   instructions at 0x00441de6 [verified]:
+
+       [sample+0x14] = hz          stored whatever it is
+       if (hz <= 1000)   return    no call
+       if (hz >= 44100)  return    NO CALL
+       IDirectSoundBuffer::SetFrequency(hz)
+
+   IT IS A SKIP, NOT A CLAMP, and the difference is audible.
+   Above 44100 the buffer KEEPS THE LAST FREQUENCY IT WAS GIVEN,
+   so the note does not clamp to 44100 and does not jump - it
+   stops climbing at whatever it last reached inside the window.
+
+   44100 IS THE GAME'S OWN CEILING, not DirectSound's;
+   DSBFREQUENCY_MAX is 200000.
+
+   o IT IS WHY THE BOTTOM TWO GEARS SING WITHOUT IT. Road gears
+     1 and 2 sweep to 48000 Hz on a 22050 Hz sample (racers.txt,
+     the engine tables), so the top of each is OUTSIDE the window
+     and the original stops tracking at ratio 2.0.  A port that
+     just sets the rate reaches 2.36 and is a couple of semitones
+     sharp at the redline.  Gears 3 to 6 peak near 40000 on a
+     14000 Hz sample, inside the window, and match either way.
+
+   o AND EVERY INPUT MATCHED WHILE IT WAS WRONG.  Both games
+     paused at the gear 1 redline held tachoRpm 11994, engine
+     6.9967 against 6.9965, the same gear and the same cue, and
+     both computed the same 47980 Hz before the wheelie term.
+     The divergence was entirely in what the back end did with
+     that number, which no field-by-field comparison can see.
+
+6.  The samples are WAV files with a cipher over them
+
+   Every one of SFX.BKF's 250 members has the extension .WAV and none
+   of them LOOKS like a RIFF file: all 250 begin with the same four
+   bytes [verified]:
+
+       72 6d 6e 72     "rmnr"
+
+   DECODED - see formats/rmnr.txt, which is the home for the format.
+   They are ordinary uncompressed PCM RIFF WAVE files with a
+   positional cipher applied:
+
+       plain[i] = (cipher[i] - 0x20 - 4*i) & 0xff
+
+   There is no compression and no custom container.  "rmnr" is not a
+   magic the game looks for - it is what "RIFF" becomes under that
+   arithmetic, and the loader's actual test is the LETTER CASE of
+   byte 0, so plain RIFF files pass through untouched.
+
+   THIS MATTERS FOR THE PORT in one specific way: the loader unmasks
+   THREE regions and restarts the counter at zero for each, so a
+   decoder that treats the file as one stream produces garbage from
+   byte 0x24 onward.  tools/rmnr.py is the oracle and reads every
+   shipped file.
+
+7.  Open questions
+
+   o RESOLVED - which group is which, and the handle table. Both are
+     section 5.
+
+   o RESOLVED - the "rmnr" container.  It is masked PCM RIFF, not a
+     container at all; formats/rmnr.txt has the cipher and the
+     three-region rule, and tools/rmnr.py reads the files.
+
+   o WHETHER g_nCfgSfxEnabled AND g_nCfgVoicesEnabled ARE SETTINGS
+     FIELDS. They behave like the options screen's two toggles, but
+     nothing has been traced from a .ini key or a menu page to
+     either. See config-globals.txt.
+
+   o DAT_00519ff0, eight bytes below the handle table, is set to
+     0x5d at the end of Snd_LoadRaceBank. 0x5d is one past the top
+     of the voices id range, which is suggestive and not evidence.
+
+   o THE 8_BITS TREE selected by g_cfgWave16Bits is a complete second
+     copy, 125 members. Nothing has checked whether the two differ in
+     more than sample width.
+
+   o 16 SAMPLE SITES AND 6 TRACK SITES are unattributed, listed in
+     section 3.
+
+   o WHETHER 0x2a IS THE SHATTER OR THE WHOLE TRANSITION. It is the
+     only sample fired when a transition arms, and the transition IS
+     the glass, so the identification is safe. But no recording has
+     been checked against it, and rule 8 forbids running the game.
+
+
+8.  THE ANNOUNCER, AND NONE OF IT IS IMPLEMENTED
+
+   The race commentator is a QUEUE, not a set of cue calls, and
+   that is the thing to know before reconstructing any of it.
+
+8.1.  Snd_QueueVoice - the 8-slot ring
+
+   Snd_QueueVoice(cueId, delayMs) @ 0x00404da0 stores into a ring
+   of eight and returns; maybe_Snd_TickRiderVoice drains it and
+   honours the delay (it reads the read index at 0x00407923).
+
+       0x005028ec[8]   cue ids
+       0x0050290c[8]   delays, ms
+       0x005028d8      write index, (i + 1) & 7
+       0x005028d4      read index
+
+   THE DRAIN IS ON ANOTHER THREAD, and that is why it appears in
+   no xref.  Nothing in the database reads 0x005028ec or
+   0x005028cc; the enqueue clears the latter and something sets
+   it back to 1 when the queue empties.  Proved live: a hardware
+   watchpoint on the read index caught NOTHING while the value
+   advanced under it, and hardware debug registers are
+   per-thread.  It is the mixer thread.
+
+   ONE ENTRY PER CONSUME.  Hand-feeding the ring advanced the
+   read index by exactly one each time (2 -> 3 -> 4), with
+   0x005028cc returning to 1 between.  [verified - live]
+
+   BOTH BUILDS RUN THE SAME STATE MACHINE, checked side by side
+   through one checkpoint with the two rings read every few
+   frames:
+
+       enqueued      MOTO rd 0 wr 2, flight 06,34
+                     port hd 0 tl 2, flight 06,34
+       blip gone     MOTO rd 1 wr 2, flight 34
+                     port hd 1 tl 2, flight 34
+       word gone     MOTO rd 2 wr 2, empty, 0x005028cc back to 1
+                     port hd 2 tl 2, empty
+
+   One consumed at a time, the second held behind the first, in
+   the order queued.  0x005028cc reading 1 again at the end
+   confirms it as the idle flag.  [verified - live, both
+   builds]
+
+   THE GAP LENGTH IS NOT COMPARABLE UNDER STEPPING, and that is
+   not a defect: MOTO's drain is on the mixer thread and runs on
+   REAL time, so it keeps going while the harness has the game
+   paused, where ours is on tm_now and stops with it.  That
+   divergence is deliberate - see the note in audio.c - and only
+   shows under a debug pause.
+
+   AND THE NEXT LINE ALSO WAITS FOR THE LAST TO FINISH.
+   [observed]  The gap alone is not enough: a win is announced
+   with a phrase well over half a second long and RACE COMPLETED
+   follows it, and on retail the phrase is allowed to finish
+   before the second speaks.  Both conditions hold - the gap has
+   passed AND the previous line is quiet - so a short blip still
+   clears in its 500 ms and only a long line extends the wait.
+
+   THE 500 IS THE GAP AFTER A LINE, NOT A WAIT BEFORE IT.
+   [inferred]  Read off behaviour rather than off the drain,
+   which is not in the database to read: retail plays the
+   checkpoint blip ON the geometry and its word well after, one
+   then the other, which a lead-in delay cannot produce and
+   spacing does.  A port that treats it as a lead-in gets both
+   cues half a second late AND on top of each other.
+
+   FULL MEANS DROPPED, SILENTLY - the enqueue compares the next
+   write index against the read index and returns without
+   storing.  Eight pending lines is the cap.
+
+   THAT QUEUE IS WHY LINES NEVER OVERLAP and why each lands a
+   beat after its event: every one of the ten callers passes a
+   delay of 500 ms.
+
+8.2.  Every announcer line in the game
+
+   +------------+---------------------------+------------------+
+   | Site       | Function                  | Cue              |
+   +============+===========================+==================+
+   | 0x0041321a | Hud_DrawInRace            | 6, an SFX        |
+   +------------+---------------------------+------------------+
+   | 0x00413299 | Hud_DrawInRace            | 0x34 ckckpnt     |
+   +------------+---------------------------+------------------+
+
+   THE WHOLE CHECKPOINT BLOCK NEEDS raceState == 1, tested at
+   0x004131d0 and again at 0x004131e6.  THE FINISHING CROSSING
+   IS ALSO A CHECKPOINT CROSSING, so without that gate the line
+   is announced as a checkpoint at the same moment the result
+   and RACE COMPLETED are queued and three voices arrive
+   together.  Finishing moves the racer to state 2, which is
+   what silences it.
+
+   THE CHECKPOINT PAIR IS NOT QUEUED FROM THE CROSSING.  The
+   crossing, in maybe_Race_UpdateProgress, only adds its time,
+   opens a five-second window (0x00519fec = 5000) and bumps a
+   per-racer CHECKPOINT COUNTER at racer+0x2f79.  Hud_DrawInRace
+   then runs its whole block only while that window is open,
+   compares the counter against a value it remembers on itself,
+   and queues both cues when they differ - storing the new one so
+   it fires once.
+
+   THE ORDER MATTERS, AND IT IS EASY TO GET WRONG.  Because the
+   HUD runs AFTER maybe_Race_UpdateProgress, lapCounter is
+   already current when the cue is queued.  Queue it from inside
+   the crossing sweep instead and the suppression reads the lap
+   count from BEFORE the crossing that closed the lap - so on the
+   lap that turns into the final one the checkpoint fires anyway
+   and talks over FINAL LAP.
+
+   THE MUTE IS ONE CHECKPOINT, AND IT FORKS ON DIRECTION.  Both
+   arms need the counter to be 1 - so at most ONE checkpoint per
+   lap is ever dropped - and then g_nRaceReverse (0x004dc144)
+   picks which lap:
+
+   +---------------+------------+---------------------------------+
+   | g_nRaceReverse| Tested at  | Dropped when                    |
+   +===============+============+=================================+
+   | 0, forward    | 0x004131d0 | lapCounter == 0                 |
+   +---------------+------------+---------------------------------+
+   | non-zero      | 0x004131e6 | lapCounter - g_nRaceLaps == -1  |
+   +---------------+------------+---------------------------------+
+
+   so running FORWARD - which is every normal race - the dropped
+   one is the first crossing of the FIRST lap.  THAT CROSSING IS
+   THE START LINE, NOT A CHECKPOINT: the line carries a linkA like
+   any checkpoint, the grid sits behind it, and so it is crossing
+   number one.  Measured on MOTO mid-lap on ile01 with two visible
+   checkpoints: counter 2, lapCounter 0, wrap limit 3 - line then
+   cp1, with cp1 audible.  Only reversed does the final lap come
+   into it.
+
+   WIDENING EITHER ARM TO THE WHOLE LAP SILENCES EVERYTHING on a
+   one-lap event, because lapCounter is then both 0 and
+   raceLaps - 1 for the entire race - and LIST.BPT gives all eight
+   tracks a lap count of 1, so that is every practice run and
+   every single race.  The counter test is what keeps it to one
+   crossing.
+
+   THE WRAP LIMIT IS NOT nbCheckPoint, though on ile01 both are 3.
+   maybe_Game_LoadRace builds [0x004e9844] at 0x0047b4ff by
+   counting the segments whose linkA (+0xd8) is non-negative - the
+   same predicate the crossing sweep uses - so it is the number of
+   TIMING CROSSINGS on the track, the start line included.
+
+   AND THE COUNTER IS NOT BUMPED PER SWEPT SEGMENT.  The sweep only
+   RAISES A FLAG when it meets a timing segment; the counter is
+   incremented ONCE for the frame afterwards, gated on that flag
+   and raceState == 1, and the same block calls
+   Race_RecordCheckpointSplit.  So a frame in which a fast bike
+   crosses two timing segments advances the counter by one, not by
+   two.  A port that increments inside the sweep counts a different
+   sequence on exactly those frames.
+
+   THE LAP BOUNDARY IS A SEPARATE MECHANISM and not a timing
+   segment at all: it is detected by the SEGMENT INDEX WRAPPING
+   past zero, which is the second flag the delta arithmetic raises,
+   and that flag drives lapCounter and the FINAL LAP cue.  Reading
+   the start line as one of the timing segments is the trap here -
+   the two sets are disjoint.
+   | 0x0047decc | maybe_Race_TickClock      | 0x39 gameover    |
+   +------------+---------------------------+------------------+
+   | 0x0047df2f | maybe_Race_TickClock      | 0x42 timeout     |
+   +------------+---------------------------+------------------+
+   | 0x0047e72f | maybe_Race_UpdateProgress | 0x46 wrongway    |
+   +------------+---------------------------+------------------+
+   | 0x0047e9fb | maybe_Race_UpdateProgress | 0x37 finlap      |
+   +------------+---------------------------+------------------+
+   | 0x0047ebf8 | maybe_Race_UpdateProgress | 0x47 / 0x48      |
+   +------------+---------------------------+------------------+
+   | 0x0047d9e3 | maybe_Game_Tick           | 0x47 / 0x48      |
+   +------------+---------------------------+------------------+
+   | 0x00412b3e | FUN_00412a50              | 0x3e racecmpl    |
+   +------------+---------------------------+------------------+
+   | 0x004583bb | FUN_00458310              | 0x3b newrecor    |
+   +------------+---------------------------+------------------+
+
+   0x47 AGAINST 0x48 IS CMP EAX,2 / JLE - third or better gets
+   yuralosr, worse gets youlost.
+
+   THE WRONG-WAY TEST IS A PLANE SIDE, NOT AN ANGLE:
+
+       dot(segment.plane0.normal,
+           raceDir * forward + position)  <  0
+
+   forward is matOrientation row 2, position its translation row,
+   so the point tested is one unit in FRONT of the bike - ahead
+   in a normal race and behind in a reversed one, which is the
+   whole job raceDir does.  The threshold at 0x004d1900 is 0.0f.
+   It is asked only when the segment step came out below 1, so
+   the moment progress stops going forward rather than on a
+   timer, and only for the racer on screen.
+
+   THE LATCH IS ON THE VOICE, NOT ON THE WARNING.  The caption
+   goes up BEFORE the latch is tested - a comma expression at
+   0x0047e727 - so the text is raised every frame while the line
+   is spoken once.  Reading that the other way round gives either
+   a warning that flashes for one frame or an announcer that will
+   not stop talking.
+
+   WRONGWAY IS LATCHED so it is said ONCE per episode:
+   0x004f0c58 is cleared at 0x0047e568 whenever the bike is
+   pointing the right way and set at 0x0047e734 after the line is
+   queued, so turning back round re-arms it.
+
+   TIMEOUT IS NOT LATCHED, IT IS RATE-LIMITED - 0x004f0c54 holds
+   the time it last spoke rather than a flag - AND IT DOES NOT
+   FIRE WHILE THE CLOCK IS MERELY LOW.  Both halves live inside
+   one arm:
+
+       if (timer < 0) {
+           if (timer + 500 < 0)  GAME OVER, 0x39, raceState 3
+           else                  TIMEOUT, 0x42
+       }
+
+   So the nag occupies the 500 ms BETWEEN the clock passing
+   zero and game over.  Its own 2000 ms rate limit is wider
+   than that window, so it speaks ONCE.
+
+   Reading it as 'nags while the clock is low' is the mistake
+   the call site invites, and it is wrong: at any positive
+   clock the arm is not reached at all.  Confirmed by setting
+   MOTO's clock to -200 and stepping - the arm ran and queued
+   0x42; at 5000, 1816 and 536 it never did.  [verified -
+   live]
+
+   PRACTICE IS UNTIMED, and the gate is on the ARM rather than
+   on the clock: g_nSelectedMode 0 without time attack never
+   runs any of it and the timer counts on into deep negatives
+   with nothing reading it.
+
+8.3.  The countdown does not use the queue
+
+   Hud_DrawCountdown (0x00413030) calls Hud_CountdownSound
+   (0x004082f0) directly, which is why the digits land on the
+   beat rather than 500 ms behind it.
+
+   TWO SOUNDS PER TICK: a beep, always, and the spoken digit only
+   while n < 4.  n is g_nTimeSeconds / 2 + 1, and it is
+   edge-gated TWICE - the drawer on DAT_00542854 and the sound on
+   DAT_00504564.
+
+       n=3 beep 1 + 0x30    n=1 beep 1 + 0x32
+       n=2 beep 1 + 0x31    n=0 beep 2 + 0x33 go
+
+   CASE 0 IS UNREACHABLE FROM THE COUNTDOWN.  n is
+   seconds / 2 + 1, which is one at its lowest, so the drawer
+   can never ask for GO.  The GO arm is entered from the OTHER
+   caller: Hud_DrawInRace runs Hud_CountdownSound(0) at
+   0x004133e6, between drawing the GO widget and clearing the
+   arm flag.
+
+   So GO's voice and its bip2 - the higher beep, the ding that
+   ends the sequence - belong to the first RACING frame, not to
+   the countdown.  Looking for them in the countdown drawer
+   finds nothing, because the switch arm is dead code from
+   there.
+
+   THE SECOND EDGE GATE EARNS ITS KEEP HERE.  hud_draw runs its
+   body twice, once per overlay pass, so both callers are
+   reached twice a frame.  GO is saved by clearing the arm flag
+   immediately after; the digits are saved by nothing but that
+   gate on the last value played.
+
+8.4.  The cue id decides voice or sfx
+
+   Not the caller.  Every play site applies the same test:
+
+       id in 0x2f..0x5c  ->  g_nCfgVoicesEnabled, voices volume
+       otherwise         ->  g_nCfgSfxEnabled,   sfx volume
+
+   So the speech setting silences the spoken digits and leaves
+   the countdown beeps, which is what it is for.  A port that
+   routes by call site instead will get that wrong.
+
+8.5.  Remarks about your place - Snd_TickPositionVoice
+
+   0x00407420, and it is where runlast, running4, stillrun and
+   yurdalst come from.  None of them appears at any of 8.2's ten
+   sites, which makes them look dead; they are behind two tables
+   here instead.
+
+   ONCE A MINUTE AT MOST - the whole function is gated on
+   DAT_0054299c + 60000 < g_framePrevMs, on voices being on, on
+   not being paused, and on the local racer being the one on
+   screen.  Racer count must be above 1.
+
+   +-----------------------+-------------------------------------+
+   | Standing              | Cue                                 |
+   +=======================+=====================================+
+   | leading               | 0x41 stillrun or 0x40 running4      |
+   +-----------------------+-------------------------------------+
+   | last, gap of 1        | 0x49 yurdalst, on a coin toss       |
+   +-----------------------+-------------------------------------+
+   | mid-pack              | 0x38 fuel, 0x3c onegear or          |
+   |                       | 0x3f runlast                        |
+   +-----------------------+-------------------------------------+
+
+   Mid-pack needs count >= 3 with a gap of 2, or count >= 4 with
+   a gap of 2 or 3; anything else says nothing.
+
+   THE LAST-PLACE LINE IS THE ODD ONE OUT.  The other two arms
+   queue with the usual 500 ms; this one plays DIRECT and carries
+   its own no-repeat guard.  So being last is remarked on at once
+   while the other observations arrive a beat late.
+
+8.6.  What the port has
+
+   o THE QUEUE AND THE COUNTDOWN ARE IN.  audio_cue_delayed is
+     the ring, drained in order from one head by audio_update,
+     and race_audio_stop clears it so a race cannot open with the
+     last one's commentary.  hud_countdown_sound plays the beep
+     and the digit, and hud_draw_go plays GO with its
+     bip2 on the first racing frame.
+
+   o THE TWO GROUP VOLUMES ARE IN AND ARE SEPARATE, which is
+     8.4's rule made real: audio_group_gain scales by
+     AUDIO_GROUP_SPEECH or AUDIO_GROUP_SFX on the cue id alone.
+     Both default to full and nothing sets them yet - the
+     original never exposed them either - but the split is there
+     to be wired to an ini setting without revisiting call
+     sites.
+
+   o THE FINISH LINE IS IN.  Solo, viewed racer only:
+
+       won        WellDone or yeaah, a coin toss on
+                  Rand_Next(1) under 0x4000
+       last       yuralosr
+       2nd, 3rd   NOTHING - the silent arm is deliberate
+       4th+       youlost
+
+     THE LAST TEST COMES BEFORE THE PODIUM TEST, so last of
+     three is remarked on where third of four is not.  And it
+     draws on STREAM 1, not the stream the rest of the race
+     audio uses - maybe_Rand is a wrapper on Rand_Next(1).
+
+   o WRONG WAY IS IN - race_wrong_way_tick, with the plane
+     test, the latch and the re-arm on the forward arm.
+
+   o CHECKPOINT AND FINAL LAP ARE IN.  Final lap fires on the
+     crossing that leaves one to go.  The checkpoint pair is
+     noted in the sweep and spoken AFTER the racer loop, so it
+     sees the same lapCounter the HUD would.
+
+     The counter now has the original's shape - flagged in the
+     sweep, incremented once a frame before the lap close-out,
+     wrapped at the timing-segment count the loader counts with
+     the sweep's own predicate.
+
+     THE COUNTER STARTS AT ONE, AND THAT IS THE WHOLE OF IT.
+     Hooked at 0x0047e83a - the store itself - over a one-lap time
+     attack on ile01, the local racer's stores were 2, 3, 1, and
+     [0x004e9844] is 3 so the 3 is immediately overwritten with 0
+     at 0x0047e849.  Reading them back against a 4-crossing lap:
+
+   +----------------+---------+-------------------------------------+
+   | Crossing       | Counter | Mute: counter 1 AND lapCounter 0?   |
+   +================+=========+=====================================+
+   | grid -> line   | no store| skipped, raceState still 0          |
+   +----------------+---------+-------------------------------------+
+   | checkpoint 1   |       2 | no - speaks                         |
+   +----------------+---------+-------------------------------------+
+   | checkpoint 2   |  3 -> 0 | no - speaks                         |
+   +----------------+---------+-------------------------------------+
+   | finish line    |       1 | lapCounter is now 1 - speaks        |
+   +----------------+---------+-------------------------------------+
+
+     so the first store of 2 means the field held ONE before any
+     crossing, and the forward mute NEVER FIRES over a drivable
+     race.  Confirmed after the run: counter 1, lapCounter 1 - and
+     lapCounter 1 after exactly one lap is also what proves it
+     0-based, which is what rules out "both fields start at 1".
+
+     SEEDING IT TO ZERO IS THE BUG.  The counter then reaches 1 at
+     the first checkpoint and the mute eats it, which is what a
+     faithful transcription of 0x004131d0 produced here. The port
+     seeds 1 in racer_reset_nonzero.
+
+     THE WRITER IS maybe_Race_StartPending, 0x004112ac [verified
+     by watchpoint].  It is the only writer of that 1 in the image
+     and it sets the pair together, one racer per iteration:
+
+         004112ac  MOV ECX,0x58739a             racer 1's +0x2f79
+         004112b2  MOV word ptr [ECX],0x1       checkpointIndex = 1
+         004112b7  ADD ECX,0x3209               next racer
+         004112bd  MOV word ptr [ECX-0x3207],DX lapCounter = 0
+
+     ECX advances BEFORE the second store, so [ECX-0x3207] is
+     +0x2f7b of the racer just handled - both stores belong to the
+     same racer, and DX is 0 throughout.  The address is
+     HARDCODED, g_racers + 0x3209 + 0x2f79, so the loop starts at
+     racer 1 and never touches racer 0.
+
+     maybe_Game_InitRace is NOT the seeder, which is what sent the
+     search wrong: both its sites store BX, the register they also
+     store into lapCounter, so they store 0.  FUN_0045bdf0 at
+     0x0045bdfc stores 0 as well.  This loop runs after both.
+
+     The port seeds 1 in racer_reset_nonzero.
+
+     THE WORD IS GATED ON THE MODE, 0x0041323f: the blip goes out
+     on every counted crossing but Snd_QueueVoice(0x34) only when
+     g_nSelectedMode or g_nTimeAttack is set.  So plain practice
+     gets the ding and no announcer, which is why a one-lap time
+     attack is the only solo run that talks.
+
+     [open] THE REST OF maybe_Race_UpdateProgress is still a
+     skeleton - rule 15 wants it whole.  What that would bring:
+     the wrong-way cue's geometry test, "new record" through
+     FUN_00458310, "well done" / 0x47 / 0x48 at the finish, and
+     the anti-cheat condition that the sweep runs only while
+     accumulated progress equals its own high-water mark.
+
+   o THE DRAIN NOW RELEASES ONE LINE AT A TIME and treats the
+     500 as the gap that follows it, so the first cue goes out
+     at once.  Before this it fired everything due in one pass,
+     which spoke the checkpoint blip and its word simultaneously
+     and half a second behind the crossing.
+
+   o THE CROSSING ITSELF IS IN THE RIGHT PLACE.  Creeping up to
+     the checkpoint banner on both builds triggered at the same
+     point on the track, a few metres past the flagpole.
+     [observed]
+
+   o NONE OF THE CAPTIONS ARE IN - WRONG WAY, the FINAL LAP
+     banner and the checkpoint banner all speak and show
+     nothing.  They want the widget layer.
+
+   o GAMEOVER IS IN.  The clock going 500 ms PAST zero - not
+     reaching it - sets the flag and queues 0x39 once.
+
+   o TIMEOUT IS IN TOO, with the 500 ms window, the 2000 ms
+     rate limit, the practice gate and raceState 3 - which
+     this is the only writer of anywhere.
+
+     obj+0x0c still gates the nag in the original and is
+     still unidentified; it read 1 throughout a normal race
+     AND through the window, so it is taken as true.  What
+     would make it false is unknown.  [open]
+
+   o TRY AGAIN IS IN, with its 3000 ms countdown - a SECOND
+     timer, DAT_004e9828, not the sequence's own.  It plays
+     DIRECT after audio_stop_all, so anything still queued
+     is discarded rather than spoken over it, exactly as
+     FUN_004358b0 does.
+
+     WE FIRE IT ONCE.  The original reaches FUN_004358b0
+     with the timer parked at 0 and nothing clearing it, so
+     it rebuilds the entire menu object every frame;
+     whatever stops that has not been found, and copying it
+     would restart the sound and leak widgets.
+     [deliberate divergence]
+
+   o THE CONTINUE MENU ITSELF IS NOT IN - a third in-game
+     menu mode beside the escape menu and the post-race
+     prompt.  The voice plays and no menu appears. [open]
+
+   o STILL MISSING - newrecor 0x3b (the record write) and
+     the whole of 8.5's position commentary.
+
+8.6a.  The end-of-time sequence
+
+   The clock running out is a chain, not a cue:
+
+     1. clock low            TIMEOUT banner (FUN_00481af0) and
+                             0x42 every 2 s
+     2. clock + 500 < 0      0x0052c238 = 1, GAME OVER banner
+                             (FUN_00482120), queue 0x39
+     3. 3000 ms on DAT_004e9828, in FUN_00412a50
+     4. solo only            FUN_004358b0 - Snd_StopAll, then
+                             Snd_PlayCue(0x44) DIRECT, then the
+                             CONTINUE menu
+
+   THE CONTINUE MENU IS A THIRD IN-GAME MENU MODE - it builds a
+   fresh InGameMenu with *g_pEscapeMenu = 5, beside the escape
+   menu and the post-race prompt.  Yes restarts the race, no
+   returns to the race select.
+
+   tryagain IS PLAYED DIRECT, like the countdown digits and
+   unlike everything else in 8.2, and it follows Snd_StopAll -
+   so whatever was still queued is discarded rather than
+   spoken over it.
+
+8.7.  The voice pool must be able to rebind
+
+   A slot is created for one sample and, unless something says
+   otherwise, stays bound to it for the rest of the run.  Once
+   all 48 exist, a sound with no slot of its own is refused no
+   matter how many slots have finished - and the pool never
+   recovers, because nothing ever rebinds one.
+
+   SEEN AS: 48 allocated, NONE owned, none held, twenty of them
+   still nailed to one throttle blip, and every later cue
+   refused.  The debug fast-forward fills it in seconds - the
+   game legitimately triggers far more sounds than can play in
+   real time - and dropping back to normal speed never gets it
+   back.  The race simply goes quiet and stays quiet.
+
+   EXHAUSTING IT UNDER FAST-FORWARD IS FINE.  Recovering
+   afterwards is not optional, and recovery means taking a
+   FINISHED slot off another sample: not owned, not looping,
+   not held by the pause, not still sounding.  The voice is
+   destroyed and remade because its format is fixed at
+   creation.
+
+   THERE ARE TWO ALLOCATORS AND BOTH NEED IT.  audio_voice_for
+   serves the cue layer and says "cue dropped"; the tail of
+   audio_voice_start serves everything else and says "cue 0x...
+   not started".  They allocate independently, so fixing one
+   leaves the other failing with a nearly identical message -
+   read which wording the log carries before deciding the bug
+   is still there.
+
+9.  MASTER VOLUME IS THE WINDOWS MIXER
+
+   The three volume options on the sound page are not software
+   gains. Settings_LoadAll (0x0042b2a0) reads three registry
+   values and passes each to Mixer_SetVolume (0x00470cf0), whose
+   body ends in mixerSetControlDetails - the Win32 mixer API.
+   [verified]
+
+   +------+----------------+------------+----------------------+
+   | line | registry key   | string at  | index pushed at      |
+   +======+================+============+======================+
+   | 0    | "MasterVolume" | 0x004e7ee4 | 0x0042b2f0           |
+   +------+----------------+------------+----------------------+
+   | 1    | "CDVolume"     | 0x004e7ed8 | 0x0042b322           |
+   +------+----------------+------------+----------------------+
+   | 2    | "WaveVolume"   | 0x004e7ecc | 0x0042b354           |
+   +------+----------------+------------+----------------------+
+
+   THE GAME THEREFORE CHANGES THE OPERATING SYSTEM'S VOLUME on
+   startup, restoring whatever was saved. That is why it can be
+   startlingly loud on a machine it has not run on before.
+
+   o THE MIXER OBJECT IS 0x005d2958. mixer[0] is non-zero once
+     initialised, mixer[1] is the HMIXEROBJ, and the per-line
+     range is mixer[line + 0x119], which reads 32.
+
+   o THE VOLUMES LIVE IN AN XOR-ENCRYPTED SETTINGS FILE, not the
+     registry and not an ini. Settings_ReadInt (0x00425bb0) is
+     the reader; it goes through FUN_00425080, which calls
+     Crypt_Xor (0x0045a4a0) and parses with sscanf, and
+     FUN_0042f310 writes it back with fwrite. [verified from the
+     call graph]
+
+     The registry holds only install information - DataPath,
+     SavingPath, Language, Version, InstallType. Two separate
+     stores; do not assume a setting is in one because another
+     is. See subsystems/config-file.txt.
+
+   o THERE IS NO COMMAND-LINE FLAG for volume. The flag block at
+     0x004dc664 ends at -FrameRateMax and -NoSound is the only
+     audio switch, disabling DirectSound entirely.
+
+   FOR THE PORT: a reimplementation should NOT move the system
+   mixer. Applying gain to its own DirectSound or XAudio2 buffers
+   is the modern equivalent and does not surprise the user by
+   changing a machine-wide setting. tools/mrhook can set it for
+   testing - see tools/mrhook/README.txt section 12.
+
+
+10.  maybe_Snd_TickRacer - the per-racer engine and effects mixer
+
+   0x00406290, renamed from FUN_00406290. Sections 1 to 7 cover the
+   CUE layer - fire sample N, play track N. This is the layer above
+   it: one call per racer per frame that holds looping voices open
+   and retunes them, and it is where the engine note actually comes
+   from.
+
+       __thiscall(int *snd, MR_Racer *racer, int master, int pan,
+                  int allowShiftCue)
+
+9.1.  The voice API, five methods on the sound manager
+
+   All five read [ECX+4] and bail if it is zero, and all five ignore
+   a voice id of -1, so they are methods on the manager object with
+   the free slot marked -1 [verified from RET n and the prologues]:
+
+   +--------------------------+--------------+--------------------------------------+
+   | Name                     | Address      | Signature, this omitted              |
+   +==========================+==============+======================================+
+   | maybe_Snd_StartVoice     | 0x00423fd0   | (int cue, int mode) returns a voice  |
+   |                          |              | id, or -1                            |
+   +--------------------------+--------------+--------------------------------------+
+   | Snd_StopVoice            | 0x00424000   | (int voice)                          |
+   +--------------------------+--------------+--------------------------------------+
+   | Snd_SetVolume            | 0x00424030   | (int voice, int vol)                 |
+   +--------------------------+--------------+--------------------------------------+
+   | maybe_Snd_SetFrequency   | 0x00424050   | (int voice, int hz)                  |
+   +--------------------------+--------------+--------------------------------------+
+   | maybe_Snd_SetPan         | 0x00424070   | (int voice, int pan)                 |
+   +--------------------------+--------------+--------------------------------------+
+
+   o WHICH SPLITS THE AUDIO CODE IN TWO. Snd_PlayCue in section 1.1
+     is fire-and-forget; these five are the handle-based path, and
+     nothing in sections 1 to 7 used them. A reconstruction needs
+     both.
+
+   o maybe_Snd_SetFrequency AND maybe_Snd_SetPan ARE TOLD APART BY
+     THEIR ARGUMENTS, not by their bodies. 0x00424050 is always
+     given __ftol of an expression in rpm or speed; 0x00424070 is
+     always given the caller's fourth argument unchanged, identical
+     for every voice of one racer. That is a pitch and a position.
+     [inferred, and the reason both keep maybe_]
+
+9.2.  The per-racer audio record
+
+   THE RECORD IS EXACTLY 0x78 BYTES [verified]. It is a state
+   block of ints that nothing else in this project has touched,
+   and it is NOT the racer and NOT the manager - see 9.2.1 for
+   why that is easy to get backwards.
+
+   Two proofs, both out of FUN_004079e0, and they agree:
+
+   o ITS RESET LOOP SUBSCRIPTS A DWORD POINTER BY iVar21 * 0x1e,
+     and 0x1e dwords is 0x78 bytes. The stride of an array IS
+     the size of its element, so this alone settles it.
+   o AND THE HIGHEST INDEX TOUCHED ANYWHERE IS [0x1d], at +0x74
+     - the last dword that fits inside 0x78. The record is
+     fully used, with no room left over.
+
+   Where they live:
+
+   +--------------+------------+----------------------------------------------+
+   | Address      | Count      | Which racers                                 |
+   +==============+============+==============================================+
+   | 0x005032c0   | 4          | audible OTHER racers, stride 0x78. The count |
+   |              |            | comes from the slot table at                 |
+   |              |            | 0x00504210..0x0050423f walked 12 bytes at a  |
+   |              |            | time                                         |
+   +--------------+------------+----------------------------------------------+
+   | 0x005034b0   | 1          | the VIEWED racer, standalone. Identical      |
+   |              |            | field offsets, reset field by field rather   |
+   |              |            | than in a loop                               |
+   +--------------+------------+----------------------------------------------+
+
+   +------------+----------------------------------------------------------------+
+   | Index      | Meaning                                                        |
+   +============+================================================================+
+   | [0]        | state: 0 idle, 1 engine running, 2 stalled or below the low    |
+   |            | threshold                                                      |
+   +------------+----------------------------------------------------------------+
+   | [0xd]      | THE PER-RACER MASTER. Every volume in the function is (v *     |
+   |            | [0xd]) >> 8, so this is the distance attenuation the caller    |
+   |            | computed.                                                      |
+   +------------+----------------------------------------------------------------+
+   | [4] [5]    | nine voice slots, each -1 when free. Stopped with              |
+   | [6] [7]    | Snd_StopVoice before being reused.                             |
+   | [8] [9]    |                                                                |
+   | [10] [0xb] |                                                                |
+   | [0xc]      |                                                                |
+   +------------+----------------------------------------------------------------+
+   | [0x11]     | a rising volume ramp, 0x50 to 200 in steps of 0x1e.            |
+   | [0x10]     | [0x10] is the SKID voice's own ramp - see 9.7.                 |
+   +------------+----------------------------------------------------------------+
+   | [0x14]     | the roll loop frequency: 5000, 8000, 18000 or 20000 by surface |
+   |            | class.                                                         |
+   +------------+----------------------------------------------------------------+
+   | [0x1b]     | a PEAK HOLD of wheelieAngle, clamped at 0x3fc90fdb = PI/2,     |
+   |            | used to size the WHEEL thud and then zeroed.  See 9.14.        |
+   +------------+----------------------------------------------------------------+
+   | [0x12]     | previous-frame copies of surface class, tickInputWord, rpm,    |
+   | [0x16]     | gear, wheelieAngle and crashLatch - the edges everything       |
+   | [0x17]     | triggers on.                                                   |
+   | [0x19]     |                                                                |
+   | [0x1a]     |                                                                |
+   | [0x1d]     |                                                                |
+   +------------+----------------------------------------------------------------+
+
+   o A RISING EDGE ON crashLatch RESETS THE WHOLE RECORD - nine
+     voice slots to -1 and a dozen counters to 0, via FUN_00406190.
+     So a crash silences the bike completely and it restarts from
+     idle.
+
+9.3.  riderStateBits is an event word, and this is its decoder
+
+   racers.txt section 3 records racer+0x2dac as "flags; collision
+   ORs 4, 8, 0x10, 0x20" from the writer's side. This is the reader,
+   and it maps bits to cues [verified]:
+
+   +------------------+----------------------------------------------------------+
+   | riderStateBits   | Cue fired                                                |
+   +==================+==========================================================+
+   | 0x40             | cue 0x11                                                 |
+   +------------------+----------------------------------------------------------+
+   | 0x02 | 0x08 |    | cue 0x12, at 0xff when 0x02 is among them and 200        |
+   | 0x20             | otherwise                                                |
+   +------------------+----------------------------------------------------------+
+   | 0x04 | 0x10      | a voice line, cue 0x3d - LOCAL RACER ONLY, one time in   |
+   |                  | four, and only if g_nCfgVoicesEnabled                    |
+   +------------------+----------------------------------------------------------+
+   | 0x02             | a voice line, cue 0x4b, on the same terms                |
+   +------------------+----------------------------------------------------------+
+   | 0x01 | 0x04 |    | cue 0x0e or 0x0f, Rand_Next picks between them           |
+   | 0x10             |                                                          |
+   +------------------+----------------------------------------------------------+
+
+   o TWO OF THE FIVE ARE VOICE LINES AND ARE LOCAL-RACER ONLY,
+     gated on the racer being g_racers[g_localRacerIndex] and on a
+     one-in-four Rand_Next draw. So the rider only comments on his
+     own crashes, and only sometimes.
+
+9.4.  Two engine banks, chosen by the bike
+
+   local_10 points at 0x004db638 when g_bikeCarac[bike].PersoAnim is
+   set and 0x004db618 when it is clear - two tables of eight ints,
+   indexed by racer->gear, giving the cue for the current gear.
+
+   o SO THE DIRT AND ROAD BIKES HAVE SEPARATE ENGINE BANKS, selected
+     by the same PersoAnim field that maybe_Racer_UpdateSkeleton uses
+     to pick an animation set. One flag, two subsystems.
+
+   o AND THE GEAR CUE CHANGES ONLY WHEN THE TABLE ENTRY CHANGES, not
+     on every shift: the code compares
+     table[prevGear] against table[gear] before restarting the loop,
+     so two gears sharing a sample do not retrigger it.
+
+9.5.  The surface class
+
+   FUN_00465d20(rearWheelContact, 1) returns a small integer that is
+   then remapped 1->2, 9->6, 0xb->5, 0xc->4 and forced to 0 when the
+   racer is not onGround. It selects the roll loop, its frequency
+   from [0x14] and its volume ceiling.
+
+   o THE REMAP MEANS THE AUDIO CLASSES ARE COARSER THAN THE SURFACE
+     IDS. Several track surfaces share one sound, which is worth
+     knowing before treating the returned number as a material id.
+     formats/bpt-carac.txt section 5 lists nine named surfaces in the
+     grip table; this collapses them to about six. [inferred]
+
+9.6.  Rand stream 4, and why that matters
+
+   Every draw here is Rand_Next(4). The FX spray and the finish
+   jingles use maybe_Rand, which is Rand_Next(1).
+
+   o SEPARATE STREAMS MEAN AUDIO RANDOMNESS CANNOT PERTURB THE
+     SIMULATION. replay.txt section 6 proved a race replays bit for
+     bit; a shared RNG between the mixer and the physics would have
+     broken that the moment a sample was skipped for being out of
+     earshot. The per-stream generator in formats/bpt.txt is what
+     makes it safe. [inferred - the determinism is measured, the
+     causal link is not]
+
+   o THE SEEDS ARE BAKED INTO THE IMAGE, and the mixer depends
+     on it. g_randState at 0x004f2590 is seven dwords of
+     INITIALISED data, not bss, and stream 4's seed is
+     0x1a3d5e7f. Nothing seeds stream 4 at run time - the only
+     Rand_Seed call in the image is the replay file's, on
+     stream 6 - so the initialiser is the only thing keeping
+     the stream alive. Zero is the generator's fixed point, so
+     a zero-filled array would make every draw here 0 and
+     leave the brake cue stuck on brake1, the throttle blip
+     firing on every edge, and the volume wander frozen at
+     240. [verified - read out of the image, and confirmed
+     against the running retail game, where streams 1, 4 and
+     6 had advanced and 0, 2, 3 and 5 had not]
+
+   o AND Rand_Next / Rand_Seed WERE NAMED IN docs/formats/bpt.txt
+     AND NOT IN THE DB. Both are now named in Ghidra too. That is
+     the exact divergence CLAUDE.md rule 5b exists to prevent, found
+     by reading a function that used them.
+
+9.2.1.  It is __thiscall, and the decompiler says otherwise
+
+   ECX IS THE AUDIO RECORD AND THE RACER IS A STACK ARGUMENT:
+
+       00406297  MOV EDI,ECX            EDI = the audio record
+       00406299  MOV EBP,[ESP+0x48]     EBP = the racer
+       0040629d  MOV ECX,[EBP+0x78]     racer+0x78 = bikeIndex
+
+   o UNTIL THE PROTOTYPE WAS SET, Ghidra modelled the function as
+     __cdecl and rendered the call in FUN_004079e0 as
+     maybe_Snd_TickRacer(&g_racers + i*0x3209, vol, ...). That
+     reads as "the first parameter is the racer", which is
+     exactly wrong: it is the stack argument promoted to first
+     place with ECX dropped. THIS NOTE WAS ALMOST REWRITTEN ON
+     THE STRENGTH OF IT - the section above was correct all
+     along and nearly got "corrected" into an error.
+   o SAME TRAP AS FUN_0040c8b0, where an "argument type
+     contradiction" turned out to be a hidden this. A decompile
+     whose calling convention has not been set is evidence about
+     Ghidra, not about the program.
+   o The prototype is now set in the DB, so the call sites
+     render correctly.
+
+9.7.  The skid voice
+
+   Record[0xc] at +0x30, and IT IS THE BRAKE SOUND. That is why
+   nothing called 'brake' appears anywhere in the tick: cues
+   0x1a and 0x1b never reach Snd_PlayCue as constants. They are
+   computed, (Rand_Next(4) & 1) + 0x1a, inside a surface switch.
+
+   THE GATE IS THE BRAKE INPUT, not a deceleration: bit 1 of
+   tickInputWord, plus onGround, plus a free slot, plus speed
+   above 8.3333 (g_sndSkidMinSpeed, 0x004d01e8).
+
+   o THE onGround TEST GUARDS THE START AND THE PER-FRAME
+     UPDATE, NOT THE RELEASE. The release at 0x00406f59 reads
+     the brake bit alone, so braking in mid-air neither starts
+     a skid nor fades a running one. [verified]
+
+   The switch, through the jump table at 0x004073c0:
+
+   +---------------+------------+-----------------------------------------+
+   | Surface class | Cue        | Sample                                  |
+   +===============+============+=========================================+
+   | 3, 5, 8, 10   | 0x17       | gravier                                 |
+   +---------------+------------+-----------------------------------------+
+   | 4             | 0x19       | herbe                                   |
+   +---------------+------------+-----------------------------------------+
+   | 6, 7          | 0x1a 0x1b  | brake1 or brake2, one Rand_Next(4) draw |
+   +---------------+------------+-----------------------------------------+
+   | 0xd           | 0x18       | glace                                   |
+   +---------------+------------+-----------------------------------------+
+
+   o ONLY FIVE OF THESE CLASSES CAN ARRIVE HERE - 4, 5, 6, 10
+     and 0xd. SurfaceUnder's +9 and the remap in 9.5 never
+     produce 3, 7 or 8; those belong to the other, unflagged
+     caller. And class 6 is plain ROAD, so the sound heard
+     under braking through most of a race is the brake squeal
+     rather than a scrape. [verified]
+
+   Frequency, recomputed every frame at 0x00406eea:
+
+       hz = (int)(base + speed * 4000.0 / RealSpeedMax)
+       hz = (int)(hz * velocityPitch)
+
+   The base is 22050, or 12050 on classes 6 and 7 where the cue
+   is the brake - the lower base is what makes a brake squeal
+   read lower than gravel. The span is a full 4000 Hz
+   (g_sndPitchSpan4000, 0x004d0228) between a standstill and
+   the BIKE'S OWN top speed - carac index 18, not a shared
+   constant, so a slow bike and a fast one sound alike at their
+   respective limits. Volume is record[0x10] * record[0xd] >> 8,
+   starting at 0xe6.
+
+   THE RELEASE HAS TWO TRIGGERS, not one: letting the brake go,
+   or the rpm fraction falling under 0.2 (g_sndSkidRpmFloor,
+   0x004d0230). The second is what stops the squeal carrying on
+   into a standstill. record[0x10] then falls by 0x32 a frame
+   and the voice is stopped when it goes NEGATIVE.
+
+   o THE RAMP IS NEVER FLOORED AT ZERO, so with no voice up and
+     the engine idling it keeps counting down for as long as
+     the race lasts. At 50 a frame that needs days to matter,
+     and it is the original's arithmetic, so the
+     reconstruction keeps it rather than quietly diverging.
+
+9.8.  The five arguments, and the two the caller computes
+
+   Settled from the prologue and the call site at
+   0x00407d48..0x00407d5e. Push order puts the LAST push first,
+   so the list reads backwards from the assembly.
+
+   +---------+----------------+--------------------------------------+
+   | Slot    | Argument       | What it is                           |
+   +=========+================+======================================+
+   | +0x48   | racer          | MR_Racer *                           |
+   +---------+----------------+--------------------------------------+
+   | +0x4c   | master         | 0..255, clamped by the caller        |
+   +---------+----------------+--------------------------------------+
+   | +0x50   | pan            | handed to maybe_Snd_SetPan           |
+   +---------+----------------+--------------------------------------+
+   | +0x54   | bPlayerVoices  | 1 from the caller, but CLEARED at    |
+   +---------+----------------+--------------------------------------+
+   |         |                | 0x004063f2 when humanPlayer is 0     |
+   +---------+----------------+--------------------------------------+
+   | +0x58   | velocityPitch  | float; MULTIPLIES EVERY FREQUENCY    |
+   +---------+----------------+--------------------------------------+
+
+   o velocityPitch IS ONE FACTOR OVER THE WHOLE BIKE, not a
+     per-voice tweak: the same slot scales the engine note at
+     0x00406dda and the skid at 0x00406f0d. The caller builds
+     it at 0x00407ce3..0x00407d1b from two dot products scaled
+     by -1/46080 and +1/46080, each offset by 1.0 - a
+     Doppler term. [verified]
+
+   o THE master ARGUMENT IS A LINEAR DISTANCE RAMP, computed
+     beside it: (10240.0 - dist) * 0.033203125, clamped 0..255.
+     So a bike is at full volume inside 2560 units and silent
+     past 10240 (g_sndDistMax, 0x004d0280). [verified]
+
+   FOR THE VIEWED RACER ALL THREE ARE ALREADY RIGHT, and that
+   was not obvious. The driver passes pan 0 and bPlayerVoices
+   1 for it literally, and velocityPitch is set to 1.0 and
+   overwritten ONLY when g_dwReplayMode is set - so outside a
+   replay the viewed bike has no Doppler at all. race.c's
+   master of 255 is the one approximation left, and it is
+   right whenever the camera is on the bike.
+
+   THE DOPPLER IS FOR THE OTHER RACERS. It is computed per
+   slot in the loop at the foot of the driver, which is what
+   has to exist before any of it matters. See 9.11.
+
+9.9.  The engine note
+
+   Recomputed every frame while record[0] is 1 and the gear is
+   above neutral. Seven terms, in this order
+   [0x00407112..0x00407212]:
+
+       hz  = lo + (hi - lo) * rpmFraction
+       hz += 2000 + rand % 3000      one frame in four, on the
+                                     throttle's RISING edge
+       hz -= revDrift
+       hz  = hz + wheelieAngle * 4000.0
+       hz -= (frontY - rearY) / (AxeDistance * 48.0) * 1800.0
+       hz += record[0x1c]
+       hz  = hz * velocityPitch
+
+   lo and hi come from the per-gear table the bank flag picks -
+   see 9.4 - indexed by gear with a stride of 8 bytes. frontY
+   and rearY are racer+0x1b8 and racer+0x33c, the Y components
+   of the two wheel contact points.
+
+   o THE DRIFT IS SUBTRACTED. The decompiler renders the whole
+     chain as additions because revDrift is always zero (9.5),
+     so the sign shows only in the SUB at 0x004071b1. Nothing
+     can hear the difference, which is exactly why it is worth
+     writing down. [verified]
+
+   o THE WHEELIE TERM IS 4000 Hz PER RADIAN, not a 4000 Hz
+     ceiling. The tick clamps its own peak hold at PI/2, so a
+     full wheelie is worth about 6280 Hz - much the largest of
+     the three corrections. [verified]
+
+   o THE SLOPE TERM IS THE BIKE'S PITCH, NOT THE GROUND'S. It
+     is the height difference between the two wheel contact
+     points over the wheelbase, and the 48.0 is the same
+     constant that PLACES those points - BIKE_AXLE_K in
+     bikes.h. Nose-up lowers the note. [verified]
+
+   o record[0x1c] IS VESTIGIAL. The only instruction in the
+     image that writes +0x70 is FUN_004073f0, and it stores
+     zero, so the term contributes nothing. It is not
+     reconstructed. [verified]
+
+   o TRUNCATION HAPPENS FOUR TIMES, not once - after the gear
+     ramp, after the wheelie term, on the slope term by
+     itself, and after velocityPitch. Each is its own __ftol,
+     and folding them into one expression drifts by a few
+     hertz.
+
+   The volume is separate: 250 for an AI, 255 for a human on
+   the throttle or up on the back wheel, and otherwise a slow
+   wander of 240 less a draw modulo 50, re-rolled no oftener
+   than every 50 ms on the road bike and 100 ms on the dirt
+   one. Under 20 km/h the result is then scaled linearly to
+   nothing at 1 km/h [0x004072ac] - which is what keeps a bike
+   sitting on the grid quiet, and was missing from the port
+   until the expression was read whole.
+
+9.10.  The idle loop, and why a stopped bike is not silent
+
+   Cue 0x21, 'motostp', record[8] at +0x20 [0x00406c10]. It is a
+   SEPARATE SAMPLE, not a gear loop slowed down, and it is already
+   in both engine bank tables.
+
+   Two thresholds, and between them BOTH loops play:
+
+   +-------------+------------------+----------------------------+
+   | Voice       | Full volume      | Silent / stopped           |
+   +=============+==================+============================+
+   | gear loop   | above 20 km/h    | fades to nothing at 1 km/h |
+   |             |                  | and STOPS under 5 km/h     |
+   +-------------+------------------+----------------------------+
+   | motostp     | below 10 km/h    | fades out by 29 km/h       |
+   +-------------+------------------+----------------------------+
+
+   o BOTH SLOPES ARE 19/3.6 WIDE. The gear loop's fade rises over
+     1..20 km/h and the idle loop's falls over 10..29; they are
+     the same curve twice, offset. That is the tell that they are
+     meant as a crossfade rather than two independent gates.
+
+   o UNDER 5 km/h THE GEAR LOOP IS STOPPED OUTRIGHT and record[0]
+     goes to 2 - which is the state that keeps it from restarting.
+     So below walking pace the idle loop is the ONLY engine voice,
+     and a port without it is completely silent at a standstill.
+     [verified]
+
+   Frequency is rpmFraction * 8000 + 16050, so blipping the
+   throttle at rest is still heard. Volume is (8.0555 - speed) *
+   918/19, clamped 0..255 - the product reaches 389 standing
+   still, so the clamp is doing real work.
+
+   o record[0xa] at +0x28 IS VESTIGIAL, like record[0x1c]. It is
+     cleared to -1 beside the engine voice in three places and no
+     code anywhere assigns it a voice. [verified]
+
+9.11.  Snd_TickRace - the driver, and how AI racers get heard
+
+   FUN_004079e0, called once a frame. It is the whole reason the
+   per-racer mixer takes master, pan and velocityPitch as
+   arguments: this is what computes them.
+
+   Gated on g_nCfgSfxEnabled. In order:
+
+   1. Distance pass. For every active racer, the straight-line
+      distance from the CAMERA EYE to the bike, cached at
+      racer+0x2fe1.
+
+   2. The viewed racer, ticked from the standalone record at
+      0x005034b0 with pan 0, bPlayerVoices 1 and velocityPitch
+      1.0 - see 9.8. Its record is wiped whenever the viewed
+      index changes.
+
+   3. FUN_00407600 for the LOCAL racer only, outside replay -
+      the rider commentary scheduler, which is a separate thing
+      from the per-racer mixer. Wheelie-held lines, a dirt-bike
+      random table at 0x004db978, and a road-bike delayed cue.
+
+   4. Every OTHER active racer is collected as {index, distance},
+      qsorted by distance (FUN_004079a0), and cut at 10240 -
+      g_sndDistMax again, the same range the volume ramp dies at.
+
+   5. The survivors are fitted into FOUR slots at 0x00504210,
+      stride 12. A racer already holding a slot KEEPS it, and
+      only then are free slots handed out - so a bike that stays
+      in earshot keeps its record, and with it its engine voice
+      and gear state, instead of restarting every frame.
+
+   6. Each occupied slot is ticked from its own 0x78 record in
+      the array at 0x005032c0, with its own volume, its own pan,
+      and a real velocityPitch built from the camera's movement
+      and the bike's.
+
+   o FOUR IS THE AUDIBILITY BUDGET, not the racer count. The
+     table is four entries and the code walks it to 0x0050423f.
+     [verified]
+
+   o bPlayerVoices IS 0 FOR EVERY AI RACER, so they never get
+     the depart voices - those are the player's alone.
+     [verified]
+
+   o THE SLOT-KEEPING IN STEP 5 IS THE PART TO GET RIGHT. Clear
+     the table and reassign from scratch each frame and every
+     audible bike restarts its engine loop every frame.
+
+9.12.  The throttle blip, and why it is not the rev bump
+
+   Cue 0x1d..0x1f - the three DEPART samples - fired as a
+   ONE-SHOT on the throttle's rising edge [0x00406fcd]. record
+   [0xb] at +0x2c.
+
+   o IT IS A SEPARATE SAMPLE, NOT THE PITCH BUMP AT 0x0040714b.
+     The two are easy to conflate because both are throttle
+     edges, but the bump only shifts a RUNNING gear loop's
+     frequency. This starts a recording. [verified]
+
+   o WHICH IS WHY TAPPING THE GAS AT A STANDSTILL MAKES A NOISE.
+     Below 5 km/h the gear loop is stopped outright and record[0]
+     is 2 (see 9.10), so there is no loop left for a pitch bump
+     to act on - the blip is the only thing that can be heard
+     down there, and a port without it is silent on a throttle
+     tap no matter how the engine note is wired. [verified]
+
+   o 'DEPART' IS THE RACE START, which is why it sounds like the
+     rev under the menu's 'let's go' - the same family of
+     recording, and the reason the sample name looks unrelated to
+     a throttle blip when scanning the bank.
+
+   The choice differs by bike:
+
+   +--------+------------------------------------------------+
+   | Bike   | Sample                                         |
+   +========+================================================+
+   | dirt   | Rand_Next(4) % 3 + 0x1d - any of the three     |
+   +--------+------------------------------------------------+
+   | road   | 0x1f - min((int)(speed/RealSpeedMax * 5), 2):  |
+   |        | DEPART3 standing still, DEPART2 from a fifth   |
+   |        | of top speed, DEPART1 from two fifths          |
+   +--------+------------------------------------------------+
+
+   Mode 2 - polyphonic, not looping - at volume master * 200 >> 8.
+   record[0xb] carries the CUE on the way in and is overwritten
+   with the VOICE handle on the way out, which is worth knowing
+   before reading the field's type as one or the other.
+
+   o THE PLAYER'S ALONE. bPlayerVoices is 1 only for the viewed
+     racer and is cleared again for anyone whose humanPlayer is
+     0, so AI bikes never blip. [verified]
+
+9.13.  Open
+
+   x The record at param_1 is EXACTLY 0x78 bytes. CLOSED - see
+     9.2. The array stride in FUN_004079e0 settles it without
+     needing an allocation site at all, which is worth
+     remembering: for a statically allocated array the stride is
+     as good as a malloc size, and often easier to find.
+   x [0xf], the pitch base.  CLOSED.  It is the skid voice's
+     base frequency, written the instant that voice starts -
+     see 9.7.
+   x maybe_Snd_TickRacer calls maybe_Racer_SlipSpeed and DISCARDS
+     the result. CLOSED, AND IT IS DEAD CODE. The call is at
+     0x0040672e and the next instruction is FSTP ST0 - pop and
+     throw away. maybe_Racer_SlipSpeed reads its receiver and
+     never writes it, and its one call is handed a stack local,
+     so there is no side effect for the call to be there for.
+     [verified]
+     A LEFTOVER FROM A REMOVED FEATURE is the likeliest reading
+     [guess]. racers.txt 9.19.4 briefly guessed the opposite -
+     that audio read slip to drive tyre skid - on the strength
+     of the call existing. It does not; that is retracted there.
+   x FUN_0048cf20, called once on the landing frame, is unread.
+     Still open - moved to 9.15's list, where the landing cue
+     it sits beside is recorded.
+
+9.14.  The wheelie landing thud, cue 0x13
+
+   The one-shot that fires when a wheelie comes back down.  It is
+   cue 0x13, named WHEEL in BOTH bike tables - Ktm at 0x004db8a0
+   and Ninja at 0x004db920 - so the sample differs per bike and
+   the id does not [verified].
+
+   ORIGIN  maybe_Snd_TickRacer @ 0x00406290, at 0x00406b72.
+
+   Three conditions, every one a sign-masked test:
+
+       00406b75  TEST [rec+0x68], 0x7fffffff    prev angle != 0
+       00406b86  TEST racer+0x307d, 0x7fffffff  angle now == 0
+       00406b93  TEST racer+0x2db8              onGround
+
+   So it fires on the frame the angle reaches zero, and ONLY with
+   the wheels down: bring the nose down in mid-air off a jump and
+   there is no thud.
+
+   THE VOLUME COMES FROM THE PEAK, NOT THE CURRENT ANGLE, which is
+   the whole reason the peak hold at [0x1b] exists.  By the time
+   the test passes the angle IS zero, so a reading taken at the
+   trigger would be silent every time.
+
+       peak = min(peak, PI/2)                   004d0158
+       vol  = (int)(peak * 121.59437652220804)  004d0200
+              + 0x40                            00406bd1
+       Snd_SetVolume(v, master * vol >> 8)
+
+   THE MULTIPLIER IS NOT ROUND AND THAT IS DELIBERATE.  PI/2 times
+   121.59437652220804 is 191.0 exactly, and 191 + 64 is 255 - so
+   the constant was chosen to land a FULL wheelie at full volume,
+   with 64 the floor a flick of the nose gets.  Range 64..255.
+
+   The peak is zeroed at 00406bfb, by this block alone.  It is
+   raised in the tail at 004072f4 and nowhere else, so a wheelie
+   that ends airborne carries its peak into the next one.
+
+9.15.  What the port's racer_audio_tick still does NOT play
+
+   racer_audio_tick is a skeleton import (rule 15.1) and the gaps
+   are all in one place: the impact and rider-event group between
+   0x004064f0 and 0x00406b72.  The engine, idle, skid and depart
+   voices are live; these are not.
+
+   +-------+--------------+----------------------------------------+
+   | Cue   | Sample       | Trigger                                |
+   +=======+==============+========================================+
+   | 0x13  | WHEEL        | wheelie landing.  DONE - see 9.14      |
+   +-------+--------------+----------------------------------------+
+   | 0x11  | rouleman     | riderStateBits & 0x40                  |
+   +-------+--------------+----------------------------------------+
+   | 0x12  | crash        | riderStateBits & 0x2a; 0xff if bit 1,  |
+   |       |              | else 200                               |
+   +-------+--------------+----------------------------------------+
+   | 0x0e  | choc1        | riderStateBits & 0x15, Rand_Next(4)&1  |
+   | 0x0f  | choc2        | picks; volume capped at 0xe1           |
+   +-------+--------------+----------------------------------------+
+   | 0x0b  | land1        | onGround rising edge - the JUMP        |
+   | 0x0c  | land2        | landing.  Road takes 0x0b alone; dirt  |
+   | 0x0d  | land3        | picks Rand_Next(4) % 3 + 0x0b          |
+   +-------+--------------+----------------------------------------+
+   | 0x3d  | a voice line | riderStateBits & 0x14, local racer,    |
+   |       |              | 1 in 4, gated on VoicesState           |
+   +-------+--------------+----------------------------------------+
+   | 0x4b  | a voice line | riderStateBits & 2, otherwise as above |
+   +-------+--------------+----------------------------------------+
+
+   o THE JUMP LANDING IS THE AUDIBLE ONE OF THESE.  0x0b..0x0d
+     fire on every landing off every jump, which on the dirt
+     tracks is constant.
+
+   o riderStateBits IS racer+0x2dac and its decoder is 9.3.  The
+     bits are already written by the port's collision code, so
+     these are trigger-side gaps only - nothing upstream is
+     missing.
+
+   o FUN_0048cf20 is called once on the landing frame, before the
+     0x0b cue, and is still unread.
+
+
+11.  THE CD AUDIO MAP - every track call in the game
+
+   CdAudio_PlayTrackCue (0x00404990) is called from ELEVEN sites
+   and CdAudio_StopCue (0x004049e0) from ONE.  That is the whole
+   of the game's CD audio.  Every row below is read off its own
+   pushes [verified].
+
+   The mode bits are section 1's: bit 0 do not restart if this
+   track is already playing, bit 1 repeat at the end.
+
+11.1.  The eleven starts
+
+   +------------------------------+-------+------+------------+
+   | Caller                       | Track | Mode | Call site  |
+   +==============================+=======+======+============+
+   | MenuPage25_DsiLogo_Enter     |  13   | ESI  | 0x00453b61 |
+   +------------------------------+-------+------+------------+
+   | MenuPage14_Title_Enter       |   3   |  2   | 0x00446b27 |
+   +------------------------------+-------+------+------------+
+   | MenuPage03_MainMenu_Enter    |   3   |  3   | 0x004426f5 |
+   +------------------------------+-------+------+------------+
+   | MenuPage05_ModeSelect_Enter  |   3   |  3   | 0x004476ea |
+   +------------------------------+-------+------+------------+
+   | MenuPage06_RaceSelect_Enter  |   3   |  3   | 0x0044807c |
+   +------------------------------+-------+------+------------+
+   | MenuPage07_NetSessionList    |   3   |  3   | 0x0044954d |
+   +------------------------------+-------+------+------------+
+   | MenuPage08_NetRaceLobby      |   3   |  3   | 0x0044ae99 |
+   +------------------------------+-------+------+------------+
+   | maybe_Game_InitRace          | level |  0   | 0x0047bf95 |
+   +------------------------------+-------+------+------------+
+   | MenuPage24_Podium_Enter      |  11   |  0   | 0x00452e32 |
+   +------------------------------+-------+------+------------+
+   | MenuPage24_Podium_Enter      |  12   |  0   | 0x00452e44 |
+   +------------------------------+-------+------+------------+
+   | FUN_0048aca0, the credits    |  12   |  0   | 0x0048acc1 |
+   +------------------------------+-------+------+------------+
+
+   TRACK 3 IS THE MENU TRACK and six pages ask for it.  Five of
+   them pass mode 3 - loop, and do not restart if it is already
+   playing - which is what carries one continuous piece of music
+   across the whole menu chain.  ONLY THE TITLE PAGE PASSES 2, so
+   returning to the title restarts it and moving between the
+   other five does not.
+
+   THE RACE TRACK IS THE LEVEL'S OWN, and this is the entry the
+   reconstruction was missing:
+
+       CALL Snd_StopAll              0x0047bf84
+       PUSH 0                        mode - play ONCE
+       MOV  EAX, [0x004db67c]        AudioTrack, from Level.Spt
+       PUSH EAX
+       CALL CdAudio_PlayTrackCue     0x0047bf95
+
+   o MODE 0 MEANS RACE MUSIC DOES NOT LOOP.  It plays once and
+     stops, and nothing restarts it - so a race longer than its
+     track finishes in silence.  That is the original's
+     behaviour, not a gap to fill.
+
+   o 0x004db67c IS THE LEVEL SCRIPT'S AudioTrack, the last key
+     0x00427e80 reads out of %sLevel.Spt (5.5).  The track is per
+     level and read from data, which is why no table of race
+     tracks appears anywhere in the code.
+
+   o THE Snd_StopAll IN FRONT OF IT IS THE SAMPLES, NOT THE CD.
+     The menu music is still playing at this point and is
+     REPLACED by the new track rather than stopped first.
+
+   THE PODIUM PICKS ONE OF TWO BY POSITION.  EDI counts up a list
+   ending at 0x53f848 and then:
+
+       EDI >  2   track 11, and Snd cue 0x5b beside it
+       EDI <= 2   track 12
+
+   so track 12 is the good result and track 11 the poor one, the
+   latter with the consolation line - 0x5b, yutrygan - over it.
+   The credits use track 12 as well.
+
+   [open] MenuPage25's mode is the register ESI rather than a
+   literal.  The reconstruction reads it as 0 and the observed
+   behaviour agrees - the intro plays once - but it is the one
+   mode in this table not read off a push.
+
+11.2.  There is exactly ONE stop
+
+   MenuPage25_DsiLogo_Leave, at 0x00453bff.  Nothing else in the
+   game ever stops the CD.
+
+   THAT IS THE DESIGN AND NOT AN OVERSIGHT.  A page that wants
+   music asks for its own track, and the request REPLACES
+   whatever was playing; a page that does not care says nothing
+   and INHERITS what is already going.  The intro is the
+   exception because it is the one place where the next thing to
+   happen - the title page - would otherwise start track 3 over
+   the top of track 13 still running.
+
+   SO MUSIC PLAYS ON EVERY MENU PAGE and only six of them start
+   it.  Bike select, options, the controller config, TOP 5, name
+   entry, the championship load and save pages and the loading
+   page have NO CD call at all - they keep whatever the page
+   before them left running.
+
+11.3.  The track a race asks for comes out of the level
+
+   maybe_Game_InitRace reads AudioTrack from the level manifest and
+   passes it to CdAudio_PlayTrackCue with MODE 0 - play ONCE - at
+   0x0047bf95.  So there is no table of race tracks anywhere in the
+   code, and a race longer than its track finishes in silence
+   because nothing restarts it.
+
+   Decoded from the ten shipped manifests, AudioTrack takes the
+   values 2, 4, 5, 6, 7, 8, 9 and 10.  Never 3, which is the menu
+   track, and never 11 to 13, which are the podium and the intro.
+
+   o A ZERO WOULD MEAN RANDOM, and the reconstruction passes it
+     straight through as the original does.  No shipped level
+     carries one.
+
+   Reconstructed in race_build_grid, beside the sample bank,
+   because the original does both behind the loading caption.
+
+11.4.  What this means for the reconstruction
+
+   What is still NOT wired:
+
+   +------------------------------+--------------------------+
+   | Site                         | Why it matters           |
+   +==============================+==========================+
+   | MenuPage24_Podium_Enter      | no podium music          |
+   +------------------------------+--------------------------+
+   | the credits                  | not built at all         |
+   +------------------------------+--------------------------+
+   | pages 7 and 8                | network, unreachable     |
+   +------------------------------+--------------------------+
+

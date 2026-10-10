@@ -1,0 +1,17 @@
+; mrmod - loaded beside MOTO.EXE by mrhook LOAD_MOD.
+;
+; THE ALIASES ARE NOT OPTIONAL. A __fastcall C function is decorated
+; @name@N, where N is the total size of every parameter in bytes -
+; register ones included, so three pointers is twelve. Exporting the
+; decorated name alone would make HOOK_FUNC take "@mrmod_plane_distance@12"
+; on the wire; mapping it here keeps the command readable.
+;
+; If a signature changes, the link fails naming the symbol it wanted.
+; That is the intended way to find out.
+LIBRARY mrmod
+
+EXPORTS
+    mrmod_plane_distance      = @mrmod_plane_distance@12
+    mrmod_plane_distance_bad  = @mrmod_plane_distance_bad@12
+    mrmod_plane_distance_flip = @mrmod_plane_distance_flip@12
+    mrmod_call_count          DATA

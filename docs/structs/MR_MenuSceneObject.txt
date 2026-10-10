@@ -1,0 +1,335 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          MR_MENUSCENEOBJECT
+
+
+Abstract
+
+   Size: 0x94 = 148 bytes [verified] - from PUSH 0x94 into operator new
+   at 0x004870ed in MenuPage15_NameEntry_Enter.
+
+   Ghidra type applied: yes, as MR_MenuSceneObject, with the class
+   applied to SEVEN methods. An eighth, MenuTools_BuildViewMatrix, was
+   applied in error and removed - see section 4 and
+   structs/MR_MenuCamera.txt section 1.
+
+   The 3D menu scene object: one mesh plus TWO independently animated
+   vec3 channels. It is what the 3D menu pages - the rotating bike, the
+   turning DSI logo, the podium - are built from, and it was once
+   the next real struct to discover.
+
+   Every byte is accounted for except two four-byte fields, and those
+   two sit at the SAME relative position in each of the two animation
+   blocks, which is itself evidence the blocks are one layout used
+   twice.
+
+Table of Contents
+
+   1. Fields
+   2. The two blocks are one layout, twice
+   3. The animation model, and its third mode
+   4. The methods
+      4.1. MenuTools_NormaliseMeshToSize, and what "scales them" meant
+      4.2. MenuTools_DrawSceneObject - the method section 4
+           was missing
+   5. What this is not
+   6. Open questions
+
+
+1.  Fields
+
+   +--------+------+-----------+-------------------+------------+
+   | Offset | Size | Type      | Name              | Confidence |
+   +========+======+===========+===================+============+
+   | +0x00  | 12   | float[3]  | vec               | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x0c  | 12   | float[3]  | target            | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x18  | 4    | MR_Mesh * | pMesh             | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x1c  | 4    | void *    | pBuf1c            | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x20  | 4    | int       | targetActive      | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x24  | 4    | int       | vecActive         | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x28  | 4    | int       | vecRebase         | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x2c  | 12   | float[3]  | vecStart          | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x38  | 4    | int       | createArg3        | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x3c  | 4    | int       | createArg4        | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x40  | 12   | float[3]  | vecDelta          | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x4c  | 4    | uint      | vecEndMs          | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x50  | 4    | ?         | unknown50         | UNKNOWN    |
+   +--------+------+-----------+-------------------+------------+
+   | +0x54  | 4    | uint      | vecDurationMs     | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x58  | 4    | uint      | vecStartMs        | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x5c  | 4    | int       | vecMode           | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x60  | 12   | float[3]  | targetStart       | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x6c  | 12   | float[3]  | targetDelta       | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x78  | 4    | uint      | targetEndMs       | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x7c  | 4    | ?         | unknown7c         | UNKNOWN    |
+   +--------+------+-----------+-------------------+------------+
+   | +0x80  | 4    | uint      | targetDurationMs  | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x84  | 4    | uint      | targetStartMs     | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x88  | 4    | int       | targetMode        | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x8c  | 4    | void *    | pBuf8c            | verified   |
+   +--------+------+-----------+-------------------+------------+
+   | +0x90  | 4    | void *    | pBuf90            | verified   |
+   +--------+------+-----------+-------------------+------------+
+
+   0x90 + 4 = 0x94, so the record is exactly full.
+
+
+2.  The two blocks are one layout, twice
+
+   Reading MenuTools_StartVecMove and maybe_MenuTools_StartTargetMove
+   side by side, the correspondence is exact [verified]:
+
+   +------------------+------------+---------------+
+   | Role             | vec block  | target block  |
+   +==================+============+===============+
+   | current vec3     | +0x00      | +0x0c         |
+   +------------------+------------+---------------+
+   | active flag      | +0x24      | +0x20         |
+   +------------------+------------+---------------+
+   | start vec3       | +0x2c      | +0x60         |
+   +------------------+------------+---------------+
+   | end or delta     | +0x40      | +0x6c         |
+   +------------------+------------+---------------+
+   | end time         | +0x4c      | +0x78         |
+   +------------------+------------+---------------+
+   | UNKNOWN          | +0x50      | +0x7c         |
+   +------------------+------------+---------------+
+   | duration, ms     | +0x54      | +0x80         |
+   +------------------+------------+---------------+
+   | start time       | +0x58      | +0x84         |
+   +------------------+------------+---------------+
+   | mode             | +0x5c      | +0x88         |
+   +------------------+------------+---------------+
+
+   THE TWO UNKNOWNS LINE UP. Each sits four bytes after its block's end
+   time, and neither is read by the tick or written by either starter.
+   That symmetry is why they are recorded as one open question rather
+   than two: whatever +0x50 is, +0x7c is the same thing for the other
+   channel.
+
+   Only the vec block has the extra rebase flag at +0x28, and only the
+   vec block's active flag is adjacent to it. The layout is otherwise
+   a straight duplication with the current vec3 hoisted to the front of
+   the record.
+
+
+3.  The animation model, and its third mode
+
+   MenuTools_UpdateMoves (0x0047a3d0, renamed from FUN_0047a3d0) ticks
+   both blocks. It is the 3D analogue of Sprite_UpdateMove and it
+   shares that function's easing exactly.
+
+       now = timeGetTime();
+       if (vecRebase && vecMode == 2) { vecRebase = 0; vecStartMs = now; }
+       per block, when active:
+           t = (min(now, endMs) - startMs) / durationMs;
+
+   +------+---------------+------------------------------------------+
+   | Mode | Name          | Behaviour                                |
+   +======+===============+==========================================+
+   | 0    | linear        | cur = start + delta * t; clears active   |
+   |      |               | when now reaches endMs                   |
+   +------+---------------+------------------------------------------+
+   | 1    | sine ease     | e = (sin(t*PI - PI/2) + 1) * 0.5, then   |
+   |      |               | cur = start + delta * e; clears active   |
+   +------+---------------+------------------------------------------+
+   | 2    | continuous    | ignores endMs, uses raw elapsed time,    |
+   |      |               | NEVER clears active, wraps each          |
+   |      |               | component into +/- 2*PI                  |
+   +------+---------------+------------------------------------------+
+
+   THE EASING CONSTANTS ARE THE SPRITE'S. 0x004d1880, 0x004d1888,
+   0x004d1890 and 0x004d1898 are PI, PI/2, 1.0 and 0.5, and the
+   duration multiplier at 0x004d18a8 is 1000.0 - all identical to
+   structs/MR_Sprite.txt section 2 [verified]. One easing model serves
+   both the 2D and the 3D menu layers, so a port implements it once.
+
+   MODE 2 IS THE INTERESTING ONE. It never completes and it wraps, so
+   the vec3 it drives is EULER ANGLES rather than a position: it is a
+   free-running rotation. That is the rotating bike on the selection
+   screens and the turning logo on MenuPage25, and it explains why
+   vecRebase exists - to restart the timebase of a spin without
+   stopping it.
+
+   o THE WRAP IS REPEATED SUBTRACTION of 6.2831855, not fmod, with the
+     negative case handled by negating, looping and negating back.
+     Cheap while the angle stays near range and unbounded if it ever
+     does not - a port using fmod is better behaved and marginally
+     different.
+
+   BOTH STARTERS TAKE A MODE AND STORE A DELTA. When the mode is not 2
+   they subtract the current value from the target so the block holds a
+   DELTA; when it is 2 they store the argument as given. So mode 2's
+   "delta" is really an angular rate.
+
+
+4.  The methods
+
+   +---------------------------------+------------+------------------+
+   | Function                        | Address    | Note             |
+   +=================================+============+==================+
+   | MenuTools_CreateSceneObject     | 0x004794b0 | inits in place;  |
+   |                                 |            | allocates the    |
+   |                                 |            | 0x70-byte mesh   |
+   |                                 |            | and loads it     |
+   +---------------------------------+------------+------------------+
+   | MenuTools_FreeSceneObject       | 0x004795b0 | frees pMesh,     |
+   |                                 |            | pBuf1c, pBuf8c,  |
+   |                                 |            | pBuf90           |
+   +---------------------------------+------------+------------------+
+   | MenuTools_DrawSceneObject       | 0x00479eb0 | THE DRAW METHOD, |
+   |                                 |            | see 4.2          |
+   +---------------------------------+------------+------------------+
+   | MenuTools_StartVecMove          | 0x0047a820 |                  |
+   +---------------------------------+------------+------------------+
+   | maybe_MenuTools_StartTargetMove | 0x0047a8b0 |                  |
+   +---------------------------------+------------+------------------+
+   | MenuTools_UpdateMoves           | 0x0047a3d0 | the tick         |
+   +---------------------------------+------------+------------------+
+   | MenuTools_NormaliseMeshToSize   | 0x0047a960 | see 4.1          |
+   +---------------------------------+------------+------------------+
+   | MenuTools_BuildViewMatrix       | 0x0047b1d0 | Euler angles     |
+   |                                 |            | through the      |
+   |                                 |            | sin/cos table    |
+   +---------------------------------+------------+------------------+
+   | MenuTools_SetVecPair            | 0x0047a340 | sets both vec3s, |
+   |                                 |            | clears both flags|
+   +---------------------------------+------------+------------------+
+
+   MenuTools_BuildViewMatrix (0x0047b1d0) WAS IN THIS LIST AND IS NOT A
+   METHOD OF THIS STRUCT. It operates on the menu CAMERA - two 3x4
+   matrices and two vec3s - and the class assignment made in the
+   discovery pass has been undone. See structs/MR_MenuCamera.txt
+   section 1 for how the mistake showed itself.
+
+   MenuTools_SetVecPair lost its maybe_ prefix in the same pass: it is
+   read and it is exactly what its name says.
+
+   CreateSceneObject does NOT allocate the object - the caller does,
+   which is how the 0x94 size was pinned. It takes a .3df path, an
+   optional .map path and two values it stores at +0x38 and +0x3c, and
+   it picks Load3df or Load3dfAndMap on whether the map path is NULL.
+
+4.1.  MenuTools_NormaliseMeshToSize, and what "scales them" meant
+
+   Renamed from FUN_0047a960 [verified]:
+
+       walk pMesh's vertices for the bounding box
+       halfExtent = (max - min) * 0.5      per axis; a zero becomes 1
+       scale      = min over axes of half / halfExtent
+       v = (v - centre) * scale            centre = (min + max) * -0.5
+
+   and it returns the scale. THIS IS WHAT "the page scales them" MEANS
+   in subsystems/menu-pages.txt's account of MenuPage25: the logo
+   meshes are normalised to a common size at load rather than authored
+   to one, which is why their raw .3df coordinates need not agree.
+
+   o IT MUTATES THE LOADED MESH, so a second call compounds. A port
+     that caches meshes must normalise the copy.
+
+   o THE SMALLEST RATIO WINS, so the mesh is fitted inside the box on
+     every axis rather than filling it on one. Uniform scale, no
+     distortion.
+
+
+4.2.  MenuTools_DrawSceneObject - the method section 4 was missing
+
+   0x00479eb0, renamed from FUN_00479eb0. __thiscall, with a parent
+   matrix as its one argument. Sole caller MenuPage15_NameEntry_Tick.
+
+       1. two one-shot static-matrix constructors, guarded by bits 0
+          and 1 of DAT_005da290 with _atexit destructors - MSVC
+          static initialisation, not game logic
+       2. builds a rotation from this->vec as THREE EULER ANGLES,
+          FLD / FMUL [0x004d1878] / __ftol into g_cosTable
+       3. takes the translation from this->target
+       4. concatenates that with the parent matrix into a static at
+          0x005da230 and publishes the result to 0x005da260
+       5. Screen3D_TransformVertsFlat over this->pMesh, then queues
+
+   o IT PROVES THE vec/target SPLIT. Section 3 inferred that vec is
+     euler angles because move mode 2 never completes and wraps.
+     This is the consumer, and FLD [ESI+0x4] is vec[1] feeding the
+     second angle. Inference confirmed by a reader. [verified]
+
+   o AND IT NAMES createArg3 AND createArg4, which were named after
+     where MenuTools_CreateSceneObject puts them rather than what
+     they are for:
+
+         createArg3 == 0  ->  Screen3D_CullAndQueueFacesEx(..., 1)
+         otherwise        ->  Screen3D_CullAndQueueFaces(...,
+                                                    createArg4)
+
+     So createArg3 picks the cull entry point and createArg4 is the
+     last argument to the non-Ex one. The field names are left alone
+     - they are honest about where the values come from, and a
+     reconstruction wants both facts.
+
+   o THE MESH RECORD, via this->pMesh: +0x00 MR_Primitive *, +0x04
+     the vertex array, +0x2c the face count, +0x30 the vertex count.
+     That is the 0x70-byte mesh MenuTools_CreateSceneObject
+     allocates.
+
+5.  What this is not
+
+   THE MENU CAMERA IS A DIFFERENT STRUCT, and one menuTools function
+   operates on it rather than on this - see section 4 and
+   structs/MR_MenuCamera.txt.
+
+   THE SHADED TRANSFORM'S OBJECT IS A DIFFERENT STRUCT AGAIN.
+   Screen3D_TransformVertsShaded takes an object and reads a matrix at
+   its +0x68 and a translation at +0x98..+0xa0. This record is only
+   0x94 bytes, so +0x98 lies past its end, and its own +0x68 is the z
+   component of targetStart. The two cannot be the same type
+   [verified].
+
+   That was worth checking rather than assuming - the shaded
+   transform's second-matrix path is still unattributed, and this was
+   the obvious candidate.
+
+
+6.  Open questions
+
+   o +0x50 and +0x7c. Written by nothing found, read by nothing found,
+     and symmetric across the two blocks. A per-block field the tick
+     does not use - possibly a callback, a completion flag, or padding
+     the compiler inserted for alignment of the following field.
+
+   o pBuf1c, pBuf8c and pBuf90. Three heap pointers the destructor
+     frees and the constructor zeroes, with no writer identified. Two
+     of them are adjacent at the end of the record, which suggests a
+     pair.
+
+   o createArg3 and createArg4, stored verbatim from the constructor
+     and not read by any method examined.
+
+   o WHICH PAGE DRIVES WHICH CHANNEL. MenuPage15_NameEntry_Enter
+     creates five of these into a pointer table at 0x005f1880, and
+     MenuPage25 uses six model instances. Neither page's tick has been
+     read against this struct now that it exists.
+
+   o maybe_MenuTools_SetVecPair and MenuTools_BuildViewMatrix are named
+     but were not read in this pass. The view matrix one is the camera,
+     so it is the next thing a 3D menu page needs.

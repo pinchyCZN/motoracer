@@ -1,0 +1,12 @@
+; mrhook - deployed as dplayx.dll beside MOTO.EXE.
+;
+; MOTO.EXE imports DirectPlay BY ORDINAL (Ordinal_1 and Ordinal_2), so
+; the stubs have to carry the ordinals as well as the names or the
+; loader will not bind them. NONAME is deliberately NOT used: the real
+; dplayx.dll exports both names too, and matching it keeps the module
+; interchangeable with the system one.
+LIBRARY mrhook
+
+EXPORTS
+    DirectPlayCreate      @1
+    DirectPlayEnumerateA  @2

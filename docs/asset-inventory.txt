@@ -1,0 +1,206 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            ASSET INVENTORY
+
+
+Abstract
+
+   All 23 banks extracted with tools/bkf.py. 1507 members, 77 MB, in
+   decomp/DATA/extracted, which is gitignored.
+
+   The .bkf reader is verified: extracting ILE01.BKF and byte-comparing
+   against the pre-existing DATA/extract/ile01 tree gives 57 of 57
+   identical, 0 differing, 0 missing [verified].
+
+Table of Contents
+
+   1. By type
+   2. By bank
+   3. The .WAV files are not RIFF
+   4. The .RAW texture pages
+   5. Per-island texture banks
+   6. Animation data
+   7. What this settles about .lez
+   8. Open questions
+
+
+1.  By type
+
+   +-------+-------+--------------------------------------------+
+   | Ext   | Count | Meaning                                    |
+   +=======+=======+============================================+
+   | RAW   | 421   | texture pages, 32-byte header + 24-bit RGB |
+   +-------+-------+--------------------------------------------+
+   | LEZ   | 295   | compressed TGA, see formats/lez.txt        |
+   +-------+-------+--------------------------------------------+
+   | WAV   | 250   | sound, but NOT RIFF; see below             |
+   +-------+-------+--------------------------------------------+
+   | MAP   | 132   | paired with 3DF                            |
+   +-------+-------+--------------------------------------------+
+   | 3DF   | 128   | 3D meshes                                  |
+   +-------+-------+--------------------------------------------+
+   | ROT   | 106   | animation, magic "ROT\0", 112 bytes each   |
+   +-------+-------+--------------------------------------------+
+   | BPT   | 52    | small obfuscated tables                    |
+   +-------+-------+--------------------------------------------+
+   | FNT   | 34    | fonts                                      |
+   +-------+-------+--------------------------------------------+
+   | GEN   | 20    | logo/intro sequences                       |
+   +-------+-------+--------------------------------------------+
+   | SKL   | 10    | skeletons                                  |
+   +-------+-------+--------------------------------------------+
+   | PIV   | 9     | pivots                                     |
+   +-------+-------+--------------------------------------------+
+   | 1..11 | 44    | per-island texture banks, see below        |
+   +-------+-------+--------------------------------------------+
+   | DEM   | 3     | demo scripts                               |
+   +-------+-------+--------------------------------------------+
+   | SNI   | 2     | unknown, bike banks only                   |
+   +-------+-------+--------------------------------------------+
+   | ACT   | 1     | unknown, DESIGN bank only                  |
+   +-------+-------+--------------------------------------------+
+
+2.  By bank
+
+   +------------------+------------+-----------------------------------------+
+   | Bank             | Members    | Holds                                   |
+   +==================+============+=========================================+
+   | ILE01..ILE11     | 47-57 each | 3DF MAP LEZ RAW BPT: one circuit        |
+   +------------------+------------+-----------------------------------------+
+   | MENU             | 225        | 3DF MAP LEZ RAW: the front end          |
+   +------------------+------------+-----------------------------------------+
+   | MENUUS           | 93         | LEZ GEN: US-language variants           |
+   +------------------+------------+-----------------------------------------+
+   | SFX              | 250        | WAV only                                |
+   +------------------+------------+-----------------------------------------+
+   | SPEED, SPEEDPKT  | 62, 52     | bike model, animation, per-island banks |
+   +------------------+------------+-----------------------------------------+
+   | KTMCROSS, KTMPKT | 90, 82     | as above, second bike                   |
+   +------------------+------------+-----------------------------------------+
+   | FONTES           | 36         | FNT RAW                                 |
+   +------------------+------------+-----------------------------------------+
+   | PAGES            | 28         | 3DF MAP RAW                             |
+   +------------------+------------+-----------------------------------------+
+   | PODIUM           | 20         | 3DF MAP RAW ROT SKL                     |
+   +------------------+------------+-----------------------------------------+
+   | GENERIC          | 19         | GEN: logo sequences                     |
+   +------------------+------------+-----------------------------------------+
+   | DEMO             | 11         | DEM RAW                                 |
+   +------------------+------------+-----------------------------------------+
+   | DESIGN           | 6          | ACT RAW                                 |
+   +------------------+------------+-----------------------------------------+
+
+3.  The .WAV files are masked RIFF
+
+   All 250 members of SFX.BKF begin with the four bytes 72 6d 6e 72,
+   which is "rmnr" [verified]. A RIFF file would begin "RIFF".
+
+   An earlier version of this note called that a custom sound container.
+   It is not. The files are ordinary uncompressed PCM RIFF WAVE with a
+   positional cipher applied, plain[i] = cipher[i] - 0x20 - 4*i, which
+   turns the "R" of "RIFF" into a lowercase "r" and the rest into "mnr"
+   [verified].
+
+   The guesses in that note were wrong for the same reason. Bytes 4 to 7
+   are the RIFF size, not a rate, and bytes 8 to 11 were identical
+   across files because they are the literal "WAVE" tag under a fixed
+   key.
+
+   All 250 decode, and the 8_BITS and 16_BITS trees cross-validate
+   against each other at a mean correlation of 0.998. See
+   formats/rmnr.txt.
+
+   That matters for the audio work: do not assume these can be handed to
+   any standard decoder. The format has to be reversed like the others,
+   starting from the DirectSound buffer fill path.
+
+4.  The .RAW texture pages
+
+   Sizes cluster tightly [verified]:
+
+   244 files   196640 bytes    = 0x30000 + 32
+   161 files    49184 bytes    = 0x0C000 + 32
+    13 files    66336 bytes
+     3 files    other
+
+   0x30000 is 196608, which is 256 x 256 x 3, and 0x0C000 is 49152,
+   which is 128 x 128 x 3. So a 32-byte header over 24-bit RGB pixels at
+   two standard page sizes [inferred].
+
+   This dovetails with the in-memory side. bankw.Cpp allocates 0x20000
+   bytes per bank and sets the page dimensions to 0x100 by 0x100, and
+   256 x 256 x 2 is exactly 0x20000. So the on-disk page is 24-bit and
+   is converted to the 16-bit surface format on load, the same pattern
+   as every other image path in the game.
+
+5.  Per-island texture banks
+
+   The bike banks contain 44 files named BNK00_00 with numeric
+   extensions .1 through .11, four sets of eleven [verified]. Eleven is
+   the island count including the missing ILE07, so these are almost
+   certainly the bike's texture bank specialised per circuit [inferred]
+   - track-specific lighting or reflection, resolved at load time by
+   appending the island number.
+
+6.  Animation data
+
+   ROT files carry the magic "ROT\0" and are all exactly 112 bytes.
+   Their names are French and describe rider actions: ATTERISSAGE is
+   landing, CHUTEDOS is falling backwards, DEPART is the start.
+
+   SKL is a skeleton, roughly 17 KB. PIV holds pivots, roughly 5.7 KB,
+   and begins with a count followed by readable text. Together with the
+   3DF meshes these are the rider and bike animation system, present in
+   the two bike banks and in PODIUM.
+
+   A fixed 112-byte ROT with a name per action suggests a small fixed
+   set of joint rotations per animation rather than keyframed curves
+   [guess].
+
+7.  What this settles about .lez
+
+   Running the decoder over all 295 extracted .lez files: 294 decode,
+   one does not [verified].
+
+   The corpus is more varied than the six-file sample suggested. Three
+   TGA variants appear:
+
+   +-----------------------------+-------+--------------------------+
+   | Variant                     | Count | Notes                    |
+   +=============================+=======+==========================+
+   | type 1, 8-bit colour-mapped | 282   | the common case          |
+   +-----------------------------+-------+--------------------------+
+   | type 3, 8-bit grayscale     | 12    | font banks, button masks |
+   +-----------------------------+-------+--------------------------+
+   | type 2, 24-bit true colour  | 1     | AUTORUN.LEZ only         |
+   +-----------------------------+-------+--------------------------+
+
+   This resolves an open question. formats/lez.txt recorded the
+   synthesised greyscale ramp - used when the colour map length is zero
+   - as an untested path that might not exist in practice. It is not
+   vestigial: it is the handling for type 3 grayscale TGAs, and
+   FONTBNK1.LEZ and FONTBNK2.LEZ are exactly that, 256 x 256 with no
+   palette and no footer.
+
+   AUTORUN.LEZ is the single outlier and is almost certainly not the
+   game's [inferred]. It is 24-bit, which Lez_Decode cannot read because
+   that routine consumes one index byte per pixel, and its packed header
+   dimension field is 0 x 0 where every other file carries real
+   dimensions. It sits in MENU/BITMAP and is presumably for the CD
+   autorun program.
+
+8.  Open questions
+
+   o RESOLVED. Masked PCM RIFF WAVE; see formats/rmnr.txt. The suggested
+     approach was the right one: Wave_Read was found from the
+     Csample::load error string, not from the file bytes.
+   o What is in the 32-byte .RAW header? Palette reference, dimensions,
+     and flags are the obvious candidates.
+   o 13 .RAW files are 66336 bytes, which is 66304 plus the 32-byte
+     header, and 66304 factors as neither 256 x 256 x 3 nor 128 x 128 x
+     3. Identify them.
+   o .SNI appears only in SPEED and KTMCROSS, two files total. .ACT
+     appears only in DESIGN.
+   o The .BPT tables are still unread and are the likely home of the
+     bike physics parameters.

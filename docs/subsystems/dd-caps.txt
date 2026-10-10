@@ -1,0 +1,197 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                     DIRECTDRAW CAPABILITY DECODING
+
+
+Abstract
+
+   Cdd_GetCaps decodes about a hundred DirectDraw capability bits into
+   188 booleans. NOTHING READS ANY OF THEM. The entire capability
+   surface the rest of the engine actually consumes is three globals,
+   and one of those is a constant.
+
+   That is a useful answer for the port: the decoding does not need
+   reproducing, only three decisions do.
+
+   +-------------+--------------------------+
+   | Item        | Address                  |
+   +=============+==========================+
+   | Cdd_GetCaps | 0x00473da0               |
+   +-------------+--------------------------+
+   | source file | screen3d\dd.cpp line 706 |
+   +-------------+--------------------------+
+
+Table of Contents
+
+   1. What the function does
+   2. Nothing reads the decoded flags
+   3. The three that matter
+   4. What this means for the port
+   5. Open questions
+
+1.  What the function does
+
+   Cdd_GetCaps is named from its own error string, and that string is
+   the first in this project to carry a LINE NUMBER as well as a path:
+   "Cdd::getCaps() : %s %d" formatted with D:\Dsed\mr320\screen3d\dd.cpp
+   and 0x2c2, which is 706 [verified]. The other twelve assert anchors
+   give only a filename.
+
+   It calls IDirectDraw::GetCaps with dwSize 0x13c = 316, which is
+   sizeof(DDCAPS) in the DirectX 3 and 5 headers, filling both the
+   hardware and the emulation-layer structures. Then it decodes.
+
+   Seven descriptor tables are copied from one part of .data into
+   another, then each is walked at a 0x10 stride. Each entry is:
+
+       +0x00  u32    the mask to test
+       +0x04  char*  the capability name, e.g. "DDCAPS_BLTQUEUE"
+       +0x08  char*  a sentence of English description
+       +0x0c  u32    written with (capsField & mask) != 0
+
+   The walk runs twice per table, once against the hardware caps and
+   once against the HEL caps, so each capability ends as a pair of
+   booleans [verified]:
+
+   +---------------+------------+------------+---------+
+   | Field decoded | Source     | Mirror     | Entries |
+   +===============+============+============+=========+
+   | dwCaps        | 0x004ee2f8 | 0x005d9060 | 26      |
+   +---------------+------------+------------+---------+
+   | dwCaps2       | 0x004ee498 | 0x005d9200 | 2       |
+   +---------------+------------+------------+---------+
+   | ckey caps     | 0x004ee4b8 | 0x005d9290 | 18      |
+   +---------------+------------+------------+---------+
+   | hel caps      | 0x004ee5d8 | 0x005d9a80 | 26      |
+   +---------------+------------+------------+---------+
+   | fx caps       | 0x004ee778 | 0x005d99d8 | 10      |
+   +---------------+------------+------------+---------+
+   | rops / misc   | 0x004ee818 | 0x005d4328 | 8       |
+   +---------------+------------+------------+---------+
+   | sv caps       | 0x004ee898 | 0x005d3048 | 4       |
+   +---------------+------------+------------+---------+
+
+   94 capabilities, 188 flags. The names and descriptions are real and
+   complete - DDCAPS_3D is "Display hardware has 3D acceleration",
+   DDCAPS_BLTQUEUE is "Display hardware is capable of asynchronous blit
+   operations", and so on for all of them.
+
+2.  Nothing reads the decoded flags
+
+   All 188 result slots were checked two ways [verified]. First every
+   result address individually through the reference database: zero
+   readers outside Cdd_GetCaps. Then a raw byte scan of every
+   initialised block for each table base and each base+0x0c, which would
+   catch a computed-index read the reference database misses: only
+   Cdd_GetCaps.
+
+   The second check mattered. This project has twice been misled by the
+   reference database - a count passed by pointer in Trk_Load, and a
+   mesh reached only as base + slot * 0x70 - so a bare "no references"
+   result is not sufficient evidence on its own.
+
+   The name and description strings are dead too. Of four sampled, three
+   have no references at all and the fourth is referenced only from the
+   table itself.
+
+   Nor does Cdd_WriteDdInfo use them, which had been assumed: it does
+   not reference any table base. Whatever it prints into DdInfos.tmp, it
+   is not these.
+
+   So roughly 200 strings and 188 booleans are pure weight. The decoding
+   was almost certainly written for a debug build that dumped the whole
+   capability set, and the dump was removed while the machinery stayed.
+
+3.  The three that matter
+
+   Cdd_GetCaps produces exactly three values that anything downstream
+   reads, and it computes all three from the raw DDCAPS fields directly,
+   bypassing the tables [verified]:
+
+   +---------------------+----------------------------+---------------------------+------------------------------+
+   | Global              | Value                      | From                      | Read by                      |
+   +=====================+============================+===========================+==============================+
+   | g_bltSyncFlag       | DDBLT_ASYNC or DDBLT_WAIT  | DDCAPS_BLTQUEUE           | 8 functions in the blit path |
+   +---------------------+----------------------------+---------------------------+------------------------------+
+   | g_no2DDuring3DScene | 0 or 1                     | DDCAPS2_NO2DDURING3DSCENE | 5 menu functions             |
+   +---------------------+----------------------------+---------------------------+------------------------------+
+   | g_texSurfaceCaps    | 0x4000 DDSCAPS_VIDEOMEMORY | nothing - a constant      | D3D_AllocTextureSlot         |
+   +---------------------+----------------------------+---------------------------+------------------------------+
+
+   g_bltSyncFlag is a DirectDraw BLT FLAG, settled by reading its call
+   sites [verified]:
+
+       caps & DDCAPS_BLTQUEUE && !DAT_004dc1c8  ->  0x00000200
+       otherwise                                ->  0x01000000
+
+   0x200 is DDBLT_ASYNC and 0x01000000 is DDBLT_WAIT. Every reader does
+   the same thing: load it, OR in 0x400 - DDBLT_COLORFILL - where the
+   call is a fill, and push it as the dwFlags argument to
+   maybe_Surface_Blt, which calls IDirectDrawSurface vtable slot +0x14,
+   Blt. Sites that are not fills, such as the one in FUN_00471440, pass
+   it unmodified.
+
+   So when the hardware can queue blits the engine issues them
+   asynchronously; otherwise it asks Blt to block until the request can
+   be accepted. DAT_004dc1c8 forces the blocking form regardless of
+   hardware.
+
+   CORRECTION. This note first read the two values as a wait or retry
+   budget - 512 against 16.7 million - from their magnitudes and from
+   where they were read. Wrong in mechanism, if not in spirit: they are
+   not counts at all. Two constants of very different size are not
+   evidence of a numeric quantity, and one instruction of context at any
+   call site would have shown they were bit flags.
+
+   g_no2DDuring3DScene comes from DDCAPS2_NO2DDURING3DSCENE, but it is
+   not purely a capability output - Main_InitAndParseCommandLine and
+   D3D_InitDevice also write it, so a command-line switch or the device
+   bring-up can force it. Every reader is menu code, so it gates whether
+   2D menu drawing may happen over a live 3D scene [verified].
+
+   g_texSurfaceCaps is set to 0x4000, DDSCAPS_VIDEOMEMORY,
+   unconditionally. Despite living in the capability routine it is not a
+   capability decision at all: textures are always requested in video
+   memory. Its only reader is D3D_AllocTextureSlot.
+
+4.  What this means for the port
+
+   A DX9 port replaces this function outright, since D3D9 exposes
+   D3DCAPS9 rather than DDCAPS. The question worth answering before
+   doing that was which capabilities the engine actually depends on, and
+   the answer is: almost none.
+
+   o The 188-flag decode and its 200 strings can be dropped whole.
+     Nothing consumes them.
+
+   o g_bltSyncFlag disappears entirely. DDBLT_ASYNC and DDBLT_WAIT have
+     no D3D9 counterpart - the runtime owns queuing - so every site that
+     ORs it into a flags word simply drops the term. The DDBLT_COLORFILL
+     sites become a clear or a coloured quad.
+
+   o g_no2DDuring3DScene should read as 0 on any modern target. The
+     restriction it describes does not exist, and it is already forcible
+     from the command line, so the override path is there.
+
+   o g_texSurfaceCaps is already a constant and becomes a D3DPOOL
+     choice.
+
+   So the whole capability layer reduces to one decision - whether menus
+   may draw over 3D - plus a blit-pacing constant that a modern runtime
+   makes meaningless.
+
+5.  Open questions
+
+   o What DAT_004dc1c8 is. It forces the long blit budget regardless of
+     hardware, and looks like a command-line switch.
+
+   o RESOLVED. It is a DDBLT flag word, not a budget. See section 3.
+
+   o What Cdd_WriteDdInfo actually prints, given it is not these tables.
+     subsystems/d3d-textures.txt describes the DdInfos.tmp dump and
+     should be re-read against this finding.
+
+   o The eighth copied block, 0x004ee8d8 to 0x005d9230, is copied but
+     never decoded - Cdd_GetCaps instead assigns six scalars out of the
+     caps structures individually. Those six are unexamined.

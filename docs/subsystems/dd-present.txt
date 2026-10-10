@@ -1,0 +1,350 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                           PRESENTING A FRAME
+
+
+Abstract
+
+   Cdd_Present at 0x00474860 is how a finished frame reaches the screen.
+   Three paths, a scanline effect, and - contrary to what this project
+   previously recorded - real surface-loss recovery.
+
+   +-----------------------+------------+
+   | Item                  | Address    |
+   +=======================+============+
+   | Cdd_Present           | 0x00474860 |
+   +-----------------------+------------+
+   | maybe_Surface_Blt     | 0x0045ab60 |
+   +-----------------------+------------+
+   | Cdd_LockMain          | 0x00476700 |
+   +-----------------------+------------+
+   | Cdd_UnlockMain        | 0x004767b0 |
+   +-----------------------+------------+
+   | g_bltSyncFlag         | 0x004ee960 |
+   +-----------------------+------------+
+   | maybe_g_interlaceMode | 0x005d9058 |
+   +-----------------------+------------+
+
+Table of Contents
+
+   1. Three paths
+   2. Surface loss is recovered, not fatal
+   3. The scanline effect
+   4. The surface-access family
+   5. A layout correction
+   6. The tile grid is initialised and never used
+      6.1. What the sizing still tells us
+      6.2. Two of the six are alive, and misnamed
+      6.3. The off-screen lock pair, and a pointer pinned properly
+         6.3.1. The stride is stored in PIXELS
+         6.3.2. Lock, PageLock, Unlock - the pointer is pinned
+   7. Open questions
+
+1.  Three paths
+
+   +---------------------------+--------------------------------------------+
+   | Condition                 | How the frame is presented                 |
+   +===========================+============================================+
+   | windowed                  | Blt main -> primary, clipped to the window |
+   +---------------------------+--------------------------------------------+
+   | fullscreen, flip chain    | Flip                                       |
+   +---------------------------+--------------------------------------------+
+   | fullscreen, no flip chain | Blt main -> primary                        |
+   +---------------------------+--------------------------------------------+
+
+   The windowed path calls GetClientRect then ClientToScreen twice -
+   once per corner - to convert the client area into screen coordinates,
+   and blits into that rectangle. That is the whole of windowed
+   presentation [verified].
+
+   The flip path passes 1 rather than 0 as Flip's second argument when
+   PowerVR is selected AND the hardware renderer is not up. Before
+   flipping it can spin on GetBltStatus(2) until the previous blit has
+   retired.
+
+2.  Surface loss is recovered, not fatal
+
+   On DDERR_SURFACELOST, 0x887601c2, Cdd_Present restores and retries
+   [verified]:
+
+       Restore(primary)      -> bail out if it fails
+       Restore(main)         -> bail out if it fails
+       vtable+0x6c on DAT_005d8940, when DAT_004ee940 is set
+       vtable+0x6c on DAT_005d93b4, when DAT_004e8928 is set
+       then loop and present again
+
+   It also loops on DDERR_WASSTILLDRAWING, 0x8876021c. Any other result
+   returns.
+
+   CORRECTION. subsystems/game-object.txt section 6.1 said
+   Screen3D_BeginFrame aborts on a lost surface, and concluded the
+   engine treats surface loss as fatal - which would have been a serious
+   obstacle for a windowed port. It is not true. That note has been
+   corrected.
+
+   The claim came from reading App_Shutdown's 47 call sites, seeing
+   Screen3D_BeginFrame among them, and assuming which failure it aborts
+   on. A call site in a function is not evidence about a particular
+   error path in that function.
+
+3.  The scanline effect
+
+   Each of the three paths can first fill every other line of the
+   surface, gated by maybe_g_interlaceMode [verified]:
+
+       for (y = 0; y < height; y += 2)
+           Blt(surface, {0, y+1, width, y+2}, NULL, NULL,
+               g_bltSyncFlag | DDBLT_COLORFILL, {fill = 100})
+
+   Full width, one line high, stepping two - a scanline or interlace
+   look, drawn with colour 100. Three copies of the loop, one per path,
+   differing only in which surface they target and which height they
+   use.
+
+   This is also the third independent confirmation of the g_bltSyncFlag
+   reading: a colour fill is exactly what DDBLT_COLORFILL is for, and
+   Cdd_Clear uses the identical combination.
+
+4.  The surface-access family
+
+   Classifying dd.cpp's unnamed functions by which COM vtable slot they
+   call turned up a tight family operating on g_lpDDSMain. Ghidra
+   already has the IDirectDrawSurface vtable typed, so the slot numbers
+   resolve to method names and the identification is direct rather than
+   inferred [verified]:
+
+   +-----------------+---------------------------+--------------------+
+   | COM slot        | Function                  | Confidence         |
+   +=================+===========================+====================+
+   | +0x44 GetDC     | maybe_Cdd_GetDC           | from the slot only |
+   +-----------------+---------------------------+--------------------+
+   | +0x64 Lock      | Cdd_LockMain              | body read          |
+   +-----------------+---------------------------+--------------------+
+   | +0x68 ReleaseDC | Cdd_ReleaseDC             | sole COM call      |
+   +-----------------+---------------------------+--------------------+
+   | +0x80 Unlock    | Cdd_UnlockMain            | sole COM call      |
+   +-----------------+---------------------------+--------------------+
+   | +0x60, +0x6c    | maybe_Cdd_RestoreAndClear | body read          |
+   +-----------------+---------------------------+--------------------+
+
+   Cdd_LockMain is the one worth reading in full, because its surface-
+   loss branch reinforces section 2:
+
+       if (!g_ddInitComplete || alreadyLocked) return;
+       if (IsLost() == DDERR_SURFACELOST) {
+           g_videoSettingsDirty = 1;      /* and do not lock */
+       } else {
+           Lock(0, &desc, 1, 0);
+           ... stash the result, raise the locked flag
+       }
+
+   Losing the surface raises the SAME dirty flag that a resolution
+   change raises. So the recovery is the ordinary mode reapply -
+   maybe_Screen3D_UpdateScreen, run at the end of the frame by
+   maybe_Game_RenderFrame. Surface loss is not an error path here at
+   all; it is folded into the existing display-change machinery
+   [verified].
+
+   That is the third place surface loss is handled gracefully, after
+   Cdd_Present's restore-and-retry and maybe_Cdd_RestoreAndClear. For a
+   windowed port this is good news: the engine already expects to lose
+   surfaces and has three distinct recoveries for it.
+
+5.  A layout correction
+
+   maybe_g_interlaceMode sits at 0x005d9058, which falls inside what
+   structs/MR_DisplayMode.txt had typed as MR_DisplayMode[50] -
+   specifically the +0x20 padding of entry 49.
+
+   It is a genuine independent global: written by FUN_00473a00, read by
+   FUN_00474520 and three times here. The array has been retyped [49] so
+   it is no longer mislabelled.
+
+   The two never actually collide. Cdd_EnumModesCallback accepts counts
+   below 0x32, so a 50th mode is permitted, but the callback writes only
+   the first 0x20 bytes of a record - the +0x20 field was already known
+   to have no writer. A 50th mode would occupy 0x005d9038 to 0x005d9057
+   and stop four bytes short of the flag. Whether the original source
+   declared 49 or 50 cannot be determined from the layout [verified].
+
+6.  The tile grid is initialised and never used
+
+   maybe_Cdd_CreateOffScreen at 0x00475f80 lays out a 16-pixel grid over
+   the main surface and clears a state array before creating anything
+   [verified]:
+
+   +------------+---------------------+-----------------------+
+   | Address    | Set to              | Readers               |
+   +============+=====================+=======================+
+   | 0x004e704c | g_mainWidth         | Font_DrawTextInternal |
+   +------------+---------------------+-----------------------+
+   | 0x004e7050 | g_mainHeight        | Font_DrawTextInternal |
+   +------------+---------------------+-----------------------+
+   | 0x004e705c | g_mainWidth / 16    | NONE                  |
+   +------------+---------------------+-----------------------+
+   | 0x004e7060 | g_mainHeight / 16   | NONE                  |
+   +------------+---------------------+-----------------------+
+   | 0x004e7064 | 16, the cell size   | NONE                  |
+   +------------+---------------------+-----------------------+
+   | 0x0053e030 | 0x4b dwords cleared | NONE                  |
+   +------------+---------------------+-----------------------+
+
+   The grid geometry and its state array are written once and read by
+   nothing. Verified two ways: no cross-reference reaches any of them
+   except the write, and a raw scan of the whole of .text for each
+   address as a four-byte immediate finds exactly ONE occurrence apiece
+   - the write itself. A scan for immediates pointing anywhere INSIDE
+   the 300-byte array finds none, so it is not reached by a computed
+   base either [verified].
+
+6.1.  What the sizing still tells us
+
+   The array is 0x4b dwords, 2400 bits, and the largest grid the engine
+   could produce is 640x480 / 16 = 40 x 30 = 1200 cells - exactly two
+   bits per cell with no slack [verified arithmetic]:
+
+   +------------+---------+-------+
+   | Resolution | Grid    | Cells |
+   +============+=========+=======+
+   | 320 x 240  | 20 x 15 | 300   |
+   +------------+---------+-------+
+   | 512 x 384  | 32 x 24 | 768   |
+   +------------+---------+-------+
+   | 640 x 480  | 40 x 30 | 1200  |
+   +------------+---------+-------+
+
+   So the array WAS sized deliberately for a two-bit-per-cell state over
+   the maximum supported resolution. That is what makes this vestigial
+   rather than accidental: nobody allocates 2400 bits by chance and then
+   clears them on every off-screen creation. The consumer was removed
+   and the initialisation was left behind.
+
+   It is the same shape as primitive kind 4 in rasterizer-pipeline.txt
+   section 43 - a complete pipeline whose innermost function became a
+   RET - and as maybe_Screen3D_Walk7Defer in section 51.1, which no
+   table entry can reach. Three independent cases of machinery that
+   survives its purpose.
+
+6.2.  Two of the six are alive, and misnamed
+
+   0x004e704c and 0x004e7050 do have a reader, but not as grid geometry.
+   Font_DrawTextInternal uses them as the surface width and height,
+   which is what maybe_Cdd_CreateOffScreen set them to. They record the
+   size the off-screen surfaces were created at and have been renamed
+   g_offScreenWidth and g_offScreenHeight accordingly [verified].
+   Calling them part of a tile grid would have been wrong.
+
+   o For the port: drop the grid entirely. Nothing reads it, so removing
+     the arithmetic and the 300-byte clear changes no behaviour. Keep
+     the two size globals, which are load-bearing for text rendering.
+
+   o The clear runs on every off-screen surface creation, so it is not
+     free - 300 bytes each time, plus the divides. Small, but it is pure
+     waste and it is easy to mistake for something meaningful when
+     reading the function.
+
+
+6.3.  The off-screen lock pair, and a pointer pinned properly
+
+   FUN_004236b0 and FUN_00423590 fill and clear the descriptor of
+   section 6.2, and both name themselves in their own error strings -
+   'lockOffScreen lock', 'lockOffScreen pageLock', 'unlockOffScreen
+   Unlock', 'unlockOffScreen PageUnlock'. They are now Cdd_LockOffScreen
+   and Cdd_UnlockOffScreen [verified].
+
+6.3.1.  The stride is stored in PIXELS
+
+   The lock converts on the way in [verified]:
+
+       g_offScreenBits   = desc.lpSurface;
+       g_offScreenStride = desc.lPitch >> 1;
+
+   lPitch is bytes per scanline, so the shift is a division by two bytes
+   per pixel. That is why Font_DrawTextInternal multiplies by two again
+   when it addresses a pixel: the stride is kept in pixels and converted
+   back at the point of use. Two halves of the same assumption, in two
+   different translation units, and a port has to change both or
+   neither.
+
+6.3.2.  Lock, PageLock, Unlock - the pointer is pinned
+
+   The interesting part is the sequence. After a successful Lock the
+   function does NOT keep the lock [verified]:
+
+       if (!locked) {
+           Lock(NULL, &desc, DDLOCK_WAIT, NULL);
+           bits = desc.lpSurface;  stride = desc.lPitch >> 1;
+           locked = 1;
+       }
+       if (!pageLocked) {
+           if (PageLock(dx2view) == 0) {
+               Unlock(NULL);          /* give the lock back */
+               locked = 0;  pageLocked = 1;
+           }
+       }
+
+   So it takes the address under a lock, PAGE-LOCKS the surface through
+   its IDirectDrawSurface2 view, and then releases the ordinary lock.
+   The page lock is what keeps the memory resident and the pointer
+   valid, so the address stays usable with no lock held.
+
+   That is the LEGITIMATE version of the pattern rasterizer-pipeline.txt
+   section 47.3 flags as undefined behaviour. There,
+   g_ddReleaseLockEarly drops the frame-buffer lock and keeps using the
+   pointer with nothing pinning it, and maybe_Bankw_LockPageBits does
+   the same for texture pages. Here the same outcome is achieved
+   correctly.
+
+   +------------------------------------+-----------------------------+
+   | Path                               | How the pointer stays valid |
+   +====================================+=============================+
+   | frame buffer, g_ddReleaseLockEarly | nothing - it just hopes     |
+   +------------------------------------+-----------------------------+
+   | texture pages, LockPageBits        | nothing                     |
+   +------------------------------------+-----------------------------+
+   | off-screen, Cdd_LockOffScreen      | PageLock pins the memory    |
+   +------------------------------------+-----------------------------+
+
+   o So the engine knew the correct idiom and used it in one place out
+     of three. That is worth knowing before concluding the other two are
+     deliberate: they may be, on the grounds that a 1997 driver returns
+     a stable address anyway, but they are not the pattern this codebase
+     reaches for when it cares.
+
+   o DAT_004e706c disables the page-lock path entirely when set, leaving
+     the plain lock held. That is a third policy switch alongside
+     g_ddReleaseLockEarly and LockPageBits' argument, and its writer has
+     not been found.
+
+   The lock also handles surface loss before doing anything: on
+   DDERR_SURFACELOST it page-unlocks if needed, Restores the surface and
+   clears the page-locked flag, then falls through to lock normally.
+
+
+7.  Open questions
+
+   o What failure Screen3D_BeginFrame actually aborts on, now that
+     surface loss is ruled out.
+
+   o RESOLVED. DAT_005d8940 and DAT_005d93b4 are the two off-screen
+     surfaces that maybe_Cdd_CreateOffScreen creates - system-memory
+     OFFSCREENPLAIN surfaces the size of the main surface, each with an
+     IDirectDrawSurface2 view in DAT_005d93cc and DAT_005d9220. They are
+     optional because each is created only on request, which is why
+     Cdd_Present guards both restores. See subsystems/dd-vidmem.txt.
+
+   o RESOLVED as to the writer. FUN_00473a00 is maybe_Cdd_SetGeometry, a
+     six-field setter called only from Screen3D_SetViewport, which
+     passes the interlace flag as its sixth argument along with
+     g_mainWidth and g_mainHeight. What makes the viewport ask for it is
+     still unknown.
+
+   o The fill colour 100 is a raw value, not converted through the pixel
+     format helpers. In a 16-bit surface that is a dark blue rather than
+     black.
+
+   o Four functions at 0x00472030 to 0x00472590 call vtable +0x28 on
+     g_pDirectDraw - GetCaps - and then MessageBoxA, two of them
+     followed by ExitProcess. They look like fatal-error reporters that
+     quote the caps, and are unread.

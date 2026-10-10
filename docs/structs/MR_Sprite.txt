@@ -1,0 +1,494 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                               MR_SPRITE
+
+
+Abstract
+
+   Size: 0x74 [verified] - PUSH 0x74 into operator new at 29 of the 35
+   sites that construct one. The other six use a different call shape
+   and were not read.
+
+   Constructed by: Sprite_Ctor 0x0043e7e0, eleven bytes that zero the
+   two image pointers and return this. Ghidra type applied: YES, with
+   the eight accessors collected into a GhidraClass named MR_Sprite so
+   the __thiscall this parameter types correctly. Belongs to:
+   menu/bitmap.cpp.
+
+   The 2D drawable the menu is built out of. Every menu page composes
+   its screen from these: it loads one from a .BMP or a .LEZ, places
+   it, optionally starts a timed move, and lets the per-frame pump
+   animate it. Sprite_UpdateMove is called from 61 sites and
+   Sprite_StartMove from 57, almost all of them MenuPageNN_Enter and
+   MenuPageNN_Tick, which makes this the busiest object on the menu
+   path.
+
+   THE HEADLINE FACT IS IN SECTION 5. Sprite_Draw writes 16-bit pixels
+   straight into the frame buffer. The 2D menu layer does not queue a
+   primitive, does not touch the span buffer, and never enters the
+   rasterizer.
+
+Table of Contents
+
+   1. Fields
+   2. The move animation
+   3. Kind 4 is a wave effect
+   4. Applying the type
+   5. Sprite_Draw, and what it means for the port
+   6. Accessors
+   7. What bounds the layout
+   8. Open questions
+
+
+1.  Fields
+
+   Offsets are bytes; the index column is the 4-byte index the
+   decompiled code used before the type was applied.
+
+   +--------+-------+-----------+---------------+------------+
+   | Offset | Index | Type      | Name          | Confidence |
+   +========+=======+===========+===============+============+
+   | 0x00   |   0   | int       | x             | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x04   |   1   | int       | y             | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x08   |   2   | int       | width         | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x0c   |   3   | int       | height        | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x10   |   4   | int       | moveActive    | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x14   |   5   | int       | kind          | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x18   |   6   | uint      | waveOffsetX   | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x1c   |   7   | uint      | waveOffsetY   | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x20   |   8   | int       | waveOutA      | inferred   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x24   |   9   | int       | waveOutB      | inferred   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x28   |  10   | DWORD     | waveStartMs   | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x2c   |  11   | void *    | bitmap        | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x30   |  12   | void *    | lezImage      | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x34   |  13   | uint      | lezFileSize   | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x38   |  14   | int       | waveArgA      | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x3c   |  15   | int       | bitmapAlign   | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x40   |  16   | int       | waveArgB      | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x44   |  17   | int       | originX       | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x48   |  18   | int       | originY       | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x4c   |  19   | int       | deltaX        | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x50   |  20   | int       | deltaY        | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x54   |  21   | uint      | startMs       | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x58   |  22   | int       | durationMs    | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x5c   |  23   | uint      | endMs         | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x60   |  24   | int       | easingMode    | verified   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x64   |  25   | uint      | wavePhase0    | inferred   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x68   |  26   | uint      | wavePhase1    | inferred   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x6c   |  27   | uint      | wavePhase2    | inferred   |
+   +--------+-------+-----------+---------------+------------+
+   | 0x70   |  28   | uint      | wavePhase3    | inferred   |
+   +--------+-------+-----------+---------------+------------+
+
+   EVERY FIELD OF THE 29 IS NOW IDENTIFIED. The last two fell out of
+   reading the image formats:
+
+   o 0x34 holds the size of the compressed .LEZ file. Lez_LoadFile
+     stores it immediately after reading the file. See
+     docs/formats/lez.txt section 4.
+
+   o 0x3c holds 0x10, the ALIGNMENT used for the decoded bitmap. Both
+     Lez_Decode and Bitmap_LoadFile hand-align that buffer to 16 bytes
+     - allocate size + 0x13, round up, stash the real pointer in the
+     dword before it - and both write the alignment they used into this
+     field. Nothing reads it back, so it looks like bookkeeping for a
+     free path that ended up recovering the pointer from -4 instead.
+
+   Evidence for the named fields:
+
+   o x, y, width, height. Sprite_StartMove centres the sprite with
+     (0x280 - width) / 2, which is (640 - w) / 2, so index 2 is a
+     width in pixels and 640 is the design resolution. The
+     centre-on-point mode subtracts width/2 and height/2, which fixes
+     index 3 as height and confirms indices 0 and 1 as the top-left
+     corner rather than a centre. Sprite_Draw uses all four as a blit
+     rectangle, which is independent confirmation.
+
+   o moveActive. Set to 1 by Sprite_StartMove, cleared by
+     Sprite_UpdateMove when the clock passes endMs, and tested at the
+     top of Sprite_UpdateMove. Menu_Tick also clears it on every
+     non-null entry of g_menuObjects when a page changes, which is how
+     a page change cancels every animation in flight.
+
+   o kind. Sprite_LoadFromFile stores its third argument here, and
+     Sprite_UpdateMove and Sprite_Draw both special-case the value 4.
+     Three functions agreeing on the same constant for the same field
+     is what makes it verified.
+
+   o bitmap and lezImage. Sprite_LoadFromFile writes one and zeroes
+     the other, chosen on the file extension. Sprite_Ctor zeroes
+     exactly these two offsets and nothing else. Section 5 refines what
+     they hold: lezImage is the compressed source, bitmap is the
+     DECODED 16bpp buffer, produced on first draw rather than at load.
+
+
+2.  The move animation
+
+   Three functions and eight fields implement a complete tweening
+   system, and it is the only animation the 2D menu has [verified].
+
+   Sprite_StartMove(this, target, durationSEC, easingMode, anchorMode):
+
+       startMs    = timeGetTime()
+       durationMs = (int)(durationSec * 1000.0)
+       endMs      = startMs + durationMs
+       anchor 1 -> target.x = (640 - width) / 2        centre in X
+       anchor 2 -> target -= (width/2, height/2)       centre on point
+       deltaX     = target.x - x
+       deltaY     = target.y - y
+       originX    = x
+       originY    = y
+       moveActive = 1
+       easingMode = easingMode
+
+   Sprite_UpdateMove(this, ...), per frame:
+
+       t = min(timeGetTime(), endMs)
+       u = (t - startMs) / durationMs
+       easingMode 0:  e = u                              linear
+       easingMode 1:  e = (sin(u*PI - PI/2) + 1) * 0.5   sine ease
+       x = originX + deltaX * e
+       y = originY + deltaY * e
+       if (t == endMs) moveActive = 0
+
+   o THE DURATION ARGUMENT IS IN SECONDS. An earlier revision of this
+     note read it as milliseconds, which was wrong: the function takes
+     a FLOAT and multiplies by the double 1000.0 at 0x004d07d0 before
+     converting to an integer. Its callers push 0.7f and 1.0f -
+     MenuPage03_MainMenu_Tick uses 0.7, MenuPage05_ModeSelect_Enter
+     uses 1.0. Reading it as milliseconds makes every menu animation a
+     thousand times too fast, which looks like nothing moving at all
+     rather than like a units bug.
+
+   o THE EASING IS A REMAPPED SINE, NOT A BARE ONE. The same earlier
+     revision gave the factor as sin(u*PI - PI/2), which runs -1 to +1
+     and would start the sprite a whole delta BEFORE its origin. The
+     four constants the x87 code actually uses are pi at 0x004d07a8,
+     pi/2 at 0x004d07d8, 1.0 at 0x004d07e0 and 0.5 at 0x004d07e8, and
+     they compose as
+
+         e = (sin(u*PI - PI/2) + 1) * 0.5
+
+     which maps u in 0..1 onto e in 0..1 with zero slope at both ends -
+     symmetric ease-in-ease-out [verified from the disassembly].
+
+   o A reimplementation that substitutes smoothstep will be close but
+     not equal. Measured, the two agree at 0, 0.5 and 1 and diverge
+     most at the quarter points, where the sine ease reads 0.1464
+     against smoothstep's 0.1562 - a difference of about one per cent
+     of the total travel.
+
+   o THE CLAMP IS THE TERMINATION CONDITION. t is clamped to endMs and
+     the flag is cleared by comparing t to endMs, not by comparing u to
+     1.0, so the last frame lands exactly on the target with no
+     floating-point residue.
+
+   o TIME IS timeGetTime, the winmm millisecond clock, not the frame
+     counter. Menu animation is wall-clock paced and independent of
+     frame rate.
+
+2.1.  How the two errors above got in
+
+   Both came from reading the decompiled C without checking the
+   disassembly. Ghidra renders the FP work as bare __ftol() calls with
+   the arithmetic hoisted out of view, so the multiply by 1000.0 and
+   the +1, *0.5 remap were simply not in the text being read - and
+   neither absence looks like an absence.
+
+   The constants were the tell. Any easing expression built from
+   literals at four separate addresses is worth reading those four
+   addresses before writing the formula down.
+
+
+3.  Kind 4 is a wave effect
+
+   Kind 4 has its own update and its own draw, and neither is the
+   tweening system above [verified]:
+
+       Sprite_UpdateMove  kind 4 -> maybe_Sprite_UpdateWave 0x0043f840
+       Sprite_Draw        kind 4 -> maybe_Sprite_DrawWave   0x0043f0f0
+
+   maybe_Sprite_UpdateWave latches waveStartMs from timeGetTime on
+   first call, accumulates its two arguments into waveOffsetX and
+   waveOffsetY and masks them to 0x7f, then evaluates four cosines -
+   one per wavePhase - and masks each phase to 0x7ff. waveOutA and
+   waveOutB take __ftol of two of the cosine terms.
+
+   Masks of 0x7f and 0x7ff on a scrolling offset, four independent
+   cosine phases, and a latched start time LOOK like a scrolling
+   sinusoidal distortion - a flag ripple or a plasma.
+
+   THAT INFERENCE IS WRONG, and section 8 has the reason. The draw
+   half has since been read in full: it is a plain tiled scroll with
+   no per-pixel displacement, and it reads NONE of the cosine
+   outputs. Whatever wavePhase0..3, waveOutA and waveOutB drive, it
+   is not what reaches the screen through Sprite_DrawWave. [verified]
+
+   o THE LESSON IS ABOUT INFERRING A CONSUMER FROM A PRODUCER. Four
+     cosines and a phase mask are strong evidence that something
+     sinusoidal is computed. They are no evidence at all about what
+     reads the result, and the only function that could have been
+     checked was the one described as "not read".
+
+
+4.  Applying the type
+
+   Worth recording because the obvious route does not work.
+
+   Setting the type of a __thiscall this parameter directly fails:
+
+       Parameter.setDataType(...)
+       -> InvalidInputException: Auto-parameter may not be modified
+
+   Ghidra generates that parameter from the calling convention, so it
+   cannot be edited as a parameter. Changing the convention to
+   __fastcall would make it editable but would be WRONG here - under
+   __fastcall the second argument is assigned EDX, and these functions
+   pass everything after this on the stack.
+
+   The route that works is the one Ghidra intends. Create a GhidraClass
+   whose name matches the structure, and move the methods into it:
+
+       GhidraClass cls = symbolTable.createClass(global, "MR_Sprite", ...);
+       function.setParentNamespace(cls);
+
+   Ghidra then resolves the auto this to MR_Sprite * by name. All eight
+   accessors took it, and the decompiled bodies went from param_1[0x15]
+   to this->startMs with no further work.
+
+   This supersedes an earlier note that a
+   __thiscall this "cannot be retyped via the API". It cannot be
+   retyped as a parameter; it can be typed through the class.
+
+
+5.  Sprite_Draw, and what it means for the port
+
+   Sprite_Draw at 0x0043ede0 is the entire 2D menu blitter, and it
+   writes u16 pixels directly into g_frameBuffer, stepping by
+   g_frameStridePx [verified]. It queues nothing. The 2D menu layer
+   bypasses the renderer completely.
+
+   o LAZY DECODE. If bitmap is null it calls Lez_Decode(this) and
+     caches the result. So a .LEZ is decompressed on first draw, not
+     at load.
+
+   o REVEAL AND SHRINK. Two arguments are percentages, clamped to
+     0..100. reveal skips the top ((100 - p) * height) / 100 rows;
+     shrink removes (p * width) / 100 from the width. Together they are
+     the menu's grow-and-slide reveal.
+
+   o FOUR DRAW MODES, selected by an argument; the value 5 means "use
+     this->kind" instead:
+
+       +------+---------------------------------------------------+
+       | Mode | Inner loop                                        |
+       +======+===================================================+
+       |  0   | opaque copy, four bytes at a time                 |
+       +------+---------------------------------------------------+
+       |  1   | colour-keyed copy, texel 0 is transparent         |
+       +------+---------------------------------------------------+
+       |  2   | STIPPLED opaque - every other pixel, start column |
+       |      | alternating each row: 50% screen-door             |
+       +------+---------------------------------------------------+
+       |  3   | stippled and colour-keyed                         |
+       +------+---------------------------------------------------+
+
+   o CLIPPING is against g_clipWidth and g_clipHeight, applied by
+     adjusting the source pointer and the run length before the loop
+     rather than per pixel.
+
+   FOR THE PORT, three consequences:
+
+   o THIS IS A 16-BIT DEPENDENCY OUTSIDE screen3d\. Every pixel is a
+     u16 and every stride is doubled. subsystems/pixel-format.txt
+     catalogues the rasterizer's depth assumptions; this one is in
+     menu/bitmap.cpp and is not in that catalogue.
+
+   o MODES 2 AND 3 ARE A STIPPLE, NOT A BLEND. Replacing them with
+     real alpha changes the look. Reproducing them faithfully needs the
+     parity of the destination row, because the start column
+     alternates.
+
+   o THERE ARE TWO SEPARATE 2D PATHS IN THIS GAME, and they do not
+     share code. This one writes pixels. The other,
+     Screen3D_QueueScreenQuad at 0x00485e50, builds a screen-space quad
+     and submits it through Screen3D_QueuePrimitive - that is what
+     maybe_Cdd_DrawSurface and maybe_Screen3D_FadeRect use. A port
+     needs both, and needs to know which callers use which.
+
+
+6.  Accessors
+
+   All eight are in the GhidraClass MR_Sprite.
+
+   +---------------------------+------------+-------------------------+
+   | Function                  | Address    | Note                    |
+   +===========================+============+=========================+
+   | Sprite_Ctor               | 0x0043e7e0 | zeroes the two image    |
+   |                           |            | pointers, returns this  |
+   +---------------------------+------------+-------------------------+
+   | Sprite_LoadFromFile       | 0x0043e7f0 | .LEZ or .TGA by         |
+   |                           |            | extension; fatal if     |
+   |                           |            | missing                 |
+   +---------------------------+------------+-------------------------+
+   | Sprite_Load               | 0x0043e8e0 | loads from the sprite   |
+   |                           |            | manifest; see 6.1       |
+   +---------------------------+------------+-------------------------+
+   | Sprite_Draw               | 0x0043ede0 | section 5               |
+   +---------------------------+------------+-------------------------+
+   | Sprite_DrawWave           | 0x0043f0f0 | kind 4 draw, READ - a   |
+   |                           |            | tiled scroll, section 8 |
+   +---------------------------+------------+-------------------------+
+   | maybe_Sprite_UpdateWave   | 0x0043f840 | kind 4 update           |
+   +---------------------------+------------+-------------------------+
+   | Sprite_StartMove          | 0x0043f9a0 | 57 callers              |
+   +---------------------------+------------+-------------------------+
+   | Sprite_SetPosition        | 0x0043fa40 | also called from        |
+   |                           |            | Menu_HitTest            |
+   +---------------------------+------------+-------------------------+
+   | Sprite_UpdateMove         | 0x0043fab0 | 61 callers              |
+   +---------------------------+------------+-------------------------+
+   | Bitmap_LoadFile           | 0x0043e280 | added later: its this   |
+   |                           |            | is the sprite           |
+   +---------------------------+------------+-------------------------+
+   | Lez_LoadFile              | 0x0043e700 | added later: its this   |
+   |                           |            | is the sprite           |
+   +---------------------------+------------+-------------------------+
+
+   Lez_Decode at 0x0043eb00 is __fastcall with an explicit argument
+   rather than an auto this, so it takes MR_Sprite * directly without
+   needing the class. Sprite_Draw calls it as Lez_Decode(this).
+
+   THE TWO LOADERS WERE NOT OBVIOUS. Their names describe the file
+   format, so they read as free functions on a path; in fact both are
+   sprite methods. Sprite_LoadFromFile calls one or the other and
+   stores the result into this->bitmap or this->lezImage, which is
+   what identifies the receiver.
+
+   Sprite_LoadFromFile chooses its loader by comparing the extension
+   from __splitpath against a literal, and calls Cdd_FatalError with
+   either "LEZ file '%s' not found." or "BITMAP file '%s' not found."
+   if the load returns null. So a missing menu asset is fatal, not
+   degraded - worth knowing when a port first runs with an incomplete
+   asset tree.
+
+   THE NON-.LEZ BRANCH IS A TARGA LOADER, not a Windows BMP one, and
+   no .TGA file ships. See docs/formats/tga.txt.
+
+6.1.  Sprite_Load and the sprite manifest
+
+   Sprite_Load (0x0043e8e0) is the other entry point, and it does not
+   take a path at all - it takes an INDEX into a table at 0x0053a8dc
+   with a stride of 0x10 [verified]:
+
+       +0x00  int    if zero, the path prefix is "data\menu\bitmap\";
+                     otherwise the localised directory for g_language,
+                     from the table of pointers at 0x004e8b60
+       +0x04  char * the file name
+       +0x08  int    the sprite kind
+
+   So a sprite is named by number, and whether it is localised is a
+   property of the entry rather than of the caller. When a localised
+   file fails to open, the loader retries with the US directory - the
+   fallback is per file, not per language.
+
+   THAT TABLE WAS ALREADY WALKED, and this note should have said so.
+   docs/subsystems/menu-resources.txt has had all 209 records, their
+   names and the record layout since before this struct was written;
+   only the meaning of the three flags was open, and section 5 there
+   now answers them. The kind field is f3, and it is what makes section
+   3's kinds concrete: exactly four resources carry kind 4, and all
+   four are 128x128, which is the size Lez_Decode's kind-4 branch
+   expects.
+
+
+7.  What bounds the layout
+
+   o UPPER BOUND 0x74, from operator new. Twenty-nine independent
+     construction sites agree on it.
+
+   o Every named field is written or read at a fixed constant index off
+     the object pointer by at least one of the accessors, and the type
+     now applies cleanly across all eight of them with no field
+     straddling a boundary.
+
+   o g_menuObjects at 0x00504880 runs to g_screenModeCopy at
+     0x00504bc4 - 0x344 bytes, 209 pointer slots. Menu_Tick walks the
+     whole span and clears +0x10 on every non-null entry, which both
+     confirms moveActive's offset and gives the menu's sprite budget.
+
+
+8.  Open questions
+
+   o RESOLVED - maybe_Sprite_DrawWave at 0x0043f0f0, the kind 4 draw.
+     It has an MMX path and a plain one; the plain one is short and
+     they agree.
+
+         src = pixels + ((offY + dy) & 0x7f) * 256 + (offX & 0x7f)
+         five copies of 128 pixels at x = 0, 128, 256, 384, 512
+         repeated for 480 rows, straight into the framebuffer
+
+     Five 128s is 640 exactly, which is why the count is hardcoded
+     rather than derived from the width. The draw is opaque and
+     covers the frame, so it stands in for the clear.
+
+     o AND IT ANSWERS SECTION 3 IN THE NEGATIVE. The four cosine
+       phases wavePhase0..3, and the waveOutA / waveOutB the update
+       derives from them, are READ BY NOTHING. The draw uses only
+       waveOffsetX and waveOffsetY. So a kind-4 background is a plain
+       two-axis scroll with no distortion at all, and the "wave"
+       fields are vestigial on the only path that draws them.
+
+       That is worth stating plainly because the field names promise
+       an effect the code does not produce, and the next reader will
+       otherwise go looking for where the wobble is applied.
+
+   o Sprite_Load at 0x0043e8e0, the other loader, and how it differs
+     from Sprite_LoadFromFile.
+
+   o RESOLVED - the kind enumeration. The manifest carries a kind per
+     resource and uses every value 0 to 4, with 4 confined to the four
+     128x128 wave sprites. Kinds 0..3 are the four blit modes. See
+     subsystems/menu-resources.txt section 5.3.
+
+   o Whether the six construction sites that do not push 0x74 build
+     this same object. Three of them push 0x43e170, an address rather
+     than a size, so they are a different call shape and may be a
+     derived class.
+
+   o The .LEZ format itself. Lez_LoadFile, Lez_Decode and the
+     compressed layout are unread; see docs/formats/ for where it would
+     belong.
+
+   o WHO USES reveal AND shrink. Section 5 documents both arguments,
+     but the button layer always passes 100 and 0 - see
+     structs/MR_MenuButton.txt section 9.1 - so the callers that
+     animate them are somewhere else and have not been found.

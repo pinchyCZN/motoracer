@@ -1,0 +1,376 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                              MR_PRIMITIVE
+
+
+Abstract
+
+   Size: 0x40 = 64 bytes [verified] - the stride of the split-primitive
+   pool at 0x0062ebf0 and of the face arrays a mesh owns.
+
+   Ghidra type applied: yes, as MR_Primitive[2500] at 0x0062ebf0.
+
+   The face record. It is what a mesh stores on disk, what the transform
+   and cull stages pass around, what the queue links, and what both back
+   ends finally draw - the most-touched struct in the renderer. Every
+   byte is now accounted for.
+
+Table of Contents
+
+   1. Fields
+   2. Five slots, not four
+   3. Two kinds, and why
+   4. How each field was established
+   5. Open questions
+   6. How a primitive gets its colour
+      6.1. The 5-5-5 to 8-8-8 expansion
+      6.2. A dead store, and the search that missed it
+   7. The flags word
+      7.1. Bit 1 is a depth bias of +1024
+      7.2. Bit 2 is written and never read
+
+
+1.  Fields
+
+   +--------+------+------------+---------------+------------+-----------------------------+
+   | Offset | Size | Type       | Name          | Confidence | Notes                       |
+   +========+======+============+===============+============+=============================+
+   | +0x00  | 2    | ushort     | kind          | verified   | the AUTHORED primitive kind |
+   +--------+------+------------+---------------+------------+-----------------------------+
+   | +0x02  | 2    | ushort     | colorIndex    | verified   | 5-5-5, or a palette index   |
+   +--------+------+------------+---------------+------------+-----------------------------+
+   | +0x04  | 40   | float[10]  | uv            | verified   | FIVE (u,v) pairs, stride 8  |
+   +--------+------+------------+---------------+------------+-----------------------------+
+   | +0x2c  | 10   | ushort[5]  | vertexIndex   | verified   | FIVE indices; [4] is a wrap |
+   +--------+------+------------+---------------+------------+-----------------------------+
+   | +0x36  | 2    | ushort     | bankIndex     | verified   | texture bank, biased at load|
+   +--------+------+------------+---------------+------------+-----------------------------+
+   | +0x38  | 2    | ushort     | flags         | verified   | five bits used, see sect 7  |
+   +--------+------+------------+---------------+------------+-----------------------------+
+   | +0x3a  | 2    | ushort     | effectiveKind | verified   | the kind actually DRAWN     |
+   +--------+------+------------+---------------+------------+-----------------------------+
+   | +0x3c  | 4    | uint       | flatColor     | verified   | 0x3f is its alpha byte      |
+   +--------+------+------------+---------------+------------+-----------------------------+
+
+   No padding and no gaps. 0x04 + 5*8 = 0x2c, 0x2c + 5*2 = 0x36, and
+   0x36 + 2 + 2 + 2 + 4 = 0x40.
+
+
+2.  Five slots, not four
+
+   A face has at most four corners, so four (u,v) pairs and four indices
+   is the natural guess, and it was wrong. Both arrays hold FIVE, and
+   the fifth is a WRAP entry that repeats the first [verified].
+
+   The face constructors state it outright. FUN_00422be0, FUN_00422c80,
+   FUN_00422d20 and FUN_00422ed0 all open with the same inlined
+   construct-array over five elements:
+
+       LEA EBX,[ECX + 0x4]      ; base = this + 0x04
+       MOV EDI,0x4              ; five iterations, 4 down to 0
+     loop:
+       MOV ECX,EBX
+       ADD EBX,0x8              ; stride 8
+       CALL FUN_00403170        ; a no-op constructor
+       DEC EDI
+       JNS loop
+
+   Base +0x04, stride 8, count 5 - so the elements sit at +0x04, +0x0c,
+   +0x14, +0x1c and +0x24, the last ending at +0x2b where vertexIndex
+   begins. FUN_00403170 returns its argument and does nothing else, the
+   signature of a trivial C++ constructor for a POD pair.
+
+   The quad constructor then fills the wrap slots explicitly:
+
+       uv[8]          = uv[0];      uv[9]          = uv[1];
+       vertexIndex[4] = vertexIndex[0];
+
+   and the triangle constructors instead write vertexIndex[3] =
+   vertexIndex[0] and vertexIndex[4] = 0xffff.
+
+2.1.  What that corrects
+
+   An earlier reading of this record had uv as float[8], vertexIndex as
+   ushort[4], eight unexplained bytes at +0x24..+0x2b, and a separate
+   field called wQuadMarker at +0x34. All four of those were the same
+   mistake seen from different sides.
+
+   o The eight "unknown" bytes are uv[8] and uv[9].
+   o wQuadMarker is vertexIndex[4]. Every "is this a quad" test in the
+     engine reads it, and 0xffff means "no fourth edge" - the wrap slot
+     is unset, so the polygon does not close through a fourth vertex.
+
+   The reading was reasonable and still wrong: a value of 0xffff in a
+   field tested for -1 looks exactly like a marker, and it happens to
+   behave like one. Naming it after its use rather than its position
+   hid an array boundary.
+
+2.2.  Why a wrap slot at all
+
+   Storing the first corner again at the end lets edge-walking code run
+   i and i+1 to the end of the array without a modulo or a special last
+   case. That was inferred here before any reader was found. A reader
+   has now been found, and it does exactly that [verified].
+
+   Screen3D_WirePolygon (0x0049a300) walks vertexIndex[i] and
+   vertexIndex[i+1] for 2 + (vertexIndex[4] != 0xffff) edges, running
+   off the end into the wrap entry to close the polygon.
+
+   The catch is that it sits on the DEAD WIREFRAME ROUTE, so the
+   only code that reads the
+   wrap slot as a coordinate never executes in the shipped build. Every
+   face constructor still writes it, and the value is still what the
+   quad test reads, so a port that keeps the layout must keep writing
+   it.
+
+
+3.  Two kinds, and why
+
+   kind at +0x00 is what the artist or loader asked for. effectiveKind
+   at +0x3a is what actually gets drawn, and the two differ whenever
+   detail reduction fires [verified]:
+
+       prim->effectiveKind = reverseIndex[modified feature bits];
+
+   Screen3D_QueuePrimitive writes it; Screen3D_DispatchPrimitive and
+   D3D_DrawScene both read +0x3a and never +0x00. The whole
+   level-of-detail system is this one substitution - see
+   subsystems/detail-levels.txt.
+
+   o Screen3D_MakeTriangle copies the EFFECTIVE kind into BOTH fields
+     of a split triangle, so a triangle produced by a split carries the
+     reduced kind as though it had been authored that way. A port must
+     not "restore" the original kind there.
+
+
+4.  How each field was established
+
+   +---------------+-----------------------------------------------------------+
+   | Field         | Evidence                                                  |
+   +===============+===========================================================+
+   | uv            | Load3dfAndMap's flat-colour test compares                 |
+   |               | +0x04/+0x0c/+0x14 against each other and                  |
+   |               | +0x08/+0x10/+0x18 against each other, which only works if |
+   |               | the pairs interleave. Screen3D_MakeTriangle reads src +   |
+   |               | 0x04 + slot*8 and + 0x08 + slot*8, agreeing from a second |
+   |               | direction. The count of five comes from the constructors. |
+   +---------------+-----------------------------------------------------------+
+   | vertexIndex   | D3D_DrawScene walks ushorts from +0x2c; the constructors  |
+   |               | write five and set [4]                                    |
+   +---------------+-----------------------------------------------------------+
+   | bankIndex     | indexes MR_Bank at stride 0x338 in D3D_DrawScene and      |
+   |               | every software setup function                             |
+   +---------------+-----------------------------------------------------------+
+   | flags         | bit 0 drives the transparency re-sort in Load3dfAndMap,   |
+   |               | bit 3 is the detail-level-2 opt-out, bit 4 selects a line |
+   |               | over a triangle in D3D_DrawScene                          |
+   +---------------+-----------------------------------------------------------+
+   | effectiveKind | written by Screen3D_QueuePrimitive, read by both back     |
+   |               | ends                                                      |
+   +---------------+-----------------------------------------------------------+
+   | flatColor     | D3D_DrawScene stamps alpha 0x80 into +0x3f for the        |
+   |               | blended kinds; see subsystems/d3d-render-state.txt        |
+   |               | section 3.2                                               |
+   +---------------+-----------------------------------------------------------+
+
+
+5.  Open questions
+
+   o RESOLVED for vertexIndex[4] - Screen3D_WirePolygon reads it as a
+     coordinate, on the dead wireframe route. See section 2.2.
+
+   o uv[8..9] HAS A WRITER, found later: Screen3D_QueueScreenQuad
+     (0x00485e50) fills uv[0..7] from its caller and then writes
+     uv[8] = uv[0] and uv[9] = uv[1] - the fifth pair mirroring the
+     first, exactly as vertexIndex[4] mirrors vertexIndex[0]. That is
+     a second, independent producer treating both fifth slots as wrap
+     entries [verified]. A READER of uv[8..9] is still not found.
+
+   o RESOLVED - the expansion is a dead store. See section 6.2.
+
+   o flags bits 5 to 15. Section 7 shows nothing tests them, but only
+     the mesh loader's writers were traced; a HUD or effect producer
+     could set one.
+
+   o Which of colorIndex and flatColor a given KIND samples. Section 6
+     establishes what each field holds and who writes it, but not
+     which of the seventy kinds reads which - that lives in the span
+     fillers and the D3D emit path.
+
+
+6.  How a primitive gets its colour
+
+   The record carries two colours and they are not alternatives - one
+   is the 16-bit source and the other the 32-bit form the hardware path
+   wants [verified]:
+
+   +--------+------------+--------------------------------------------+
+   | Field  | Width      | What it holds                              |
+   +========+============+============================================+
+   | +0x02  | ushort     | colorIndex - either a 5-5-5 colour or an   |
+   |        |            | index into the bank's palette              |
+   +--------+------------+--------------------------------------------+
+   | +0x3c  | uint       | flatColor - 8-8-8 with an alpha byte at    |
+   |        |            | +0x3f                                      |
+   +--------+------------+--------------------------------------------+
+
+   Who writes flatColor, by producer:
+
+   +----------------------------+---------------------------------------+
+   | Producer                   | flatColor                             |
+   +============================+=======================================+
+   | FUN_00422be0 (tri, no UVs) | expand555(colorIndex)                 |
+   +----------------------------+---------------------------------------+
+   | FUN_00422ed0 (tri, UVs)    | 0xffffffff                            |
+   +----------------------------+---------------------------------------+
+   | FUN_00422d20 (quad, UVs)   | 0xffffffff                            |
+   +----------------------------+---------------------------------------+
+   | Screen3D_MakeTriangle      | copied from the source                |
+   +----------------------------+---------------------------------------+
+
+   So an UNTEXTURED face derives its 32-bit colour from its 16-bit one
+   at construction, and a TEXTURED face sets flatColor to opaque white
+   and lets the texel supply the colour. That is consistent with
+   D3D_DrawScene, which stamps alpha 0x80 into +0x3f for the blended
+   kinds - it is modifying a colour that is otherwise white.
+
+   The other consumer is the paletted path. D3D_DrawScene, when the
+   primitive is paletted and colorIndex is below 0x100, ignores
+   flatColor entirely and builds a 32-bit colour by reading
+   palette[colorIndex] and expanding it through the six adaptive
+   mask/shift globals. See subsystems/renderer.txt section 3.4.1.
+
+6.1.  The 5-5-5 to 8-8-8 expansion
+
+   The expansion appears in two places with identical arithmetic
+   [verified]:
+
+       (((c & 0x7c0) >> 6) << 8 | (c >> 11) << 16 | (c & 0x1f)) << 3
+
+   Read it as r<<19 | g<<11 | b<<3: each 5-bit channel is placed at the
+   TOP of its 8-bit field, which is the usual 5-to-8 widening without a
+   replicate of the low bits. So the darkest non-zero value of a
+   channel is 8, not 1, and pure white comes out 0xf8f8f8 rather than
+   0xffffff.
+
+   o A port that widens 5-bit channels by replication - the usual
+     (v << 3) | (v >> 2) - will produce slightly brighter flat colours
+     than the original on untextured geometry. The difference is at
+     most 7 of 255 per channel, but it is systematic.
+
+6.2.  A dead store, and the search that missed it
+
+   Screen3D_MakeTriangle computes the expansion and then throws it
+   away [verified from the disassembly]:
+
+       00499523  MOV [EAX + 0x3c], EDI     ; expand555(colorIndex)
+       ...straight line, no branch...
+       00499585  ADD EAX, 0x40             ; advance to the next record
+       00499588  MOV EDX, [EDX + 0x3c]     ; src->flatColor
+       0049958d  MOV [EAX + -0x4], EDX     ; same address as the first
+
+   [EAX-4] after ADD EAX,0x40 is [EAX_original + 0x3c]. The expansion
+   is overwritten unconditionally, so it is genuinely dead - a leftover
+   from when the copy presumably rebuilt the colour rather than
+   inheriting it.
+
+   o THE METHODOLOGY NOTE MATTERS MORE THAN THE FINDING. This note
+     twice declined to call the store dead, because an instruction
+     search for operands containing 0x3c returned exactly one store.
+     That search was wrong: the winning store is spelled [EAX + -0x4]
+     and contains no 0x3c to match. An offset search cannot see the
+     advance-the-pointer-then-index-backwards idiom, which MSVC emits
+     freely at the end of a fill loop. Before concluding that a field
+     is written once, check whether the base pointer is bumped
+     anywhere in the function.
+
+
+7.  The flags word
+
+   A search of all 239,429 instructions for tests against +0x38 returns
+   eleven sites and no more, so the readers are fully enumerated
+   [verified]:
+
+   +-----+--------------------------------+---------------------------+
+   | Bit | Meaning                        | Read by                   |
+   +=====+================================+===========================+
+   | 0   | member of the second-pass      | Load3dfAndMap x3,         |
+   |     | group - see below              | FUN_00422280,             |
+   |     |                                | Screen3D_CullAndQueueFaces|
+   +-----+--------------------------------+---------------------------+
+   | 1   | DEPTH BIAS of +1024.0          | FUN_0049b7f0 only         |
+   +-----+--------------------------------+---------------------------+
+   | 2   | nothing - written always,      | NOTHING                   |
+   |     | never tested                   |                           |
+   +-----+--------------------------------+---------------------------+
+   | 3   | opt out of detail reduction    | Screen3D_QueuePrimitive   |
+   |     | at detail level 2              | only                      |
+   +-----+--------------------------------+---------------------------+
+   | 4   | a LINE, not a triangle         | D3D_DrawScene x4          |
+   +-----+--------------------------------+---------------------------+
+
+   The writers are the .map loader, and mesh-3df-map.txt section 5's
+   higher flag bits map onto these one for one [verified]:
+
+       .map 0x020000  ->  flags bit 0   (and sets objectFlags bit 0)
+       .map 0x400000  ->  flags bit 1
+       (unconditional) ->  flags bit 2
+       .map 0x100000  ->  flags bit 3
+
+   Bit 4 is not set by the mesh loader at all - a line primitive comes
+   from somewhere else.
+
+   Bit 0's use is the clearest. Load3dfAndMap partitions the face array
+   in place so that bit-0 faces move to the front, counts them into
+   flaggedFaceCount, and sets objectFlags bit 0 if any exist. Then
+   Screen3D_CullAndQueueFaces skips a face outright when bit 0 is set
+   AND its kind is 0x0d. So bit 0 marks a face as belonging to a
+   grouped second pass, and one kind within that group is suppressed.
+
+7.1.  Bit 1 is a depth bias of +1024
+
+   The single reader chooses between two depth keys [verified]:
+
+       if (prim->flags & 2)  depth = vertex->camZ + 1024.0f;
+       else                  depth = vertex->camZ;
+
+   The constant at 0x004d1f94 is 0x44800000, which is 1024.0f exactly.
+   Since Screen3D_QueuePrimitive turns the depth into a bucket with
+   __ftol clamped to 0..0x1f3e, that is a shift of a thousand buckets
+   toward the far end of the sort.
+
+   Both walk orders agree on what it looks like. Under the painter's
+   back-to-front walk the primitive is drawn EARLIER, so nearer
+   geometry paints over it; under the default span-buffer front-to-back
+   walk it is reached LATER, so nearer geometry has already claimed the
+   pixels. Either way it renders BEHIND things it would otherwise
+   contest.
+
+   o NO SHIPPED MESH SETS IT. The writer is the .map loader and the
+     map bit is 0x400000, and that bit is clear in all 10,330 face
+     records of all 124 paired .map files - counted by
+     tools/map_kinds.py. So the mechanism is real, fully documented at
+     both ends, and unused by the game's own geometry. Either a
+     non-mesh producer sets it, or it is a feature the level tools
+     could emit and the artists never did.
+
+   o It is a coarse "push to the background" flag, not a decal nudge.
+     1024 is enormous next to a per-object depth range; a z-fighting
+     fix would be a fraction of a bucket.
+
+   o A port with a real depth buffer cannot express this as a bias. The
+     faithful translation is to keep the ordering: draw bit-1
+     primitives in an earlier pass, or offset them in the sort key the
+     same way, rather than adding 1024 to a z value.
+
+7.2.  Bit 2 is written and never read
+
+   Load3dfAndMap sets bit 2 on every face it builds, unconditionally
+   and on both of its paths. Nothing in the image tests it - the
+   eleven-site census above is exhaustive [verified].
+
+   So it is dead state. Either the consumer was removed before ship, or
+   it is a marker kept for a tool that reads the runtime face array. A
+   port can drop it, but should not repurpose the bit without checking
+   whether anything writes the face records back out.

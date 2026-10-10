@@ -1,0 +1,340 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                             MR_DISPLAYMODE
+
+
+Abstract
+
+   Size: 0x24 = 36 bytes [verified] - the stride of every walk over the
+   table, and the multiplier in the callback that writes it.
+
+   Table: g_displayModes at 0x005d8950, 50 entries of 0x24. Count in
+   g_displayModeCount at 0x004ee984. Ghidra type applied: yes, as
+   MR_DisplayMode[50].
+
+   One enumerated display mode. This is the table the whole display-mode
+   decision is made from, and it is where both of the hard display
+   restrictions - 16 bits per pixel, and no resolution above 640x480 -
+   are actually imposed.
+
+Table of Contents
+
+   1. Fields
+   2. Why the layout is certain
+   3. sizeClass is the ScreenMode setting
+   4. Readers
+   5. Stepping the table
+      5.1. What the callers do with the result
+      5.2. Two routes, and only one uses this table
+   6. Open questions
+
+1.  Fields
+
+   +--------+-------+-----------+------------+---------------------------------------+
+   | Offset | Type  | Name      | Confidence | Notes                                 |
+   +========+=======+===========+============+=======================================+
+   | 0x00   | void* | name      | verified   | ctor/dtor per element; likely CString |
+   +--------+-------+-----------+------------+---------------------------------------+
+   | 0x04   | uint  | rMask     | verified   | ddpfPixelFormat.dwRBitMask            |
+   +--------+-------+-----------+------------+---------------------------------------+
+   | 0x08   | uint  | gMask     | verified   | ddpfPixelFormat.dwGBitMask            |
+   +--------+-------+-----------+------------+---------------------------------------+
+   | 0x0c   | uint  | bMask     | verified   | ddpfPixelFormat.dwBBitMask            |
+   +--------+-------+-----------+------------+---------------------------------------+
+   | 0x10   | int   | width     | verified   | dwWidth                               |
+   +--------+-------+-----------+------------+---------------------------------------+
+   | 0x14   | int   | height    | verified   | dwHeight                              |
+   +--------+-------+-----------+------------+---------------------------------------+
+   | 0x18   | int   | bpp       | verified   | always 16                             |
+   +--------+-------+-----------+------------+---------------------------------------+
+   | 0x1c   | int   | pixels    | verified   | width * height                        |
+   +--------+-------+-----------+------------+---------------------------------------+
+   | 0x20   | int   | sizeClass | verified   | 0, 1 or 2 - the ScreenMode            |
+   +--------+-------+-----------+------------+---------------------------------------+
+
+   Every field is sourced from the DDSURFACEDESC the callback receives,
+   except pixels and sizeClass which it computes.
+
+2.  Why the layout is certain
+
+   The layout is taken from the single writer rather than assembled from
+   readers, which is what makes it complete rather than merely
+   consistent. Cdd_EnumModesCallback at 0x00477160 assigns eight of the
+   nine dwords in one basic block, so the field set is closed
+   [verified].
+
+   It was then confirmed a second way. The Ghidra database already
+   carried a partial DDSURFACEDESC - correct to offset 0x14, then eighty
+   bytes of filler. Filling that filler in with the real DirectDraw
+   layout and applying it to the callback parameter made every source
+   offset resolve to a named field, and all eight matched what had been
+   read from the raw offsets:
+
+   +------------+-------------------------------+
+   | Raw offset | Resolved field                |
+   +============+===============================+
+   | +0x04      | dwFlags                       |
+   +------------+-------------------------------+
+   | +0x08      | dwHeight                      |
+   +------------+-------------------------------+
+   | +0x0c      | dwWidth                       |
+   +------------+-------------------------------+
+   | +0x4c      | ddpfPixelFormat.dwFlags       |
+   +------------+-------------------------------+
+   | +0x54      | ddpfPixelFormat.dwRGBBitCount |
+   +------------+-------------------------------+
+   | +0x58      | ddpfPixelFormat.dwRBitMask    |
+   +------------+-------------------------------+
+   | +0x5c      | ddpfPixelFormat.dwGBitMask    |
+   +------------+-------------------------------+
+   | +0x60      | ddpfPixelFormat.dwBBitMask    |
+   +------------+-------------------------------+
+
+   DDCOLORKEY and DDPIXELFORMAT were created to do this and
+   DDSURFACEDESC now has no filler. That is a shared type, so the
+   improvement lands on every DirectDraw function in the project, not
+   only this one.
+
+   Note the width and height ordering. The callback reads dwWidth from
+   desc +0x0c into record +0x0c, and dwHeight from desc +0x08 into
+   record +0x10, so the record puts width before height while
+   DDSURFACEDESC puts height before width. An earlier draft of
+   subsystems/dd-init.txt had the record layout wrong partly on this
+   point; it has been corrected.
+
+3.  sizeClass is the ScreenMode setting
+
+   The last computed field is a small integer derived from the pixel
+   count [verified]:
+
+       if (pixels <  0x30000)       sizeClass = 0;
+       else if (pixels == 0x30000)  sizeClass = 1;
+       else                         sizeClass = 2;
+
+   0x30000 is 196608, which is 512 x 384 exactly. Against the three
+   supported resolutions the classes fall out as:
+
+   +---------+--------+---------+------------+-----------+
+   | Mode    | Pixels | Hex     | vs 0x30000 | sizeClass |
+   +=========+========+=========+============+===========+
+   | 320x240 | 76800  | 0x12c00 | below      | 0         |
+   +---------+--------+---------+------------+-----------+
+   | 512x384 | 196608 | 0x30000 | equal      | 1         |
+   +---------+--------+---------+------------+-----------+
+   | 640x480 | 307200 | 0x4b000 | above      | 2         |
+   +---------+--------+---------+------------+-----------+
+
+   So sizeClass is g_cfgScreenMode, computed here from the dimensions of
+   the mode itself. That is an independent confirmation - from the
+   DirectDraw enumeration path, which has nothing to do with fonts or
+   menus - that screen mode 2 is 640x480 and not 320x240. An earlier
+   reading had that backwards; see structs/MR_Font.txt section 5
+   [verified].
+
+4.  Readers
+
+   +------------+-----------------------------+--------------------------------+
+   | Address    | Function                    | Uses                           |
+   +============+=============================+================================+
+   | 0x00477160 | Cdd_EnumModesCallback       | writes every field             |
+   +------------+-----------------------------+--------------------------------+
+   | 0x004741a0 | Cdd_EnumVideoModes          | width, height                  |
+   +------------+-----------------------------+--------------------------------+
+   | 0x00474ca0 | Cdd_IsMode16Available       | width, height, bpp             |
+   +------------+-----------------------------+--------------------------------+
+   | 0x00474cf0 | Cdd_FindModeByPixels        | pixels; w,h on the wrap path   |
+   +------------+-----------------------------+--------------------------------+
+   | 0x004592a0 | maybe_Screen3D_UpdateScreen | width, height, sizeClass       |
+   +------------+-----------------------------+--------------------------------+
+   | 0x004599e0 | Cdd_WriteDdInfo             | width, height, for DdInfos.tmp |
+   +------------+-----------------------------+--------------------------------+
+   | 0x0043c2b0 | FUN_0043c2b0                | rMask, width, height           |
+   +------------+-----------------------------+--------------------------------+
+   | 0x0047ec50 | maybe_Game_ApplyModeRequest | bpp, w, h, pixels, sizeClass   |
+   +------------+-----------------------------+--------------------------------+
+   | 0x00443bc0 | MenuPage11_Options_Tick     | pixels, sizeClass              |
+   +------------+-----------------------------+--------------------------------+
+   | 0x004447d0 | caseD_9                     | pixels, sizeClass              |
+   +------------+-----------------------------+--------------------------------+
+
+   The table is read far more widely than the DirectDraw layer.
+   MenuPage11_Options_Tick and caseD_9 read it directly, which is how
+   the options page offers a resolution list: it is showing the
+   surviving entries of this table [inferred].
+
+5.  Stepping the table
+
+   Cdd_FindModeByPixels at 0x00474cf0 is how the table is navigated. It
+   searches by PIXEL COUNT rather than by dimensions, which is why the
+   pixels field exists at all, and returns an index or -1 [verified].
+
+   +-----+-------------------------------------------+----------------------------+
+   | dir | Returns                                   | If nothing qualifies       |
+   +=====+===========================================+============================+
+   | 0   | the entry whose pixels match exactly      | -1                         |
+   +-----+-------------------------------------------+----------------------------+
+   | 1   | the fewest-pixel entry ABOVE the argument | wraps to the smallest mode |
+   +-----+-------------------------------------------+----------------------------+
+   | -1  | the most-pixel entry BELOW the argument   | wraps to the largest mode  |
+   +-----+-------------------------------------------+----------------------------+
+
+   The two stepping directions wrap rather than stopping at the end of
+   the list. When a scan finds nothing the target is reset past the far
+   end of the range and the scan repeats, so the answer comes back from
+   the opposite end:
+
+       dir -1 exhausted:  pixels = largest.width * largest.height + 1
+       dir  1 exhausted:  pixels = smallest.width * smallest.height - 1
+
+   That is the sole purpose of g_smallestModeIndex (0x004ee97c) and
+   g_largestModeIndex (0x004ee980). Both are written only by
+   Cdd_EnumVideoModes and read only here [verified].
+
+   The multiplication in those two lines recomputes what the pixels
+   field of the same record already holds. It is redundant, not a
+   different quantity - which answers an open question left by an
+   earlier reading of this function.
+
+   HANG. Both wrapping branches loop until they find something, and
+   neither has an attempt counter. With g_displayModeCount == 0 no scan
+   can ever succeed, the reset reads record 0 of an empty table, and the
+   function spins forever. dir 0 is safe; it returns -1. No caller
+   checks the count first [verified].
+
+   That matters because an empty table is exactly what the 16-bit filter
+   produces on hardware that reports no 16 bpp modes. It is the second
+   such hang found on this path, after the 640x480 retry loop in
+   Screen3D_SetViewport - see subsystems/rasterizer-pipeline.txt section
+   11.
+
+   Every call site loads g_pCd3d (0x00624afc) into ECX and the function
+   ends RET 0x8, so it is a __thiscall method taking two stack
+   arguments. The body never touches this. Its address neighbourhood is
+   Cdd, so the class attribution is unresolved and the Cdd_ prefix
+   follows the neighbours [inferred].
+
+5.1.  What the callers do with the result
+
+   Six call sites, and the argument pattern is identical at all of them:
+   push the direction, push g_screenPixelCount, load g_pCd3d into ECX
+   [verified].
+
+   +-------------------------+----------+----------------------------+
+   | Caller                  | dir      | Role                       |
+   +=========================+==========+============================+
+   | FUN_00431250            | -1 and 1 | a previous/next pair       |
+   +-------------------------+----------+----------------------------+
+   | MenuPage11_Options_Tick | 0 and 1  | current, then step up      |
+   +-------------------------+----------+----------------------------+
+   | caseD_9                 | 1        | step up                    |
+   +-------------------------+----------+----------------------------+
+   | FUN_004592a0            | 0 twice  | look up a fixed resolution |
+   +-------------------------+----------+----------------------------+
+
+   The right-arrow path in MenuPage11_Options_Tick shows the whole idiom
+   in nine instructions at 0x00443b78. It steps up, then takes BOTH of
+   the derived fields straight out of the chosen record -
+   g_screenPixelCount from +0x18 and the screen mode from +0x1c
+   [verified]:
+
+       MOV ESI,[ECX + ECX*8 + 0x5d896c]    ; record[idx].pixels
+       MOV [0x004dc0cc],ESI                ; -> g_screenPixelCount
+       MOV ECX,[EDX + 0x5d8970]            ; record[idx].sizeClass
+
+   So the options page does not compute a resolution. It picks a record
+   and copies two fields out of it, and the second of them becomes the
+   screen mode. That is the strongest evidence that sizeClass IS
+   g_cfgScreenMode rather than merely agreeing with it [verified].
+
+   The same nine instructions are a retry loop with two back edges, both
+   returning to the load at 0x00443b78: one when g_fullscreenResolved is
+   zero, one when the stepper returns -1. Nothing inside the loop can
+   change either condition, so if g_fullscreenResolved is clear on entry
+   the menu tick spins [verified]. The second edge is unreachable in
+   practice, since for dir 1 the stepper either succeeds or hangs
+   internally and never returns -1.
+
+5.2.  Two routes, and only one uses this table
+
+   The F2 and F3 hotkeys in Input_OnKeyDown are the resolution control
+   outside the menus, and reading them exposes something the options
+   page hides: the table is consulted in fullscreen only [verified].
+
+       case VK_F2:                      /* and VK_F3, mirrored */
+           if (g_fullscreenResolved) {
+               idx = Cdd_FindModeByPixels(g_pCd3d,
+                                          g_screenPixelCount, -1);
+               if (idx != -1) {
+                   g_videoSettingsDirty = 1;
+                   g_displayModeIndex   = idx;
+                   g_screenPixelCount   = modes[idx].pixels;
+                   g_cfgScreenMode      = modes[idx].sizeClass;
+                   return idx;
+               }
+               return g_fullscreenResolved;   /* always taken */
+           }
+           /* windowed: a hardcoded three-entry cycle */
+           if (--g_cfgScreenMode < 0) g_cfgScreenMode = 2;
+           g_screenPixelCount = 0x12c00 / 0x30000 / 0x4b000;
+
+   Both arms inside the fullscreen branch return, so the code below it
+   is reached only when g_fullscreenResolved is zero. That gives two
+   entirely separate resolution mechanisms:
+
+   +----------------+------------------------------+---------------------------+
+   |                | Fullscreen                   | Windowed                  |
+   +================+==============================+===========================+
+   | Source         | g_displayModes               | three hardcoded constants |
+   +----------------+------------------------------+---------------------------+
+   | Choices        | whatever survived the filter | always exactly three      |
+   +----------------+------------------------------+---------------------------+
+   | Order          | by pixel count, wrapping     | mode index, wrapping      |
+   +----------------+------------------------------+---------------------------+
+   | Sets mode from | record sizeClass             | the index it just cycled  |
+   +----------------+------------------------------+---------------------------+
+
+   So in windowed mode the game never touches the enumerated table,
+   never asks DirectDraw what the adapter supports, and cycles 320x240,
+   512x384, 640x480 unconditionally. The 16-bit filter and the 640x480
+   ceiling are both irrelevant on that path, because nothing on it reads
+   their output.
+
+   That is worth recording for the modernization work. The windowed
+   resolution path is already independent of DirectDraw mode
+   enumeration, so it is the one that survives removing the enumeration
+   entirely [inferred].
+
+   It is also a fourth independent confirmation of the ScreenMode
+   numbering, since the windowed cycle pairs mode 0 with 0x12c00, 1 with
+   0x30000 and 2 with 0x4b000 in a plain if-chain.
+
+   Note the dead test. Inside the fullscreen branch the code checks
+   g_fullscreenResolved a second time, having just branched on it, so
+   that arm always returns. Combined with the fact that
+   Cdd_FindModeByPixels never returns -1 for a stepping direction - it
+   hangs instead, see section 5 - neither of the two escape paths in
+   this case can ever be taken [verified].
+
+6.  Open questions
+
+   o The dword at +0x20 has no writer and no reader. It rounds the
+     record to nine dwords, so it may be nothing more than that, but
+     0x24 is not a natural alignment and 0x20 would have been. More
+     likely a field that was removed [guess].
+
+   Taken with the masks above, 16 of the record's 36 bytes are dead:
+   three write-only masks and one dword touched by nothing. Only width,
+   height, bpp, pixels and sizeClass are ever read [verified].
+
+   o RESOLVED, negatively. rMask, gMask and bMask have NO reader
+     anywhere. A raw byte scan finds exactly one occurrence of each
+     address in the whole image, and all three are the write in
+     Cdd_EnumModesCallback. Both functions previously suspected of
+     reading them have since been read and neither does: 0x0047ec50 is
+     maybe_Game_ApplyModeRequest and 0x0043c2b0 is
+     maybe_Menu_ShowModePicker, and both use only bpp, width and height.
+
+   o RESOLVED. It is a cyclic stepper, and the multiplication sits in
+     its wrap-around path where it recomputes what the pixels field
+     already holds. See section 5.

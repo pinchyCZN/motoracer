@@ -1,0 +1,131 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                    DEVICE CREATION AND VIDEO MEMORY
+
+
+Abstract
+
+   How the DirectDraw device is obtained, and what the engine asks it
+   about video memory. Two functions, one of which names itself.
+
+   +-------------------------------+------------+
+   | Item                          | Address    |
+   +===============================+============+
+   | Cdd_CreateDD                  | 0x00475150 |
+   +-------------------------------+------------+
+   | maybe_Cdd_EnumDevicesCallback | 0x00475020 |
+   +-------------------------------+------------+
+   | maybe_Cdd_CheckVideoMemory    | 0x004759c0 |
+   +-------------------------------+------------+
+   | Cdd_GetGlobalAvailableMem     | 0x00475900 |
+   +-------------------------------+------------+
+
+Table of Contents
+
+   1. Two ways to get a device
+   2. Where IDirectDraw2 comes from
+   3. The video memory check
+   4. What this means for the port
+   5. Open questions
+
+1.  Two ways to get a device
+
+   Cdd_CreateDD is named from its own error string, "Fatal error in
+   Cdd_createDD". It takes one of two paths [verified]:
+
+   +--------------------------------------+------------------------+---------------------------+
+   | Condition                            | Path                   | Sets                      |
+   +======================================+========================+===========================+
+   | !DAT_004dc1a0 and g_use3DHardware    | DirectDrawEnumerateA   | g_ddUsingEnumeratedDevice |
+   +--------------------------------------+------------------------+---------------------------+
+   | otherwise, or enumeration found none | DirectDrawCreate(NULL) | g_ddUsingDefaultDevice    |
+   +--------------------------------------+------------------------+---------------------------+
+
+   The enumerated path passes maybe_Cdd_EnumDevicesCallback with
+   &g_pDirectDraw as its context, so the callback writes the chosen
+   adapter straight into the global. That is how a secondary 3D card - a
+   3Dfx or PowerVR board - gets selected over the primary display.
+
+   On any failure the function reports through Cdd_ReportError and
+   releases both pointers, leaving them null.
+
+2.  Where IDirectDraw2 comes from
+
+   subsystems/dd-chain.txt asked whether there is a second IDirectDraw2
+   pointer and where the QueryInterface is. Both answers are here
+   [verified]:
+
+       DirectDrawCreate(NULL, &g_pDirectDraw, NULL)
+       g_pDirectDraw->QueryInterface(IID_IDirectDraw2,
+                                     &g_pDirectDraw2)
+       g_pDirectDraw2->GetAvailableVidMem(caps 0x40, ...)
+
+   The third call is a probe: its only purpose is to confirm the DX2
+   interface actually works before Cdd_CreateDD reports success.
+
+   Worth noting for the port: this happens on the DEFAULT-DEVICE PATH
+   ONLY. When an adapter is found by enumeration, g_pDirectDraw2 is
+   never assigned in this function. Anything that depends on the DX2
+   interface therefore depends on which path ran - and
+   maybe_Cdd_CheckVideoMemory calls GetAvailableVidMem through
+   g_pDirectDraw2 unconditionally.
+
+3.  The video memory check
+
+   maybe_Cdd_CheckVideoMemory measures video memory twice, by surface
+   class [verified]:
+
+   +-----------+-------------------------+--------------+
+   | Probe     | DDSCAPS bit             | Result       |
+   +===========+=========================+==============+
+   | textures  | 0x1000 DDSCAPS_TEXTURE  | DAT_004ee98c |
+   +-----------+-------------------------+--------------+
+   | z buffers | 0x20000 DDSCAPS_ZBUFFER | DAT_004ee994 |
+   +-----------+-------------------------+--------------+
+
+   It then derives a total and a free figure and applies a consistency
+   test - free plus texture should equal total. Two globals,
+   DAT_004dc188 and DAT_004dc18c, override the measured values when they
+   are not -1, which is the shape of a command-line switch for forcing
+   the VRAM figures [inferred].
+
+   When the test fails it formats one of the two reports at 0x004eec34
+   and 0x004eece4 - the video-memory accounting that
+   subsystems/renderer.txt lists among the diagnostics - appends
+   "INCORRECT VRAM PARAMETERS", adds "ONLY PRIMARY DISPLAY" when
+   DAT_004dc1a0 is set, and shows it with Cdd_MessageBoxF. It returns
+   true only when the figures agree.
+
+4.  What this means for the port
+
+   o Device selection collapses. D3D9 enumerates adapters through one
+     API and there is no separate secondary-3D-card case, so both paths
+     become a single CreateDevice and the two g_ddUsing... flags go
+     away.
+
+   o The IDirectDraw2 QueryInterface disappears with it. The DX2
+     interface exists in this code only to reach GetAvailableVidMem.
+
+   o GetAvailableVidMem has no reliable D3D9 equivalent, and modern
+     drivers do not report memory the way this check assumes. The
+     consistency test would fail or be meaningless. Drop the check
+     rather than port it - but keep the OVERRIDES, since something
+     downstream reads the resulting figures to size its texture budget.
+
+5.  Open questions
+
+   o What reads DAT_004ee98c, DAT_004ee990, DAT_004ee994 and
+     DAT_004ee998 afterwards. That is the texture budget, and it decides
+     how much the engine tries to upload.
+
+   o maybe_Cdd_EnumDevicesCallback's body has not been read. It calls
+     vtable +0x2c and +0x08, so it tests each adapter and releases the
+     ones it rejects, but the acceptance test is unknown.
+
+   o DAT_004dc1a0 forces the default device and adds "ONLY PRIMARY
+     DISPLAY" to the diagnostic. It looks like a command-line switch and
+     should be findable in the flag documentation at 0x004dc664.
+
+   o Cdd_GetGlobalAvailableMem at 0x00475900 is named but unread, and is
+     a third caller in this area.

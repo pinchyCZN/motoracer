@@ -1,0 +1,393 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          THE IN-RACE MAP
+
+
+Abstract
+
+   The track outline drawn over the race, with every rider on it as
+   a triangle.  Five modes on a cycling hotkey: two placements times
+   two orientations, plus off.
+
+   Hud_DrawMap (0x0040f2d0), __fastcall, ECX is a map object global
+   at 0x0052c108.  Called once a frame from maybe_Game_RenderFrame
+   at 0x004802aa.
+
+   NOT IMPLEMENTED IN THE PORT.  This note is the design, read out
+   of the binary and off a running MOTO.
+
+Table of Contents
+
+   1. It is generated from the track
+      1.1. Lines or quads, by device
+      1.2. Centring and scale
+   2. The five modes
+   3. Placement, and the two kinds of widescreen
+   4. Colours
+   5. The rider triangles
+   6. The map object
+      6.1. Two traps this port walked into
+   7. What a port needs
+   8. Open questions
+
+1.  It is generated from the track
+
+   Trk_BuildMap (0x0040ed10) builds it at load, from Trk_Load.  The
+   outline is a SIMPLIFIED COPY OF THE SEGMENT ARRAY, flattened to
+   y = 0, baked to map scale and stored as a mesh inside the track
+   object.  Nothing is loaded from a file.
+
+   o MAP.LEZ AND SMALLMAP.LEZ ARE NOT THIS.  Both ship in every
+     ILEnn.BKF and both are LEZ images; the only reader found is
+     MenuPage08_NetRaceLobby_Tick, which builds its name with the
+     format "%ssmallmap.lez" at 0x004e9590.  The manifest keys
+     FileMap and FileSmallMap - LEVEL.BPT fields 6 and 10, read live
+     as "Map.raw" and "Map1.raw" - belong to something else. [open]
+
+1.1.  Lines or quads, by device
+
+   The counts and the geometry both depend on whether the device can
+   draw lines [verified]:
+
+       lines = g_rendererReady && g_rendererMode == 0
+               && D3DDevice[g_devIndex].nDoesLines
+
+       primCount = segmentCount / 4          197 for ile01's 788
+       vertCount = lines ? primCount/2 + 1   99
+                         : primCount*2 + 2   396
+
+   THE LINE PATH takes one vertex every EIGHT segments - the walk
+   steps 0x7e0 and a segment is 0xfc - using the segment's own
+   origin with y flattened by copying +8 over +4 and zeroing +8.
+   The first vertex is repeated at the end to close the loop.  Its
+   faces are Face_InitTriangle(0, black, i, i+1, i): TWO DISTINCT
+   INDICES, a degenerate triangle used as a line, with 0x10 then
+   stored at the primitive's +0x38 to select the line kind.
+
+   THE QUAD PATH takes one quad every FOUR segments, stepping 0x3f0,
+   using the segment's left and right edge offsets scaled by
+   [0x004d0314] and [0x004d0318] - so without hardware lines the map
+   becomes a RIBBON WITH WIDTH rather than an outline.
+
+   o SO "IS IT LINES OR A BITMAP" HAS A THIRD ANSWER: it is lines
+     where the device supports them and quads where it does not, and
+     the vertex count differs by a factor of four between the two.
+
+1.2.  Centring and scale
+
+       origin (+0x98..+0xa0) = Mesh_CenterOnBounds of the outline
+       scale  (+0x114)       = [0x004d031c] / track[0x20]
+       Mesh_Scale(outline, scale, scale, scale)
+
+   BOTH TERMS READ LIVE off a running MOTO on ile01:
+
+       track[0x20]   57470.5       +0x80 of the track object
+       scale         0.022274      +0x114
+       origin        -9542.8, 25552.2, 0
+
+   so [0x004d031c] is exactly 1280.0 and track[0x20] is the
+   flattened outline's bounding-CIRCLE radius [verified]:
+
+       track[0x20] = sqrt(dx*dx + dy*dy) / 2
+
+   over the bounding box of the 99 outline vertices.  Measured
+   scale-free off MOTO's own baked vertices, whose bounding-box
+   half-diagonal comes back 1280.000 exactly - so 1280.0 is a target
+   RADIUS, not a target extent.
+
+   THE RADIUS AND NOT THE LONGER SIDE, because the map ROTATES in
+   three of its five modes and so has to fit its circumscribed circle
+   at every angle.  Dividing by the longer axis instead leaves ile01
+   at 0.01432 against retail's 0.022274 - a map 64 per cent of the
+   right size.
+
+   The outline is baked at map scale, so the draw only transforms
+   it.  The rider triangles are built in world units each frame and
+   scaled by that same +0x114 at draw time.
+
+2.  The five modes
+
+   Input_OnKeyDown cycles the mode at 0x004321d7:
+
+       g_cfgMapMode = (g_cfgMapMode + 1) % 5
+
+   FIVE, not four - mode 4 is OFF, an early return that only parks
+   the placement and leaves.  The other four are two independent
+   choices, each tested separately [verified]:
+
+   +------+---------------------------+------------------------+
+   | Mode | Orientation               | Placement              |
+   +======+===========================+========================+
+   | 0    | ROTATES to the racer's    | corner                 |
+   |      | yaw - rider points north  |                        |
+   +------+---------------------------+------------------------+
+   | 1    | rotates                   | centred                |
+   +------+---------------------------+------------------------+
+   | 2    | fixed - riders move       | corner                 |
+   +------+---------------------------+------------------------+
+   | 3    | fixed                     | centred                |
+   +------+---------------------------+------------------------+
+   | 4    | off                       |                        |
+   +------+---------------------------+------------------------+
+
+   The rotating modes build the matrix from
+   Matrix34_YawOf(racer + 0x2d4) through g_cosTable; the fixed ones
+   use a constant one.
+
+   g_cfgMapMode is 0x004dbdac, loaded from the ini key "MapMode"
+   (0x004e7f98) by Settings_LoadAll and written back by
+   Settings_SaveAll.
+
+3.  Placement, and the two kinds of widescreen
+
+   Three floats - two offsets and a zoom - chosen by placement
+   [verified]:
+
+   +-----------+-------------------+-------------------+
+   | Placement | 4:3               | cropped 16:9      |
+   +===========+===================+===================+
+   | corner    | -2000, -1200,     | -2000, -500,      |
+   |           | 4000              | 4000              |
+   +-----------+-------------------+-------------------+
+   | centred   | 0, 0, 2000        | 0, 0, 2500        |
+   +-----------+-------------------+-------------------+
+
+   o THE SECOND COLUMN IS FOR A SHORTER FRAME, NOT A WIDER ONE,
+     and a port that reads it as "widescreen" will place the map
+     wrongly.  g_viewWidescreen (0x00625728) is a FLAG, written by
+     Screen3D_SetViewport from its own argument at 0x00499bc0 -
+     not an aspect test.  The shipped 16:9 is a CROP, height times
+     3/4 with the width untouched, so for retail "widescreen" and
+     "shorter" are the same thing and both readings agree.
+
+     Both corrections undo a loss of HEIGHT: -500 lifts the corner
+     map back off a bottom edge that moved up, and 2500 shrinks the
+     centred one to fit.  Neither has anything to do with width.
+
+   o A FRAME THAT GROWS SIDEWAYS NEEDS THE OTHER CORRECTION, and
+     the original has none because it has no such mode.  The map
+     is a camera-space point projected with a lens that does not
+     depend on the resolution, so its offset from the centre is a
+     fixed pixel count while the centre moves with the frame:
+     widen the frame and the corner map slides inward by half the
+     extra width.  The port subtracts it back,
+
+         dx = -(W - 640)/2 * z / lens
+
+     which is zero at 640, so 4:3 and the cropped mode keep the
+     original's numbers exactly.  The centred map needs no such
+     term - x = 0 projects to the centre at any width.  See
+     hud_map_widen_dx in src/hud.c.
+
+   o THE PLACEMENT IS LERPED, NOT SNAPPED.  Each component eases
+     toward its target by [0x004d0338] every frame, so changing mode
+     slides the map across rather than cutting.
+
+4.  Colours
+
+   Packed with Color_Pack16, five bits a channel [verified]:
+
+   +----------------------+-----------------------------------+
+   | What                 | Colour                            |
+   +======================+===================================+
+   | outline, first prim  | 0x1f,0x1f,0x1f  white             |
+   +----------------------+-----------------------------------+
+   | outline, corner      | 8,8,8                             |
+   +----------------------+-----------------------------------+
+   | outline, centred     | 0x10,0x10,0x10                    |
+   +----------------------+-----------------------------------+
+   | other racers         | 0x1f,8,8 or 0x1f,0,0, alternating |
+   |                      | on bit 1 of the racer index       |
+   +----------------------+-----------------------------------+
+   | the viewed racer     | 0x1f,0x1f,0  YELLOW               |
+   +----------------------+-----------------------------------+
+
+   o THE CENTRED MAP IS A BRIGHTER GREY AND A DIFFERENT PRIMITIVE
+     FLAG - 0x18 against the corner map's 0x10 - which is what makes
+     the large map read as translucent grey rather than as a black
+     outline.
+
+   o THE VIEWED RACER IS DRAWN LAST and after Prim_SetKind(0), so it
+     is on top of the field and in a different primitive kind.
+
+   o THE FIRST OUTLINE PRIMITIVE IS WHITE BECAUSE IT IS THE START
+     LINE.  The outline is walked from segment 0, so primitive 0 is
+     the piece across the start, and retail shows a light grey
+     segment there [observed].  Not an artefact of setting the
+     colour inside the loop, which is how it read from the code
+     alone.
+
+5.  The rider triangles
+
+   THEY ARE ARROWHEADS, NOT EQUILATERAL, and that is what makes a
+   rider's FACING readable off the map.  Each is built in the
+   racer's OWN rotated frame from a matrix off his yaw, with the
+   three corners at [verified, 0x0040f858]:
+
+       corner 0   pos - size * (R + F)      rear, one side
+       corner 1   pos + size * 2.0 * F      the NOSE
+       corner 2   pos + size * (R - F)      rear, other side
+
+   where 2.0 is [0x004d02d8].  So the triangle is three sizes long
+   and two wide, pointing the way the rider is going.
+
+   o AN AXIS-ALIGNED TRIANGLE THROWS THAT AWAY and makes every
+     rider look like he is heading north, which is exactly how it
+     looks next to retail.
+
+
+   THE MESH IS FIXED AT 25 TRIANGLES, built once by Trk_BuildMap:
+
+       +0xd4 = 0x4b   75 vertices,   new(900)   = 75 * 12
+       +0xd0 = 0x19   25 primitives, new(0x640) = 25 * 64
+       Face_InitTriangle(0, Color_Pack16(0x1f,0,0), i*3, i*3+1,
+                         i*3+2)
+
+   one per racer with a red default, so the field is capped at 25 on
+   the map whatever the racer count is.  Hud_DrawMap overrides the
+   colour per racer and rewrites the three vertices every frame.
+
+   Three vertices per racer, written into the object at +0xa8, 0x24
+   bytes a racer.  Each is built from the racer's world position
+   with the object's +0x98..+0xa0 origin subtracted and +0x114
+   applied as a scale, then offset by a half-size:
+
+       50.0 normally, 30.0 in the two CENTRED modes (1 and 3)
+
+   so the triangles are smaller on the large map, not larger.
+
+6.  The map object
+
+   A global at 0x0052c108.  Fields used by the draw [verified]:
+
+   +--------+--------------------------------------------------+
+   | Offset | What                                             |
+   +========+==================================================+
+   | +0x28  | outline primitives                               |
+   +--------+--------------------------------------------------+
+   | +0x2c  | outline vertices                                 |
+   +--------+--------------------------------------------------+
+   | +0x54  | primitive count, 197 for ile01                   |
+   +--------+--------------------------------------------------+
+   | +0x58  | vertex count, 99 for ile01                       |
+   +--------+--------------------------------------------------+
+   | +0x98  | origin x, subtracted from every rider            |
+   +--------+--------------------------------------------------+
+   | +0x9c  | origin y                                         |
+   +--------+--------------------------------------------------+
+   | +0xa0  | origin z                                         |
+   +--------+--------------------------------------------------+
+   | +0xa4  | rider primitives                                 |
+   +--------+--------------------------------------------------+
+   | +0xa8  | rider vertices                                   |
+   +--------+--------------------------------------------------+
+   | +0xd4  | rider vertex count                               |
+   +--------+--------------------------------------------------+
+   | +0x80  | outline bounding-circle radius, the divisor      |
+   +--------+--------------------------------------------------+
+   | +0x114 | world-to-map scale                               |
+   +--------+--------------------------------------------------+
+
+   +0x04 reads 788 and +0x10 reads 197 for ile01 - the track's
+   segment count and the map's primitive count - so the object knows
+   about both, and whatever builds it has not been found. [open]
+
+6.1.  Two traps this port walked into
+
+   Both were silent - no error, no counter, nothing on screen - and
+   both cost a build each to find.
+
+   o THE MAP MUST BE QUEUED BEFORE THE DRAIN.  race_draw_3d ends
+     with queue_walk(drawscene_dispatch), which EMPTIES the queue,
+     so anything queued after it is never dispatched.  It is not
+     dropped either: it queues, the queue counters show it, nothing
+     reports a rejection, and the next frame's queue_reset wipes it.
+     The original puts Hud_DrawMap between the scene and the flush
+     at 0x004802aa for exactly this reason.
+
+     THE TELL is drawscene's s_lines sitting at 0 while s_tris runs
+     into the millions.  Nothing calls drawscene_begin, so those
+     counters are cumulative for the process - which makes them a
+     good "has this EVER drawn" probe.
+
+   o THE LINE FLAG GOES ON THE PRIMITIVE, NOT THE FACE.
+     prim_build_from_mesh derives a primitive's flags from its .map
+     data and gives a mesh without one PRIM_FLAG_WRITTEN_ONLY, so a
+     flag set on MESH_FACE is discarded.  A line primitive that
+     loses its flag draws as a triangle with two identical corners -
+     zero area, invisible.  The original stamps 0x10 at the
+     primitive's +0x38 AFTER Face_InitTriangle, which is the same
+     order.
+
+   o THE MAP HAS TO BEAT THE DEPTH TEST, and the original's answer
+     does not port.  It pins every map vertex's invZ to 1.0 - the
+     nearest value there is - whenever the z-buffer is on
+     (0x0040f6a0), and queues the map with the rest of the scene.
+
+     OUR fill_vertex SUBMITS camZ AS THE DEPTH and keeps invZ only
+     so the record is whole, so the map was tested at its placement
+     z of 4000 and lost to the road, which is a few hundred units
+     away and fills the bottom of the screen.  The half that
+     survived was whatever cleared the horizon; in the corner mode
+     the map moves down into the road entirely and vanishes.
+
+     camZ CANNOT SIMPLY BE MOVED NEARER, because it is also the
+     projection divisor - the map would shrink and slide forward as
+     it came.
+
+     MR_Vertex DOES HAVE AN invZ - it is not a missing field.  What
+     changed is WHO PROJECTS.  The original submitted pre-transformed
+     screen-space vertices, so invZ was the rhw D3D compared and
+     pinning it set the depth directly.  This port submits CAMERA
+     SPACE and lets the renderer project, so invZ is carried "only
+     so the record is whole" and feeds nothing.
+
+     AND THE DEPTH TEST IS SET PER PRIMITIVE, in
+     drawscene_dispatch - so turning it off around a queue_walk does
+     not work either: the first primitive puts it straight back.
+     The port adds drawscene_set_depth_test for a pass to say
+     otherwise, and the map gets its own queue pass with it clear.
+     Same intent as pinning invZ, one level up.
+
+   o AND THE COLOUR LIVES IN flatColor.  drawscene_dispatch reads
+     prim->flatColor, an 0x00RRGGBB word, and never colorIndex - so
+     a colour written to colorIndex is ignored and the primitive
+     draws with whatever flatColor holds, which for a hand-built
+     mesh is zero.  Black, on a dark track.
+
+7.  What a port needs
+
+   The builder is now known and it needs nothing this port does not
+   already have: the segment array, Mesh_Init/Mesh_Scale and
+   Mesh_CenterOnBounds, and Face_InitTriangle/Face_InitQuad.  What
+   remains is
+
+   o Trk_BuildMap itself, called from the track load;
+   o Screen3D_TransformVertsFlat's flat-transform path;
+   o a MapMode setting and its cycling hotkey.
+
+   THE LINE PATH IS THE ONE TO BUILD FIRST.  It is the simpler
+   geometry and it is what a hardware device takes; the quad path
+   only matters for a back end that cannot draw lines, which this
+   port's rasteriser can.
+
+   The rider triangles, the colours and the placement are all
+   arithmetic on data the port already holds.
+
+8.  Open questions
+
+   o WHAT FileMap AND FileSmallMap ARE FOR.  The manifest names them
+     "Map.raw" and "Map1.raw" and the archives hold MAP.LEZ and
+     SMALLMAP.LEZ; the only LEZ reader found is the network lobby's
+     preview, and the in-race map does not touch any of them.
+
+   o THE FOURTH ARGUMENT to Screen3D_TransformVertsFlat is a SHADE,
+     0x10 for the corner map and 0x18 for the centred one - so the
+     large map is lighter for two reasons at once, the shade and the
+     colour index.
+
+   o WHICH KEY cycles the mode.  Input_OnKeyDown's dispatch has not
+     been walked back to a virtual-key code.
+
+   o WHAT THE WHITE FIRST PRIMITIVE IS.

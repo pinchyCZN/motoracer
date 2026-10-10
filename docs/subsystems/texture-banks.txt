@@ -1,0 +1,1206 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            TEXTURE BANKS
+
+
+Abstract
+
+   The bank is the unit of texture storage in MotoRacer, managed by
+   screen3d\bankw.Cpp. It is a C++ class with a constructor and
+   destructor, held in a static array of forty-six, and every textured
+   face in the game names one by index.
+
+   This note establishes the array base, stride and count from the
+   static constructor rather than from field offsets seen at call
+   sites, and reconstructs the record. MR_Bank is applied in the DB.
+
+   +----------------------+------------+
+   | Item                 | Address    |
+   +======================+============+
+   | the bank array       | 0x004f92f8 |
+   +----------------------+------------+
+   | Bankw_StaticCtor     | 0x00401000 |
+   +----------------------+------------+
+   | Bankw_BankCtor       | 0x00401bf0 |
+   +----------------------+------------+
+   | Bankw_LoadBank       | 0x00401d90 |
+   +----------------------+------------+
+   | Bankw_CreateBank     | 0x00401e40 |
+   +----------------------+------------+
+   | Bankw_LoadRawTexture | see below  |
+   +----------------------+------------+
+   | g_bankCount          | 0x004db1c0 |
+   +----------------------+------------+
+
+Table of Contents
+
+   1. The base, corrected
+   2. Forty-six banks, forty-five usable
+      2.1. Banks 0x19 and up are a dynamic pool
+   3. The record
+      3.1. What the constructor establishes
+      3.2. What creation establishes
+      3.3. The page is 256 x 256 x 2
+      3.4. The hardware page is a system-memory surface
+      3.5. Freeing, and what it proves
+      3.6. The record is fully accounted for: two MAX_PATH strings
+   4. Loading a bank
+      4.1. Every subPage is a palette, and there can be eight
+      4.2. The 256x256 mode-0 skip
+      4.2.2. RESOLVED against shipped data: it fires, on the Speed bikes
+      4.2.4. The software rasterizer DOES sample bnk1 - a real defect
+      4.3. Who loads banks, and the two bike banks
+      4.4. Two more calling conventions were wrong
+   5. What this means for the port
+      5.1. Two slot arrays: reserved and published
+      5.2. The flags word, decoded
+         5.2.1. Who sets 0x10, and the two switches both called
+         5.2.2. keyBlack is not a colour key, and its name reads
+                backwards
+         5.2.3. The measurement that had been read off the wrong
+                rectangle
+                "the key"
+      5.3. lastBoundSlot and the batch it invalidates
+      5.4. What the reconstruction keeps
+   6. Open questions
+
+
+1.  The base, corrected
+
+   formats/mesh-3df-map.txt section 6.1 gave the bank array base as
+   0x004f9300, inferred from three globals that are indexed with the
+   same stride. That is 8 bytes into the record [verified].
+
+   The true base is 0x004f92f8, and it comes from the static
+   constructor, which states base, element size and count in one call:
+
+       Bankw_StaticCtor:
+           _eh_vector_constructor_iterator_(
+               &DAT_004f92f8,      /* base  */
+               0x338,              /* size  */
+               0x2e,               /* count */
+               Bankw_BankCtor,
+               Bankw_BankDtor);
+           _atexit(Bankw_StaticDtor);
+
+   That is an MSVC static array construction, so the bank is a C++
+   class with a real constructor - not a POD table. Bankw_LoadBank
+   confirms the same base independently by passing
+   &DAT_004f92f8 + index * 0xce to a member function.
+
+   o The correction matters because 0x004f9300 is subPageCount, a field
+     that happens to be non-zero for paletted banks. Reading it as a
+     base makes every other offset 8 bytes too small. This is the same
+     error, in the same shape, as the device-caps record documented in
+     an earlier type note - a base guessed from field offsets
+     rather than taken from a base computation.
+
+   o The stride 0x338 is unaffected and remains confirmed four ways
+     now: Load3dfAndMap, maybe_Cdd_LoadRawToSurface,
+     maybe_D3D_UploadTexture, and this constructor.
+
+
+2.  Forty-six banks, forty-five usable
+
+   The array is constructed with 0x2e = 46 elements, but both
+   Bankw_LoadBank and Bankw_CreateBank refuse an index above 0x2c
+   [verified]:
+
+       if (0x2c < index) return -1;
+
+   So indices 0 to 0x2c are usable - forty-five banks - and the array
+   carries one spare. D3D_EmitTriangle applies the same 0x2c bound
+   before resolving a texture handle, and D3D_DrawScene rejects a bank
+   above 0x2d. Three slightly different bounds on the same array, none
+   of which overrun it.
+
+   g_bankCount at 0x004db1c0 is the next-free index. Both creation
+   paths return the OLD value and post-increment, so a bank index is
+   handed out in allocation order and never reused.
+
+
+2.1.  Banks 0x19 and up are a dynamic pool
+
+   Font_UploadAtlasToBank at 0x00496da0 claims a bank rather than
+   being given one, and how it does so splits the array in two
+   [verified]:
+
+       for (i = 0x19; i < 0x2d; i++)
+           if (bank[i].texSlot[0] == -1) { font->bankIndex = i; break; }
+
+   So banks 0x00 to 0x18 are statically assigned - loaded by name
+   through Bankw_LoadBank and kept - while 0x19 to 0x2c are a pool
+   handed out on demand, with texSlot[0] == -1 as the free marker. That
+   is twenty-five static and twenty dynamic, against the forty-five
+   usable of section 2.
+
+   o It also explains FUN_00401f90, which frees banks 0 through 0x13
+     and resets g_bankCount. That is a reset of part of the static
+     range, not of the whole array, so it leaves the dynamic pool
+     alone. Why it stops at 0x13 rather than 0x18 is still open.
+
+   o A PORTING HAZARD. If the scan finds no free bank it breaks out
+     without assigning anything, so font->bankIndex keeps whatever it
+     held before - it is NOT set to -1. Everything downstream then
+     writes into a bank that belongs to something else. A port should
+     decide deliberately whether to reproduce that or to fail cleanly.
+
+   The consumer of the free marker is texSlot[0], not a separate
+   in-use flag, which is why Bankw_FreeBank resetting texSlot to -1 is
+   what actually returns a bank to the pool.
+
+   field298[0] receives the D3D_AllocTextureSlot result in the same
+   function and is tested against -1 on failure, which settles that
+   field298 is a slot array like the two beside it. Its constructor
+   initialiser of 0 rather than -1 is inconsistent with texSlot and
+   paletteSlot and is not explained.
+
+
+3.  The record
+
+3.1.  What the constructor establishes
+
+   Bankw_BankCtor is the authority on the layout, because it names
+   every field the class treats as initial state [verified]:
+
+   +--------+------+---------------+-------------------------------------+
+   | Offset | Init | Field         | Notes                               |
+   +========+======+===============+=====================================+
+   | +0x008 | 0    | subPageCount  | COUNT of used palette entries, not  |
+   |        |      |               | a boolean - see section 3.5         |
+   +--------+------+---------------+-------------------------------------+
+   | +0x00c | 0    | palette[16]   | ALL sixteen are 256-entry 16-bit    |
+   |        |      |               | palettes - see section 4.1          |
+   +--------+------+---------------+-------------------------------------+
+   | +0x150 | ""   | assetPath     | second MAX_PATH string - the bank   |
+   |        |      |               | identity, see section 3.6           |
+   +--------+------+---------------+-------------------------------------+
+   | +0x254 | 0    | flags         | word; decoded in section 5.2        |
+   +--------+------+---------------+-------------------------------------+
+   | +0x256 | 0    | field256      | word                                |
+   +--------+------+---------------+-------------------------------------+
+   | +0x258 | -1   | texSlot[16]   | texture slot ids, -1 unallocated    |
+   +--------+------+---------------+-------------------------------------+
+   | +0x298 | 0    | allocSlot[16] | the RESERVED slot - section 5.1     |
+   +--------+------+---------------+-------------------------------------+
+   | +0x2d8 | -1   | formatId      | index into g_texFormats, stride 0x98|
+   +--------+------+---------------+-------------------------------------+
+   | +0x2dc | 0    | pSurface      | IDirectDrawSurface, hardware only   |
+   +--------+------+---------------+-------------------------------------+
+   | +0x2e0 | 0    | pSurface2     | IDirectDrawSurface2, hardware only  |
+   +--------+------+---------------+-------------------------------------+
+   | +0x2e4 | 0    | field2e4      |                                     |
+   +--------+------+---------------+-------------------------------------+
+   | +0x2e8 | -1   | paletteSlot[16]| palette slot ids, -1 unallocated;  |
+   |        |      |                | [0] assigned by UploadTexture      |
+   +--------+------+---------------+-------------------------------------+
+   | +0x328 | 0    | lastBoundSlot | batch cache; zeroed on palette      |
+   |        |      |               | change - see section 5.3            |
+   +--------+------+---------------+-------------------------------------+
+   | +0x32c | 0x100| pitchPixels   | pitch in 16-bit PIXELS, not bytes   |
+   +--------+------+---------------+-------------------------------------+
+   | +0x330 | 0    | pageBits      | the page, see 3.3                   |
+   +--------+------+---------------+-------------------------------------+
+   | +0x334 | 0    | ownsPageBits  |                                     |
+   +--------+------+---------------+-------------------------------------+
+
+   The three sixteen-entry arrays are written by ONE loop with three
+   displacements, which is what proves they are parallel and all
+   sixteen long rather than one long array read three ways. Sixteen
+   agrees with d3d-textures.txt section 8.6, "a bank holds sixteen
+   sub-textures", and the separate paletteSlot array agrees with
+   section 8.5, "palettes are a second, parallel slot system".
+
+   texSlot and paletteSlot initialise to -1 while field298 initialises
+   to 0. An earlier draft concluded from that alone that field298 was
+   not a slot array. That was wrong - see section 2.1. The odd
+   initialiser is real; the conclusion drawn from it was not.
+
+3.2.  What creation establishes
+
+   Bankw_CreateBank fills in the rest [verified]:
+
+   +--------+--------+-------------------------------------------------+
+   | Offset | Set to | Field                                           |
+   +========+========+=================================================+
+   | +0x000 | 0x100  | width                                           |
+   +--------+--------+-------------------------------------------------+
+   | +0x004 | 0x100  | height                                          |
+   +--------+--------+-------------------------------------------------+
+   | +0x04c | ""     | name - MAX_PATH, 0x104 bytes, ends at +0x150    |
+   +--------+--------+-------------------------------------------------+
+   | +0x254 | 0x180  | flags                                           |
+   +--------+--------+-------------------------------------------------+
+
+   Note width and height are NOT set by the constructor, so a
+   constructed but uncreated bank has zero dimensions. That is a real
+   state a port has to reproduce if anything reads a bank before it is
+   created.
+
+   The name is 0x104 bytes - MAX_PATH - running from +0x4c to +0x14f,
+   which is exactly where flag150 begins. Bankw_LoadBank copies the
+   source path into it with an inline strcpy.
+
+3.3.  The page is 256 x 256 x 2
+
+   The single most useful fact in the record [verified]:
+
+       if (!g_rendererReady || !device.DoesTextures) {
+           pageBits     = operator new(0x20000);
+           ownsPageBits = 1;
+           field2dc = field2e0 = 0;
+       } else {
+           pageBits     = FUN_00401c80();   /* a D3D surface */
+           ownsPageBits = 0;
+       }
+
+   0x20000 is 131072, which is 256 * 256 * 2. So the software path
+   allocates a 256x256 16-bit page per bank, and the hardware path
+   substitutes a driver surface. That closes the loop on the 256x256
+   page size quoted throughout docs/ without a byte count behind it.
+
+   A null result is FATAL, not degraded: it prints "MALLOC error in
+   BANK creating." with the bankw.Cpp path and line 0x303, then
+   App_Shutdown and _exit(1).
+
+   o ownsPageBits is the field a port needs most. It is the only thing
+     distinguishing a system-memory page the engine frees itself from
+     a driver-owned surface it must not touch.
+
+   o It also means bank storage is 45 * 128 KB = 5.6 MB worst case on
+     the software path, all of it allocated up front per bank rather
+     than pooled.
+
+
+3.4.  The hardware page is a system-memory surface
+
+   Bankw_CreateSurfacePage at 0x00401c80 is the hardware counterpart of
+   the operator new. Read from the disassembly, because the decompiler
+   mis-tracks two stack slots here [verified]:
+
+       dwSize   = 0x6c        dwFlags = 7  CAPS | HEIGHT | WIDTH
+       dwHeight = 0x100       dwWidth = 0x100
+       ddsCaps  = 0x840 = DDSCAPS_SYSTEMMEMORY | DDSCAPS_OFFSCREENPLAIN
+
+       CreateSurface(g_pDirectDraw, &desc, &bank->pSurface, NULL)
+       pSurface->QueryInterface(IID_IDirectDrawSurface2, &bank->pSurface2)
+       pSurface->Lock(NULL, &desc, DDLOCK_WAIT, NULL)
+       pSurface->Unlock(NULL)
+       bank->pageBits    = desc.lpSurface
+       bank->pitchPixels = desc.lPitch / 2
+       bank->ownsPageBits = 0
+
+   Two things here are more interesting than the allocation itself.
+
+   o IT IS NOT A TEXTURE. 0x840 asks for an offscreen-plain surface in
+     SYSTEM memory. So a bank page is the staging image a texture is
+     later uploaded FROM, not a texture the device samples. That
+     reframes the whole subsystem: banks are the CPU-side texture
+     store, and the slot system of d3d-textures.txt section 8 is what
+     moves them to the device.
+
+   o THE LOCK IS A PROBE. It locks and immediately unlocks, purely to
+     capture lpSurface and lPitch. Because the surface is in system
+     memory the pointer remains valid afterwards, so every later read
+     of the page dereferences pageBits with no lock at all. That is the
+     same cached-pointer trick the -DoRealLock flag hints at for the
+     main surface in renderer.txt section 3.
+
+   pitchPixels is the pitch in 16-BIT PIXELS - the code does an
+   arithmetic shift right by one. Its constructor default of 0x100 is
+   the pixel width of a 256-wide page, so the units agree, and it
+   matches the same convention recorded in dd-present.txt section
+   6.3.1.
+
+   o So pageBits means the same thing on both paths: a raw pointer to
+     256 x 256 16-bit texels. A port can keep that uniformity and
+     replace only where the memory comes from.
+
+   Lock and Unlock failures are reported through Cdd_ReportError and
+   then IGNORED, so a failed Lock leaves pageBits holding whatever the
+   uninitialised desc contained. Only CreateSurface and QueryInterface
+   failures return 0 and reach the fatal path.
+
+3.5.  Freeing, and what it proves
+
+   Bankw_FreeBank at 0x00401ab0 is the array element destructor and is
+   also called at the head of both Bankw_LoadBank and Bankw_CreateBank,
+   so a bank is always torn down before reuse [verified]:
+
+       if (pSurface) { pSurface->Release(); pSurface2->Release();
+                       pageBits = 0; }
+       if (ownsPageBits) { free(pageBits); ownsPageBits = 0; }
+       for (i = 0; i < subPageCount; i++) free(subPage[i]);
+       subPageCount = 0;
+       for (i = 0; i < 16; i++) {
+           if (texSlot[i] != -1) D3D_FreeTextureSlot(texSlot[i]);
+           if (paletteSlot[i] != -1) {
+               g_texPalettes[paletteSlot[i]]->Release();
+               g_texPaletteCount--;
+           }
+           texSlot[i] = paletteSlot[i] = -1;
+       }
+
+   o IT PROVES +0x08 IS A COUNT. The field is the loop bound for
+     freeing subPage[], so the name isIndexed used in an earlier draft
+     of this note and in formats/mesh-3df-map.txt is wrong: it is
+     subPageCount. Load3dfAndMap testing it against zero still behaves
+     correctly, because a bank with sub-pages is exactly the paletted
+     case, but the value is a count and reading it as a boolean would
+     mislead a port.
+
+   o The two page paths are mutually exclusive and correctly
+     separated - Release a surface, free a malloc - with ownsPageBits
+     as the discriminator. That is the field a port most needs, and
+     this function is why.
+
+   o field298[16] at +0x298 is NOT touched here, unlike the two slot
+     arrays either side of it. Whatever it holds is not an owned
+     resource, which rules out the obvious guesses.
+
+
+3.6.  The record is fully accounted for: two MAX_PATH strings
+
+   An earlier draft of this note reported 0x103 bytes at +0x151..+0x253
+   as the largest hole in the record, untouched by every function in
+   bankw.Cpp. There is no hole. The bytes are the tail of a second
+   MAX_PATH string that starts at +0x150 [verified].
+
+   What gave it away is an inlined strcmp in maybe_D3D_LoadRawToTexture
+   at 0x0041c2f6:
+
+       LEA ECX,[EAX + 0x4f9448]      ; EAX = bankIndex * 0x338
+       MOV EAX,ECX
+       MOV BL,byte ptr [EAX]         ; compare against 0x004e6d88
+       CMP BL,byte ptr [EDX]
+       ...
+
+   0x004f9448 is base + 0x150, and 0x004e6d88 is the string
+   "data\SpeedPkt\bnk00_01.raw". So +0x150 holds a FILENAME, and the
+   field this note called flag150 was its first byte.
+
+   The arithmetic then closes exactly. 0x4c + 0x104 = 0x150, and
+   0x150 + 0x104 = 0x254, which is flags. Two MAX_PATH strings laid
+   end to end, tiling the whole span with nothing left over.
+
+   o The lesson is the same one this project keeps relearning. A single
+     byte written to zero by three functions looked like a flag, and
+     naming it flag150 made the 259 bytes after it look like a gap.
+     A cleared first byte is what an empty STRING looks like.
+
+3.6.1.  Which string is which
+
+   They are not duplicates - only one of them is ever read [verified]:
+
+   +--------+-----------+---------------------------+--------------------+
+   | Offset | Field     | Written by                | Read by            |
+   +========+===========+===========================+====================+
+   | +0x04c | loadPath  | Bankw_LoadBank strcpy;    | NOTHING            |
+   |        |           | cleared by CreateBank     |                    |
+   +--------+-----------+---------------------------+--------------------+
+   | +0x150 | assetPath | FUN_00496da0 strided      | four functions, all|
+   |        |           | strcpy; MenuPage25_       | strcmp - it is the |
+   |        |           | DsiLogo_Enter for bank 0  | lookup key         |
+   +--------+-----------+---------------------------+--------------------+
+
+   loadPath has exactly four references in the whole image, three in
+   Bankw_LoadBank and one in Bankw_CreateBank, and every one is a write.
+   Nothing reads it back. So the guess in section 4 that it is kept for
+   diagnostics is as far as the evidence goes, and a port may drop it.
+
+   assetPath is the bank's identity. maybe_D3D_LoadRawToTexture,
+   FUN_0040a4d0, FUN_00410590 and FUN_00496da0 all walk the array
+   comparing it, which is how the engine answers "is this asset already
+   in a bank?" without a hash or an index.
+
+   o That is a linear scan over up to 45 banks doing a byte-at-a-time
+     strcmp, once per lookup. Cheap in 1997 terms and not worth
+     reproducing faithfully; a port can key a map on the path.
+
+   o It also means the bank array is content-addressed by FILE PATH,
+     which is worth knowing before designing a replacement: bank
+     indices are stable only for as long as the load order is.
+
+
+4.  Loading a bank
+
+   Bankw_LoadBank(path, mode) is the entry point [verified]:
+
+       if (0x2c < g_bankCount) return -1;
+       Bankw_BankDtor-ish cleanup (FUN_00401ab0);
+       if (!Bankw_LoadRawTexture(path, mode)) return -1;
+       strcpy(bank[g_bankCount].name, path);
+       return g_bankCount++;
+
+   So the .RAW is read first and the bank is only named and counted if
+   that succeeded. The name is kept for the whole run, which is why the
+   record carries a MAX_PATH string it never appears to read back -
+   diagnostics, or a reload path not yet found.
+
+   The mode argument is passed straight through to the .RAW loader and
+   is what formats/raw-texture.txt calls the load mode; mode 0 keeps a
+   palette, which is what sets isIndexed.
+
+
+4.1.  Every subPage is a palette, and there can be eight
+
+
+   RESOLVED, AND IT IS THE BIKE LIVERIES. SPEED.BKF carries
+   BNK00_00.RAW plus BNK00_00.1 through .11, and bank_load's sibling
+   loop reads the numbered files as ALTERNATE PALETTES of the one
+   indexed page rather than as further pages. Page 10's tick then
+   selects among them with (selectedBike + spinOffset) & 7 - eight
+   palettes, masked to eight - so the eight selectable bikes are
+   eight colour schemes over a single 256x256 page of indices
+   [verified].
+
+   That is what the eight-palette capacity is FOR, and it also
+   answers why there are more sibling files than bikes: the loop
+   stops at seven siblings, so .8 through .11 are never read.
+   Bankw_LoadRawTexture settles what the +0x00c array holds. Both the
+   mode 0 and mode non-zero palettised paths do the same thing
+   [verified]:
+
+       bank->palette[bank->subPageCount] = operator new(0x200);
+       ...read 256 entries, convert each to the surface format...
+       bank->subPageCount++;
+
+   0x200 is 512 bytes, which is 256 entries of 16 bits. So every entry
+   in the array is a palette of the same shape, not a mix of palettes
+   and sub-texture pixels as an earlier draft of section 3.1 guessed.
+   The field is named palette[16] accordingly.
+
+   The mode non-zero path then loads SIBLING palettes. It splits the
+   path, and for suffixes 1 through 7 builds a new filename, opens it,
+   allocates another 0x200, stores it at the next free index and
+   increments the count again. So one bank can carry EIGHT palettes -
+   the original plus seven alternates - and stops early at the first
+   file that will not open.
+
+   o Alternate palettes for one image is how a 1997 title recolours
+     the same texture, most obviously for the four bikes. That fits
+     d3d-textures.txt section 5.2.2.2, which found only two distinct
+     bike images despite four bikes.
+
+   o Sixteen slots for at most eight palettes means the array is half
+     used at worst. A port sizing it to eight would be safe against the
+     loader but not against anything else that writes the array, so
+     keep sixteen.
+
+   The page buffer is allocated as height * 512 on every path, which is
+   two bytes per pixel at 256 wide. The palettised path then writes
+   only 256 BYTES per row into it, so an 8-bit page occupies half of
+   what it reserves [verified]. Not a bug, but a port that sizes the
+   allocation from the texel format will differ from the original.
+
+
+4.2.  The 256x256 mode-0 skip
+
+   Bankw_LoadRawTexture's truecolour path allocates the page and then
+   puts everything else behind one guard. Read from the disassembly at
+   0x004012dc, not from the decompiler [verified]:
+
+       pageBits = operator new(height * 512);      /* unconditional */
+       ownsPageBits = 1;  pSurface = pSurface2 = 0;
+       if (width != 0x100 || height != 0x100 || mode != 0) {
+           flags = (mode == 1) ? 2 : 1;
+           ...read and convert every row...
+       }
+       /* 0x00401432 */  File_Close();  return 1;
+
+   So a truecolour .RAW that is exactly 256x256 loaded with mode 0
+   allocates a 0x20000 page, reads NO pixels into it, leaves flags at
+   whatever Bankw_CreateBank set, and returns success. The jump target
+   is the ordinary success exit, not an alternative reader - that was
+   checked, because a bulk-read fast path would have been the
+   comfortable explanation.
+
+   Both the width and height come from the FILE header a few
+   instructions earlier, not from the 0x100 defaults Bankw_CreateBank
+   writes, so the test is about the image and not about the bank.
+
+4.2.1.  Reachable in principle, not proven reached
+
+   The honest position. Two facts say it can happen:
+
+   o mode 0 call sites exist. FUN_0040a4d0 and FUN_00410590 both push 0
+     as the mode through Bankw_LoadBank, which forwards it unchanged.
+   o 244 of the shipped .RAW files are 196640 bytes, and
+     196640 = 256 * 256 * 3 + 32, which is exactly a 256x256 truecolour
+     page. See asset-inventory.txt section 4.
+
+   One fact says it may not:
+
+   o Those two callers build their filename at run time into the buffer
+     at 0x00518b20, so which files they open has not been traced. The
+     three menu callers - MenuPage14_Title_Enter, MenuPage24_Podium_
+     Enter and MenuPage25_DsiLogo_Enter - all pass mode 1 and therefore
+     never take the skip.
+
+   There are also three separate .RAW loaders, so the 244 truecolour
+   pages may reach the renderer through maybe_Cdd_LoadRawToSurface or
+   maybe_D3D_LoadRawToTexture instead and never pass through this one.
+
+4.2.2.  RESOLVED against shipped data: it fires, on the Speed bikes
+
+   The extracted assets settle it. Every link in the chain checks out
+   [verified]:
+
+   1. The bike manifest supplies both bank paths. Decoding MOTOSPD.BPT
+      with tools/bpt.py gives records [0] and [1] as
+      data\speed\bnk00_00.raw and data\speed\bnk00_01.raw - exactly
+      g_pathBnk0 and g_pathBnk1.
+
+   2. Reading the mhwanh headers - width at +0x08, height at +0x0a,
+      colours at +0x0c, all big-endian - gives the same answer in all
+      four bike directories:
+
+      +--------------+---------+---------+--------------------------+
+      | File         | Size    | Colours | Therefore                |
+      +==============+=========+=========+==========================+
+      | BNK00_00.RAW |  66336  |   256   | PALETTED - takes the     |
+      |              |         |         | palettised branch, so    |
+      |              |         |         | the skip cannot apply    |
+      +--------------+---------+---------+--------------------------+
+      | BNK00_01.RAW | 196640  |     0   | TRUECOLOUR, 256x256 -    |
+      |              |         |         | the skip's exact shape   |
+      +--------------+---------+---------+--------------------------+
+
+      Both are 256x256, and colours * 3 + w * h * (3 if colours == 0
+      else 1) + 32 reproduces both file sizes exactly, which validates
+      the header reading against formats/raw-texture.txt.
+
+   3. bnk1's mode is (PersoAnim == 1), and PersoAnim is index 72 of the
+      carac record. Decoding all thirty-two CARAC1..8.BPT files gives a
+      clean split by bike family:
+
+      +-----------+-----------+------+-------------------------------+
+      | Bike dir  | PersoAnim | Mode | bnk1 truecolour path          |
+      +===========+===========+======+===============================+
+      | SPEED     | 0 (all 8) |  0   | SKIPS - no pixels read        |
+      +-----------+-----------+------+-------------------------------+
+      | SPEEDPKT  | 0 (all 8) |  0   | SKIPS - no pixels read        |
+      +-----------+-----------+------+-------------------------------+
+      | KTMCROSS  | 1 (all 8) |  1   | reads every row               |
+      +-----------+-----------+------+-------------------------------+
+      | KTMPKT    | 1 (all 8) |  1   | reads every row               |
+      +-----------+-----------+------+-------------------------------+
+
+   So the branch is NOT dead. It is taken for exactly the two Speed
+   bikes and not for the two motocross bikes, on stock data.
+
+4.2.3.  Why it is nevertheless not a visible bug
+
+   On the HARDWARE path the page is not the texture source [verified].
+   Game_LoadBikeAndBanks registers bnk1 with srcSurface = 0, so
+   maybe_D3D_RegisterTexture takes the maybe_D3D_LoadRawToTexture
+   branch and reads BNK00_01.RAW from disk a second time, straight into
+   the locked D3D texture. The bank page is never sampled.
+
+   That is corroborated from the other side: maybe_D3D_LoadRawToTexture
+   carries four hardcoded path literals, and they are precisely the
+   four bnk1 files - data\speed\bnk00_01.raw, data\SpeedPkt\...,
+   data\ktmcross\... and data\KTMpkt\... It special-cases the dust
+   and shadow rectangles in them. So bnk1 is a texture the D3D loader
+   owns outright.
+
+   o The reading that fits every fact is that the skip is DELIBERATE:
+     for a full-size truecolour page in mode 0 the software page would
+     be filled and then never read, so the loader does not bother. Mode
+     1 - the KTM case, which also pulls sibling palettes - fills it
+     [inferred; the code carries no comment either way].
+
+   The SOFTWARE renderer is a different matter, and section 4.2.4
+   settles it: it does sample bnk1, and the consequence is real.
+
+4.2.4.  The software rasterizer DOES sample bnk1 - a real defect
+
+   Three steps, each verified, close the loop.
+
+   FIRST, the software path samples whatever bank a primitive names.
+   All four setup functions and all eight Screen3D_DrawPrimK* functions
+   compute &MR_Bank_ARRAY_004f92f8[prim->wBankIndex] and call
+   maybe_Bankw_LockPageBits, keeping the result as the texel source -
+   for example at 0x0049e583 the bank index is loaded straight from the
+   primitive's +0x36.
+
+   SECOND, that accessor hands back the raw pointer with no refresh for
+   a malloc-backed page:
+
+       if (this->pSurface2 != NULL) { IsLost / Restore / Lock ... }
+       return this->pageBits;
+
+   bnk1 is malloc-backed - Bankw_LoadRawTexture's truecolour path zeroes
+   pSurface and pSurface2 and sets ownsPageBits - so the guard is false
+   and the unfilled buffer is returned as-is.
+
+   THIRD, bike meshes really do name bank 1. Mesh bank indices are
+   stored RELATIVE and biased at load time: FUN_0045c700 walks every
+   face at stride 0x40 and does
+
+       *(short *)(faces + i * 0x40 - 0x0a) += baseBankIndex;
+
+   and 0x40 - 0x0a is +0x36, wBankIndex. So relative 1 becomes bnk1.
+   Counting the flags field of every .map record in the SPEED bike
+   directory gives:
+
+   +------------------+-------+--------------------------------------+
+   | Mesh             | Faces | Faces on relative bank 1             |
+   +==================+=======+======================================+
+   | ROUEARF.MAP      |   61  | 50                                   |
+   +------------------+-------+--------------------------------------+
+   | ROUEAVF.MAP      |   61  | 50                                   |
+   +------------------+-------+--------------------------------------+
+   | CORPS.MAP medium |  197  | 1                                    |
+   +------------------+-------+--------------------------------------+
+
+   ROUEARF and ROUEAVF are the blurred spinning-wheel variants of
+   ROUEAR and ROUEAV, and the plain versions use bank 0 only. That
+   agrees with maybe_D3D_LoadRawToTexture's own note that the bnk1 page
+   carries spoked wheel sprites.
+
+   CONCLUSION. On the SOFTWARE renderer, a SPEED or SPEEDPKT bike's
+   blurred wheels sample a heap buffer that was allocated and never
+   written. The KTM bikes are unaffected because PersoAnim is 1, which
+   makes the mode non-zero and fills the page - and their wheels lean on
+   bank 1 even harder, 60 faces of 61.
+
+   o This is a defect in the original, not in this reconstruction. It is
+     invisible in the shipped configuration because the hardware path
+     rebuilds bnk1 as a real D3D texture, and hardware was the normal
+     way to play. It would show only in software rendering, on two of
+     the four bikes, on the wheels.
+
+   o It has NOT been observed at runtime. Every step is verified
+     statically - the guard, the file headers, the PersoAnim values, the
+     bank accessor, and the mesh bank indices - but the game has not
+     been run to see it. Treat it as a very well-supported prediction
+     rather than an observation.
+
+   o FOR A PORT: reproduce the guard, because removing it changes what
+     is read. But do NOT reproduce the consequence. A port that keeps
+     the software rasterizer should fill the page unconditionally, or
+     zero it, so the wheels degrade to black rather than to whatever
+     the allocator handed back. Note that in the original the two paths
+     agree only by accident: bnk1's pixels reach the hardware renderer
+     from the D3D loader and were never meant to come from the bank
+     page at all.
+
+
+4.3.  Who loads banks, and the two bike banks
+
+   Game_LoadBikeAndBanks (0x0040a4d0, was FUN_0040a4d0) is the client
+   that passes mode 0. It loads a level's bike data and then exactly two
+   texture banks, and the two are deliberately different [verified]:
+
+   +--------+-----------+---------+-----------+-------+---------------+
+   | Bank   | Path       | Mode    | Sub-texs  | Kind  | Surface      |
+   +========+===========+=========+===========+=======+===============+
+   | base   | g_pathBnk0 | 0       | EIGHT     | 8-bit | 256 or 128   |
+   |        |            |         |           | pal   | see below    |
+   +--------+-----------+---------+-----------+-------+---------------+
+   | base+1 | g_pathBnk1 | PersoAnim| ONE      | 16-bit| forced 128   |
+   |        |            | == 1    |           | true  |              |
+   +--------+-----------+---------+-----------+-------+---------------+
+
+   Three things worth having.
+
+   o THE MODE IS BIKE DATA. bnk1's mode is
+     (g_bikeCarac[sel].PersoAnim == 1), so a bike flagged PersoAnim
+     loads the _1.._7 sibling palettes of section 4.1 and the others do
+     not. That is the mechanism behind d3d-textures.txt section 5.2.2's
+     finding that four bikes share two images: the recolouring is
+     palette variants, selected here from the bike record.
+
+   o A REAL LOW-MEMORY FALLBACK. bnk0's "small" argument is
+     (DAT_004ee998 < 0x400000) - if the card reports under 4 MB of
+     texture memory the bike atlas is created at 128x128 instead of
+     256x256. The only such fallback found in the renderer so far.
+
+   o The filenames are not literals. g_pathBnk0 and g_pathBnk1 are BSS
+     and are filled by maybe_Bike_ReadManifest, so which .RAW a bank
+     holds is manifest data, not code.
+
+   FUN_00410590 is the near-identical sibling - same two banks, same
+   strcpy into assetPath, same registration - presumably the reload
+   path after a device or mode change. It was not read line by line;
+   its bank handling matches.
+
+4.3.1.  What this says about the 256x256 skip
+
+   It narrows section 4.2 without closing it [inferred]:
+
+   o bnk0 is registered with D3D as PALETTED, 8 bits. A truecolour
+     .RAW would give Bankw_LoadRawTexture no palette to build, so bnk0's
+     file is almost certainly paletted - which means it takes the
+     palettised branch and never reaches the skip.
+
+   o bnk1 IS truecolour, and its mode is 0 whenever the bike is not
+     PersoAnim. So bnk1 is the live candidate: if its .RAW is exactly
+     256x256, the skip fires and the bank page is never filled.
+
+   o On the HARDWARE path that may be harmless. Registration passes
+     srcSurface = 0, so maybe_D3D_RegisterTexture takes the
+     maybe_D3D_LoadRawToTexture branch and reads the .RAW from disk
+     straight into the D3D texture. The bank page is not the source.
+
+   o On the SOFTWARE path there is no such second read, and the
+     rasterizer samples the page. That is where an unfilled page would
+     show. Whether it does depends on bnk1's actual dimensions, which
+     are manifest data.
+
+   Still not resolved, and still recorded as an anomaly rather than a
+   bug. The cheapest resolution is now obvious though: read the bike
+   manifest, find the bnk1 filename, and check its size against
+   196640.
+
+4.4.  Two more calling conventions were wrong
+
+   Chasing the call sites turned up the same defect twice more. Both
+   D3D_AllocTextureSlot and maybe_D3D_RegisterTexture are __thiscall on
+   g_pCd3d, and both were recorded without a this pointer [verified
+   from the push sequences at 0x0040a876 and 0x0040a897, each preceded
+   by MOV ECX,[0x00624afc]].
+
+   D3D_AllocTextureSlot was also one parameter short. RET 0x28 is forty
+   bytes, so ten stack arguments, and the previous nine-parameter
+   signature is why its body read an unaff_retaddr. Aligning the two
+   independent call sites gives:
+
+       D3D_AllocTextureSlot(this, bankIdx, small, wantKey, paletted,
+                            palBits, rgbBits, subIdx, width, height,
+                            pMemOut)
+
+   Font_UploadAtlasToBank passes atlasWidth/atlasHeight in arguments 8
+   and 9 and &font->unk_1240 in argument 10; Game_LoadBikeAndBanks
+   passes the sub-texture index in argument 7 and zeros for the rest.
+   Both agree.
+
+   o That is three functions in Dsi_d3d.cpp now found with a missing
+     this - these two and Bankw_LoadRawTexture in bankw.Cpp. The six
+     D3D state emitters are the same shape. When a function in this
+     class looks like it takes a bare index, check for
+     MOV ECX,[0x00624afc] before the call.
+
+
+5.  What this means for the port
+
+   o The bank array is static, fixed at 46, and never grows. A port can
+     declare it exactly as the original does; there is no allocator to
+     reproduce.
+
+   o A bank is a 256x256 page plus sixteen sub-texture slots plus
+     sixteen palette slots. That is the whole abstraction. Modern
+     hardware has no reason to keep the 256x256 packing, but the face
+     data references (bank, sub-texture) pairs, so the pairing has to
+     survive even if the packing does not.
+
+   o The software and hardware paths differ in exactly one field,
+     ownsPageBits, and one call, FUN_00401c80. A D3D9 back end replaces
+     that call and leaves everything else alone.
+
+   o The fatal-on-failure behaviour is worth keeping. A bank that fails
+     to allocate leaves every face that references it drawing garbage,
+     so failing loudly is correct.
+
+
+5.1.  Two slot arrays: reserved and published
+
+   texSlot at +0x258 and allocSlot at +0x298 are not redundant. They are
+   the two halves of a two-stage handoff, and reading
+   D3D_AllocTextureSlot with maybe_D3D_RegisterTexture makes the split
+   plain [verified]:
+
+       bank.allocSlot[sub] = D3D_AllocTextureSlot(bank, ...);
+       bank.texSlot[sub]   = maybe_D3D_RegisterTexture(
+                                 &bank.assetPath, bank, sub, ...);
+
+   and inside the second of those:
+
+       slot = bank.allocSlot[sub];       /* consume the reservation */
+       ...build the texture from a file or a surface...
+       return slot;                      /* or -1 if anything failed */
+
+   So allocSlot is the RESERVATION - a slot index with a COM chain
+   built but no image in it - and texSlot is the PUBLISHED slot, set
+   only once the texture actually loaded. On failure texSlot stays -1
+   while allocSlot keeps the index that was freed.
+
+   That resolves three things this note previously recorded as odd:
+
+   o Why texSlot initialises to -1 and allocSlot to 0. Only texSlot is
+     a public "is this usable" marker; allocSlot is internal.
+   o Why the dynamic-pool scan of section 2.1 tests texSlot[0] rather
+     than allocSlot - it must not hand out a bank whose texture is
+     merely reserved.
+   o Why Bankw_FreeBank calls D3D_FreeTextureSlot on texSlot and
+     ignores allocSlot. texSlot is the owning reference.
+
+   An earlier draft of section 3.1 said field298 was "not a slot
+   array", reasoning from its initialiser alone. It is a slot array;
+   the initialiser is simply inconsistent with the other two.
+
+   Sub-textures share a surface. D3D_AllocTextureSlot calls
+   DuplicateSurface with bank.texSlot[0]'s surface as the source, so
+   sub-textures 1 to 15 alias sub-texture 0 and are marked kind 2 in
+   g_texSlotKind. That is where d3d-textures.txt section 8.8's sharing
+   is decided.
+
+5.2.  The flags word, decoded
+
+   Most of the word at +0x254 is now accounted for, from the bits
+   D3D_AllocTextureSlot and maybe_D3D_RegisterTexture set [verified]:
+
+   +--------+----------------------------------------------------------+
+   | Bit    | Meaning                                                  |
+   +========+==========================================================+
+   | 0x0001 | source is 8-bit paletted                                 |
+   +--------+----------------------------------------------------------+
+   | 0x0002 | source is 16-bit, or the format retry fell back to 16bpp |
+   +--------+----------------------------------------------------------+
+   | 0x0008 | the surface is 128x128 rather than 256x256               |
+   +--------+----------------------------------------------------------+
+   | 0x0010 | a colour key was applied                                 |
+   +--------+----------------------------------------------------------+
+   | 0x0020 | source is 4-bit paletted                                 |
+   +--------+----------------------------------------------------------+
+   | 0x0040 | source is 8-bit non-paletted                             |
+   +--------+----------------------------------------------------------+
+   | 0x0200 | explicit width and height were supplied                  |
+   +--------+----------------------------------------------------------+
+   | 0x0400 | key black                                                |
+   +--------+----------------------------------------------------------+
+   | 0x0080 | set together as 0x180 by Bankw_CreateBank; meaning not   |
+   | 0x0100 | established                                              |
+   +--------+----------------------------------------------------------+
+
+   Two independent checks agree. Bankw_LoadRawTexture sets flags to 1
+   on its paletted path and 2 on its truecolour path, matching bits
+   0x01 and 0x02. And the condition in D3D_DrawScene that selects
+   D3D_SetBlendModeSrcAlpha - flags 0x10 AND 0x02 - now reads as
+   "a colour-keyed 16-bit texture", which is exactly the case that
+   needs real per-texel alpha instead of the half blend of
+   d3d-render-state.txt section 3.1. That was previously recorded as
+   an unexplained pair of bits.
+
+
+5.2.1.  Who sets 0x10, and the two switches both called "the key"
+
+   THE BITS COME FROM D3D_AllocTextureSlot's ARGUMENTS, not from
+   inspecting the data. Its signature is
+
+       D3D_AllocTextureSlot(this, bankIdx, small, wantKey, paletted,
+                            palBits, rgbBits, subIdx, w, h, pMemOut)
+
+   and the ORs are [verified, 0x0041b24a..0x0041b56b]:
+
+   +--------------------------+------------------------------------+
+   | rgbBits == 16            | flags |= 0x02                      |
+   | rgbBits == 8             | flags |= 0x40                      |
+   | paletted, palBits 8 / 4  | flags |= 0x01 / 0x20               |
+   | small                    | flags |= 0x08, else cleared        |
+   | wantKey                  | flags |= 0x10, else CLEARED (0xffef|
+   |                          | at 0x0041b56b)                     |
+   +--------------------------+------------------------------------+
+
+   The key bit is set OR cleared, never merely set, so a bank reused
+   for an unkeyed page does not inherit the previous page's key.
+
+   WHEN wantKey IS SET the function also applies a colour key to the
+   surface - a DDCOLORKEY of {0, 0}, BLACK, with DDCKEY_SRCBLT - but
+   only when the texture is paletted, or when NEITHER DAT_004dc1bc nor
+   -Alpha (DAT_004dc1c0) is on. With -Alpha the flag is still set and
+   SetColorKey is skipped, because the transparency then travels as
+   per-texel alpha in a 4444 texture. Those are two implementations of
+   one idea, and the flag is what both leave behind for D3D_DrawScene
+   to read.
+
+   TWO DIFFERENT SWITCHES ARE BOTH CALLED "THE COLOUR KEY", and
+   confusing them is what kept page 14's transparency open:
+
+   +----------------------------+-----------------------------------+
+   | D3D_AllocTextureSlot's     | sets flags 0x10; drives the blend |
+   | wantKey argument           | ladder. Page 14 passes 1.         |
+   +----------------------------+-----------------------------------+
+   | maybe_D3D_RegisterTexture's| sets flags 0x400. NOT a colour    |
+   | keyBlack argument          | key - see 5.2.2. Page 14 passes 0.|
+   +----------------------------+-----------------------------------+
+
+   Reading only the second says the title bank is unkeyed, which is
+   wrong and is exactly the conclusion an earlier session drew.
+
+   PAGE 14, read off the pushes at 0x00446671..0x0044668e [verified]:
+   bankIdx 3, small 0, wantKey 1, paletted 0, palBits 0, rgbBits 16.
+   So bank 3 carries 0x10 | 0x02 - a colour-keyed 16-bit texture - and
+   the blend ladder's one conditional row selects SRCALPHA for every
+   face that textures from it.
+
+
+5.2.2.  keyBlack is not a colour key, and its name reads backwards
+
+   The second switch was left as "drives the raw loader", which is
+   true and says nothing. Reading maybe_D3D_LoadRawToTexture through
+   settles it [verified, 0x0041c050].
+
+   For a TRUECOLOUR .raw going into a 16-bit texture - which is every
+   menu artwork page, all of them colours = 0 in the header - the
+   alpha of each texel is decided by
+
+       if (fmt->alphaMask == 0 ||
+           (r < 1<<(8-g_bitsR) && g < 1<<(8-g_bitsG) &&
+            b < 1<<(8-g_bitsB)))
+           alpha = 0;
+       else
+           alpha = (fmt->alphaBits == 4) ? 15 : 1;
+
+   and keyBlack is NOT CONSULTED. Black is transparent either way. On
+   a 565 surface the test is r<8 && g<4 && b<8, which is exactly the
+   texels whose RGB565 word is zero.
+
+   What keyBlack does, when set, is run BEFORE that test and change
+   two things:
+
+   +---------------------------------+------------------------------+
+   | (0, 255, 0) -> (0, 0, 0)        | pure green becomes black, so |
+   |                                 | green keys out too           |
+   +---------------------------------+------------------------------+
+   | r,g,b all below the             | near-black is RAISED to the  |
+   | OpaqueBlackLevel floor -> floor | floor, so it stays OPAQUE    |
+   +---------------------------------+------------------------------+
+
+   So keyBlack = 1 keys LESS black than keyBlack = 0. The name is
+   backwards, and every caller that reaches a menu bank passes 0.
+
+   WHO PASSES 1, settled by reading all seven call sites' pushes
+   [verified]:
+
+   +------------+--------------------------------+-------------------+
+   | Site       | Caller                         | keyBlack          |
+   +============+================================+===================+
+   | 0x00478844 | maybe_Cdd_LoadRawToSurface     | 1  - the only one |
+   +------------+--------------------------------+-------------------+
+   | 0x0040a897 | Game_LoadBikeAndBanks          | 0                 |
+   | 0x0040a93b | Game_LoadBikeAndBanks          | 0                 |
+   | 0x004106a7 | FUN_00410590                   | 0                 |
+   | 0x004107ac | FUN_00410590                   | 0                 |
+   | 0x004109b8 | FUN_00410590                   | 0                 |
+   | 0x00496f77 | Font_UploadAtlasToBank         | 0                 |
+   +------------+--------------------------------+-------------------+
+   | 0x0041f1ef | D3D_InitDevice                 | bank.flags & 0x400|
+   +------------+--------------------------------+-------------------+
+
+   D3D_InitDevice replays the stored bit rather than deciding it - it
+   reloads every bank after a device change - so the ONLY origin of a
+   set 0x400 in the whole binary is maybe_Cdd_LoadRawToSurface.
+
+   ITS USERS EXPLAIN THE FEATURE. That loader serves the HORIZON
+   BACKDROP - banks 4, 5 and 6, Bank\HorizLow.raw / HorizMed / HorizHi
+   through maybe_Track_SetHorizonBanks - plus App_Init, Cdd_Init,
+   FUN_00479080 and FUN_004121e0. A full-screen sky-and-ground
+   backdrop must not have its dark half punched into holes, so it gets
+   the floor, and green takes over as its key colour.
+
+   o SO -OpaqueBlackLevel REACHES THE TRUECOLOUR PATH ONLY HERE. Every
+     other truecolour .raw - the menu artwork pages, the bike effects
+     atlas - registers with keyBlack 0 and takes the unconditional
+     black key with no floor. The flag still reaches the PALETTED
+     upload path unconditionally; see d3d-textures.txt section 3.
+
+   o THE BIKE EFFECTS ATLAS WAS THE WRONG GUESS. It looked like the
+     caller because its shadow art sits at (0,0,16), exactly the
+     OpaqueBlackLevel floor for level 1 at 5 bits. It registers with
+     keyBlack 0, and the hardcoded dust/shadow block in
+     maybe_D3D_LoadRawToTexture is gated on the path strcmp and on
+     alphaBits == 4, not on keyBlack. Blue 8 would already have
+     survived the unconditional test, so 16 is the artists following
+     the floor convention where the code does not enforce it.
+
+   THE CONSEQUENCE FOR wantKey. It is not merely the blend selector -
+   it is the only switch that decides keying, because it is also what
+   calls SetColorKey({0,0}, DDCKEY_SRCBLT) on the surface. Both
+   routes arrive at "black is transparent", and both are gated on
+   wantKey alone.
+
+   FOUR BANKS, AND THE ARGUMENT GETS ALL FOUR RIGHT [verified]:
+
+   +--------+------------------------+---------+---------------------+
+   | Bank   | Loaded by              | wantKey | Why                 |
+   +========+========================+=========+=====================+
+   | 0, 1   | MenuPage25_DsiLogo     |    1    | artwork; black is   |
+   |        | _Enter 0x00453860,     |         | the background      |
+   |        | 0x004538f0             |         |                     |
+   +--------+------------------------+---------+---------------------+
+   | 3      | MenuPage14_Title_Enter |    1    | likewise            |
+   |        | 0x00446690             |         |                     |
+   +--------+------------------------+---------+---------------------+
+   | 2      | Menu_LoadResources     |    0    | a SCREEN CAPTURE;   |
+   |        | 0x0040ab03             |         | its blacks are      |
+   |        |                        |         | picture             |
+   +--------+------------------------+---------+---------------------+
+
+   Bank 2 is the glass-shatter capture. It is the only wantKey = 0 of
+   the four, and it has to be: keying a screenshot would punch holes
+   in the shards.
+
+5.2.3.  The measurement that had been read off the wrong rectangle
+
+   The reconstruction had page 14 keyed and page 25 not, recorded as a
+   deliberate divergence. The justification was that "60 per cent of
+   the texels the camera's own faces sample are exactly black", so
+   keying would turn a solid model into holes.
+
+   THAT WAS THE WHOLE PAGE, NOT THE SAMPLED RECTANGLES. Measuring the
+   .map records' own UV bounds against the shipped art gives
+   [verified, from PAGES.BKF]:
+
+   +----------+-------+---------------------+---------------+
+   | Mesh     | Faces | Sampled UV bounds   | Black inside  |
+   +==========+=======+=====================+===============+
+   | CAMERA   | 166   | x 19..241 y 14..223 |    1.7 %      |
+   | DSINT    |   2   | x 0..240 y 217..255 |   50.8 %      |
+   | ELLIPSE  |   2   | x 0..255 y 0..120   |   21.1 %      |
+   | MOTO     |   2   | x 0..255 y 121..214 |   29.3 %      |
+   | RACER    |   2   | x 0..255 y 214..255 |   31.8 %      |
+   +----------+-------+---------------------+---------------+
+
+   The whole of BNK00_01.RAW is 63 per cent black; the camera's faces
+   are 1.7, and 158 of its 166 faces are 0.0. The four flat billboards
+   - DSINT on page 25 and the three on page 14 - are the ones carrying
+   a black background, and they are the ones the key is for.
+
+   The hollow camera that the divergence was written to explain was
+   the missing Mesh_MirrorXAndFlipWinding, found and fixed in a later
+   session. This was collateral from the same wrong reading, and it
+   survived the fix because nothing re-tested it.
+
+   o A SYMPTOM THAT SURVIVES ITS FIX IS EVIDENCE THE DIAGNOSIS WAS
+     WRONG. The same lesson is recorded for the "carved pan = depth
+     ordering" attribution. Both were reasonable-sounding causes
+     accepted without a measurement that would have refuted them, and
+     both cost a later session.
+
+
+5.3.  lastBoundSlot and the batch it invalidates
+
+   lastBoundSlot at +0x328 is not storage, it is a cache, and the two
+   ends of it sit in different translation units [verified].
+
+   D3D_DrawScene reads it once per primitive:
+
+       if (bank[b].lastBoundSlot != texSlot) {
+           bank[b].lastBoundSlot = texSlot;
+           D3D_InvalidateBatch();          /* forces a new batch */
+       }
+
+   and maybe_D3D_UploadTexture writes zero into it whenever it creates
+   a palette for that bank:
+
+       bank[b].paletteSlot[0] = <the new palette slot>;
+       bank[b].lastBoundSlot  = 0;
+
+   Zeroing it is deliberate invalidation. The palette has just changed
+   underneath the bank, so the next primitive that uses it must re-emit
+   its texture handle and open a fresh D3DOP_TRIANGLE batch rather than
+   append to one drawn with the old palette. See
+   d3d-render-state.txt section 4.1 for the batching this feeds.
+
+   o For a port: the caching is an optimisation and can be dropped, but
+     the ORDERING it protects cannot. Any back end that batches draw
+     calls has to break the batch when a palette or texture changes.
+
+   The same function allocates the palette slot itself by scanning
+   g_texPalettes for a NULL entry, and only while g_texPaletteCount is
+   below 0x32 - the same fifty-slot ceiling as the texture arrays, so
+   palettes and textures compete for two separate pools of fifty.
+
+
+5.4.  What the reconstruction keeps
+
+   src/bank.c and src/bank.h in mracer implement the SOFTWARE HALF of
+   this record and nothing else: the decoded page, the palette array,
+   the dimensions, and the flag saying whether the page holds indices
+   or pixels. The DirectDraw surfaces, the D3D texture slots, the
+   reserved and published slot arrays of section 5.1 and the flags
+   word of section 5.2 are all deferred, because none of them means
+   anything until a back end exists.
+
+   Three things from this note were carried over deliberately rather
+   than tidied away:
+
+   o The page is allocated the full 0x20000 regardless of the texel
+     format, so an indexed page uses half of what it reserves
+     (section 3.3).
+
+   o The 256x256 mode-0 skip of section 4.2 is reproduced, and prints
+     a console line when it fires. Reproducing a defect is the point:
+     if the reconstruction quietly filled that page it would diverge
+     from the original in exactly the case section 4.2.4 says is
+     visible on the software path.
+
+   o ownsPage is kept even though every page in the reconstruction is
+     ours. It is the only field distinguishing a system-memory page
+     the engine frees itself from a driver surface it must not touch,
+     and that distinction returns the moment a back end does.
+
+   The bank ARRAY is a flat static of BANK_COUNT in the
+   reconstruction, matching 0x004f92f8. The static/dynamic split at
+   0x19 (section 2.1) is not enforced yet; nothing allocates banks
+   dynamically so far.
+
+6.  Open questions
+
+   o field298[16] at +0x298 - parallel to the two slot arrays,
+     initialised to 0 rather than -1, and NOT freed. Not an owned
+     resource.
+   o field2d8 (-1 init and reset) and field2e4 (zeroed in three
+     places). Both look like state, not storage.
+   o RESOLVED - see section 4.1. Bankw_LoadRawTexture sets
+     subPageCount, and the array is palettes throughout.
+   o RESOLVED - see section 3.6. The supposed hole is the tail of a
+     second MAX_PATH string at +0x150, written from outside bankw.Cpp
+     and used as the bank lookup key. The record now has no unexplained
+     bytes.
+   o RESOLVED - FUN_00496da0 is Font_UploadAtlasToBank, the font
+     atlas upload. See section 2.1.
+   o FUN_00401f90 frees banks 0 through 0x13 and resets g_bankCount.
+     Section 2.1 explains why it stops short of the whole array - it
+     resets static banks and leaves the pool - but not why it stops at
+     0x13 rather than 0x18.
+   o RESOLVED - both handoff functions are read; see sections 5.1 and
+     5.2. allocSlot is the reservation, texSlot the published slot.
+   o flags bits 0x80 and 0x100, set together as 0x180 by
+     Bankw_CreateBank and never tested anywhere found so far.
+   o D3D_AllocTextureSlot's free-slot scan falls through to a counter
+     (DAT_0053bce8) when no g_texTextures entry is NULL. Whether that
+     can yield an index past the fifty-slot ceiling is not
+     established, and it would be an overrun if so.
+   o CLOSED. All three were already documented before this pass.
+     maybe_D3D_ChooseTexFormat and maybe_D3D_LoadRawToTexture needed no
+     change; maybe_D3D_UploadTexture gained the two bank field names of
+     section 5.3. The bank chain is now read end to end, from
+     Bankw_StaticCtor to the D3D texture handle.
+   o FULLY RESOLVED - sections 4.2.2 to 4.2.4. The skip fires on stock
+     data for the SPEED and SPEEDPKT bikes; it is harmless on the
+     hardware path, and on the software path it leaves the blurred
+     wheel meshes sampling an unwritten heap buffer. A defect in the
+     original, predicted statically and not yet observed at runtime.
+   o READ - see section 4.3. FUN_0040a4d0 is Game_LoadBikeAndBanks;
+     FUN_00410590 is its reload sibling and was not read line by line.
+   o Running the game in software mode on a Speed bike to confirm
+     section 4.2.4 at runtime. That is the one step the static
+     evidence cannot supply.
+   o FUN_00401f80, which hands out the base bank index that
+     Game_LoadBikeAndBanks uses for its pair.
+   o FUN_004020b0 sums every sixteenth texel of every loaded bank page
+     into DAT_00502708. It reads width and height to bound the walk.
+     A checksum over texture memory, purpose unknown; the copy
+     protection is the obvious suspect but this was not chased.
+   o The 0x103 bytes from +0x151 to +0x253 are entirely unexamined.
+     They are the largest hole in the record.
+   o Why flags is set to 0x180 at creation when the bits the renderer
+     tests are 0x02 and 0x10. Something else sets those later,
+     presumably the .RAW loader once the texel format is known.
+   o Whether subPage[0] being the palette means the other fifteen
+     entries are sub-texture pixel pointers, or whether the array is
+     palettes throughout.

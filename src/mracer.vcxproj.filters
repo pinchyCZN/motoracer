@@ -1,0 +1,275 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="config.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="framebuffer.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lez.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="scene.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="sprite.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tga.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="menures.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mesh.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="transform.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="rawtex.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="bank.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="bkf.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="assets.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="shade.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="prim.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="detail.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="queue.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="clip.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="cull.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="drawscene.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="d3d9rt.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="xa2.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="font.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="log.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="model.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="glass.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="menu.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="timing.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="rand.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="fontdef.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="audio.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="options.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="bpt.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tracks.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="bikes.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="skl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="trig.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="level.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="trk.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="grid.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="horizon.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="race.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="physics.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="racer.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="agent.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="config.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="framebuffer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lez.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="menures.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mesh.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="transform.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="rawtex.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bkf.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="assets.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shade.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="prim.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="detail.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="queue.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="clip.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="cull.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="drawscene.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="render.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bank.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="scene.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="sprite.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tga.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="font.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="log.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="model.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="menu.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="timing.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="rand.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="fontdef.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="audio.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="xa2.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="options.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bpt.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tracks.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bikes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="skl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="trig.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="camera.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="horizon.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="race.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="agent.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

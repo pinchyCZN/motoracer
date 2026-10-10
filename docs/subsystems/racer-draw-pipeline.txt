@@ -1,0 +1,829 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                    THE RACER DRAW PIPELINE
+
+
+Abstract
+
+   Where maybe_Racer_Draw sits in the frame, what it calls, and how
+   the reconstruction now matches it. The port drew racers through an
+   invented layer for a long time; that layer is gone and both the
+   race and the bike-select page go through one function, as all three
+   of the original callers go through maybe_Racer_Draw.
+
+Table of Contents
+
+   1. The retail tree
+   2. The port
+   3. The divergence that was, and why it could not be wired
+   4. What is still missing
+   5. The first-person cockpit - FUN_00462110
+      5.1. It is a pure camera-space placement
+      5.2. Two things in it are the compiler, not the design
+      5.3. The submitter forces a translucency that never fires
+      5.4. What it exposed, and only one of them is a defect
+         5.4.1. The autopilot holds the wheelie button - a trap
+         5.4.2. Why it drew white and mostly not at all
+         5.4.3. The cockpit is textured from the track's banks
+         5.4.4. Most of the handlebars are below the screen
+         5.4.5. The 0.2 depth key is an ordering trick
+      5.5. Reconstructed
+   6. A deviation that was not one
+   7. The steering speed fade
+   8. The visible segment list
+
+1.  The retail tree
+
+   Read out of the database, not reconstructed. Every edge below is a
+   real call [verified].
+
+   maybe_Game_RenderFrame            0x0047ff90
+     |
+     +- Screen3D_BeginFrame          0x0049a160
+     +- Dd_DrawHorizon               0x00402960
+     +- maybe_Trk_DrawZonesAndListSegments  0x0040ce60
+     |    builds the segment list the racer loop filters on
+     +- maybe_Race_DrawRacers        0x00458b80
+     |    |
+     |    +- FUN_0046e8b0            the cull: draw distance then
+     |    |                          frustum, radius 512
+     |    +- maybe_Racer_Draw        0x0045f290   THE SUBJECT
+     |    +- maybe_Racer_DrawShadow  0x00461f70
+     |    +- FUN_00462110            the VIEWED racer takes this
+     |                               path instead
+     +- maybe_Fx_DrawAllParticles    0x004575c0
+     +- Screen3D_DrawScene           0x0049ad90   walks the queue
+     +- Screen3D_EndFrame            0x0049b0e0
+     +- Screen3D_Present             0x0049b1c0
+
+   and maybe_Racer_Draw itself:
+
+   maybe_Racer_Draw
+     |
+     +- the matrix chains, offsets and placement
+     +- Skl_BuildPartMatrices  x2   0x00463d90
+     |    bike subtree off part 0, rider off part 3
+     +- maybe_Inst_DrawWithMatrix   0x0048c6d0
+     |    the two wheel instances
+     +- maybe_Racer_ShadeParts      0x00462a40
+     +- Screen3D_TransformVertsFlat 0x0049b2c0   per part
+     +- Screen3D_CullAndQueueFaces  0x0049c110
+
+   THREE CALLERS, and only one of them is the race:
+
+       maybe_Race_DrawRacers        the track,       lod -1
+       MenuPage10_BikeSelect_Tick   bike select,     lod  0
+       MenuPage24_Podium_Tick       the podium
+
+   The lod argument is the fourth and it decides two things: whether
+   racer+0x638 is overwritten, and whether matBikeRoot is replaced by
+   matOrientation. The race passes -1 and keeps what
+   maybe_Racer_SelectLod chose during the TICK; page 10 passes 0
+   (PUSH 0x0 at 0x0044f231) because a menu racer has never ticked and
+   has no bike root at all.  [verified]
+
+2.  The port
+
+   race_draw_3d
+     |
+     +- race_draw_racers            race.c, shaped on 0x00458b80
+     |    |
+     |    +- racerdraw_select_lod   the LOD band
+     |    +- racerdraw_visible      the cull
+     |    +- race_pose_racer        anim frame -> r->pose
+     |    +- racerdraw_racer        racerdraw.c   ONE FUNCTION
+     |    +- racerdraw_shadow
+     +- trk_draw
+     +- queue_walk(drawscene_dispatch)
+
+   MenuPage10_BikeSelect goes through racerdraw_racer as well, with a
+   menu MR_Racer standing in for g_menuRacer and lod 0, so the port has
+   one per-racer draw where it used to have three paths.
+
+   EVERY PRIMITIVE THE ORIGINAL USES ALREADY EXISTED:
+
+   +-------------------------------+--------------------------+
+   | retail                        | ours                     |
+   +===============================+==========================+
+   | Screen3D_TransformVertsFlat   | transform_verts_flat     |
+   +-------------------------------+--------------------------+
+   | Screen3D_CullAndQueueFaces    | cull_and_queue_faces     |
+   +-------------------------------+--------------------------+
+   | Screen3D_DrawScene            | queue_walk + dispatch    |
+   +-------------------------------+--------------------------+
+   | Skl_BuildPartMatrices         | racerdraw_part_walks     |
+   +-------------------------------+--------------------------+
+
+   so nothing was ever missing at the bottom of the stack. The
+   renderer is D3D9 rather than a software rasterizer; it sits below
+   queue_walk and is not what diverged.
+
+3.  The divergence that was, and why it could not be wired
+
+   THIS IS HISTORY, kept because the trap is easy to walk back into.
+
+   bike_draw had no original. It was a layer this port invented
+   between the racer draw and the transform, and it made two choices
+   maybe_Racer_Draw does not:
+
+   o IT INVERTED EVERY MEMBER MATRIX, unconditionally. The original
+     inverts in its part loop too, but special-cases counters 0 and 3
+     out of it and hands those prebuilt matrices instead.
+
+   o IT MULTIPLIED EVERY PART BY a matrix carrying the placement, so
+     part matrices there were in MODEL space. The original walks from
+     the BODY matrix, so its part matrices are ALREADY PLACED, and its
+     fork and arm blocks produce WORLD-space matrices it does not
+     place again.
+
+   THE TWO HALVES THEREFORE DISAGREED ABOUT WHAT SPACE A PART MATRIX
+   WAS IN. Feeding the original walk into bike_draw applied the
+   placement twice; feeding its fork or arm in did the same. That is
+   not a sign error or an ordering slip, and three attempts to wire
+   the seam each produced a worse picture than the last.
+
+   THE FIX WAS TO DELETE THE LAYER. racerdraw_racer owns the whole
+   per-racer draw - transform and face queue included - and
+   race_draw_racers calls one function. bike_draw, bike_draw_piece,
+   bike_draw_body_parts, MR_BikeDraw, skl_build_anim, skl_apply_anim,
+   skl_refork_front, skl_swingarm and racerdraw_publish_matrices all
+   went with it.
+
+4.  What is still missing
+
+   THE SEGMENT LIST IS DONE. trk_list_visible_segments is the list
+   half of maybe_Trk_DrawZonesAndListSegments and race_draw_racers
+   filters on it, so an AI racer who pulls far enough ahead is no
+   longer drawn. The span is 10, a constructor constant at
+   0x0040c5b4, and the backward run is behind*4+4 - not the +5 this
+   project recorded for a long time. See trk.h.
+
+   EVERYTHING STILL MISSING NOW HAS A NAMED STUB in the right place
+   in the call graph, which says so once when it first runs
+   (MR_STUB_ONCE in log.h). A run that prints no stub lines is a run
+   with nothing missing.
+
+   +---------------------------+------------------------------------+
+   | missing                   | what it costs                      |
+   +===========================+====================================+
+   | the zone GEOMETRY         | trk_draw still picks meshes by     |
+   |                           | distance and a budget. The         |
+   |                           | original draws 12 - the camera     |
+   |                           | mesh plus a fixed window each way  |
+   |                           | - and needs no budget at all       |
+   +---------------------------+------------------------------------+
+   | per-segment decor         | trk_draw_segment_decor. The index  |
+   |                           | lists ARE parsed - +0xb4 and +0xd4 |
+   |                           | are MR_TrkSegment.indices and      |
+   |                           | indexCount, and trk_draw already   |
+   |                           | draws the props from them. What is |
+   |                           | left is the AnimDecor class table  |
+   |                           | and the dispatch shape             |
+   +---------------------------+------------------------------------+
+   | the frustum half of       | racerdraw_visible tests draw       |
+   | FUN_0046e8b0              | distance only. Plane_Distance      |
+   |                           | takes planes the port has not got  |
+   +---------------------------+------------------------------------+
+   | maybe_Racer_ShadeParts    | racerdraw_shading_enabled is       |
+   |                           | imported and uncalled; every bike  |
+   |                           | draws at a flat 0x1f               |
+   +---------------------------+------------------------------------+
+   | maybe_Racer_ShadeLevel    | 0x00465d60 picks 0x10 in a shaded  |
+   | 0x00465d60                | segment. Needs the segment shade   |
+   |                           | flag, which is not mapped          |
+   +---------------------------+------------------------------------+
+   | CullAndQueueFacesEx       | the shadow queues through the      |
+   |                           | plain call. cull.h records the gap |
+   +---------------------------+------------------------------------+
+   | the rider shadow quad     | four vertices at racer+0x30ed are  |
+   |                           | laid out and left unfilled: the    |
+   |                           | original gates them on crashLatch, |
+   |                           | which nothing in the port sets     |
+   +---------------------------+------------------------------------+
+
+   racer+0x0 IS "DRAWN THIS FRAME" and race_draw_racers owns it now -
+   cleared for every racer, set only for those that draw.
+
+5.  THE FIRST-PERSON COCKPIT - FUN_00462110
+
+   maybe_Race_DrawRacers forks at 0x00458bdf: when
+   g_bFirstPersonActive is set AND the racer is the viewed one, it
+   calls FUN_00462110 INSTEAD of maybe_Racer_Draw, and reaches neither
+   maybe_Racer_DrawShadow nor racer+0x0. So a rider in first person
+   draws no bike, casts no shadow, and is not marked drawn.
+
+   What goes up instead is two meshes: g_meshGuidon, the handlebars
+   and forks, and g_meshCockpit, the dash and screen.
+
+5.1.  It is a pure camera-space placement
+
+   THIS IS THE THING TO UNDERSTAND FIRST, because the maths looks
+   incomplete until it is clear: FUN_00462110 takes no view matrix and
+   reads no world position. The eye is already on the bike in mode 6,
+   so the cockpit only ever needs a fixed offset in front of it. Every
+   matrix comes from bike STATE alone, and the result goes straight to
+   Screen3D_TransformVertsFlat as an object-to-CAMERA transform - the
+   same shape as the glass pane in glass.c.
+
+   +------------------------------------------------------------------+
+   |  attitude += (Racer_ChassisAttitude(r)*-0.25 - attitude) * 0.25  |
+   |  Mpitch    = euler(attitude, 0, 0)                               |
+   |  Mroll     = euler(0, 0, -lean * 0.4)                            |
+   |  up        = springBounce*10 + wheelieAngle*(2/pi)*-80 - 350     |
+   |  fwd       = springBounce*5  + 350                               |
+   |  P         = Mpitch * (0, up, fwd)                               |
+   |                                                                  |
+   |  bars      = Mpitch * Mroll * eulerPos((0, steering/3500, 0), P) |
+   |  dash      = Mpitch * Mroll * eulerPos((0, 0, 0),            P)  |
+   +------------------------------------------------------------------+
+
+   +--------------+---------------+---------------------------------+
+   | Constant     | Value         | What it is                      |
+   +==============+===============+=================================+
+   | 0x004d1068   | 2/pi, double  | wheelieAngle scale              |
+   +--------------+---------------+---------------------------------+
+   | 0x004d1070   | -0.25         | chassis attitude scale          |
+   +--------------+---------------+---------------------------------+
+   | 0x004d0f88   | 0.25          | the attitude filter rate        |
+   +--------------+---------------+---------------------------------+
+   | 0x004d1074   | -80.0         | the wheelie term, up axis       |
+   +--------------+---------------+---------------------------------+
+   | 0x004d1078   | 10.0, double  | springBounce, up axis           |
+   +--------------+---------------+---------------------------------+
+   | 0x004d1080   | 350.0, double | up-axis offset, SUBTRACTED      |
+   +--------------+---------------+---------------------------------+
+   | 0x004d0f78   | 5.0           | springBounce, forward axis      |
+   +--------------+---------------+---------------------------------+
+   | 0x004d1088   | 350.0         | forward-axis offset             |
+   +--------------+---------------+---------------------------------+
+   | 0x004d1090   | 0.4, double   | the share of the lean it rolls  |
+   +--------------+---------------+---------------------------------+
+   | 0x004d1098   | 1/3500        | steering to radians             |
+   +--------------+---------------+---------------------------------+
+
+   o THE TRANSLATION SURVIVES THE COMPOSITION UNCHANGED. Mpitch and
+     Mroll both leave a zero translation - maybe_Mat34_FromEuler
+     zeroes rows 9..11 explicitly - so the product's translation is
+     exactly P.
+
+   o THE ROLL IS NEGATED where the camera's is not, and that is what
+     makes the lean read on screen: camera.txt 3.2.1 rolls the VIEW by
+     +0.25 of the lean and this rolls the BARS by -0.4 of it.
+
+   o THE FILTER IS WHY THE DASH LAGS THE CHASSIS. A quarter per frame,
+     so over a jump face the cockpit pitches behind the bike.
+
+   o racer+0x110 SATURATES AT +-600 in units of pi/4096, so the bars
+     swing +-9.82 degrees and no further.
+
+   Read live with the bike stationary, level and straight [verified,
+   F6 paused]: springBounce 0, steering 0, lean -0.0, wheelieAngle 0,
+   attitude filter a denormal at 0x004ea4e4. So P is (0, -350, 350)
+   and both meshes sit 350 ahead of the eye and 350 below it, with no
+   rotation - a 45-degree downward look at the bars.
+
+5.2.  Two things in it are the compiler, not the design
+
+   Both read as findings if taken at face value.
+
+   THE DASH'S EULER IS FOLDED TO CONSTANTS at 0x0046247f. The
+   cos-table reads there are g_cosTable[0] and g_cosTable[0x3000] as
+   bare absolute addresses - 1 and 0 - so the rotation is the
+   identity. The same fold appears in Camera_Update's roll block and
+   means the same thing: the angles are literally zero.
+
+   AND P IS RECOMPUTED INLINE at 0x00462300 rather than kept, because
+   the compiler wanted its three components on the FPU stack to store
+   as the dash matrix's translation.
+
+   ONE ASSUMPTION IS OPEN. Mat34_FromEulerPos (0x00403740) and
+   maybe_Mat34_FromEuler (0x0040fd40) are diffed at 0.77 similarity,
+   97 instructions each, identical data and call references, storing
+   the same nine 3x3 slots; they differ in FPU scheduling and in the
+   tail - RET 4 plus a zeroed translation against RET 8 plus a copied
+   one. The port uses mat34_from_euler for both on the reading that
+   the 3x3 halves are the same expression. Not proved term by term.
+   [open]
+
+5.3.  The submitter forces a translucency that never fires
+
+   Screen3D_CullAndQueueTranslucent (0x0049bca0) does two things its
+   siblings do not, and only one of them matters here.
+
+   +---------------------------+--------------------------------------+
+   | What it does              | On these two meshes                  |
+   +===========================+======================================+
+   | kind != 0 becomes 0x10 or | NOTHING. Every face in both meshes   |
+   | 0x2c, the blended family  | reads kind 0 live, so both draw      |
+   |                           | OPAQUE flat colour [verified]        |
+   +---------------------------+--------------------------------------+
+   | depth = camZ * 0.2 -      | this is the whole effect: the faces  |
+   | nearPlaneZ                | land in the nearest sort buckets and |
+   |                           | paint over the world                 |
+   +---------------------------+--------------------------------------+
+
+   So the name and the forced kinds describe a capability the shipped
+   assets do not use. A port that adds blending support for this
+   function's sake is solving a problem the data does not have; what
+   it must reproduce is the ORDERING.
+
+   Read live [verified, F6 paused]:
+
+   +---------------+--------+-------+---------------------------------+
+   | Mesh          | Verts  | Faces | Live evidence                   |
+   +===============+========+=======+=================================+
+   | g_meshGuidon  |  319   |  231  | 0x00504edc / 0x00504f08 and     |
+   |               |        |       | 0x00504ed8 / 0x00504f04         |
+   +---------------+--------+-------+---------------------------------+
+   | g_meshCockpit |  142   |  151  | 0x0051bf64 / 0x0051bf90 and     |
+   |               |        |       | 0x0051bf60 / 0x0051bf8c         |
+   +---------------+--------+-------+---------------------------------+
+
+   Vertices are three floats, stride 12, spanning about +-170 in x and
+   ~100 in y - a bar roughly 340 units across. Faces carry flags 4
+   (written-only), effectiveKind 0 and a flatColor, so they are
+   flat-shaded coloured geometry with unused uv slots. Some of those
+   slots still hold a stale filename fragment from whatever the heap
+   block was before, which is harmless and a good reminder that a uv
+   read on a kind-0 face is meaningless.
+
+5.4.  WHAT IT EXPOSED, and only one of them is a defect
+
+   The cockpit is the first geometry in the port that reads
+   wheelieAngle directly and the first that is drawn in CAMERA space,
+   where 80 units is a fifth of the screen height. It is therefore a
+   sensitive probe, and the first thing it turned up was NOT a defect
+   at all but a difference in what the two bikes were being told to do.
+   One real defect came with it. Both read out of the two running
+   processes at the same grid, paused.
+
+5.4.1.  THE AUTOPILOT HOLDS THE WHEELIE BUTTON - a comparison trap
+
+   Compared side by side at the same grid, paused, the two processes
+   disagree about the bike itself. EVERY DIFFERENCE BELOW FOLLOWS FROM
+   ONE INPUT BIT and none of it is a draw defect:
+
+   +----------------------+------------------+---------------------+
+   | Field                | MOTO             | port                |
+   +======================+==================+=====================+
+   | stuntHeld    +0x31f9 | -                | 1                   |
+   +----------------------+------------------+---------------------+
+   | stuntOrOverspeed     | 0                | 1                   |
+   | +0x2e85              |                  |                     |
+   +----------------------+------------------+---------------------+
+   | wheelieAngle +0x307d | 0.0              | 1.5707964 = pi/2,   |
+   |                      |                  | K_WHEELIE_MAX       |
+   +----------------------+------------------+---------------------+
+   | wheelieTimer +0x3081 | -                | 185.2, still ramping|
+   +----------------------+------------------+---------------------+
+   | frontWheelContact    | (-12.8, -0.0,    | (-128.0, 118.79,    |
+   | +0x01b4              | 5343.7)          | 7311.0)             |
+   +----------------------+------------------+---------------------+
+   | rearWheelContact     | (-23.3, -0.0,    | (-128.0, -0.0,      |
+   | +0x0338              | 5175.8)          | 7192.7)             |
+   +----------------------+------------------+---------------------+
+   | matBikeRoot +0x2e55  | Ry(3.56 deg)     | Rx(45 deg)          |
+   +----------------------+------------------+---------------------+
+   | chassis attitude     | 0.0              | pi/4                |
+   +----------------------+------------------+---------------------+
+   | springBounce +0x2e91 | 0.0              | 0.0                 |
+   +----------------------+------------------+---------------------+
+   | lean +0x2e1d         | -0.0             | 3.6e-12             |
+   +----------------------+------------------+---------------------+
+
+   THE CHAIN IS CLOSED, term by term, and every link is the code doing
+   what it says:
+
+     autopilot_input returns stunt = 1 - race.c's second override,
+     ahead of the keyboard
+       -> race_stunt_edge sets stuntHeld
+       -> racer_latch_stunt_request copies it to stuntOrOverspeed
+       -> racer_update_wheelie ramps and saturates at K_WHEELIE_MAX
+       -> racer_wheelie_swing_contact swings the FRONT contact about
+          the rear; a 168-unit wheelbase at 45 degrees gives
+          168*sin45 = 118.8, which is the port's front-contact HEIGHT
+          and its shortened z gap, both to the digit
+       -> mat34_look_at over that pair is exactly the Rx(45) read back
+       -> racer_chassis_attitude over Rx(45) is
+          atan2(0.7071, 0.7071) = pi/4
+       -> the cockpit filter lags that to pi/4 * -0.25 = -pi/16, the
+          -0.19634955 read out of s_cockpitAttitude
+
+   o SO THE COCKPIT IS DRAWING CORRECTLY FOR THE STATE IT IS GIVEN.
+     wheelieAngle enters the up term directly - pi/2 * (2/pi) * -80 =
+     -80, so the anchor sits at -430 rather than -350 - and the
+     45-degree frame pitches the mesh until much of it crosses the
+     near plane. What looks like a near-clip bug is a bike doing a
+     permanent maximum wheelie.
+
+   o WHICH MAKES THIS THE TRAP TO WRITE DOWN: a port on autopilot and
+     a MOTO being ridden are not in the same state, and the cockpit is
+     the first geometry sensitive enough to show it. It reads
+     wheelieAngle directly and it is drawn in CAMERA space, where 80
+     units is a fifth of the screen height. Turn the autopilot off
+     before comparing anything about it.
+
+   o MOTO's TWO CONTACTS ARE AT THE SAME HEIGHT on the grid, which is
+     what a bike with both wheels down looks like, and is the reading
+     to expect from the port once nothing is asking for a wheelie.
+
+   o ONE THING HERE IS WORTH CHECKING ANYWAY, and it is not settled:
+     whether the autopilot SHOULD be pulling a wheelie off the line at
+     all. racer_update_wheelie's timer cap of 200 will end it either
+     way, so it is self-limiting rather than stuck. [open]
+
+5.4.2.  WHY IT DREW WHITE AND MOSTLY NOT AT ALL - four faults
+
+   The symptom was: the windscreen's grey reflection visible, a couple
+   of white slivers, and nothing else. Every part of it is accounted
+   for, and the two meshes turn out to be an unusually sharp probe
+   because they are the only shipped geometry drawn through the
+   translucent submitter.
+
+   THE ONE THAT EXPLAINS THE SHAPE OF IT. GUIDON.MAP's 232 records are
+   all n >= 3; COCKPIT.MAP's 152 are 52 records of n = 0 and 100 of
+   n >= 3. A flat face with n >= 3 must be forced to KIND 0 by the
+   loader - formats/mesh-3df-map.txt 6 - and prim.c applied the
+   flags-to-kind table instead, giving kind 1 and 0x15. So:
+
+   +---------------------+------------------------------------------+
+   | Records             | What the port did                        |
+   +=====================+==========================================+
+   | COCKPIT.MAP n = 0   | kind 0 via the n < 3 path, colour from   |
+   | (52 of 152)         | the record - DREW CORRECTLY. These are   |
+   |                     | the grey windscreen polygons.            |
+   +---------------------+------------------------------------------+
+   | everything else     | a textured kind on bank 7, no texture -  |
+   | (all 232 guidon,    | white where it drew at all               |
+   | 100 cockpit)        |                                          |
+   +---------------------+------------------------------------------+
+
+   That is the whole observation: the ONLY faces that worked were the
+   ones whose .map records take the other path.
+
+   THE FOUR FAULTS, two of them in the cockpit work and two older:
+
+   +---+--------------------------------+--------------------------+
+   | # | Fault                          | Where                    |
+   +===+================================+==========================+
+   | 1 | a flat n >= 3 face must be     | prim.c - the table was   |
+   |   | kind 0, not the flags table    | applied unconditionally  |
+   +---+--------------------------------+--------------------------+
+   | 2 | an INDEXED page is a valid     | prim.c - it returned     |
+   |   | flat-colour source, read as a  | 0xffffffff and the       |
+   |   | byte through the palette       | bike's page 0 is indexed |
+   +---+--------------------------------+--------------------------+
+   | 3 | the texel index is u*256 + v   | prim.c - transposed      |
+   +---+--------------------------------+--------------------------+
+   | 4 | the translucent rewrite must   | cull.c - it wrote only   |
+   |   | write effectiveKind too, since | +0x00, so the rewrite    |
+   |   | the dispatcher reads only that | changed nothing drawn    |
+   +---+--------------------------------+--------------------------+
+   | 5 | the cockpit prims must NOT be  | race.c - bank 7 became   |
+   |   | bank-rebased                   | 35, a slot nothing loads |
+   +---+--------------------------------+--------------------------+
+
+   o FAULT 5 IS READ TWO WAYS. maybe_Game_LoadBikeMeshes calls
+     Load3dfAndMap seven times and Mesh_RebaseFaceBanks NOT ONCE, and
+     MOTO's guidon prims read bankIndex 7 live - exactly what
+     GUIDON.MAP's flags say. The rebase was copied from
+     race_load_wheels, where it does belong.
+
+   o FAULTS 1 TO 3 ARE IN SHARED CODE and were reached by every mesh
+     in the game; they were invisible because a transposed one-texel
+     lookup gives a plausible wrong colour and because nothing else
+     drawn through prim.c depended on a paletted flat face. 62 of the
+     196 faces in SPEED\MEDIUM\CORPS.MAP span one texel or less, so
+     this path is not a corner.
+
+   o THE LIVE EVIDENCE, port against MOTO, same grid, paused. MOTO's
+     guidon prim 0: kind 0, colorIndex 0xc8c8, flatColor 0xffc81840,
+     bankIndex 7. The port's, before the fix: kind 0x2c, effectiveKind
+     0x15, flatColor 0xffffffff, bankIndex 35.
+
+   o AND THE TRANSFORM WAS NEVER WRONG. A hook on MOTO at 0x004622c8
+     caught its own transformed guidon vertex 0 as camZ 390.857,
+     screen (493, 493) - which is what the port's P of (0, -350, 350)
+     and a 394 projection base give to the digit. Both agree, and both
+     put that corner off the bottom edge; the visible cockpit is the
+     rest of the mesh.
+
+5.4.3.  THE COCKPIT IS TEXTURED FROM THE TRACK'S BANKS
+
+   231 of GUIDON.MAP's 232 records name bank 7, and 99 of COCKPIT.MAP's
+   152 do, where every other bike mesh names 0 or 1. Read out of MOTO's
+   bank array - base 0x004f92f8, stride 0x338, assetPath at +0x150
+   [verified]:
+
+   +------+------------------------------------+
+   | Slot | assetPath                          |
+   +======+====================================+
+   | 0    | data\speed\bnk00_00.raw            |
+   +------+------------------------------------+
+   | 1    | data\speed\bnk00_01.raw            |
+   +------+------------------------------------+
+   | 2    | data\ile01\bank\bnk00_02.raw       |
+   +------+------------------------------------+
+   | 6    | data\ile01\bank\bnk00_06.raw       |
+   +------+------------------------------------+
+   | 7    | data\ile01\bank\bnk00_07.raw       |
+   +------+------------------------------------+
+   | 8    | data\ile01\bank\bnk00_08.raw       |
+   +------+------------------------------------+
+   | 19   | empty                              |
+   +------+------------------------------------+
+
+   So the original keeps ONE FLAT TABLE in which index N is the level
+   manifest's bank N, and the bike's two pages occupy entries 0 and 1 -
+   which is why the level manifest's first entry is the placeholder
+   MOTO\BNK00_00.RAW that the port reports as missing. The bike's
+   meshes name 0 and 1 and land on the bike's pages; the cockpit's name
+   7 and land on the TRACK's seventh page.
+
+   THE PORT SPLITS THAT TABLE - manifest entries to
+   RACE_TRK_BANK_BASE..+19, the bike's two pages to RACE_BIKE_BANK - so
+   a cockpit face naming 7 has to be rebased by RACE_TRK_BANK_BASE,
+   exactly as the track's own meshes are. Rebasing it by the BIKE base
+   gave 35 and leaving it alone gave a stale menu slot; both resolve to
+   no texture, and the back end then falls back to flatColor, which for
+   a non-flat face is 0xffffffff. That is the white.
+
+   o ONLY 46 OF THE GUIDON'S 231 n >= 3 RECORDS ARE FLAT, and 40 of the
+     cockpit's 100. So most of this geometry is genuinely TEXTURED and
+     the kind-0 fix of 5.4.2 could never have been the whole answer -
+     it fixes 86 faces out of 331.
+
+5.4.4.  MOST OF THE HANDLEBARS ARE BELOW THE SCREEN, AND THAT IS RETAIL
+
+   Worth writing down so nobody corrects it. Projected from the .3df
+   files at the 768 scale with P = (0, -350, 350), a 394 base and a
+   480-tall screen:
+
+   +---------------+----------------+-----------+----------+----------+
+   | Mesh          | extent         | on screen | below    | past     |
+   |               |                |           | y=479    | near     |
+   +===============+================+===========+==========+==========+
+   | GUIDON        | x +-268, y     |  25 / 319 |   276    |    18    |
+   |               | -132..151, z   |           |          |          |
+   |               | -332..139      |           |          |          |
+   +---------------+----------------+-----------+----------+----------+
+   | COCKPIT       | x +-204, y     |  85 / 142 |    57    |     0    |
+   |               | -131..276, z   |           |          |          |
+   |               | -88..344       |           |          |          |
+   +---------------+----------------+-----------+----------+----------+
+
+   THE MODEL IS CONFIRMED AGAINST MOTO ITSELF, twice, not derived.
+
+   A hook on 0x004622c8 caught MOTO's own transformed guidon vertex 0:
+
+       camZ 390.857   screen (493, 493)
+
+   against a prediction of camZ 390.857 and screenY 493.2 from the mesh
+   vertex (171.556, 98.844, 40.857). Exact.
+
+   And the same hook reading ESP+0x124 caught the MATRIX MOTO hands to
+   Screen3D_TransformVertsFlat, with the bike at rest [verified]:
+
+       1.0   ~0    ~0
+       ~0    1.0   ~0
+       ~0    ~0    1.0
+       0    -350.0  +350.0
+
+   an identity rotation and a translation of exactly (0, -350, 350).
+   The port's four inputs read 0 in the same state - wheelieAngle,
+   springBounce, the attitude filter and lean - so it builds the same
+   matrix to the bit. AT REST THE TWO PICTURES ARE THE SAME PICTURE.
+
+   THERE IS NO CLIP PLANE, and the port looked as though there were:
+   the horizontal boundary that appears to bisect the cockpit is the
+   BOTTOM EDGE of the 480-row viewport, and a wheelie appears to lift
+   the model through it because P and the pitch genuinely move.
+
+   +----------+--------------------------+-----------+-------------+
+   | Mesh     | P                        | on screen | screenY     |
+   +==========+==========================+===========+=============+
+   | GUIDON   | rest    (0, -350, 350)   |  25 / 319 |  418..683   |
+   +----------+--------------------------+-----------+-------------+
+   | GUIDON   | wheelie (0, -353.5, 427) |  95 / 319 |  392..1822  |
+   +----------+--------------------------+-----------+-------------+
+   | COCKPIT  | rest    (0, -350, 350)   |  85 / 142 |  317..824   |
+   +----------+--------------------------+-----------+-------------+
+   | COCKPIT  | wheelie (0, -353.5, 427) | 108 / 142 |  314..691   |
+   +----------+--------------------------+-----------+-------------+
+
+   A full wheelie is only 5.4 degrees of lift, but it also RECEDES the
+   anchor from 350 to 427, and the recession shrinks the whole model
+   toward the screen centre. Between them the visible handlebars go
+   from 25 vertices to 95. That is the "emerging through water".
+
+   o SO THE ANCHOR IS 45 DEGREES BELOW THE VIEW AXIS - 350 down at 350
+     forward - where the vertical half-angle is atan(240/394) = 31.3
+     degrees. The centre of the cockpit is BELOW THE BOTTOM EDGE by
+     design, and what is in frame is the top of it: the dash, the
+     screen, and the fork tops. A port that "fixes" this by moving the
+     anchor up is fighting the original.
+
+   o AND IT MEANS VISIBILITY WAS NEVER THE BUG. 25 on-screen guidon
+     vertices is the correct number; the reason almost nothing showed
+     before 5.4.3 is that those faces had no texture and drew white.
+
+   o SO DO NOT RAISE THE ANCHOR. The cockpit mesh is a model of the
+     front of a bike and most of it is BELOW the rider's sightline -
+     the underside of the fairing is geometry you are not meant to
+     see. Moving P up to get more of it on screen would be inventing
+     a view the original does not have.
+
+5.4.5.  THE 0.2 DEPTH KEY IS AN ORDERING TRICK AND A Z-BUFFER CANNOT
+        EXPRESS IT
+
+   The last thing wrong, and it was written down before the code was:
+   cull.h's note on the three submitters, and the plate on 0x0049bca0,
+   both say to reproduce the times-0.2 as a PASS and not as a depth
+   value. It was implemented as a depth value anyway.
+
+   THE ORIGINAL HAS NO DEPTH BUFFER. The compressed key
+   camZ * 0.2 - nearPlaneZ drops the cockpit into the lowest buckets of
+   a painter's walk, and being walked last is the whole mechanism that
+   puts it in front. Our back end depth-tests on the TRUE camZ, which
+   the compression never touched, so:
+
+       the road    camZ 280 outward from the bottom of the screen
+       the cockpit camZ 262..700
+
+   interleave, and the road wins wherever it is nearer. The cockpit is
+   buried IN the road surface - which reads as the bike sinking into
+   the ground, with a waterline that drops as a wheelie pitches the
+   view up and lifts the model clear. Every camera and cockpit quantity
+   measured identical between the two while this was true, which is
+   what made it hard to see: nothing was in the wrong place.
+
+   FIXED by giving it its own pass after the world walk, with
+   drawscene_set_depth_test(0) - the same shape the end-of-race plaque
+   and the HUD map already use in race_draw_3d.
+
+   o THE COMPRESSION STAYS. Within its own pass it is monotonic, so the
+     two meshes still sort against each other as they do in the
+     original, and it drops the same near faces: bucket_for rejects a
+     negative key exactly as Screen3D_QueuePrimitive's JL at
+     0x0049c5d5 does, so every face nearer than camZ 320 is discarded
+     on both sides.
+
+   o AND THE ORIGINAL'S UNITS PER BUCKET IS 4, NOT 1. 0x004d1f9c reads
+     0.25 and Screen3D_QueuePrimitive multiplies the key by it before
+     the ftol. queue.h says "the original is 1 - the bucket IS the
+     integer camera depth", which is wrong; 4 units per bucket covers
+     31,992 units and is why the 18000 far plane fits. The port runs
+     ~5 from its ini. It does not affect this bug - the compression
+     keeps the cockpit below every road bucket either way - but it
+     does affect far-field ordering. [open]
+
+5.5.  Reconstructed
+
+   +------------------------+-----------------------------------------+
+   | Original               | Port                                    |
+   +========================+=========================================+
+   | FUN_00462110           | racerdraw_cockpit, racerdraw.c          |
+   +------------------------+-----------------------------------------+
+   | 0x0049bca0             | cull_and_queue_translucent, cull.c. The |
+   |                        | kind rewrite and the 0.2 key; it        |
+   |                        | rewrites the faces IN PLACE as the      |
+   |                        | original does                           |
+   +------------------------+-----------------------------------------+
+   | 0x004ea4e4             | s_cockpitAttitude, a racerdraw.c static |
+   +------------------------+-----------------------------------------+
+   | the FileGuidon and     | race_load_cockpit, race.c. BOTH scales: |
+   | FileCockpit loads      | the loader's 96.0 and THEN Mesh_Scale   |
+   |                        | 8.0 - bike-assets.txt 2                 |
+   +------------------------+-----------------------------------------+
+   | g_bFirstPersonActive   | s_race_fpActive, resolved once per tick |
+   |                        | in race_camera and read by the draw     |
+   +------------------------+-----------------------------------------+
+
+   NOT RECONSTRUCTED: the gate's replay-mode and pocket-bike arms at
+   0x0046213e. The port has no pocket bike and its replay does not
+   reach mode 6. The rear-view arm is the same TAB key camera.txt
+   3.2.2 lists as missing. [open]
+
+6.  A deviation that was not one
+
+   THE PORT LOOKS LIKE IT WALKS THE QUEUE SIX TIMES A FRAME and it
+   does not. There are six queue_walk(drawscene_dispatch) sites -
+   race.c, four menu pages and glass.c - but menu_draw_page_3d
+   dispatches to ONE page, so exactly one runs per frame. A glass
+   transition adds a second.
+
+   So this is a STRUCTURAL difference from Screen3D_DrawScene, which
+   the original calls once from maybe_Game_RenderFrame, and not a
+   behavioural one. Hoisting the walk into the frame loop would touch
+   every menu page to produce an identical picture, which is why it
+   has been left alone. Written down so the six sites do not read as
+   a bug to the next person who counts them.
+
+7.  The steering speed fade
+
+   THE FORKS STOP TURNING AT HALF TOP SPEED, and that is the
+   design rather than a bug to look for.  Every steering term in
+   maybe_Racer_Draw is scaled by a factor that falls to zero as
+   the bike accelerates.
+
+   Two branches compute it, differing only in where the 2.0 goes.
+   The live one is at 0x0045f63e [verified, disassembled]:
+
+       0045f63e  FLD   [EBX + 0x124]            a speed
+       0045f644  FMUL  [0x004d0f60]             2.0f
+       0045f653  FDIV  [bike*292 + 0x5092c0]    RealSpeedMax
+       0045f65a  FSUBR [0x004d0e70]             1.0f - that
+       ...       clamped to [0, 1] at 0x0045f660..0x0045f696
+       0045f6a4  FSTP  double [ESP + 0x168]
+
+   +------------+------------------------------------------------+
+   | constant   | value                                          |
+   +============+================================================+
+   | 0x004d0f60 | 2.0f                                           |
+   +------------+------------------------------------------------+
+   | 0x004d0e70 | 1.0f                                           |
+   +------------+------------------------------------------------+
+   | 0x004d0e54 | 0.0f, the lower clamp                          |
+   +------------+------------------------------------------------+
+   | 0x005092c0 | per bike, stride 292.  Bike 0 reads 80.0,      |
+   |            | which is RealSpeedMax - the same 80.0 that     |
+   |            | racer+0x00b4 holds                             |
+   +------------+------------------------------------------------+
+
+   So the whole pipeline is
+
+       factor = clamp(1 - 2 * racer[+0x124] / RealSpeedMax, 0, 1)
+       angle  = racer[+0x110] * factor * pi/4096
+
+   and with RealSpeedMax 80 the factor is 1 - speed/40:
+
+   +-----------+--------+---------------------------------------+
+   | speed     | factor | front wheel at full lock (+-600)      |
+   +===========+========+=======================================+
+   | 0         | 1.00   | +-26.4 deg                            |
+   +-----------+--------+---------------------------------------+
+   | 2.5       | 0.94   | +-24.7 deg   (measured 0.918..0.933)  |
+   +-----------+--------+---------------------------------------+
+   | 20        | 0.50   | +-13.2 deg                            |
+   +-----------+--------+---------------------------------------+
+   | 34        | 0.15   |  +-4.0 deg                            |
+   +-----------+--------+---------------------------------------+
+   | 40 and up | 0.00   |   0.0 deg - THE FORKS DO NOT MOVE     |
+   +-----------+--------+---------------------------------------+
+
+   WHICH IS WHY THE FORKS LOOK BROKEN ON THE STREET BIKE.  They
+   turn plainly on the dirt bikes and are hard to catch on tarmac,
+   and the difference is not the bodywork hiding them: at racing
+   speed the angle is literally zero.  Only a creeping bike steers
+   visibly, so the way to see it is a short throttle bump and then
+   a turn.
+
+   AND IT IS WHY A SIGN SWEEP TAKEN AT SPEED FINDS NOTHING.  A
+   sweep at speed 30 to 40 runs with the factor between 0.25 and
+   0, so the front wheel is not moving at all while the record is
+   searched for something that moves.  The thing being looked for
+   is switched off by the conditions of the experiment.
+
+   racer+0x124 IS A SPEED BUT NOT racer+0x2da8.  Read back to back
+   with the game paused they were 2.5095 and 2.5320 - the same
+   units, out of the same 80, but not the same field.
+
+   NOT THE PHYSICS FADE.  racers.txt 9.9.5 describes a second one
+   that divides by VitesseMaxBoite and scales TORQUE rather than
+   the visual angle.  Different function, different divisor,
+   different consumer; they must not be merged.
+
+   Reconstructed as racerdraw_steer_factor.  PersoAnim picks
+   between the clamped and an UNCLAMPED form, so a pocket bike can
+   drive the factor negative at speed - kept as found.
+
+8.  The visible segment list
+
+   maybe_Race_DrawRacers takes the list as an argument and there is
+   exactly ONE call site, at 0x00480263 in maybe_Game_RenderFrame
+   [verified]:
+
+       MOV  ECX, 0x52c108        the track object
+       CALL 0x0040ce60           returns a COUNT
+       MOV  [0x005dabcc], EAX
+       ...
+       PUSH EAX                  count
+       PUSH 0x5dabd8             THE LIST
+       CALL maybe_Race_DrawRacers
+
+   +--------------+-------------------------------------------+
+   | 0x005dabd8   | the visible segment list, int[]           |
+   +--------------+-------------------------------------------+
+   | 0x005dabcc   | how many entries are valid                |
+   +--------------+-------------------------------------------+
+   | 0x0052c108   | the track object it is built from         |
+   +--------------+-------------------------------------------+
+
+   FUN_0040ce60 IS THE TRACK ZONE RENDERER and the list is its
+   by-product: given the camera segment it picks how far to look
+   each way from a dot product, then walks that window.
+   Reconstructed as trk_zone_span - one dot product picking 10/1,
+   5/5 or 1/10 in MESHES, which the segment lister multiplies by
+   the four segments a mesh covers.
+

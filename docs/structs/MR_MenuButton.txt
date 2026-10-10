@@ -1,0 +1,567 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                             MR_MENUBUTTON
+
+
+Abstract
+
+   Size: 0x58 [verified] - the stride used identically by
+   Menu_AddTextButton and Menu_AddSpriteButton when indexing the array.
+
+   Allocated at: never separately. It exists only as MR_Menu.buttons[32]
+   inline at +0x44. Ghidra type applied: yes. Belongs to: menu/menu.cpp.
+
+   One clickable or selectable item on a menu page. Pages call
+   Menu_ClearButtons on entry and then append their own, so the array is
+   rebuilt on every page change and its meaning is entirely page-local.
+
+Table of Contents
+
+   1. Fields
+   2. The two kinds
+      2.1. The kind 1 draw path
+   3. Key codes
+      3.1. What buttons register
+      3.2. What Menu_OnKey handles itself
+      3.3. Numbered rows on the four list pages
+   4. navNeighbours, the focus graph
+   5. The draw state and the five late fields
+   6. Reading the iteration, not just the fields
+   7. Relationships
+   8. Open questions
+   9. The pointer fields are typed, and what that showed
+      9.1. An idle button is drawn stippled
+
+1.  Fields
+
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | Offset | Size | Type       | Name          | Confidence | Evidence                                            |
+   +========+======+============+===============+============+=====================================================+
+   | 0x00   | 4    | int        | rectX1        | verified   | kind 1 only; Menu_HitTest compares the cursor       |
+   |        |      |            |               |            | against these four                                  |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x04   | 4    | int        | rectY1        | verified   | as above                                            |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x08   | 4    | int        | rectX2        | verified   | as above                                            |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x0c   | 4    | int        | rectY2        | verified   | as above                                            |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x10   | 4    | MR_MenuKey | keyCode       | verified   | Menu_OnKey matches the input code against this      |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x14   | 4    | int        | kind          | verified   | 1 from Menu_AddTextButton, 2 from                   |
+   |        |      |            |               |            | Menu_AddSpriteButton                                |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x18   | 4    | char*      | text          | verified   | walked as a C string by Font_DrawTextInternal       |
+   |        |      |            |               |            | 0x00493ee0                                          |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x1c   | 4    | void*      | font          | verified   | font object from Font_Get; has a vtable             |
+   |        |      |            |               |            | always a call result                                |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x20   | 4    | void*      | spriteA       | verified   | kind 2; Menu_HitTest reads x,y,w,h from its first   |
+   |        |      |            |               |            | four ints                                           |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x24   | 4    | void*      | spriteB       | verified   | kind 2; highlight sprite; Menu_Draw branches on it  |
+   |        |      |            |               |            | being non-NULL                                      |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x28   | 4    | int        | drawArg       | verified   | kind 1; fourth argument to the text draw. Always 0  |
+   |        |      |            |               |            | at all 23 sites                                     |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x2c   | 4    | int        | x             | verified   | kind 1 position                                     |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x30   | 4    | int        | y             | verified   | as above                                            |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x34   | 4    | int        | spriteX       | verified   | kind 2; Menu_Draw repositions unless it is -1       |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x38   | 4    | int        | spriteY       | verified   | as above                                            |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x3c   | 4    | int        | field_3c      | unknown    | always -1 from both constructors; no reader         |
+   |        |      |            |               |            | anywhere. Dead                                      |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x40   | 4    | uint       | navNeighbours | verified   | packed focus graph, one byte per direction; see     |
+   |        |      |            |               |            | section 4                                           |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x44   | 4    | int        | groupId       | verified   | Menu_Draw: equal to the hovered button's groupId    |
+   |        |      |            |               |            | sets bit 2                                          |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x48   | 4    | void*      | boundVar      | verified   | Menu_Draw: dereferenced and compared with           |
+   |        |      |            |               |            | boundValue                                          |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x4c   | 4    | int        | boundValue    | verified   | the value boundVar must hold for the checked look   |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x50   | 4    | int        | blink         | verified   | Menu_Draw: forces the draw state to 0 on alternate  |
+   |        |      |            |               |            | redraws                                             |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+   | 0x54   | 4    | int        | repeatOnHold  | verified   | Menu_Tick: bit 0 makes a held mouse button auto-    |
+   |        |      |            |               |            | activate                                            |
+   +--------+------+------------+---------------+------------+-----------------------------------------------------+
+
+   The last six were unnamed until every write to them was traced.
+   Section 6 records what that showed, including which of them are
+   reachable at all.
+
+2.  The two kinds
+
+   Field kind at +0x14 discriminates, and the two constructors populate
+   almost disjoint sets of fields [verified]:
+
+   +-------------+---------------------------------+---------------------------+
+   |             | kind 1, text                    | kind 2, sprite            |
+   +=============+=================================+===========================+
+   | Constructor | Menu_AddTextButton              | Menu_AddSpriteButton      |
+   +-------------+---------------------------------+---------------------------+
+   | Hit test    | own rect at +0x00               | bounds read from spriteA  |
+   +-------------+---------------------------------+---------------------------+
+   | Draw        | vtable call then text draw      | Sprite_SetPosition        |
+   +-------------+---------------------------------+---------------------------+
+   | Highlight   | yellow when hovered, else white | the spriteB variant       |
+   +-------------+---------------------------------+---------------------------+
+   | Sets        | +0x00..0x0c, 18, 1c, 28, 2c, 30 | +0x20, 24, 34, 38, 44, 50 |
+   +-------------+---------------------------------+---------------------------+
+
+   That split explains the sprite naming convention in subsystems/menu-
+   resources.txt. Pairs like practice.lez and practic2.lez, or
+   single.lez and single2.lez, are the spriteA and spriteB of one kind 2
+   button - the normal and highlighted states of a single menu entry
+   [inferred].
+
+2.1.  The kind 1 draw path
+
+   Naming the two functions behind a kind 1 button settles text and
+   font, which had been inferred from position alone [verified].
+
+   +------------+-----------------------+----------------------------------------+
+   | Address    | Name                  | Role                                   |
+   +============+=======================+========================================+
+   | 0x004903d0 | Font_Get              | font id -> font object, with fallbacks |
+   +------------+-----------------------+----------------------------------------+
+   | 0x00493ee0 | Font_DrawText         | wrapper Menu_Draw calls                |
+   +------------+-----------------------+----------------------------------------+
+   | 0x00493820 | Font_DrawTextInternal | the real draw                          |
+   +------------+-----------------------+----------------------------------------+
+
+   Font_DrawTextInternal walks its text argument as a C string and uses
+   each byte to index a 256-entry advance table at font+0x618, so text
+   at +0x18 is a NUL-terminated string and font at +0x1c is the object
+   that owns the glyph metrics. Menu_Draw independently calls vtable
+   slot +4 on the same pointer, so it is an object with virtual methods.
+
+   Font_Get is more interesting than a table lookup. Before indexing
+   g_fontTable it may swap the requested id for a paired variant, and it
+   does so when g_cfgSmallFonts is clear AND g_cfgScreenMode is 2 -
+   which is exactly the mode Menu_SetPage forces on entry to the menus.
+   The two switches are inverse permutations over twelve id pairs: 0/4,
+   1/5, 2/6, 3/7, 10/11, 13/14, 15/16, 19/20, 22/23, 25/26, 28/29,
+   32/33.
+
+   So every font id has a partner, and which of the pair is used depends
+   on the resolution and the small-fonts setting. Screen mode 2 is
+   640x480, the mode Menu_SetPage forces on entry, so in the menus a
+   request for a low-resolution font is answered with its high-
+   resolution twin. All twelve pairs are named in structs/MR_Font.txt
+   section 5 [verified].
+
+   Lookup then falls back in stages - the paired id, the requested id,
+   then font 8 - and sets the caller's out-parameter to 1 whenever a
+   substitution happened. A kind 5 or 6 font that is unavailable is
+   replaced by font 0x1b.
+
+
+3.  Key codes
+
+   keyCode holds a Windows virtual-key code. The database has them as
+   the MR_MenuKey enum [verified].
+
+3.1.  What buttons register
+
+   There are 128 calls to the two Add functions. Every one of them has
+   been resolved, by taking the keyCode argument of each call in the
+   decompiler's pcode and following its definition back through copies,
+   casts and phi nodes until it reaches a constant [verified].
+
+   +--------+---------------+------+----------------------------------------+
+   | Code   | Name          | Uses | Where                                  |
+   +========+===============+======+========================================+
+   | -1     | MENUKEY_NONE  | 74   | no shortcut; mouse or focus only       |
+   +--------+---------------+------+----------------------------------------+
+   | 0x1b   | VK_ESCAPE     | 21   | back or cancel; the commonest real key |
+   +--------+---------------+------+----------------------------------------+
+   | 0x0d   | VK_RETURN     | 10   | confirm                                |
+   +--------+---------------+------+----------------------------------------+
+   | 0x25   | VK_LEFT       | 6    | pages 6, 10, 23 - value steppers       |
+   +--------+---------------+------+----------------------------------------+
+   | 0x27   | VK_RIGHT      | 6    | the matching right stepper             |
+   +--------+---------------+------+----------------------------------------+
+   | 0x26   | VK_UP         | 1    | page 7, the session list               |
+   +--------+---------------+------+----------------------------------------+
+   | 0x28   | VK_DOWN       | 1    | page 7                                 |
+   +--------+---------------+------+----------------------------------------+
+   | 0x6b   | VK_ADD        | 1    | page 6, the lap counter                |
+   +--------+---------------+------+----------------------------------------+
+   | 0x6d   | VK_SUBTRACT   | 1    | page 6, the lap counter                |
+   +--------+---------------+------+----------------------------------------+
+   | 0x61+i | VK_NUMPAD1 up | 7    | computed per row; see section 3.3      |
+   +--------+---------------+------+----------------------------------------+
+
+   Three quarters of all buttons have no keyboard shortcut at all. That
+   is the single largest fact in the table, and it says the menus were
+   designed mouse-first, with keys added only where they earn their
+   place: escape to back out, return to confirm, arrows to step a value.
+
+   The two rarest fixed keys are the most telling. Page 6 is the only
+   page that registers VK_ADD and VK_SUBTRACT, and page 6 is also the
+   only page holding the moin, plus, moiflach and pluflach sprites. The
+   numeric keypad plus and minus drive the lap counter, and the resource
+   evidence and the key evidence were gathered independently [verified].
+
+   An earlier pass over this data read the argument pushes in the raw
+   instruction stream instead, and reached only 55 of the 128 sites. It
+   undercounted MENUKEY_NONE by 66, because -1 is commonly hoisted into
+   a register outside a loop rather than pushed as an immediate. No key
+   was missed, only miscounted.
+
+3.2.  What Menu_OnKey handles itself
+
+   Codes that never reach a button because Menu_OnKey's switch consumes
+   them [verified]:
+
+   +------+------------+----------------------------------------------------------------------+
+   | Code | Name       | Effect                                                               |
+   +======+============+======================================================================+
+   | 0x09 | VK_TAB     | move focus one button forward, wrapping; backward when Shift is held |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x0d | VK_RETURN  | activate the focused button                                          |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x20 | VK_SPACE   | activate the focused button, same case body                          |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x10 | VK_SHIFT   | set g_menuModifiers bit 1                                            |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x11 | VK_CONTROL | set g_menuModifiers bit 2                                            |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x12 | VK_MENU    | set g_menuModifiers bit 0 (Alt)                                      |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x25 | VK_LEFT    | move focus using navNeighbours bits 0-7                              |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x27 | VK_RIGHT   | move focus using navNeighbours bits 8-15                             |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x28 | VK_DOWN    | move focus using navNeighbours bits 16-23                            |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x26 | VK_UP      | move focus using navNeighbours bits 24-31                            |
+   +------+------------+----------------------------------------------------------------------+
+   | 0x2d | VK_INSERT  | calls FUN_00471110(1,0) when DAT_004e8928 is set                     |
+   +------+------------+----------------------------------------------------------------------+
+
+   Two interactions are worth recording because they are not obvious
+   from either half alone. Alt suppresses activation: the VK_RETURN and
+   VK_SPACE case requires g_menuModifiers bit 0 to be clear, which is
+   what keeps Alt+Enter from pressing a menu button while it toggles the
+   display mode. And once g_menuKeyboardNav is set, a button's own
+   VK_RETURN keyCode stops self-activating, so the focused item wins
+   rather than the first button that happens to claim Return.
+
+3.3.  Numbered rows on the four list pages
+
+   Seven of the 128 sites do not pass a constant. They are the four
+   pages that build a list of rows, and all seven use the same idiom:
+   the row index is added to a base so that each row gets the next
+   numpad digit [verified].
+
+   +------+-------------------------+-------------------------+-----------+
+   | Page | What it lists           | Expression              | First row |
+   +======+=========================+=========================+===========+
+   | 7    | network sessions        | (row - scroll) + 0x61   | 0x61      |
+   +------+-------------------------+-------------------------+-----------+
+   | 8    | lobby rows              | i + 0x60, i starts at 1 | 0x61      |
+   +------+-------------------------+-------------------------+-----------+
+   | 20   | championship load slots | i + 0x61, i starts at 0 | 0x61      |
+   +------+-------------------------+-------------------------+-----------+
+   | 21   | championship save slots | i + 0x61, i starts at 0 | 0x61      |
+   +------+-------------------------+-------------------------+-----------+
+
+   Page 8's expression appears in the pcode as PTRADD(i, 0x18, 0x4),
+   which is i + 0x18 * 4 = i + 0x60. It reads as a pointer operation
+   only because the decompiler had typed the loop counter as a pointer;
+   the arithmetic is the same as the others.
+
+   0x61 to 0x69 is exactly VK_NUMPAD1 to VK_NUMPAD9, so the first listed
+   row answers to numpad 1, the second to numpad 2, and so on
+   [inferred]. The competing reading is ASCII 'a' + i, and it is
+   rejected: the argument is compared against the code Menu_OnKey
+   receives, and every other value in that space is a virtual-key code.
+   Letter virtual-key codes are 0x41 to 0x5a, uppercase, so 0x61 cannot
+   be a letter.
+
+   A consequence worth noting is that the numpad only supplies nine
+   usable digits, so a list longer than nine rows has rows that no
+   shortcut can reach. Whether any of these four lists can exceed nine
+   rows has not been checked.
+
+4.  navNeighbours, the focus graph
+
+   Field +0x40 is not a scalar. Menu_OnKey reads a different byte of it
+   for each arrow key, and each byte is the index of the button to move
+   focus to [verified]:
+
+   +-------+------+----------+--------------------------+
+   | Bits  | Byte | Arrow    | Read as                  |
+   +=======+======+==========+==========================+
+   | 0-7   | 0    | VK_LEFT  | value & 0xff             |
+   +-------+------+----------+--------------------------+
+   | 8-15  | 1    | VK_RIGHT | (value & 0xff00) >> 8    |
+   +-------+------+----------+--------------------------+
+   | 16-23 | 2    | VK_DOWN  | (value & 0xff0000) >> 16 |
+   +-------+------+----------+--------------------------+
+   | 24-31 | 3    | VK_UP    | value >> 24              |
+   +-------+------+----------+--------------------------+
+
+   A byte of 0xff means there is no neighbour in that direction and the
+   key is ignored. So each page hand-authors a four-way adjacency graph
+   over its own buttons and packs it into one dword per button. That is
+   why arrow navigation follows the visual layout rather than creation
+   order, while VK_TAB, which ignores navNeighbours entirely, follows
+   creation order.
+
+   Both constructors write the whole dword from a single argument, so
+   the packing is done by the caller. The field is therefore typed as a
+   uint rather than split into four bytes, to keep the write side
+   readable.
+
+   One edge case is verified but its consequence is not. When hoverIndex
+   is -1 an arrow key sets it to the value of the expression
+   (buttonCount == 0), which is 0 when the page has buttons - focus the
+   first - but 1 when the page has none, which is out of range. No page
+   observed so far takes arrow input with an empty button array.
+
+5.  The draw state and the five late fields
+
+   Every write to the six fields that had no name was resolved the same
+   way as the key codes, by following each constructor argument back
+   through the pcode at all 128 call sites [verified]:
+
+   +--------------+----------------------+---------------------------------+
+   | Field        | Written as           | Result                          |
+   +==============+======================+=================================+
+   | field_3c     | -1 at every site     | no reader; dead                 |
+   +--------------+----------------------+---------------------------------+
+   | groupId      | -1 at every site     | read, but the test never passes |
+   +--------------+----------------------+---------------------------------+
+   | boundVar     | 0 at every site      | read, but the test never passes |
+   +--------------+----------------------+---------------------------------+
+   | boundValue   | 0 at every site      | read with boundVar              |
+   +--------------+----------------------+---------------------------------+
+   | blink        | 1 at 8 sites, else 0 | live; page 10 only              |
+   +--------------+----------------------+---------------------------------+
+   | repeatOnHold | 1 at 8 sites, else 0 | live; page 11 only              |
+   +--------------+----------------------+---------------------------------+
+
+   Menu_Draw builds a four-value state word per button and switches on
+   it to pick a sprite draw mode [verified]:
+
+   +---------+---------------------------------------------------------------+-------------+
+   | Bit     | Set when                                                      | Status      |
+   +=========+===============================================================+=============+
+   | 2 (0x4) | this button's groupId equals the hovered button's             | unreachable |
+   +---------+---------------------------------------------------------------+-------------+
+   | 1 (0x2) | this button is the hovered one                                | live        |
+   +---------+---------------------------------------------------------------+-------------+
+   | 0 (0x1) | boundVar is non-NULL and *boundVar == boundValue              | unreachable |
+   +---------+---------------------------------------------------------------+-------------+
+   | -       | blink is set and g_menuBlinkPhase is 1, forcing the word to 0 | live        |
+   +---------+---------------------------------------------------------------+-------------+
+
+   Two of the four inputs to that switch can never fire. groupId is -1
+   on every one of the 128 buttons the game creates, so the hovered
+   button's groupId is always -1 and the bit 2 test is guarded by an
+   explicit iVar != -1 check that always fails. boundVar is 0
+   everywhere, so the bit 0 test fails on its first clause. Neither
+   field is written after construction anywhere in the 100 functions
+   that reference g_menu.
+
+   So the widget layer supports grouped highlighting and radio or
+   checkbox binding, and the shipped menus use neither. Only two of the
+   eight switch cases are reachable: 0, the plain look, and 2, the
+   hovered look. That is a fair description of what the menus actually
+   do [inferred].
+
+   The two live fields are each used by exactly one page. blink is set
+   on 8 buttons of page 10, bike select, where it alternates a button
+   between the highlighted and plain sprite every redraw. repeatOnHold
+   is set on 8 buttons of page 11, options, where Menu_Tick re-activates
+   the hovered button for as long as the mouse button stays down across
+   frames - press and hold to step a value.
+
+   Menu_Draw reaches these fields through a walking pointer rather than
+   by name: ppuVar4 is set to &buttons[0].font at +0x1c and then
+   indexed, so ppuVar4[10], [0xb], [0xc] and [0xd] are groupId,
+   boundVar, boundValue and blink. That is why an earlier pass over the
+   decompiled text concluded these fields had no reader.
+
+
+6.  Reading the iteration, not just the fields
+
+   Applying MR_MenuButton fixed field access everywhere the compiler
+   emitted a plain offset, but not the loops. Menu_HitTest and Menu_Draw
+   walk the array with a pointer that MSVC strength-reduced to start
+   PART WAY INTO the first record, so the decompiler showed raw
+   subscripts on an untyped pointer:
+
+       ppuVar3 = &this->buttons[0].spriteA;   /* record + 0x20 */
+       if (ppuVar3[-3] == 2) ...              /* kind, at +0x14 */
+       ppuVar3 = ppuVar3 + 0x16;              /* next record   */
+
+   Ghidra models exactly this with an offset pointer: a typedef of a
+   struct pointer that carries a component offset. Retyping the walking
+   variable to one renders every access by name, with ADJ() marking the
+   adjustment back to the record base [verified]:
+
+       btn = &this->buttons[0].font;
+       if (ADJ(btn)->kind == 1) ...
+       Font_DrawText(ADJ(btn)->text, ADJ(btn)->x,
+                     ADJ(btn)->y, ADJ(btn)->drawArg, 0, 0, 0, 0);
+
+   Three were applied. The offsets are where each loop's pointer starts,
+   not where the record does:
+
+   +------------------------+--------+----------------------+-----------+
+   | Typedef                | Offset | Used in              | Points at |
+   +========================+========+======================+===========+
+   | MR_MenuButtonAtSpriteA | 0x20   | Menu_HitTest         | spriteA   |
+   +------------------------+--------+----------------------+-----------+
+   | MR_MenuButtonAtFont    | 0x1c   | Menu_Draw main loop  | font      |
+   +------------------------+--------+----------------------+-----------+
+   | MR_MenuButtonAtKind    | 0x14   | Menu_Draw first loop | kind      |
+   +------------------------+--------+----------------------+-----------+
+
+   The first two are unambiguous wins. The third is a trade: the
+   meaningful line becomes ADJ(walk)->kind == 2 instead of *(int
+   *)pMVar3 == 2, but the two setup lines gain casts, because that
+   pointer starts at the menu object rather than inside a button.
+   Recorded as it is rather than tidied.
+
+   The stride still prints as + 0x16 rather than + 1. The offset pointer
+   fixes the reads, not the increment.
+
+   Building one from a script needs the method componentOffset, not
+   withComponentOffset, and PointerTypedefBuilder is not reachable
+   through Class.forName from a script bundle - load it from a known
+   Ghidra class's own classloader instead. Both cost a round of silent
+   compile failures here.
+
+   The retyping paid for itself immediately: it confirmed three readings
+   taken from raw subscripts in section 5. Ghidra now prints
+   ADJ(btn)->boundValue == *ADJ(btn)->boundVar for the checked test,
+   ADJ(btn)->blink for the blink override and ADJ(btn)->groupId for the
+   group match, which is the same structure that had been derived by
+   hand from ppuVar4[0xb], [0xc] and [0xd].
+
+   It also settled the draw call this document previously left open.
+   Menu_Draw now renders it as Font_DrawText(text, x, y, drawArg), which
+   is the argument mapping that could not safely be asserted while the
+   pointer was untyped [verified].
+
+7.  Relationships
+
+   o Contained by: MR_Menu at +0x44, 32 inline slots. See
+     structs/MR_Menu.txt.
+   o Points to: sprite objects owned by g_menuObjects, not by the
+     button. The button holds borrowed pointers.
+   o Indexed by: MR_Menu.hoverIndex and MR_Menu.activatedIndex, and by
+     the four bytes of navNeighbours.
+
+8.  Open questions
+
+   o ANSWERED. All six are traced; see section 5. Only field_3c has no
+     reader at all. groupId, boundVar and boundValue are read but can
+     never pass their tests, and blink and repeatOnHold are live.
+
+   o ANSWERED. font comes from Font_Get (0x004903d0) and text is walked
+     as a C string by Font_DrawTextInternal (0x00493820). Both are now
+     verified; see section 2.1.
+
+   o ANSWERED. All 128 Add call sites are resolved; see sections 3.1 and
+     3.3. 121 pass a constant and the remaining 7 are the numbered-row
+     idiom.
+
+   o Whether any of the four list pages can show more than nine rows,
+     which would leave rows with no reachable numpad shortcut. See
+     section 3.3.
+
+
+9.  The pointer fields are typed, and what that showed
+
+   Four fields were carried as bare pointer. All four are now typed,
+   verified from Menu_Draw (0x0040c1f0) and Menu_HitTest (0x0040c0c0):
+
+   +--------+---------------+----------------------------------------+
+   | Offset | Type          | Evidence                               |
+   +========+===============+========================================+
+   | 0x1c   | MR_Font *     | Menu_Draw passes it as the this        |
+   |        |               | argument of Font_DrawText and vtable-  |
+   |        |               | calls offset +0x04 on it               |
+   +--------+---------------+----------------------------------------+
+   | 0x20   | MR_Sprite *   | passed to Sprite_SetPosition,          |
+   |        |               | Sprite_Draw and Sprite_UpdateMove      |
+   +--------+---------------+----------------------------------------+
+   | 0x24   | MR_Sprite *   | the alternate sprite; null means there |
+   |        |               | is only spriteA                        |
+   +--------+---------------+----------------------------------------+
+   | 0x48   | int *         | Menu_Draw dereferences it and compares |
+   |        |               | against boundValue                     |
+   +--------+---------------+----------------------------------------+
+
+   Section 6 records that applying MR_MenuButton fixed field access.
+   Typing these four extends that across a struct boundary: Menu_HitTest
+   now prints spriteA->x, ->y, ->width and ->height where it printed
+   piVar1[0] through piVar1[3]. Its plate comment already asserted that
+   kind 2 "tests the bounds of spriteA, read from its first four ints",
+   so the comment and the type now confirm each other from opposite
+   directions.
+
+9.1.  An idle button is drawn stippled
+
+   Section 5 establishes the draw state word and that only two of its
+   eight cases are reachable - 0, plain, and 2, hovered. What it could
+   not say at the time is what the resulting DRAW MODE means, because
+   Sprite_Draw had not been read. It has now; see structs/MR_Sprite.txt
+   section 5.
+
+   The two reachable cases resolve to [verified]:
+
+   +-------+-----------+--------+-----------+----------------------------+
+   | State | spriteB   | Sprite | Draw mode | Blit                       |
+   +=======+===========+========+===========+============================+
+   | 0     | absent    | A      |     3     | STIPPLED, colour-keyed     |
+   +-------+-----------+--------+-----------+----------------------------+
+   | 0     | present   | A      |     5     | the sprite's own kind      |
+   +-------+-----------+--------+-----------+----------------------------+
+   | 2     | absent    | A      |     5     | the sprite's own kind      |
+   +-------+-----------+--------+-----------+----------------------------+
+   | 2     | present   | B      |     5     | the sprite's own kind,     |
+   |       |           |        |           | after repositioning B      |
+   +-------+-----------+--------+-----------+----------------------------+
+
+   Mode 5 is the sentinel meaning "use this->kind" rather than a mode
+   of its own. Mode 3 draws every other pixel with the start column
+   alternating per row.
+
+   SO A BUTTON WITH NO ALTERNATE SPRITE IS DRAWN AT 50 PER CENT SCREEN
+   DOOR WHEN IDLE, AND SOLID WHEN HOVERED. Highlighting in this menu is
+   a stipple being switched off, not a colour change and not a blend.
+   A button that HAS an alternate sprite never stipples - it swaps
+   spriteA for spriteB instead.
+
+   o FOR A PORT: substituting alpha for the stipple will not match, and
+     the difference is on every idle button of every page, not an edge
+     case. Reproducing it needs the parity of the destination row,
+     because the start column alternates.
+
+   The draw call is always Sprite_Draw(sprite, ..., mode, 100, 0) -
+   fully revealed, unshrunk. The reveal and shrink arguments that
+   MR_Sprite section 5 describes are not used by the button layer;
+   whatever drives them is elsewhere.
+
+   Kind 1 buttons are text, not sprites. They set the colour to yellow
+   when hovered and white otherwise, through FUN_00490a60 and
+   FUN_00490a30, then call Font_DrawText. So text buttons DO highlight
+   by colour, and sprite buttons do not - the two kinds use different
+   mechanisms.

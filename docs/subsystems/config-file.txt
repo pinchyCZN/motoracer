@@ -1,0 +1,520 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            THE CONFIG FILE
+
+
+Abstract
+
+   CONFIG.BPT holds 51 records and every one is now named. The loader is
+   Settings_LoadAll at 0x0042ae30; the file format is in formats/bpt.txt
+   and what the other .bpt files contain is in formats/bpt-content.txt.
+
+   This note is about position, not meaning. What each setting does and
+   which global receives it is already in subsystems/settings.txt; what
+   was missing was which byte of the file each one comes from, because
+   the binary form stores no names.
+
+Table of Contents
+
+   1. How position maps to name
+   2. The full table
+   3. Verification
+   4. The registry is not used, and will not be
+      4.1. [OPTIONS], and why every value is an integer
+      4.1. When the port writes the file back
+   5. Open questions
+
+1.  How position maps to name
+
+   The binary form is positional. A reader takes the next record each
+   time it is called, so the order of the calls in Settings_LoadAll IS
+   the layout of the file [verified].
+
+   Walking that function in address order gives the sequence directly.
+   It reads one string and fifty integers:
+
+   +----------+--------------------------------------------+-------+
+   | Records  | Source                                     | Count |
+   +==========+============================================+=======+
+   | 0        | Settings_ReadString("DefName")             | 1     |
+   +----------+--------------------------------------------+-------+
+   | 1 to 33  | Settings_ReadInt, thirty-three named calls | 33    |
+   +----------+--------------------------------------------+-------+
+   | 34 to 47 | a loop over seven actions, Key then Btn    | 14    |
+   +----------+--------------------------------------------+-------+
+   | 48 to 50 | SmallFonts, EnumSession, SpeedUnit         | 3     |
+   +----------+--------------------------------------------+-------+
+
+   One string plus fifty integers is 51 records, which is exactly what
+   the file decodes to. The loop bound of seven is not arithmetic:
+   subsystems/input-bindings.txt already fixed it three ways, from the
+   loader's index test, the pointer walk terminating at base plus 7
+   times 8, and both setters rejecting an index of 7.
+
+   The single string is why CONFIG.BPT begins with one, which had been
+   misread as a plain leading count of 5; see formats/bpt.txt section 7.
+
+2.  The full table
+
+   Both files in DATA are somebody's saved settings rather than shipped
+   defaults, so the two value columns are real user choices [verified].
+
+   +------+-------------------+--------+----------+
+   | Item | Setting           | CONFIG | the copy |
+   +======+===================+========+==========+
+   | 0    | DefName (string)  | (name) | DSIZZZ   |
+   +------+-------------------+--------+----------+
+   | 1    | DrawLand          | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 2    | ScreenMode        | 2      | 2        |
+   +------+-------------------+--------+----------+
+   | 3    | FullScreen        | 0      | 1        |
+   +------+-------------------+--------+----------+
+   | 4    | Mode_169          | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 5    | MapMode           | 4      | 4        |
+   +------+-------------------+--------+----------+
+   | 6    | DisplaySignal     | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 7    | CurrentDetail     | 4      | 4        |
+   +------+-------------------+--------+----------+
+   | 8    | CurrentDifficulty | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 9    | NbComputerCut     | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 10   | AmbiantState      | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 11   | MotoState         | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 12   | SoundState        | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 13   | VoicesState       | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 14   | AudioState        | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 15   | Wave16Bits        | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 16   | Stereo            | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 17   | ReplayRate        | 11025  | 22050    |
+   +------+-------------------+--------+----------+
+   | 18   | MasterVolume      | 32     | 19       |
+   +------+-------------------+--------+----------+
+   | 19   | CDVolume          | 32     | 19       |
+   +------+-------------------+--------+----------+
+   | 20   | WaveVolume        | 32     | 19       |
+   +------+-------------------+--------+----------+
+   | 21   | InputDevice       | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 22   | JoyType           | 2      | 2        |
+   +------+-------------------+--------+----------+
+   | 23   | CounterType       | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 24   | ShowCounter       | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 25   | D3DOnlyEmulation  | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 26   | DetectD3DCard     | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 27   | LastLevel         | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 28   | LastMaxTour       | 4      | 4        |
+   +------+-------------------+--------+----------+
+   | 29   | LastCurMode       | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 30   | LastNbComp        | 23     | 23       |
+   +------+-------------------+--------+----------+
+   | 31   | LastRev           | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 32   | LastPokt          | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 33   | LastMoto          | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 34   | Action0Key        | 90     | 90       |
+   +------+-------------------+--------+----------+
+   | 35   | Action0Btn        | 0      | 0        |
+   +------+-------------------+--------+----------+
+   | 36   | Action1Key        | 88     | 88       |
+   +------+-------------------+--------+----------+
+   | 37   | Action1Btn        | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 38   | Action2Key        | 37     | 37       |
+   +------+-------------------+--------+----------+
+   | 39   | Action2Btn        | -2     | -2       |
+   +------+-------------------+--------+----------+
+   | 40   | Action3Key        | 39     | 39       |
+   +------+-------------------+--------+----------+
+   | 41   | Action3Btn        | -3     | -3       |
+   +------+-------------------+--------+----------+
+   | 42   | Action4Key        | 65     | 65       |
+   +------+-------------------+--------+----------+
+   | 43   | Action4Btn        | 2      | 2        |
+   +------+-------------------+--------+----------+
+   | 44   | Action5Key        | -1     | -1       |
+   +------+-------------------+--------+----------+
+   | 45   | Action5Btn        | 3      | 3        |
+   +------+-------------------+--------+----------+
+   | 46   | Action6Key        | 67     | 67       |
+   +------+-------------------+--------+----------+
+   | 47   | Action6Btn        | -1     | -1       |
+   +------+-------------------+--------+----------+
+   | 48   | SmallFonts        | 1      | 1        |
+   +------+-------------------+--------+----------+
+   | 49   | EnumSession       | 10     | 10       |
+   +------+-------------------+--------+----------+
+   | 50   | SpeedUnit         | 0      | 0        |
+   +------+-------------------+--------+----------+
+
+3.  Verification
+
+   The mapping is confirmed by data the loader never saw. Three
+   independent checks [verified]:
+
+   First, the record count. Fifty-one calls, fifty-one records, and the
+   parse consumes the file to its last byte.
+
+   Second, the action buttons. subsystems/input-bindings.txt recorded
+   the seven default buttons from the binary long before this file was
+   readable. The values landing at the Btn positions are an exact match:
+
+   +-------+--------------+---------------+-----+--------------------+
+   | Index | Action       | Key in CONFIG | Btn | Documented default |
+   +=======+==============+===============+=====+====================+
+   | 0     | Accelerate   | 0x5a Z        | 0   | 0                  |
+   +-------+--------------+---------------+-----+--------------------+
+   | 1     | Brake        | 0x58 X        | 1   | 1                  |
+   +-------+--------------+---------------+-----+--------------------+
+   | 2     | Turn Left    | 0x25 VK_LEFT  | -2  | -2                 |
+   +-------+--------------+---------------+-----+--------------------+
+   | 3     | Turn Right   | 0x27 VK_RIGHT | -3  | -3                 |
+   +-------+--------------+---------------+-----+--------------------+
+   | 4     | Higher Gear  | 0x41 A        | 2   | 2                  |
+   +-------+--------------+---------------+-----+--------------------+
+   | 5     | Lower Gear   | unbound       | 3   | 3                  |
+   +-------+--------------+---------------+-----+--------------------+
+   | 6     | Turbo/Stunts | 0x43 C        | -1  | -1                 |
+   +-------+--------------+---------------+-----+--------------------+
+
+   Every button matches the documented default. The keys do not, and
+   that is the point: this is a saved configuration, so the buttons were
+   left alone while the keys were rebound to Z and X for accelerate and
+   brake, the arrows for steering, A for a higher gear and C for stunts,
+   with the lower gear left unbound. A coherent keyboard layout, which
+   random misalignment would not produce.
+
+   Third, the two files differ only where a preference would. ReplayRate
+   is 11025 against 22050 and the three volumes are 32 against 19. Those
+   are the audio settings, sitting exactly where the loader reads
+   MasterVolume, CDVolume and WaveVolume.
+
+4.  The registry is not used, and will not be
+
+   The original keeps player data in the Windows registry as well as
+   in .ini files. THE RECONSTRUCTION USES THE .INI FOR ALL OF IT and
+   touches the registry nowhere.
+
+   That is a project decision rather than a finding: an .ini beside
+   the exe is inspectable, portable, survives being copied to another
+   machine, and needs neither an installer nor elevation. None of
+   those is true of a registry key, and nothing the game stores
+   benefits from being machine-global.
+
+   FIRST USE IS THE PLAYER NAME. Page 15 reads it on entry and writes
+   it back on exit:
+
+       [PLAYER]
+       name=ABCDEFGH
+
+   Eight characters maximum, A-Z only - the entry page folds case
+   with & 0xdf and replaces anything outside A-Z with A, so a saved
+   name cannot hold a space or a digit. There is no glyph for one.
+
+   o ONE NAME, NOT A LIST. Nothing in page 15 or its resources
+     suggests multiple profiles - one buffer, one slot row, one
+     write. An empty name is accepted by the storage but the page
+     will not LEAVE on one: the valid cell and the enter key both
+     test nameLength > 0 first.
+
+   THE UNLOCK FLAGS GO THE SAME WAY. Page 3 shows an indicator for
+   each of the two unlockable features, and each is TWO flags:
+
+       [PLAYER]
+       reverse_unlocked=1     the option exists at all   0x004dc040
+       reverse_enabled=1      it is currently on         0x004dc068
+       pocket_unlocked=1                                 0x004dc03c
+       pocket_enabled=1                                  0x004dc078
+
+   o UNLOCKED IS EARNED AND STICKY. Two sites set it: a race-result
+     path at 0x004581a5 unlocks on a record field, and 0x00455224
+     sets it whenever the ENABLED flag is on - so once the mode has
+     been used it stays available and cannot be lost by switching it
+     off again.
+
+   o BUT IT STARTS IN LIST.BPT, NOT IN A SAVE. Tracks_LoadList
+     (0x00428d60) reads PocketAvailable into 0x004dc03c and
+     ReverseAvailable into 0x004dc040 out of the island list, and the
+     shipped file has both at 0 [verified]. So the original re-reads
+     the initial value from shipped data on every run and the two
+     sites above raise it during play; there is no persistence of the
+     unlocked flags in CONFIG.BPT at all.
+
+     PERSISTING THEM IN THE INI IS THEREFORE OURS, and a divergence
+     rather than a transcription. It is the right one - a player who
+     has earned reverse mode should not lose it on exit - but it
+     should be recorded as a decision. See formats/list-bpt.txt.
+
+   o THE CHEAT DOES NOT WRITE THE SAVE. Page 3 tests unlocked OR
+     cheated, so entering CESREVER reveals the button for that run
+     without granting it permanently. Two flags tested together,
+     only one of them persistent.
+
+   o AND THE INDICATOR IS A TWO-WORD SELECTOR, not a checkbox. Both
+     ON and OFF are always drawn; the enabled flag decides which is
+     lit and which is dark. One set of four word sprites is shared
+     by both rows, repositioned and redrawn twice a frame, which is
+     why they all carry rev_ names even on the pocket row.
+
+   config.c gained write_ini_string for this. Anything else the game
+   would have put in the registry goes the same way.
+
+
+4.1.  [OPTIONS], and why every value is an integer
+
+   The options page writes one section, and options.c is our
+   Settings_LoadAll: one table of key, field, range and default,
+   read once at startup and written when the page is left.
+
+   +--------------------+-------+---------+-----------------------------+
+   | Key                | Range | Default | Original                    |
+   +====================+=======+=========+=============================+
+   | CurrentDifficulty  | 0..2  | 1       | same name                   |
+   | Controller         | 0..2  | 0       | see below                   |
+   | CurrentDetail      | 0..4  | 4       | same name, shown as 1..5    |
+   | NbComputerCut      | 0..1  | 1       | same name; 0 = 24, 1 = 12.  |
+   |                    |       |         | OURS defaults 1; see below  |
+   | VoicesState        | 0..1  | 1       | same name                   |
+   | SoundState         | 0..1  | 1       | same name                   |
+   | AudioState         | 0..1  | 1       | same name, the CD           |
+   | ScreenMode         | 0..2  | 2       | same name                   |
+   | ShowCounter        | 0..1  | 1       | same name                   |
+   | CounterType        | 0..2  | 1       | same name; see              |
+   |                    |       |         | subsystems/hud-counter.txt  |
+   | SpeedUnit          | 0..1  | 0       | same name; 1 = mph          |
+   | SmallFonts         | 0..1  | 1       | same name; retail ships 1,  |
+   |                    |       |         | see the bullet below        |
+   | TextureFilter      | 0..1  | 0       | OURS.  1 is bilinear;       |
+   |                    |       |         | retail point samples        |
+   | Mode_169           | 0..1  | 1       | same name; OURS defaults 1  |
+   | Wide169Crop        | 0..1  | 0       | OURS.  1 gives the          |
+   |                    |       |         | original's 640x360 crop     |
+   | SkipCountdown      | 0..1  | 0       | OURS, DEBUG.  1 ends the    |
+   |                    |       |         | grid countdown at once      |
+   | CrashRecoveryMs    | -1..  | -1      | OURS, DEBUG.  -1 keeps the  |
+   |                    | 10000 |         | built-in; else the remount  |
+   |                    |       |         | CEILING in ms               |
+   | FreezeRaceTimer    | 0..1  | 0       | OURS, DEBUG.  1 stops the   |
+   |                    |       |         | race timer counting down    |
+   | ShowFps            | 0..1  | 0       | OURS, DEBUG.  1 draws the   |
+   |                    |       |         | fps overlay; ini only       |
+   | MapMode            | 0..4  | 4       | same name; 4 = off, F9      |
+   |                    |       |         | cycles.  hud-map.txt        |
+   | WaveFormat         | 0..7  | 3       | see below                   |
+   | EnumSession        | 0..30 | 0       | same name; 0 = manual       |
+   | MasterVolume       | 0..32 | 32      | same name                   |
+   | CDVolume           | 0..32 | 32      | same name                   |
+   | WaveVolume         | 0..32 | 32      | same name                   |
+   +--------------------+-------+---------+-----------------------------+
+
+   AND [VIDEO] IS A THIRD, read-only.  maxfps is the render cap - it
+   DEFAULTS TO 60 with no ini at all, -1 asks for the original's 33.0
+   ms step and 0 uncaps - and simhz is the fixed simulation rate,
+   which is not wired to anything yet.  Nothing writes them back, so
+   they appear in the ini only if a reader puts them there.
+   frame-loop.txt 7 has the detail and the warning that goes with it:
+   raising maxfps changes the physics, so a differential run against
+   MOTO.EXE has to set maxfps=30 here and 30 there.
+
+   o THE ORIGINAL HAS NO FRAME-RATE SETTING to match [verified].
+     -FrameRateMax is command-line only and its global 0x004dc200 is
+     read by one function and written by one - Settings_LoadAll and
+     Settings_SaveAll never touch it, and no key of that shape exists
+     in the config block at 0x004e7d80.  So a frame-rate key could not
+     go in [OPTIONS] whatever it were called.
+
+   TWO SECTIONS FOR THE SETTINGS PROPER.  [OPTIONS] holds every key
+   above that the original has; [OPTIONS_CUSTOM] holds the six this
+   project invented - Language, Wide169Crop, SkipCountdown,
+   CrashRecoveryMs, FreezeRaceTimer and ShowFps.  TextureFilter is
+   the one key that is ours and is NOT in the custom section,
+   because it drives a switch the original has under a name we
+   did not want
+   - see 4.1 and renderer-mode.txt 1.1.  The split is so a reader can
+   tell at a glance which half of the file is evidence about MotoRacer
+   and which half is ours.
+
+   o THE PLAYER NAME IS [PLAYER] name, NOT A SETTING.  Page 15 - the
+     name-entry screen - writes it on the way out and pre-fills from
+     it on the way in, folded to upper case and clamped to eight
+     characters, exactly as the original does.  g_playerName is the
+     global, menu.h declares it, and racer.c copies it into
+     MR_Racer +0x2dd4 where the BEST LAP block reads it.
+
+     A PlayerName key briefly existed in [OPTIONS_CUSTOM] and was a
+     mistake: it duplicated a key that already worked, on the wrong
+     side of the evidence/invention split, because the name-entry
+     page had been overlooked.  It is gone.
+
+     AI racers are named COMPUTER, read live out of a running MOTO
+     rather than transcribed - whatever writes the name has not been
+     found.  An EMPTY name is not harmless: the BEST LAP block pads
+     to eight cells with '@', a full-width BLANK glyph, so a zeroed
+     name draws as a bare coloured bar with no text.
+
+   o CrashRecoveryMs IS THE OTHER DEBUG OVERRIDE, and -1 - the
+     default - takes the original branch unchanged.  The value is
+     the remount CEILING in MILLISECONDS and lands in
+     CRASH_TIMER_START, so 4000 is what the game already does and 0
+     is instant.  THE NORMAL REMOUNT IS A WHOLE SECOND EARLIER than
+     whatever is set, because the timer has two exits - see
+     racers-convergence.txt 9.66.1.
+
+     IT IS MILLISECONDS GOING IN AND CENTISECONDS ONCE STORED.
+     flCrashTimerMs does not hold milliseconds despite its name, so
+     the setting is divided by ten on the way in.
+
+   o FreezeRaceTimer IS A DEBUG OVERRIDE and holds the race timer off
+     zero so the limit never expires.  With it set the player is never
+     locked to the brake and can keep riding indefinitely, which is
+     what testing anything past the limit needs - the port has no Game
+     Over page to get out of.
+
+     THE GRID COUNTDOWN STILL RUNS, and that is not free: timerMs is
+     the countdown first and the limit afterwards, so the freeze is
+     gated on preRace.  Without that gate the bike would sit on the
+     grid for ever.  racers.txt 9.8.4.
+
+     IT AFFECTS THE PLAYER ONLY.  The timeout has exactly one writer
+     and it indexes the local racer; AI riders are never timed out
+     with or without this.
+
+   o SkipCountdown IS A DEBUG OVERRIDE and is written as one: it
+     zeroes the six-second grid timer rather than bypassing it, so
+     the real transition still fires, raceState is still assigned and
+     the time limit is still loaded.  Unset it changes nothing.  It
+     exists because waiting out the countdown on every test run is
+     the single most expensive thing about testing a race.
+
+   o A KEY WITH NO ROW ON THE OPTIONS PAGE IS STILL THE GAME'S.
+     ShowCounter, CounterType and SmallFonts are driven by in-race
+     hotkeys rather than by the page, and they belong in [OPTIONS].
+
+   o SMALLFONTS DEFAULTS TO 1, AND THAT IS THE BINARY'S OWN DEFAULT
+     rather than a value copied out of a saved file [verified].
+     g_cfgSmallFonts at 0x004f0e08 has a static initialiser of 1,
+     so a retail build that reads no setting at all still runs
+     small.  Settings_LoadAll overwrites it at 0x0042be45 from a
+     key literally named SmallFonts, and that reader throws when
+     the key is absent, so the 1 stands.  Both files in section
+     2 hold 1 as well, but those are saved user choices and only
+     corroborate.
+
+   o THREE DEFAULTS ARE DELIBERATELY NOT THE ORIGINAL'S.  Mode_169
+     ships 0 in retail and 1 here, because 4:3 is the wrong shape
+     for every monitor this will meet; [VIDEO] maxfps has no
+     original at all and defaults to 60 rather than the 33 ms step,
+     which CHANGES THE PHYSICS - see frame-loop.txt 7, and pin it
+     on both sides for a differential run.
+
+     THE THIRD IS NbComputerCut, AND ITS EVIDENCE POINTS BOTH WAYS.
+     g_cfgNbComputerCut at 0x004dbfdc carries a static
+     initialiser of 0 [verified], so a retail build reading no setting
+     runs the full 24-bike field; but BOTH shipped CONFIG files in
+     section 2 hold 1, so every saved copy we have runs 12.  The
+     port follows the saved files.  It is the one default where the
+     binary's own initialiser was read and then NOT followed, which
+     is why it is called out rather than left in the table.
+
+   THE KEY NAMES ARE THE ORIGINAL ONES wherever one exists, so the ini
+   and CONFIG.BPT can be compared without a translation table.
+   The defaults are the binary's own static initialiser where one
+   has been read, and the section 2 values otherwise - those being
+   saved settings rather than shipped defaults, they are the weaker
+   evidence of the two.
+
+   Mode_169 IS THE ONE DISPLAY SETTING THAT IS APPLIED.  ScreenMode
+   is stored and ignored.  Both are read once at startup - see
+   subsystems/projection.txt 7.1 for what the flag does and why the
+   port's 16:9 is not the original's.
+
+   o EVERY VALUE IS AN INTEGER, and where the original stored
+     something else we store an INDEX. That keeps the file hand-
+     editable and parsing to atoi, and it means a bad value can
+     always be CLAMPED into range rather than rejected - an out-of-
+     range index would otherwise read off the end of a table.
+
+   o Controller IS THE BINDING COLUMN, 0..2, not the original
+     InputDevice. That is stored as 1, 4 or 2, which is an integer
+     but not an index; the map is 0 -> 1 keyboard, 1 -> 4 joystick,
+     2 -> 2 joypad [verified, MenuPage11_Options_Enter 0x00443040].
+
+   o WaveFormat IS ONE INDEX OVER EIGHT COMBINATIONS where the
+     original keeps three separate settings - Wave16Bits, Stereo and
+     ReplayRate. The order is the order FUN_00409570 cycles them, a
+     three-digit odometer: the depth toggles 8 <-> 16, going back to
+     8 carries into the rate 11025 <-> 22050, and going up to 22050
+     carries into mono <-> stereo [inferred, read out of that
+     function]. Every step is gated on the sound device supporting
+     the next format, so on real hardware the cycle skips entries;
+     with no device to ask, all eight are offered.
+
+   o THE THREE VOLUMES ARE NOT IN THE STRUCT. They live in audio.c,
+     which is what will apply them, and options.c only passes them
+     through - so there is exactly one copy of each. See
+     subsystems/menu-pages.txt section 2.4.5 for why we do not drive
+     the Windows mixer the way the original does.
+
+   o D3D AND InputDevice ARE NOT STORED. The port has one renderer
+     and it is always on, and there is no input layer to bind yet.
+
+   o TWO SETTINGS ARE STORED BUT NOT APPLIED: ScreenMode and
+     WaveFormat. Both cycle, both persist, and both log a line
+     saying so when changed - because a row that changes and does
+     nothing otherwise looks exactly like a working setting.
+
+
+4.1.  WHEN THE PORT WRITES THE FILE BACK
+
+   options_save writes the WHOLE table, and it now runs on WM_CLOSE
+   as well as from the options page.
+
+   UNTIL IT DID, ONLY THE PAGE EVER SAVED - so a setting changed by
+   a KEY and never confirmed on that page was lost on exit.  MapMode
+   is the one that shows: F9 cycles it, the entry has been in the
+   table all along with the right range and default, and nothing
+   wrote it.  It looked like a missing setting and was a missing
+   CALL.
+
+   The same now persists a 16:9 toggled with F4, for the same
+   reason and by the same route.
+
+5.  Open questions
+
+   o The Last* group records the previous race setup: LastLevel,
+     LastMaxTour, LastCurMode, LastNbComp, LastRev, LastPokt, LastMoto.
+
+   PARTLY RESOLVED. LastNbComp reading 23 was flagged here as too large
+   to be an opponent count. It is not: maybe_Game_LoadRace sets
+   g_opponentCount to exactly 23, cut to 11 when NbComputerCut is set.
+   So the name means what it says and 23 is the maximum. See
+   subsystems/game-object.txt section 6.3 [verified].
+
+   o EnumSession is 10 in both files and sits with the multiplayer
+     settings. Whether it is a count, a timeout or a mode is unknown.
+
+   o MapMode is 4 and CurrentDetail is 4 in both files. Neither range is
+     established.
+
+   o The writer has not been traced. FUN_0042ad40 references
+     "Data\config.Spt" in lower case, which is the likely save path, and
+     confirming it would show whether the game ever emits the text form.

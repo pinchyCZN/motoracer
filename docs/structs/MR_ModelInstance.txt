@@ -1,0 +1,374 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                           MR_MODELINSTANCE
+
+
+Abstract
+
+   Size: 0x184 [verified] - four independent sources agree.
+   Initialised by ModelInstance_Init (0x0048bce0, was
+   maybe_ModelInstance_Init). Ghidra type applied: yes.
+
+   A MESH PLACED IN THE WORLD: a position, an orientation and the mesh
+   to draw. Not a menu type - Racer_Create embeds three of them in
+   every racer, so this is on the path to the bikes as much as to the
+   title screen.
+
+   The first 0x18 bytes and the mesh pointer are settled. MOST OF THE
+   RECORD IS NOT, and nothing here pretends otherwise.
+
+Table of Contents
+
+   1. Fields
+   2. What settled the argument roles
+      2.1. The retail recording agrees
+   3. Where instances live
+      3.1. ModelInstance_Draw, and what it confirms
+      3.2. The euler convention, and the angle unit
+      3.3. The camera record is not MR_MenuCamera
+      3.4. The camera view is a look-at, and it is not identity
+      3.5. Four fields the racer adds, read live
+   4. Why it mattered
+   5. Open questions
+
+
+1.  Fields
+
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | Offset | Size | Type       | Name      | Confidence | Evidence                          |
+   +========+======+============+===========+============+===================================+
+   | 0x0000 | 12   | float[3]   | rotation  | verified   | arg2; Euler, RADIANS              |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x000c | 12   | float[3]   | position  | verified   | arg1                              |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0018 | 12   | float[3]   | posPrev   | verified   | LAST frame - shifted in by        |
+   |        |      |            |           |            | maybe_Racer_UpdateGroundContact   |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0024 | 12   | float[3]   | posPrev2  | verified   | THE FRAME BEFORE THAT. Written    |
+   |        |      |            |           |            | in three instances, read in none  |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0034 | 4    | void*      | pMesh     | verified   | arg3, an MR_Mesh                  |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0044 | 4    | int        | flag44    | verified   | set to 1 by the initialiser       |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0058 | 4    | int        | flag58    | verified   | set to 1                          |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0070 | 24   | -          | -         | verified   | six dwords cleared in a loop      |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0088 | 4    | int        | flag88    | verified   | set to 1                          |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0094 | 4    | float      | scale     | inferred   | set to 1.0f, the only float       |
+   |        |      |            |           |            | constant written. No reader found |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x0098 | 48   | float[12]  | matrix    | verified   | 3x3 then translation. Identity at |
+   |        |      |            |           |            | rest in all four racer instances  |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+   | 0x014c | 4    | int        | livery    | verified   | WHICH PALETTE resolves this mesh. |
+   |        |      |            |           |            | ModelInstance_Draw; the SIGN      |
+   |        |      |            |           |            | selects the cull variant.         |
+   |        |      |            |           |            | See subsystems/liveries.txt       |
+   +--------+------+------------+-----------+------------+-----------------------------------+
+
+   The initialiser also zeroes about twenty other dwords - 0x30, 0x48,
+   0x60, 0x68, 0x6c, 0xc8, 0xd0, 0xd4, 0x8c, 0xe4, 0xe8, 0xec, 0xf0,
+   0xf4, 0xf8, 0xfc, 0x100, 0x104, 0x108, 0x118 and 0x180. Zeroing
+   tells you a field exists and nothing about what it holds, so none of
+   them is named.
+
+   o THE HIGHEST WRITE IS +0x180, the last dword of a 0x184 record.
+     That is one of the four size confirmations rather than a
+     coincidence.
+
+
+2.  What settled the argument roles
+
+   The initialiser alone does not settle them. It copies arg1 to +0x0c
+   and arg2 to +0x00, but which vector is a position and which a
+   rotation is not visible from inside it - an earlier plate said so
+   and warned against building on the parameter list.
+
+   MENUPAGE14_TITLE_TICK SETTLES IT. The tick walks the three page-14
+   instances at a stride of 0x61 FLOATS, which is 0x184, and treats
+   them as [verified]:
+
+       pfVar11[0..2]   a rotation - it writes -PI/2 and PI into [1]
+                       and [2] on one branch
+       pfVar11[3..5]   a position - three independent lerps between a
+                       start and an end triple
+
+   Those are byte offsets 0x00 and 0x0c: the same two vectors the
+   initialiser fills. So +0x00 is the rotation and +0x0c the position,
+   and therefore arg2 is the rotation and arg1 the position.
+
+   THE CONSTANT CONFIRMS THE ORDER. Page 14 passes (0,0,0) and
+   (0, PI/2, 0), the latter as 0x3fc90fdb, which is 1.5707964. A
+   quarter turn belongs in an orientation and not in a position, and it
+   is the vector that lands at +0x00.
+
+2.1.  The retail recording agrees
+
+   Page 14's three instances are the centre oval, the "moto" logo and
+   the "racer" logo [observed]. The oval rotates about the vertical
+   axis as it zooms toward the camera and then stops; the two logos
+   only slide in, from the right and the left.
+
+   THE TICK MATCHES THAT EXACTLY. Only object 0 takes the branch that
+   writes the rotation triple - objects 1 and 2 get the position lerp
+   and nothing else [verified]. One rotator, two sliders.
+
+   o THAT IS WHAT AN [observed] TAG IS FOR. It did not supply the
+     layout; it CHECKED it. A reading in which +0x00 were the position
+     would have had two objects rotating and one sliding, which is not
+     what the screen does. Before the recording, any self-consistent
+     reading of 0x184 bytes looked as good as any other.
+
+
+3.  Where instances live
+
+   +---------------------------+------------------------------------+
+   | Owner                     | Instances                          |
+   +===========================+====================================+
+   | MR_Racer                  | FOUR, embedded at +0x24, +0x1a8,   |
+   |                           | +0x32c and +0x4b0. The fourth has  |
+   |                           | NO MESH - see MR_Racer.txt 3.2     |
+   +---------------------------+------------------------------------+
+   | MenuPage14_Title_Enter    | three globals, 0x00540500,         |
+   |                           | 0x00540684, 0x00540808             |
+   +---------------------------+------------------------------------+
+   | MenuPage24_Podium_Enter   | uses the initialiser               |
+   +---------------------------+------------------------------------+
+   | MenuPage25_DsiLogo_Enter  | an array, walked with EBX += 0x184 |
+   +---------------------------+------------------------------------+
+
+   RACER_CREATE ONLY INITIALISES THREE OF THE FOUR, and the fourth
+   is invisible from the initialiser alone - what gives it away is
+   that the livery at +0x14c is written to FOUR records spaced
+   0x184 apart, +0x170, +0x2f4, +0x478 and +0x5fc.
+
+   RACER_CREATE'S THREE ARE A BODY AND TWO WHEELS. It fills them from
+   DAT_0053a6a8, g_meshRoueArriere and g_meshRoueAvant - roue arriere
+   and roue avant being rear and front wheel [verified]. So a racer is
+   three placed meshes plus its own state, and the wheels are separate
+   instances rather than part of the body mesh.
+
+
+3.1.  ModelInstance_Draw, and what it confirms
+
+   0x0048c030, was FUN_0048c030. It is the draw path, and reading it
+   closes the largest open question this note had [verified]:
+
+       dp = this->position - camera->position       (+0x0c vs +0x98)
+       R  = euler(this->rotation)                   (+0x00)
+       M  = R * camera->view                        (camera +0x68)
+       M.translation = dp * camera->view + view.translation
+
+       mesh  = this->pMesh                          (+0x34)
+       verts = Screen3D_TransformVertsFlat(M, mesh->vertices,
+                                           mesh->vertexCount, 0x1f)
+       if (this->livery >= 0)
+           Screen3D_CullAndQueueFaces(verts, mesh->faces,
+                                      mesh->faceCount, livery)
+       else
+           Screen3D_CullAndQueueFacesEx(verts, mesh->faces,
+                                        mesh->faceCount, 1)
+
+   o EVERY FIELD IT READS WAS ALREADY PREDICTED. position at +0x0c,
+     rotation at +0x00 and the mesh at +0x34 were settled from the
+     initialiser and the page-14 tick BEFORE this function was read.
+     It is independent confirmation of all three and adds exactly one
+     field.
+
+   THE MESH OFFSETS CHECK OUT against MR_Mesh.txt - +0x00 faces, +0x04
+   vertices, +0x2c faceCount, +0x30 vertexCount. The literal 0x1f is
+   the flat shade every vertex gets, so MODEL INSTANCES ARE NOT LIT.
+
+   THE POSITION IS MADE CAMERA-RELATIVE BEFORE the view matrix is
+   applied, rather than the matrix carrying the whole translation. That
+   keeps coordinates small around the viewer, which matters for a
+   single-precision pipeline on a large track.
+
+3.2.  The euler convention, and the angle unit
+
+   Read from the disassembly at 0x0048c060, because the decompiler
+   loses most of the FPU stack here [verified]:
+
+       FLD   float ptr [ESI]            the angle, in RADIANS
+       FMUL  double ptr [0x004d1bf8]    2607.5945876183
+       CALL  __ftol                     truncate to a table index
+       cos = g_cosTable[idx & 0x3fff]
+       sin = g_cosTable[(idx - 0x1000) & 0x3fff]
+
+   THE CONSTANT IS 0x4000 / 2pi AND IT USES THE SAME SHORT 2pi as the
+   table build. 16384 / 6.283185307178 is 2607.59458761826; 16384 over
+   the true 2pi is 2607.5945876176. The stored value matches the
+   former.
+
+   o SO THE TYPO'D 2pi IN trig-table.txt IS USED TWICE - once to build
+     the table and once to derive the index conversion. That is a
+     consistency check on both readings: a table built from one and
+     indexed by the other would drift by half an entry at the far end.
+
+   The nine products, with c0/s0 from rotation[0] and so on:
+
+       m0 =  c2*c0              m3 = -s2*c0              m6 =  s0
+       m1 =  c2*s0*c1 + s2*s1   m4 =  c2*s1 - s2*s0*c1   m7 = -c0*c1
+       m2 =  s2*c1 - c2*s0*s1   m5 =  c2*c1 + s2*s0*s1   m8 =  c0*s1
+
+   Each row squares to 1 identically, which is what a mis-transcribed
+   sign would break, so the transcription is checked rather than
+   trusted. THE SAME NINE APPEAR IN MenuTools_BuildViewMatrix with the
+   same signs - this is the game's single euler convention, not one
+   function's.
+
+3.3.  The camera record is not MR_MenuCamera
+
+   ModelInstance_Draw's third argument is a 0x238-byte record from an
+   array based at g_cameraRecords (0x005161c0), indexed by DAT_004dc0f8
+   [verified]:
+
+       +0x68   float[12]   the view matrix, 3x3 then translation
+       +0x98   float[3]    the camera position
+
+   g_cameraPos is exactly that +0x98 field - 0x005161c0 + 0x98 is
+   0x00516258, which is where the symbol sits. That is how
+   MenuPage14_Title_Enter setting the camera to (0, 0, 4500) reads.
+
+   o IT IS A DIFFERENT TYPE FROM MR_MenuCamera, which keeps its view
+     at +0x00 and its eye at +0x60. Two camera records; this is the
+     one the geometry path consumes.
+
+   o +0x9c IS THE CAMERA'S HEIGHT, and something outside the geometry
+     path reads it as a bare float. Dd_DrawHorizon (0x00402960)
+     lifts the horizon point to the eye's height with it, which is
+     what makes the sky sit on the true horizon rather than on the
+     view axis. Including it moved the reconstruction's band from
+     97 to the traced 98 - see dd-statics.txt 7.2.3.
+
+   o AND THE VIEW MATRIX'S ZERO TRANSLATION IS LOAD-BEARING. Section
+     3.4 records that Camera_LookAt writes translation zero. That is
+     not a detail: Dd_DrawHorizon derives the camera heading by
+     adding +0x8c to the third row and taking atan2, which is only a
+     heading BECAUSE the translation is zero. Read without that fact
+     the function looks broken, and one session duly concluded it
+     was.
+
+
+3.4.  The camera view is a look-at, and it is not identity
+
+   ModelInstance_Draw takes the view matrix from camera+0x68.
+   Camera_LookAt (0x0046e140) is what writes it, and page 14 calls it
+   every frame [verified]:
+
+       d    = normalise(target - camera->position)
+       hyp  = sqrt(d.x^2 + d.z^2)
+       A    = yaw    [[d.z/hyp, 0, d.x/hyp], [0,1,0],
+                      [-d.x/hyp, 0, d.z/hyp]]
+       B    = pitch  [[1,0,0], [0, hyp, d.y], [0, -d.y, hyp]]
+       view = A * B, translation zero
+
+   It writes NOTHING when hyp is zero - a camera looking straight up
+   or down keeps its previous matrix.
+
+   o FOR PAGE 14 THE VIEW IS A 180 DEGREE YAW. The camera sits at
+     (0, 0, 4500) and looks at the origin, so d is (0,0,-1) and the
+     matrix is [-1 0 0][0 1 0][0 0 -1].
+
+   o ASSUMING IDENTITY PUTS EVERY MODEL BEHIND THE CAMERA. The
+     ellipse's camZ comes out -44500 instead of +44500 and the whole
+     scene is clipped away silently, looking exactly like a mesh or
+     transform fault. Worked through with the real matrix:
+
+         ellipse  camZ  44500 -> 5300     the zoom
+         moto     camX  12000 -> -42      enters from the RIGHT
+         racer    camX -12000 -> -40      enters from the LEFT
+
+   o AND IT SETTLES THE DIRECTION QUESTION. The yaw NEGATES x, so a
+     world x of -12000 is a screen-right entry. An earlier note here
+     recorded a contradiction with retail footage over exactly this;
+     there is none, and the error was comparing a world coordinate to
+     a screen direction without the transform between them.
+
+
+3.5.  Four fields the racer adds, read live
+
+   Reading all four of a racer's instances side by side turned up
+   three fields this note did not have, present in EVERY instance
+   [verified]:
+
+   o +0x18 AND +0x24 ARE A POSITION HISTORY, not copies. They read
+     bit-identical in a single dump only because the bike was
+     stationary. maybe_Racer_UpdateGroundContact (0x00468ca0)
+     opens by shifting them for three of a racer's four instances
+     [verified]:
+
+         inst+0x24 = inst+0x18       oldest   = previous
+         inst+0x18 = inst+0x0c       previous = current
+
+     THE OLDEST SLOT IS WRITE-ONLY. +0x1cc, +0x350 and +0x4d4 -
+     the +0x24 of instances 1, 2 and 3 - are written there and
+     referenced nowhere else in the image. Two frames of history
+     are kept and three are shifted.
+
+   o +0x98 IS A 3x4 MATRIX. Identity at rest, with the off-diagonal
+     entries as DENORMALS rather than clean zeros - which is why a
+     dump of this region prints values that look like pointers. It
+     is the field src/racer.h calls racer+0xbc: 0x24 + 0x98 = 0xbc.
+
+   o +0x90 IS NOT A COMMON FIELD. The two wheel instances read 0
+     and the body reads 80.0, which is the racer's RealSpeedMax.
+
+   THAT LAST ONE IS THE INTERESTING RESULT. Several fields this
+   project documents as racer fields land inside instance 0 on
+   dwords the initialiser only ZEROES - +0x90, +0xe4, +0xec and the
+   run +0xf0..+0x100, which are RealSpeedMax, the self pointer, the
+   steering and the speed family. Either MR_ModelInstance is a base
+   class with fields the menu pages never use, or the racer writes
+   into space the initialiser merely clears. Nothing here picks
+   between them. [inferred - see structs/MR_Racer.txt section 3.1]
+
+4.  Why it mattered
+
+   Nine call sites in four functions, and it gates more than its size
+   suggests: page 14's animated title, page 25's Delphine logo, page
+   24's podium, and every bike. It was called the next real struct
+   to discover and that was right.
+
+   What it does NOT yet give is drawing. Nothing has been read that
+   consumes an instance and emits geometry, so the reconstruction can
+   hold the type but cannot yet put one on screen.
+
+
+5.  Open questions
+
+   o ANSWERED. The draw path is ModelInstance_Draw (0x0048c030); see
+     section 3.1. src/model.c implements it.
+
+   o ANSWERED. +0x14c IS THE LIVERY, NOT A DETAIL LEVEL, and this
+     note called it detailLevel for a long time. Racer_Create writes
+     param_3 & 7 there - eight values against a bike page with eight
+     palettes - and Screen3D_CullAndQueueFaces passes it to
+     Screen3D_QueuePrimitivePaletted and to nothing else [verified,
+     the submit at 0x0049c110]. See subsystems/liveries.txt.
+
+     The name mattered: while it read as a detail level the port had
+     nowhere to put it, and drew every AI rider in the player's
+     colours.
+
+   o WHAT THE THREE FLAGS AT 0x44, 0x58 AND 0x88 SELECT. All three are
+     set to 1 and none has a known reader.
+
+   o +0x94 = 1.0f. Called scale on the strength of the value alone,
+     which is thin. Tagged inferred.
+
+   o WHETHER THE ZEROED DWORDS ARE REALLY THIS TYPE'S. A racer
+     stores its own state in several of them - see section 3.5.
+
+   o ABOUT TWENTY ZEROED DWORDS between 0x30 and 0x180. The six
+     consecutive ones at 0x70 are cleared by a loop rather than
+     individually, which usually means an array or a vector pair.
+
+   o WHETHER THE ROTATION IS APPLIED AS XYZ, ZYX OR SOMETHING ELSE.
+     The order matters for reproduction and no composition site has
+     been read. MenuTools_BuildViewMatrix composes three angles for
+     the camera and may use the same convention; that is where to look.

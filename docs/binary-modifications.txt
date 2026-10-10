@@ -1,0 +1,315 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          BINARY MODIFICATIONS
+
+
+Abstract
+
+   The MOTO.EXE this project analyses is not the shipped binary.
+   Fourteen bytes across SEVEN sites have been changed. An untouched
+   ORIGINAL_MOTO.EXE is now available, so this is no longer inference:
+   every difference below is a verified byte-diff [verified].
+
+   Five sites defeat the CD copy protection. TWO DO NOT - they relax a
+   16-bit colour-depth gate, which lands squarely on this project's
+   stated mission.
+
+   +-------------------+---------+----------------------------------+
+   | File              | Size    | MD5                              |
+   +===================+=========+==================================+
+   | ORIGINAL_MOTO.EXE | 1133056 | 2a6bc29f87cff01e7425fb2ac3001d28 |
+   +-------------------+---------+----------------------------------+
+   | MOTO.EXE          | 1133056 | db8b3cdfa88ac408d6928a05bc13970e |
+   +-------------------+---------+----------------------------------+
+
+   Both are dated 9 July 1998 and are the same length, so every patch is
+   an in-place overwrite. Re-check at any time with
+
+       python tools/diff_original.py
+
+   which exits non-zero if the differences are not exactly the seven
+   sites recorded here.
+
+Table of Contents
+
+   1. The seven sites
+   2. The two colour-depth patches
+   3. The five protection patches
+   4. What was recorded wrongly before the diff
+   5. Why three sites were invisible
+   6. The database holds the ORIGINAL bytes
+      6.1. After a reimport
+   7. Rules that follow
+   8. Open questions
+
+1.  The seven sites
+
+   +------------+--------------+--------------+----------------------------------+
+   | VA         | Was          | Now          | Effect                           |
+   +============+==============+==============+==================================+
+   | 0x00414331 | 75 0c        | 90 90        | protection: PId message box      |
+   +------------+--------------+--------------+----------------------------------+
+   | 0x00442785 | 33 c0        | eb f4        | protection: disc check returns 1 |
+   +------------+--------------+--------------+----------------------------------+
+   | 0x00442f44 | 74 91        | 90 90        | protection: CD-present local     |
+   +------------+--------------+--------------+----------------------------------+
+   | 0x00444e73 | 74 5a        | 90 90        | protection: CD-audio playback    |
+   +------------+--------------+--------------+----------------------------------+
+   | 0x0045a7ca | 84           | 8d           | COLOUR DEPTH: JZ -> JGE          |
+   +------------+--------------+--------------+----------------------------------+
+   | 0x0047642d | 74           | 7d           | COLOUR DEPTH: JZ -> JGE          |
+   +------------+--------------+--------------+----------------------------------+
+   | 0x0047e8db | 0f 84 99 ... | e9 9a ... 90 | protection: nag screen           |
+   +------------+--------------+--------------+----------------------------------+
+
+   Note 0x0045a7ca is the second byte of a two-byte opcode; the
+   instruction it belongs to starts at 0x0045a7c9. The Ghidra annotation
+   is on the instruction, the diff reports the byte.
+
+2.  The two colour-depth patches
+
+   These are the important ones and they are not copy protection. Both
+   change a JZ into a JGE after a CMP against 0x10, turning an equality
+   test on a bit depth into a greater-or-equal test [verified].
+
+   At 0x0047642d, inside Cdd_Init:
+
+       MOV EAX,[0x004ee9e8]
+       TEST EAX,EAX
+       JZ  0x0047645e
+       MOV EAX,[0x004ee9a8]        ; bpp, set by Cdd_InitCapsVariables
+       CMP EAX,0x10
+       JZ  0x0047645e              ; ORIGINAL - bpp must equal 16
+       7d 2f -> JGE 0x0047645e     ; PATCHED  - bpp >= 16 accepted
+       ... otherwise the localized error path via 0x0053b8ac
+
+   The fall-through is the message the mission statement quotes: the
+   localized "16 bit screen mode required !". So the patch lets 24- and
+   32-bit modes past a gate that originally rejected them.
+
+   At 0x0045a7c9 the same substitution is applied to a bit depth
+   arriving as a stack argument, inside FUN_0045a660, which
+   Main_InitAndParseCommandLine calls.
+
+   IMPORTANT SCOPE LIMIT. This does NOT mean the 16-bit lock is gone.
+   Only these two gates were touched. The mode-enumeration filter in
+   Cdd_EnumModesCallback is byte-identical in both files, so the game
+   still enumerates 16-bpp modes the way it always did, and the RGB565
+   assumptions throughout the rasterizer are untouched. Whether the
+   patched binary actually runs correctly at 32 bpp has NOT been
+   established and should not be assumed [verified that the bytes
+   differ; the behavioural claim is untested].
+
+   What it does mean is that two of the checks we would have catalogued
+   as part of the lock are not in their original form.
+
+3.  The five protection patches
+
+   The protection scheme itself - the registry PId, the volume label,
+   the disc-length fingerprint, the gearbox penalty and the ILLEGAL
+   VERSION overlay - is described in subsystems/copy-protection.txt.
+   Only the patches are listed here.
+
+   +------------+----------------+----------------+--------------------+
+   | VA         | Original       | Patched        | What it defeats    |
+   +============+================+================+====================+
+   | 0x00414331 | JNZ 0x0041433f | NOP NOP        | the insert-CD box  |
+   +------------+----------------+----------------+--------------------+
+   | 0x00442785 | XOR EAX,EAX    | JMP 0x0044277b | the disc verdict   |
+   +------------+----------------+----------------+--------------------+
+   | 0x00442f44 | JZ 0x00442ed7  | NOP NOP        | a CD-present local |
+   +------------+----------------+----------------+--------------------+
+   | 0x00444e73 | JZ 0x00444ecf  | NOP NOP        | skipping CD audio  |
+   +------------+----------------+----------------+--------------------+
+   | 0x0047e8db | JZ 0x0047e97a  | JMP + NOP      | the nag overlay    |
+   +------------+----------------+----------------+--------------------+
+
+   0x00442785 is the subtle one. The original epilogue was XOR EAX,EAX /
+   POP ESI / ADD ESP,4 / RET - a plain return 0. Overwriting the XOR
+   with a two-byte jump backwards into the return-1 epilogue turns all
+   three failure exits of the disc check into successes, without
+   changing the function's length.
+
+4.  What was recorded wrongly before the diff
+
+   Three documents are corrected as a result. Two were already known to
+   be contaminated; the third was found by this diff.
+
+   o subsystems/dd-init.txt asked, as an open question, what the test
+     "0xf < DAT_004ee9a8" was about. That is a decompiler rendering of
+     the PATCHED JGE. The original is == 16, the 16-bit screen mode
+     check. The question had no answer because the code it asks about is
+     not the game's code.
+
+   o subsystems/config-globals.txt called g_protectionPassed "set to 1
+     unconditionally at init". It is conditional in the original.
+
+   o formats/bpt-carac.txt recorded the NbSpeed penalty without knowing
+     it was anti-piracy.
+
+   One claim made in this session was also wrong and is corrected in
+   subsystems/copy-protection.txt: that maybe_CdAudio_CheckDiscSignature
+   ALWAYS RETURNS 1 and that its return value was therefore not the
+   verdict. That was read off patched code. Patch site 0x00442785 is
+   precisely what made it look unconditional.
+
+   Every one of these four is the same failure: reading a patched
+   instruction as though it were the compiler's output. The give-away in
+   each case was an oddity that got written down as a curiosity instead
+   of being challenged - an unconditional flag, an unexplained
+   comparison, a function that always returns the same value.
+
+5.  Why three sites were invisible
+
+   Before the original was available, four of the seven were found by
+   scanning for structural damage. That approach found exactly the sites
+   where the patch CHANGED AN INSTRUCTION'S LENGTH and left slack:
+
+   o Three sites replaced a 2-byte Jcc with 90 90. An interior run of
+     two or more NOPs is anomalous, because MSVC pads between functions
+     with 0xCC.
+
+   o One site replaced a 6-byte near Jcc with a 5-byte near JMP, leaving
+     one 0x90. Scanning for E9 rel32 followed by a stray 0x90 found it.
+
+   The other three changed one or two bytes IN PLACE - 33 c0 to eb f4,
+   0f 84 to 0f 8d, 74 to 7d. No padding, no orphaned code, no length
+   change, nothing structurally odd to find. No amount of scanning would
+   have found them.
+
+   This was flagged at the time as the reason the four-site figure could
+   not be called complete, and the flag was correct. The lesson is that
+   structural scanning finds a lower bound on patching and never an
+   upper one. Only a diff against a known-good binary is conclusive.
+
+6.  The database holds the ORIGINAL bytes
+
+   IMPORTANT, and deliberately different from the file on disk. All
+   seven sites have been written back to their original bytes INSIDE THE
+   GHIDRA DATABASE [verified]. The decompiler now shows the game's real
+   logic.
+
+   This was done because a plate comment does not reach the decompiler.
+   Before the restore, maybe_Cdd_ValidateDisplayMode decompiled as "if
+   (0xf < iStack_18)" and maybe_CdAudio_CheckDiscSignature decompiled as
+   an unconditional "return 1". Anyone reading that output - especially
+   a scripted bulk pass, which never sees comments - would draw exactly
+   the wrong conclusion. That is how all four contaminations in section
+   4 happened.
+
+   +--------------------------+-----------------------------------+
+   | Where                    | What it holds                     |
+   +==========================+===================================+
+   | decomp/MOTO.EXE          | the modified bytes, untouched     |
+   +--------------------------+-----------------------------------+
+   | decomp/ORIGINAL_MOTO.EXE | the original, untouched           |
+   +--------------------------+-----------------------------------+
+   | the Ghidra database      | the ORIGINAL bytes at all 7 sites |
+   +--------------------------+-----------------------------------+
+
+   Nothing was written back to either executable, so
+   tools/diff_original.py still compares the two files and still reports
+   the same seven sites. It is unaffected by the database edit.
+
+   Restoring site 2 also recovered code. The 153 bytes at 0x0047e8e1 are
+   orphaned only while the jump is unconditional; with the conditional
+   restored they disassemble into 41 instructions and were folded back
+   into FUN_0047e3d0, which grew from 2003 to 2156 bytes. The ILLEGAL
+   VERSION overlay is now readable in the decompiler like any other
+   code.
+
+   Each site carries a pre-comment saying what the file holds and what
+   the database holds, plus a bookmark in the "crack" category, so the
+   divergence is visible in the listing rather than only in this note.
+
+6.1.  After a reimport
+
+   A fresh import of MOTO.EXE brings back the modified bytes. Run
+
+
+
+       tools/ghidra_restore_original_bytes.java
+
+
+
+   which re-applies all seven, re-disassembles, and re-extends
+   FUN_0047e3d0. It is idempotent - sites already original are reported
+   and skipped - and it refuses to touch a site whose bytes match
+   neither the original nor the known patch, so it cannot silently paper
+   over a different binary.
+
+   It belongs in the reimport sequence in ghidra-db-repairs.txt, after
+   the three existing repair scripts.
+
+   If you ever need the shipped behaviour back - to reproduce what the
+   cracked binary actually does at runtime - re-import rather than hand-
+   editing, because the disassembly and function bodies have to change
+   with the bytes.
+
+7.  Rules that follow
+
+   o tools/diff_original.py is now the authority on what is modified.
+     Run it before trusting any claim of the form "the game always/never
+     does X".
+
+   o The reconstruction restores the ORIGINAL bytes at all seven sites,
+     not the patched ones. The colour-depth gates are then removed
+     deliberately as part of the port, which is a different thing from
+     inheriting somebody else's patch.
+
+   o Any function on the replace-list should be checked against this
+     list before deep analysis. Cdd_Init and FUN_0045a660 both contain
+     patched instructions and both are renderer bring-up code.
+
+   o In a modified binary, "unconditional" is a claim that has to be
+     earned. A flag with no conditional writer, a comparison with no
+     consumer, a branch with one edge, and a function that always
+     returns the same value are all things a patch produces.
+
+   o THE PATCHED COPY IS THE ONE TO RUN FOR A RUNTIME CAPTURE. That
+     reverses the natural instinct, so it is worth stating: for
+     ANALYSIS the original bytes win and the DB holds them (section
+     6), but for OBSERVING THE GAME the patched copy is the better
+     subject, on two counts.
+
+     WITHOUT THE PROTECTION PATCHES THE OBSERVATION IS CORRUPTED. With
+     no CD in the drive g_protectionPassed stays 0, and Carac_Load
+     then subtracts 1.0 from every bike's NbSpeed (section 3). A
+     carac dump from ORIGINAL_MOTO.EXE would be quietly wrong in a way
+     nothing in the dump reveals. The patched copy forces the flag, so
+     it reads what the game was designed to read.
+
+     AND THE COLOUR-DEPTH PATCHES ARE WHAT LETS IT START AT ALL on a
+     modern desktop, which has no 16-bit mode to switch to.
+
+     None of the seven touches the geometry, camera or skeleton path,
+     so the values a capture is after are unaffected either way. See
+     runtime-capture.txt and tools/mrhook/README.txt.
+
+     THE CAPTURE HARNESS ITSELF MODIFIES NOTHING ON DISK. tools/mrhook
+     is a proxy dplayx.dll; it patches two registry readers in memory
+     and vanishes with the process. diff_original.py is unaffected and
+     the seven sites stay seven.
+
+8.  Open questions
+
+   o Whether the patched binary genuinely runs at 24 or 32 bpp. Two
+     gates were relaxed but the rasterizer's RGB565 packing was not.
+     This is testable by running it and worth doing, because the answer
+     tells us how much of the lock is really in those two comparisons.
+
+   o READ. It is maybe_Cdd_ValidateDisplayMode, the 16-bit lock's
+     primary enforcement point, and it is a modal Abort/Retry/Ignore
+     RETRY LOOP rather than a refusal. Fully written up in
+     subsystems/display-mode-gate.txt.
+
+   o Whether the colour-depth patches and the protection patches came
+     from the same hand. The protection work is careful - it even
+     preserves the gearbox penalty by forcing the flag - while the
+     colour-depth edits are two-byte condition flips.
+
+   o ANSWERED. 0x004ee9e8 is maybe_g_primaryIsRGB - the primary surface
+     reported a DDPF_RGB pixel format. It gates the mask derivation as
+     well as the depth check, so it is not a bypass anyone can use. See
+     subsystems/display-mode-gate.txt section 3.1.

@@ -1,0 +1,442 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                                MR_MESH
+
+
+Abstract
+
+   Size: 0x79 = 121 bytes [verified] - the element size passed to
+   _eh_vector_constructor_iterator_ at 0x0040dbab.
+
+   Allocated: Trk_Load (0x0040d650), as THREE parallel heap arrays.
+   Freed: maybe_Game_FreeRaceResources (0x004113c0). Ghidra type
+   applied: yes, to Load3df, Mesh_Ctor, Mesh_Init, Mesh_Free and
+   Mesh_FreeUnshared.
+
+   A loaded 3D mesh. It owns four heap buffers - faces, vertices, per-
+   face normals and per-face plane distances - and is filled by the .3df
+   and .map loaders documented in formats/mesh-3df-map.txt.
+
+Table of Contents
+
+   1. How it was identified
+   2. Fields
+   3. What Load3df builds
+   4. What Load3dfAndMap adds
+   5. Normals, and the last unexplained buffer
+   6. Three parallel arrays that share buffers
+   7. Methods
+   8. Open questions
+
+1.  How it was identified
+
+   The allocation bounds it exactly. Trk_Load computes n * 0x79 + 4 with
+   the usual LEA chain, calls operator new[], stores the count in the
+   first dword and hands the array base to
+   _eh_vector_constructor_iterator_ with element size 0x79, constructor
+   0x0040e520 and destructor 0x0040e570 [verified].
+
+   What the class IS came from the destructor. Its body turned out to be
+   the function this project had already named maybe_FreeViewResources -
+   a guess made when it was only seen freeing four records in a static
+   array. Following it the other way, that static array at 0x00515ff0 is
+   the one Menu_LoadFinalMeshes (0x0047b600) fills from paths built as
+   "%s\%s.3df" and "%s\%s.map". So the records are meshes, and the
+   function has been renamed Mesh_Free.
+
+   That also explains a discrepancy. The class appears at TWO sizes.
+   Static arrays and the segment-mesh array use a 0x70 stride; the
+   named-template arrays use 0x79. Mesh_Init touches nothing above
+   +0x6c, so the first 0x70 bytes are the structure proper [verified].
+
+   The trailing 9 bytes are a NAME. Trk_Load reads a length-prefixed
+   name straight into +0x70 for each named template, and later strncpy's
+   8 bytes back out of it into the instance record. So the 0x79 form is
+   the 0x70 form plus char name[9], and the two are constructed by the
+   same Mesh_Ctor with the same Mesh_Free [verified].
+
+   The two forms are now separate types in the database. MR_Mesh is the
+   0x79 named-template form; MR_MeshBase is the 0x70 form, and it is
+   what EVERY static mesh in the image uses.
+
+   CORRECTION. An earlier pass typed the static meshes - the bike parts,
+   the wheels, the final-sequence meshes - with the 0x79 MR_Mesh. That
+   was wrong and actively harmful: those arrays step by 0x70, so a 0x79
+   record overlaps the next element by nine bytes. They have been
+   retyped MR_MeshBase.
+
+2.  Fields
+
+   +--------+---------+---------------+------------+----------------------------+
+   | Offset | Type    | Name          | Confidence | Evidence                   |
+   +========+=========+===============+============+============================+
+   | 0x00   | void*   | faces         | verified   | new[faceCount * 0x40]      |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x04   | void*   | vertices      | verified   | new[vertexCount * 0x0c]    |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x08   | void*   | faceNormals   | verified   | new[(faceCount*3+3)*4]     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x0c   | void*   | facePlaneD    | verified   | new[faceCount * 4]         |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x10   | void*   | vertexNormals | verified   | new[vertexCount * 0x0c]    |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x14   | int     | f14           | unknown    | zeroed by Mesh_Init        |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x18   | ?       | -             | unknown    | NOT initialised            |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x1c   | void*   | verticesAlias | verified   | same pointer as +0x04      |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x20   | ?       | -             | unknown    | NOT initialised            |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x24   | int     | ownsData      | verified   | 1 from Mesh_Init           |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x28   | int     | objectFlags   | verified   | bit 0 from any face flag   |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x2c   | int     | faceCount     | verified   | counted before allocating  |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x30   | int     | vertexCount   | verified   | u16 read from the file     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x34   | int     | f34           | unknown    | zeroed                     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x38   | int     | f38           | unknown    | zeroed                     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x3c   | ?       | -             | unknown    | NOT initialised            |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x40   | ?       | -             | unknown    | NOT initialised            |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x44   | int     | handle44      | verified   | -1 from Mesh_Init          |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x48   | int     | f48           | unknown    | zeroed                     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x4c   | int     | f4c           | unknown    | zeroed                     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x50   | int     | f50           | unknown    | zeroed                     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x54   | ?       | -             | unknown    | NOT initialised            |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x58   | int     | f58           | unknown    | zeroed                     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x5c   | int     | f5c           | unknown    | zeroed                     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x60   | int     | f60           | unknown    | zeroed                     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x64   | int     | flaggedFaceCt | verified   | faces with +0x38 bit 0     |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x68   | int     | f68           | unknown    | zeroed by Load3dfAndMap    |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x6c   | int     | f6c           | unknown    | zeroed; last field touched |
+   +--------+---------+---------------+------------+----------------------------+
+   | 0x70   | char[9] | name          | verified   | read by Trk_Load           |
+   +--------+---------+---------------+------------+----------------------------+
+
+   CORRECTION. A first pass at this table guessed +0x04 as vertices and
+   +0x08 as faces, from nothing more than the two loaders writing both.
+   Reading Load3df settled it: +0x04 is vertices, but +0x08 is the per-
+   face NORMALS and the faces themselves are at +0x00, which the first
+   pass had left unnamed. Half the guess was right and half was wrong,
+   which is the usual value of an unverified inference.
+
+3.  What Load3df builds
+
+   Load3df at 0x00420590 is __thiscall(this, path, applyScale) and
+   returns 1 or 0. It begins by calling Mesh_Free and Mesh_Init on
+   itself, so a mesh object is reusable in place [verified]:
+
+       read u16 magic          must be 1, else a message box and 0
+       read u16 vertexCount    -> +0x30
+       vertices = new[vertexCount * 0x0c]
+                               -> BOTH +0x04 and +0x1c
+       per vertex: three float32, scaled by _DAT_004d0688 when
+                   applyScale is set
+       pre-pass over the face list to count it
+                               -> faceCount at +0x2c
+       faces       = new[faceCount * 0x40]       -> +0x00
+       faceNormals = new[(faceCount * 3 + 3) * 4] -> +0x08
+       facePlaneD  = new[faceCount * 4]          -> +0x0c
+       per face: planeD = -dot(vertices[face.firstIndex], normal)
+
+   The plane-distance loop is what pins the two ambiguous buffers down.
+   It reads a u16 vertex index from the face record at +0x2c, multiplies
+   it by 0x0c to index +0x04, and multiplies the face number by 0x0c to
+   index +0x08. So +0x00 holds 0x40-byte face records, +0x04 holds
+   12-byte vertices, and +0x08 holds three floats per face. That matches
+   formats/mesh-3df-map.txt section 1 exactly, including its note that
+   faces end up carrying a plane equation.
+
+   The vertex buffer is stored TWICE, into +0x04 and +0x1c, from a
+   single allocation. That is why Mesh_Free looks strange - it moves
+   +0x1c into +0x04 and frees once, nulling both. One buffer with two
+   handles, not two buffers [verified].
+
+   faceNormals is over-allocated by one entry: (faceCount * 3 + 3)
+   floats rather than faceCount * 3. Whether that is a sentinel or slack
+   for an off-by-one is not established.
+
+4.  What Load3dfAndMap adds
+
+   The .3df half is Load3df with one difference: vertices are scaled by
+   _DAT_004d0690 UNCONDITIONALLY, where Load3df scales by _DAT_004d0688
+   only when its third argument says so [verified]. That resolves half
+   of an open question in formats/mesh-3df-map.txt - the two scale
+   globals are not alternatives chosen at runtime, they belong one to
+   each loader.
+
+   The .map half reads a 0x200-byte header and rejects the file unless
+   bit 7 of header byte 1 is set, reporting "Erreur: Version du
+   fichier". Then one 0x80-byte record per face, exactly as
+   formats/mesh-3df-map.txt section 2 describes.
+
+   Each record's flag word drives the face's kind code and flag byte
+   [verified]:
+
+   +----------+--------------------------------------------------+
+   | Map flag | Effect on the face record                        |
+   +==========+==================================================+
+   | 0x10000  | kind code 2, or 0x26 when faceKindSelect applies |
+   +----------+--------------------------------------------------+
+   | 0x20000  | +0x38 bit 0, and objectFlags bit 0 on the mesh   |
+   +----------+--------------------------------------------------+
+   | 0x40000  | kind code 0xd                                    |
+   +----------+--------------------------------------------------+
+   | 0x80000  | kind code 8, or 0xc on the short path            |
+   +----------+--------------------------------------------------+
+   | 0x100000 | +0x38 bit 3                                      |
+   +----------+--------------------------------------------------+
+   | 0x200000 | kind code 0x15, or 0x27                          |
+   +----------+--------------------------------------------------+
+   | 0x400000 | +0x38 bit 1                                      |
+   +----------+--------------------------------------------------+
+
+   Afterwards it does three things that were not visible from Load3df,
+   and two of them write mesh fields this note had guessed wrong.
+
+   It PARTITIONS the face array in place. A double loop swaps whole
+   0x40-byte records so that every face with bit 0 of its +0x38 flag
+   byte moves ahead of every face without it. That is the re-sort
+   formats/mesh-3df-map.txt section 5 predicted from the flag bits
+   alone, now confirmed in the code [verified].
+
+   It then counts those faces into +0x64, and sets bit 0 of +0x28 if any
+   face carried the 0x20000 flag.
+
+   CORRECTION. This note named +0x64 and +0x68 map64 and map68,
+   reasoning that they were written by Load3dfAndMap and not by Load3df
+   so they had to hold the .map side. The reasoning was sound and the
+   conclusion was wrong: +0x64 is a count of flagged faces, which only
+   this loader can compute because only it reads the flags. It is now
+   flaggedFaceCt. +0x68 is set to zero and never written again, so it
+   stays unknown.
+
+   The lesson is worth keeping: "only one caller writes it" bounds where
+   a field is set, not what it means.
+
+   The face record itself is 0x40 bytes and this function fills most of
+   it. Partial layout [verified]:
+
+   +-------------+----------------------------------------------------------+
+   | Offset      | Holds                                                    |
+   +=============+==========================================================+
+   | +0x00       | u16 kind code: 1, 2, 8, 0xc, 0xd, 0x10, 0x15, 0x26, 0x27 |
+   +-------------+----------------------------------------------------------+
+   | +0x02       | u16 colour or palette index                              |
+   +-------------+----------------------------------------------------------+
+   | +0x04..0x18 | six float32, compared in pairs - the UVs                 |
+   +-------------+----------------------------------------------------------+
+   | +0x2c..0x32 | four u16 vertex indices                                  |
+   +-------------+----------------------------------------------------------+
+   | +0x34       | s16, -1 when the face is a triangle                      |
+   +-------------+----------------------------------------------------------+
+   | +0x36       | u16 TEXTURE PAGE INDEX; also gates faceKindSelect        |
+   +-------------+----------------------------------------------------------+
+   | +0x38       | flag byte; bit 2 is set on every face                    |
+   +-------------+----------------------------------------------------------+
+
+   +0x36 IDENTIFIED. Screen3D_DrawPrimK3 uses it as a u16 index into the
+   824-byte texture bank array, passing &bank[face->f36] to
+   maybe_Bankw_LockPageBits to obtain the page bits [verified]. That
+   explains the branch it was previously only known to gate: a face with
+   page 0 takes the untextured path. Whether 0 is a reserved sentinel or
+   a real page is not settled - the DrawPrim layer indexes with it
+   unconditionally. See subsystems/rasterizer-pipeline.txt section 46.3.
+
+   The +0x34 field is what the mesh/map consistency check tests: the
+   loader computes (faces[i].f34 != -1) + 3 and compares it to the
+   record's own vertex count, reporting "Erreur: Le map %s ne correspond
+   pas" on a mismatch. That is the check formats/mesh-3df-map.txt
+   section 2 records as producing false failures on the shipped data.
+
+   Two parameters are worth noting. unused3 is never read and every call
+   site passes -1. faceKindSelect is NOT the scale flag its position
+   suggests - it chooses between kind codes 1 and 0x10, or 2 and 0x26,
+   and only when the face's +0x36 is non-zero [verified].
+
+5.  Normals, and the last unexplained buffer
+
+   +0x10 was the last field that Mesh_Free released but nothing appeared
+   to fill. It is vertexNormals, and the reason it looked orphaned is
+   that NEITHER LOADER WRITES IT [verified]. Load3df and Load3dfAndMap
+   leave it null; Mesh_Free frees it anyway, which is safe because
+   Mesh_Init zeroes it.
+
+   Its only writer is Mesh_ComputeVertexNormals at 0x0041fa10, which is
+   textbook smooth-normal generation:
+
+       free any existing vertexNormals
+       if (faceNormals == NULL)
+           allocate it and fill it with Mesh_ComputeFaceNormal
+       vertexNormals = new[vertexCount * 0x0c], zeroed
+       counts        = new[vertexCount * 4],    zeroed
+       for each face, for each of its 3 or 4 vertices:
+           vertexNormals[v] += faceNormals[face]
+           counts[v]++
+       for each vertex: divide by its count, then normalise
+       free counts
+
+   So the mesh supports Gouraud shading, not only flat faces, and the
+   smoothing is computed at load time rather than baked into the asset.
+   Only FUN_00413450 calls it, twice - the same game-object method that
+   calls Load3dfAndMap seven times.
+
+   AND THE TWO CALLS ARE THE FOUR WHEEL MESHES, which is what makes
+   this field matter rather than being a curiosity.  The loop at
+   0x00413646 covers g_meshRoueAvant[0..1] and g_meshRoueArriere[0..1],
+   one pair per articulated LOD slot, and nothing else in the game
+   ever gets normals.
+
+   THE CONSUMER IS THE WHEEL DRAW, not the far LOD.
+   maybe_Mesh_ShadeVertices (0x00422540) is reached from two places:
+   maybe_Racer_Draw's far-LOD arm at 0x0045f4ae, where the mesh has no
+   normals and it returns at once, and maybe_Inst_DrawWithMatrix at
+   0x0048c9b2, which IS the wheel draw.  So the only meshes with
+   normals are the only ones whose draw path uses them.
+
+   That is the whole of the wheel lighting.  The wheel is transformed
+   with a literal 0x1f at 0x0048c94d and this overwrites it with
+   8..24, so a wheel can never be as bright as an unshaded body - and
+   since the light is a fixed direction it does not follow the segment
+   shade flag that darkens the body in a tunnel.  See
+   subsystems/racer-draw-pipeline.txt.
+
+   Its sibling Mesh_ComputeFaceNormal at 0x0041f920 takes the face's
+   first three vertex indices from the record at +0x2c, +0x2e and +0x30,
+   forms the cross product of two edges and normalises. Both loaders
+   call it in a loop over every face. That raises faceNormals at +0x08
+   from inferred to verified: a function whose whole body is a cross
+   product writes there.
+
+   The two loops in Mesh_ComputeVertexNormals also settle the counts
+   independently - it iterates vertices with +0x30 and faces with +0x2c,
+   matching what section 3 read off the allocations [verified].
+
+   With this the buffer set is closed. Five allocations, all accounted
+   for:
+
+   +---------------+-----------------------+----------------------------+
+   | Field         | Size                  | Allocated by               |
+   +===============+=======================+============================+
+   | faces         | faceCount * 0x40      | both loaders               |
+   +---------------+-----------------------+----------------------------+
+   | vertices      | vertexCount * 0x0c    | both loaders               |
+   +---------------+-----------------------+----------------------------+
+   | faceNormals   | (faceCount*3 + 3) * 4 | both loaders, or on demand |
+   +---------------+-----------------------+----------------------------+
+   | facePlaneD    | faceCount * 4         | both loaders               |
+   +---------------+-----------------------+----------------------------+
+   | vertexNormals | vertexCount * 0x0c    | Mesh_ComputeVertexNormals  |
+   +---------------+-----------------------+----------------------------+
+
+6.  Three parallel arrays that share buffers
+
+   Trk_Load builds three arrays of this type, all the same length, and
+   maybe_Game_FreeRaceResources tears them down asymmetrically
+   [verified]:
+
+   +-------+--------------+------------------------------+
+   | Array | Global       | Torn down with               |
+   +=======+==============+==============================+
+   | A     | DAT_004dc0d8 | Mesh_Free                    |
+   +-------+--------------+------------------------------+
+   | B     | DAT_004dc0dc | Mesh_FreeUnshared, against A |
+   +-------+--------------+------------------------------+
+   | C     | DAT_004dc0e0 | Mesh_FreeUnshared, against A |
+   +-------+--------------+------------------------------+
+
+   Mesh_FreeUnshared frees each buffer only when it differs from the
+   corresponding buffer of the mesh it is given. So A owns the data and
+   B and C may alias it pointer-for-pointer.
+
+   RESOLVED, and both earlier readings were wrong. The three arrays are
+   not levels of detail of anything. They are the three meshes of a .trk
+   NAMED PROP TEMPLATE: per formats/trk.txt section 4, a named entry is
+   a length-prefixed name followed by three meshes, and placed instances
+   are a separate array referring to a template by index [verified].
+
+   The first wrong reading called them bike levels of detail, citing the
+   three body entries in the bike manifests. That evidence belongs to
+   three separate static meshes - see subsystems/bike-assets.txt. The
+   second wrong step was naming their allocator
+   maybe_Game_AllocRaceResources without checking formats/trk.txt, which
+   had already walked the same function and called it Trk_Load.
+
+   The buffer sharing now makes sense too: Mesh_FreeUnshared exists
+   because two of a template's three meshes may be the same geometry,
+   and the loader lets them alias rather than duplicating.
+
+   So what the three parallel arrays are remains open. The buffer-
+   sharing between them is still the strongest clue: two of the three
+   may alias the first's geometry pointer for pointer, which fits any
+   scheme where a variant is often identical to the original.
+
+   The element count is DAT_00509b9c, which no instruction writes. It is
+   filled by pointer: Trk_Load pushes its address at 0x0040db5e into a
+   four-byte read at 0x004c5e9d, so the count comes from a file
+   [verified].
+
+7.  Methods
+
+   +------------+---------------------------+--------------------------------+
+   | Address    | Name                      | Role                           |
+   +============+===========================+================================+
+   | 0x0041f770 | Mesh_Ctor                 | constructor, wraps Mesh_Init   |
+   +------------+---------------------------+--------------------------------+
+   | 0x0041f780 | Mesh_Init                 | zero the fields                |
+   +------------+---------------------------+--------------------------------+
+   | 0x0040e570 | Mesh_Dtor                 | destructor, wraps Mesh_Free    |
+   +------------+---------------------------+--------------------------------+
+   | 0x0041f7d0 | Mesh_Free                 | release the five buffers       |
+   +------------+---------------------------+--------------------------------+
+   | 0x0041f870 | Mesh_FreeUnshared         | release all but shared buffers |
+   +------------+---------------------------+--------------------------------+
+   | 0x0041f920 | Mesh_ComputeFaceNormal    | one face normal                |
+   +------------+---------------------------+--------------------------------+
+   | 0x0041fa10 | Mesh_ComputeVertexNormals | smoothed vertex normals        |
+   +------------+---------------------------+--------------------------------+
+   | 0x00420590 | Load3df                   | load a .3df                    |
+   +------------+---------------------------+--------------------------------+
+   | 0x00420a50 | Load3dfAndMap             | load a .3df plus its .map      |
+   +------------+---------------------------+--------------------------------+
+
+8.  Open questions
+
+   o RESOLVED. +0x10 is vertexNormals, written only by
+     Mesh_ComputeVertexNormals, which neither loader calls - only
+     maybe_Game_LoadBikeMeshes, and only on the four wheel meshes.
+     Its consumer is the wheel draw. See section 5.
+
+   o Eighteen fields are zeroed by Mesh_Init and never otherwise
+     observed. They need readers found before they can be named.
+
+   o Five offsets - 0x18, 0x20, 0x3c, 0x40, 0x54 - are not initialised
+     at all, which is unusual enough to be worth explaining.
+
+   o RESOLVED. The trailing 9 bytes are char name[9], filled by Trk_Load
+     for named prop templates. The 0x70 form is the same class without
+     it. See section 1.
+
+   o handle44 is set to -1 by the constructor, the same idiom MR_Font
+     uses for textureHandle. If it is a texture handle it should be
+     released somewhere, and Mesh_Free does not touch it.
+
+   o RESOLVED, and the guess was wrong. +0x64 is a count of flagged
+     faces, not .map data; +0x68 is still unknown. See section 4.

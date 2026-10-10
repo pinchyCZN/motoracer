@@ -1,0 +1,181 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                      THE .RAW TEXTURE PAGE FORMAT
+
+
+Abstract
+
+   The texture pages are not a bespoke format. They are "mhwanh" files,
+   an existing image format with a 32-byte big-endian header, carrying
+   either 24-bit truecolour or 8-bit paletted pixels.
+
+   Verified: all 465 texture files parse with the computed size matching
+   the file size exactly, zero failures, and two decoded samples render
+   correctly [verified]. Reference reader at tools/rawimg.py.
+
+Table of Contents
+
+   1. Header
+   2. What is actually shipped
+   3. How this connects to the renderer
+   4. Per-island bike pages
+   5. Reference reader
+      5.1. And a reconstruction
+   6. Open questions
+
+
+1.  Header
+
+   Every field after the magic is big-endian, which is unusual in an x86
+   game and suggests the format arrived from a Commodore or Atari
+   lineage rather than being written for this title [inferred].
+
+   +0x00  char[6]   magic, "mhwanh"
+   +0x06  u16       version, always 4 in the shipped data
+   +0x08  u16       width
+   +0x0a  u16       height
+   +0x0c  u16       colour count; 0 means 24-bit truecolour
+   +0x0e  u16       horizontal resolution in dpi
+   +0x10  u16       vertical resolution in dpi
+   +0x12  14 bytes  reserved, zero in every file examined
+   +0x20  palette   colour count x 3 bytes RGB, omitted when the
+                    colour count is 0
+   ...    pixels    3 bytes each when truecolour, otherwise one
+                    palette index per pixel
+
+   So the payload size is
+
+   colours * 3  +  width * height * (3 if colours == 0 else 1)
+
+   That formula reproduces the file size for all 465 files with no
+   exceptions, which is what pins the layout.
+
+   The dpi fields hold 72 in several files and 0 in the rest, consistent
+   with metadata written by an authoring tool and ignored by the game.
+
+2.  What is actually shipped
+
+   +------------+------------+-------+
+   | Dimensions | Kind       | Files |
+   +============+============+=======+
+   | 256 x 256  | truecolour | 244   |
+   +------------+------------+-------+
+   | 128 x 128  | truecolour | 161   |
+   +------------+------------+-------+
+   | 256 x 256  | 256-colour | 57    |
+   +------------+------------+-------+
+   | 256 x 128  | 256-colour | 1     |
+   +------------+------------+-------+
+   | 160 x 144  | 256-colour | 1     |
+   +------------+------------+-------+
+   | 32 x 32    | 256-colour | 1     |
+   +------------+------------+-------+
+
+   Two page sizes dominate, 256 x 256 and 128 x 128, and most pages are
+   truecolour. The three odd sizes are one-offs: LOWRES, DEBUG and
+   SYMBOL.
+
+   Decoded samples confirm the content. BNK00_00.RAW is a bike texture
+   atlas holding body panels, a wheel and an exhaust, with a strip of
+   digits and letters along the bottom for race numbers. 8TRACKS.RAW is
+   a 256-colour splash graphic.
+
+3.  How this connects to the renderer
+
+   bankw.Cpp allocates 0x20000 bytes per texture bank and sets the page
+   dimensions to 0x100 by 0x100. 256 x 256 x 2 is exactly 0x20000, so a
+   bank page in memory is 16-bit.
+
+   On disk the same page is 256 x 256 x 3, 24-bit. The conversion to
+   16-bit happens on load, and the loader has since been found:
+   Bankw_LoadRawTexture at 0x00401160 [verified]. This paragraph
+   previously marked the mechanism [inferred]; it is now traced.
+
+   Each channel is shifted right by three to five bits, packed into a
+   true RGB555 word, and then converted to the destination format by an
+   inlined copy of Color_Convert555ToSurface (0x00402020), which uses
+   the six shift globals as expected.
+
+   One qualification: when hardware rendering is active the palette path
+   instead uses a hardcoded layout rather than the DirectDraw one. See
+   subsystems/pixel-format.txt section 3.3.
+
+   The hardware path has its own loader as well.
+   maybe_Cdd_LoadRawToSurface (0x00477b30) reads the same header into a
+   DirectDraw surface, converting with the 8-bit component path
+   g_shrR/G/B rather than through a 555 intermediate. It also computes
+   averaged edge colours into a per-record field. See subsystems/pixel-
+   format.txt section 1.1.2.2.
+
+   This completes the static geometry chain identified in
+   formats/mesh-3df-map.txt:
+
+   .3df   vertices and face indices
+   .map   per-face UVs, a texture bank index and a texture id
+   .RAW   the bank page those indices resolve to
+
+   Every link is now readable. A textured object from the shipped data
+   can be reconstructed end to end without running the game.
+
+4.  Per-island bike pages
+
+   The 44 files named BNK00_00 with numeric extensions .1 through .11
+   parse as ordinary texture pages. They are the bike's page specialised
+   per circuit, as suspected in asset-inventory.txt, and they carry the
+   same header as everything else.
+
+5.  Reference reader
+
+   tools/rawimg.py.
+
+   python tools/rawimg.py --check PATH [PATH ...]
+   python tools/rawimg.py --info  PATH
+   python tools/rawimg.py --ppm OUT.ppm PATH
+
+   --check validates the magic, the version, and that the computed
+   payload size matches the file exactly.
+
+5.1.  And a reconstruction
+
+   src/rawtex.c in mracer reads the same format in C. It is a
+   transcription of this note rather than an independent decode, so
+   rawimg.py remains the oracle: when the two disagree, the Python is
+   right until the binary says otherwise.
+
+   One deliberate difference from the ORIGINAL loader, which is a
+   different thing from a difference from rawimg.py. The original
+   reads the whole 0x20 header and then touches only width, height and
+   the colour count - it never checks the magic, the version, or the
+   size (section 6). src/rawtex.c checks all three and refuses a file
+   that fails any of them, because the size formula is the evidence
+   this layout rests on and a file that violates it is not a file the
+   reconstruction understands. That is stricter than the game, and it
+   will reject data the game would have accepted and misread.
+
+6.  Open questions
+
+   o RESOLVED, and there are TWO readers. Bankw_LoadRawTexture at
+     0x00401160 in bankw.Cpp fills a memory bank page for the software
+     rasterizer. maybe_Cdd_LoadRawToSurface at 0x00477b30 in
+     screen3d\dd.cpp reads the same header and converts into a locked
+     DirectDraw surface for hardware, then registers it as a texture
+     bank entry. Both byte-swap width and height and dispatch on the
+     colour count; the 24-bit to 16-bit conversion is confirmed in both.
+   o RESOLVED. Skipped. The loader reads the whole 0x20 header into a
+     stack buffer but touches only +0x08 width, +0x0a height and +0x0c
+     colour count. The version, dpi and reserved fields are never read,
+     so nothing validates them [verified].
+   o RESOLVED, and it is both: the loader takes a mode argument. With
+     mode 0 a paletted page stays indexed, keeping a converted 256-entry
+     16-bit palette in the bank slot. With mode non-zero the indices are
+     expanded through the palette into 16-bit pixels at 0x004019e2 and
+     the palette is then freed and its slot nulled [verified].
+   o The pixel buffer is allocated at height * 512 bytes, which is two
+     bytes per pixel, even on the indexed path that writes only one byte
+     per pixel. Either the buffer is deliberately over-allocated so it
+     can be expanded in place later, or the allocation is simply shared
+     with the truecolour path. Not yet determined.
+   o "mhwanh" is a recognisable magic rather than an invention of this
+     studio. Identifying the originating tool would give an independent
+     specification to check this description against.

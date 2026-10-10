@@ -1,0 +1,228 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            GAME DATA FILES
+
+
+Abstract
+
+   Survey of the shipped data set now present at decomp/DATA. Roughly 92
+   MB across ten formats. This is the orientation map for all asset
+   work.
+
+Table of Contents
+
+   1. What is there
+   2. Magic bytes
+   3. The banks
+      3.0. Our DATA is a patched US install, and one file is
+           modded
+      3.1. Two different extracted directories
+   4. The pre-extracted bank is the key asset
+   5. Naming is inconsistent
+   6. Suggested order of attack
+   7. Open questions
+
+
+1.  What is there
+
+   +---------------------+----------------------------------------------------+
+   | Path                | Contents                                           |
+   +=====================+====================================================+
+   | DATA/               | 40 files: the .BKF banks, .BPT tables, high scores |
+   +---------------------+----------------------------------------------------+
+   | DATA/ileNN/         | one .trk per island, ten of them                   |
+   +---------------------+----------------------------------------------------+
+   | DATA/demo/          | four .dem demo scripts                             |
+   +---------------------+----------------------------------------------------+
+   | DATA/extract/ile01/ | a pre-extracted bank, see below                    |
+   +---------------------+----------------------------------------------------+
+
+   +------+-------+--------+-----------------+-------------------------------------+
+   | Ext  | Files | Total  | Size range      | Role                                |
+   +======+=======+========+=================+=====================================+
+   | .bkf | 23    | 74 MB  | 15 KB - 6.6 MB  | asset bank, the main container      |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .trk | 10    | 12 MB  | 0.9 - 1.8 MB    | track geometry, one per island      |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .raw | 41    | 5.6 MB | 48 KB - 192 KB  | extracted bank members              |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .lez | 6     | 248 KB | 6.7 - 114 KB    | compressed TGA, see formats/lez.txt |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .bpt | 17    | 53 KB  | 209 B - 4.3 KB  | small tables, obfuscated            |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .map | 4     | 44 KB  | 896 B - 19.6 KB | paired with .3df                    |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .3df | 4     | 13 KB  | 102 B - 3.5 KB  | 3D meshes                           |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .dem | 4     | 4 KB   | ~130 B          | demo scripts, plain text            |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .dat | 1     | 292 KB | -               | bestscor.dat, high scores           |
+   +------+-------+--------+-----------------+-------------------------------------+
+   | .err | 1     | 862 B  | -               | delphine.err, error log             |
+   +------+-------+--------+-----------------+-------------------------------------+
+
+2.  Magic bytes
+
+   Fingerprints taken from one representative of each type [verified].
+
+   .bkf   13 00 00 00 44 53 49 32 2e 47 45 4e 00 00 00 00
+          dword count, then "DSI2.GEN" padded with NULs
+
+   .trk   54 52 4b 00 05 00 00 00 14 03 00 00
+          "TRK\0", then 5, then 0x314
+
+   .bpt   05 00 00 00 ed f0 d5 0a ea 6c 03 a2 eb f5 b0 a3
+          dword count, then high-entropy bytes
+
+   .dem   "NbItems: 2\r\n\r\nDe..."
+          plain ASCII, a key-value script
+
+   .dat   "00.1SNOW_RIDE\0\0\0"
+          readable score records
+
+   The .bkf magic settles the naming: DSI2 is Delphine Software
+   International, version 2. That is the fourth independent confirmation
+   of the studio, after the Dsed source paths, the DelphineSoft registry
+   key and logodsi.lez.
+
+   The .bpt payload is obfuscated, not compressed: a byte-wise XOR
+   against a Park-Miller generator seeded with a fixed constant
+   [verified]. See formats/bpt.txt.
+
+   The suspicion that these hold the bike parameters was right. The 32
+   CARAC files are the vehicle characteristic tables, 73 values each,
+   and they decode completely; see formats/bpt-carac.txt.
+
+3.  The banks
+
+   Twenty-three .bkf files, and their names map cleanly onto the game:
+
+   +-----------------------------------+----------------------------------------+
+   | Bank                              | Purpose                                |
+   +===================================+========================================+
+   | ILE01 .. ILE11                    | one per island; there is no ILE07      |
+   +-----------------------------------+----------------------------------------+
+   | MENU, MENUUS, PAGES               | front end, and the US-language variant |
+   +-----------------------------------+----------------------------------------+
+   | FONTES, DESIGN, GENERIC           | shared assets                          |
+   +-----------------------------------+----------------------------------------+
+   | SFX                               | 6.6 MB, the largest single file        |
+   +-----------------------------------+----------------------------------------+
+   | SPEED, SPEEDPKT, KTMCROSS, KTMPKT | per-bike asset sets                    |
+   +-----------------------------------+----------------------------------------+
+   | PODIUM, DEMO                      | end-of-race and attract mode           |
+   +-----------------------------------+----------------------------------------+
+
+   The gap at ILE07 is consistent: no bank, no ileNN directory, no
+   track. Either a cut circuit or a numbering skip.
+
+3.0.  Our DATA is a patched US install, and one file is modded
+
+   Established by hashing six retail USA CD images against it -
+   docs/releases.txt. In summary [verified]:
+
+   o it is the ENGLISH-ONLY disc layout, 45 files, not the
+     multi-language one that adds MENUFR/GR/IT/SP/SW.BKF
+
+   o the 3.20 patch is applied: design.bkf, fontes.bkf and fonts.bpt
+     are byte-identical to Patch3.20 and differ from every disc
+
+   o ILE10 and ILE11, bank and track, are present here and on NO disc
+     examined, together with LIST01.BPT and CHAMPA/B/C01.BPT
+
+   o SPEED.BKF has been repacked with EIGHT EDITED BIKE-STATISTICS
+     VALUES in its CARAC2.BPT member. Do not draw conclusions about
+     bike behaviour from it. See releases.txt section 4.3.
+
+   Everything else matches a disc byte-for-byte.
+
+3.1.  Two different extracted directories, and only one is shipped
+
+   DATA holds BOTH of these and they are not the same thing:
+
+   +------------------+-------+---------------------------------------+
+   | Directory        | Files | What it is                            |
+   +==================+=======+=======================================+
+   | DATA/extract/    |    57 | section 4 - looks like the unpacked   |
+   |                  |       | contents of ILE01.BKF, provenance     |
+   |                  |       | still open                            |
+   +------------------+-------+---------------------------------------+
+   | DATA/extracted/  |  1507 | NOT SHIPPED. Produced by an           |
+   |                  |       | extraction tool the project owner ran |
+   |                  |       | years ago, and confirmed as such      |
+   +------------------+-------+---------------------------------------+
+
+   The second one is exactly the archives unpacked and nothing else:
+   1507 files, and the twenty-three .BKF archives hold 1507 members
+   between them. Four of them - PAGES, MENU, MENUUS and ILE01, 403
+   members - were compared byte-for-byte and every one is identical.
+
+   IT WILL NOT EXIST ON ANYONE ELSE'S MACHINE, which is why CLAUDE.md
+   rule 10 forbids depending on it and src/assets.c reads the archives
+   instead.
+
+4.  The pre-extracted bank is the key asset
+
+   DATA/extract/ile01 holds what appears to be the unpacked contents of
+   ILE01.BKF:
+
+   LEVEL.BPT        1543      SOUND.BPT        2253
+   LOAD.LEZ        79681      LOADKAWA.LEZ   113943
+   MAP.LEZ         12713      PHOTO.LEZ       19024
+   SMALLMAP.LEZ     8309      SMALPHOT.LEZ     6716
+   bank/            41 x BNK00_NN.RAW, 196640 bytes each
+   final/           1RST, 2ND, 3RD, LAUREAT as .3DF + .MAP pairs
+
+   That gives ground truth. A .bkf reader can be checked by extracting
+   ILE01.BKF and comparing byte-for-byte against this directory, which
+   is a far stronger test than eyeballing a header. It is the same
+   technique that validated the .lez decoder, and it is available before
+   writing a line of the reader.
+
+   Two observations from the contents:
+
+   o Every BNK00_NN.RAW is exactly 196640 bytes, which is 0x30000 +
+     0x20. 0x30000 is 196608, and 256 x 256 x 3 is also 196608, so a
+     32-byte header over a 256x256 24-bit image is a natural reading
+     [guess]. Forty-one identically sized members says texture pages,
+     not heterogeneous data.
+   o final/ pairs a .3DF with a .MAP of roughly five times the size, for
+     each of first, second, third and laureate. So .3df is geometry and
+     .map is its texture or lightmap [inferred].
+
+5.  Naming is inconsistent
+
+   The track files are ile01.trk, ile02.trk, Track03.trk, ile04.trk,
+   ile05.trk, Track06.trk, ile08.trk, bercy.trk, ile10.trk, ile11.trk.
+
+   Three names break the pattern. bercy.trk is ile09 and is presumably
+   the Paris-Bercy arena, which fits an indoor supercross circuit.
+   Track03 and Track06 look like files that were never renamed. Do not
+   assume the directory name and the file name agree; read the
+   directory.
+
+6.  Suggested order of attack
+
+   1. .bkf, because it is 74 MB of the 92 MB and every other asset is
+      inside one. bankw.Cpp is already located at 0x00401e40, the
+      extract directory provides ground truth, and GENERIC.BKF at 15 KB
+      is a small first target.
+   2. .trk, the track geometry, once the bank reader can supply its
+      dependencies.
+   3. .3df and .map together, using the four small final/ pairs.
+   4. .bpt, small but obfuscated; likely the bike parameter tables.
+
+   All four are now done, as is the rmnr sound format in SFX.BKF, which
+   turned out to be masked PCM RIFF WAVE rather than a container. Every
+   format in the data folder now has a reader and a document.
+
+7.  Open questions
+
+   o Is DATA/extract a shipped directory or something a previous project
+     produced? If the latter, the byte-for-byte comparison is only as
+     trustworthy as whatever tool made it. Check whether the game itself
+     ever reads from an extract path.
+   o What produced delphine.err, and does it name any subsystem?
+   o bestscor.dat is 292 KB, which is large for a score table. It may
+     hold ghost or replay data.

@@ -1,0 +1,681 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                 COPY PROTECTION AND THE APPLIED CRACK
+
+
+Abstract
+
+   The MOTO.EXE this project analyses is a CRACKED build. Four
+   instructions have been overwritten to defeat the disc check. This
+   note records exactly which four, what the original code did, and -
+   the part that matters for the reconstruction - which of our existing
+   findings were contaminated by mistaking a patch for original
+   behaviour.
+
+   The protection is more interesting than a simple presence test. It is
+   layered, delayed, and one layer degrades gameplay silently rather
+   than refusing to run.
+
+   +----------------------------------+-------------------------+
+   | Item                             | Address                 |
+   +==================================+=========================+
+   | Main_InitAndParseCommandLine     | 0x00414240              |
+   +----------------------------------+-------------------------+
+   | CdAudio_FindMotoRacerDrive       | 0x004b1460              |
+   +----------------------------------+-------------------------+
+   | maybe_CdAudio_CheckDiscSignature | 0x00442740              |
+   +----------------------------------+-------------------------+
+   | g_protectionPassed               | 0x004dc1f4              |
+   +----------------------------------+-------------------------+
+   | maybe_g_protTokenA / B           | 0x004e90b4 / 0x004e90b8 |
+   +----------------------------------+-------------------------+
+   | the in-game nag payload          | 0x0047e8e0 (orphaned)   |
+   +----------------------------------+-------------------------+
+
+Table of Contents
+
+   1. The patched instructions
+   2. Layer one: the registry PId
+   3. Layer two: the volume label
+   4. Layer three: the disc signature and the nag
+   5. The gearbox penalty
+      5.1. The torque penalty, and the in-race check behind it
+           5.1.1. It reads the game's own code
+           5.1.2. What failing it costs
+           5.1.3. Our copy passes it
+      5.2. FOUR "ILLEGAL VERSION" SITES, THREE MECHANISMS, AND
+           THEY ARE PROGRESSION-GATED
+           5.2.1. Three different mechanisms, and a third flag
+           5.2.2. The payloads escalate, and two of them are not
+                  survivable
+           5.2.3. All three fire only deep into a CHAMPIONSHIP
+           5.2.4. Our copy passes all three, and that was checked
+           5.2.5. Open
+      5.3. CORRECTION AND ANSWER - check B is not a library
+           routine, and check C is a disc check
+           5.3.1. And it plants the token check C reads
+           5.3.2. The 0x004b0000 cliff is not a clean library
+                  boundary
+   6. What this contaminated
+   7. How the sites were found
+   8. What it means for the port
+   9. Open questions
+
+1.  The patched instructions
+
+   SUPERSEDED BY A BYTE-DIFF. An untouched ORIGINAL_MOTO.EXE is now
+   available and the real count is SEVEN sites, 14 bytes - five of them
+   protection, two of them an unrelated colour-depth relaxation.
+   docs/binary-modifications.txt is the authoritative record and this
+   table is kept only because the five protection sites are the subject
+   of this note [verified].
+
+   +------------+---------------+----------------------+------------------------------+
+   | Address    | Now           | Was                  | In                           |
+   +============+===============+======================+==============================+
+   | 0x00414331 | 90 90         | a 2-byte Jcc         | Main_InitAndParseCommandLine |
+   +------------+---------------+----------------------+------------------------------+
+   | 0x00442f44 | 90 90         | a 2-byte Jcc         | MenuPage03_MainMenu_Tick     |
+   +------------+---------------+----------------------+------------------------------+
+   | 0x00444e73 | 90 90         | a 2-byte Jcc         | MenuPage26_Tick              |
+   +------------+---------------+----------------------+------------------------------+
+   | 0x0047e8db | E9 rel32 + 90 | a 6-byte 0F 8x rel32 | FUN_0047e3d0                 |
+   +------------+---------------+----------------------+------------------------------+
+
+   The fourth is the classic six-into-five substitution: a near
+   conditional jump replaced by a near unconditional one, leaving a
+   single 0x90 as padding.
+
+   In every case the patched form takes the path a legitimate copy would
+   have taken. The crack does not invent behaviour; it forces the pass
+   branch. That is worth stating plainly, because it means the
+   observable behaviour of this binary matches a genuine disc run in all
+   four places [inferred - from reading each branch, not from running an
+   uncracked copy].
+
+2.  Layer one: the registry PId
+
+   Main_InitAndParseCommandLine reads the value PId from
+
+       HKLM\SOFTWARE\DelphineSoft\MotoRacer\CurrentVersion\Moto
+
+   and compares it against a value computed at startup into
+   maybe_g_expectedPId. On a match it sets g_protectionPassed = 1 and
+   continues. On a mismatch it showed a MessageBox whose caption is
+   "MotoRacer" and whose text is the language-selected pointer at
+   0x0053b8b0 - the localized "PLEASE, INSERT YOUR MOTO RACER CDROM"
+   [verified].
+
+   Those strings exist in six languages at 0x004de248 through
+   0x004de314, in a per-language table at 0x004e3d44 read by computed
+   index, which is why none of them carries a direct cross-reference.
+
+3.  Layer two: the volume label
+
+   CdAudio_FindMotoRacerDrive walks A: through Z:, keeps the drives
+   GetDriveTypeA reports as DRIVE_CDROM (5), and for each one compares
+   the first 8 characters of the volume label against "moto rac", case-
+   insensitively. A match sets g_cdAudio+0x20 and leaves the opened MCI
+   device in g_cdAudio+0x08. The whole sweep retries up to three times
+   [verified].
+
+   SetErrorMode(1) wraps the GetVolumeInformationA call so an empty
+   drive does not raise the Windows "no disk" dialog - a courtesy worth
+   keeping in any port that still enumerates drives.
+
+   This function is dual-purpose. It is the protection's disc check, and
+   it is also how the game finds the drive to play redbook audio from.
+   Removing it removes the CD music.
+
+4.  Layer three: the disc signature and the nag
+
+   maybe_CdAudio_CheckDiscSignature is the cleverest layer. It queries
+   MCI status and compares the result against 0x3e0c04 - an MSF timecode
+   of 4 minutes, 12 seconds, frame 62. That is a disc length, used as a
+   fingerprint of the genuine pressing, which a plain data-track copy
+   would not reproduce [verified for the comparison; inferred for the
+   intent].
+
+   CORRECTION - this note previously said the function ALWAYS RETURNS 1
+   and that the verdict was carried only by the token pair. That was
+   read off PATCHED code. Byte 0x00442785 was changed from 33 c0 (XOR
+   EAX,EAX, i.e. return 0) to eb f4 (a jump back into the return-1
+   epilogue), which turns all three failure exits into successes. In the
+   original the return value IS a verdict, and the token pair is a
+   second independent mechanism. Verified by byte-diff; see binary-
+   modifications.txt [verified].
+
+       if (status == 0x3e0c04) {
+           maybe_g_protTokenA = rand() | 1;
+           maybe_g_protTokenB = maybe_g_protTokenA;
+       }
+
+   The two globals are equal only if a genuine disc was seen, and the
+   value is randomised so it cannot be recognised as a constant. They
+   are re-seeded from several menu pages, so the check is repeated
+   rather than done once.
+
+   FUN_0047e3d0, called from maybe_Game_Tick, compares them DURING
+   GAMEPLAY. On a mismatch it ran the block now orphaned at 0x0047e8e0,
+   which assembles a string four bytes at a time from immediates - ILLE,
+   GAL, VERS, ION - and passes it to the text renderer at 0x00417d20
+   [verified].
+
+   So an unpatched illegitimate copy does not refuse to start. It boots,
+   plays, and paints ILLEGAL VERSION across the race. Building the
+   string from immediates rather than storing it keeps it out of a
+   strings dump, which is presumably the point.
+
+   Those 153 bytes are unreachable in this binary. Ghidra never
+   disassembled them, so they do not appear in any function and did not
+   show up in the orphaned-code sweeps described in ghidra-db-
+   repairs.txt.
+
+5.  The gearbox penalty
+
+   The subtlest layer, and the one that had already misled us. In
+   Carac_Load, at 0x0042a8b0 [verified]:
+
+       if (g_protectionPassed == 0)
+           carac->NbSpeed -= 1.0f;
+
+   NbSpeed is the gear count. A copy that failed the PId check loses one
+   gear on every bike - top speed quietly falls and the game feels wrong
+   without ever saying why.
+
+   This is deliberate anti-tamper design. Someone who found and removed
+   only the message box, leaving g_protectionPassed at 0, would ship a
+   build that runs but handles badly. The crack in this binary avoids
+   that by patching the branch so the flag is always set.
+
+5.1.  The torque penalty, and the in-race check behind it
+
+   There is a second silent penalty, driven by a different flag from a
+   different check, and it was found from the physics end rather than
+   the protection end - by reading Engine_TorqueAt for the engine map
+   and noticing what one of its multipliers was gated on.
+
+   g_codeCheckPassed IS AT 0x004dc1f8, FOUR BYTES AFTER
+   g_protectionPassed. Two protection verdicts side by side in .data,
+   which is itself a hint that was sitting there to be read.
+
+5.1.1.  It reads the game's own code
+
+   Set in FUN_0045d110, inside the per-racer tick [verified]:
+
+       0045d187  MOV ECX,[0x004dc094]
+       0045d18d  CMP ECX,0x2
+       0045d190  JNZ 0045d270              only in mode 2
+       0045d196  MOV EAX,[0x00509ba8]
+       0045d19b  CMP EAX,0x3
+       0045d19e  JL  0045d270              and only past state 3
+       0045d1a4  MOV [0x004dc1f8],0x0      assume FAILED
+       0045d1ae  MOV AL,[0x00442761]       <- READS ITS OWN .text
+       0045d1b3  CMP AL,0x75
+       0045d1b5  JNZ 0045d1cf
+       0045d1b7  MOV AL,[0x00442762]
+       0045d1bc  CMP AL,0x22
+       0045d1be  JNZ 0045d1cf
+       0045d1c0  MOV [0x004dc1f8],0x1      bytes intact -> PASSED
+
+   o IT IS A CODE-INTEGRITY CHECK ON THE DISC-CHECK ROUTINE, not on
+     the registry or the disc. 0x00442761 is in the same function as
+     the patched site at 0x00442785, so a cracker working on the disc
+     check is exactly who is likely to disturb it.
+
+   o AND IT IS PLACED IN THE PHYSICS, not in startup. FUN_0045d110 is
+     called once per racer per frame from maybe_Racer_Tick. Section 7
+     found the other sites by working outwards from the strings; this
+     one has no string, no message and no failure path, and it lives
+     in a function whose other 1000 bytes are handling code. That is
+     why five passes over the protection missed it.
+
+5.1.2.  What failing it costs
+
+   +---------------------------+------------------------------------+
+   | Consumer                  | g_codeCheckPassed == 0 costs       |
+   +===========================+====================================+
+   | Engine_TorqueAt           | the 1.1x multiplier on every       |
+   | 0x0048ee30                | torque lookup, for every bike      |
+   +---------------------------+------------------------------------+
+   | maybe_Racer_UpdateWheelie | wheelieScale drops from 2.0 to 1.6 |
+   | 0x004660f0                | while a wheelie is up - and that   |
+   |                           | scale multiplies engine torque     |
+   +---------------------------+------------------------------------+
+
+   Both are quiet. No message, no refusal, just a slower bike - the
+   same design as the gearbox penalty in section 5, and by the same
+   reasoning it is deliberate.
+
+   o Engine_TorqueAt's 1.1x ALSO REQUIRES racer+0x88 to be 0, so the
+     bonus is conditional on a per-racer field as well. What that
+     field is has not been read. [open]
+
+5.1.3.  Our copy passes it
+
+   The bytes at 0x00442761 read 75 22 [verified], and 0x00442761 and
+   0x00442762 are not among the seven patched sites in
+   binary-modifications.txt. So the check succeeds and NO PENALTY
+   APPLIES in the binary this project reads.
+
+   o WHICH IS THE OPPOSITE SITUATION TO SECTION 5. There the crack
+     had to patch the branch to avoid the gearbox penalty; here it
+     simply never touched the bytes being watched. Same outcome -
+     full performance - by two different routes.
+
+   o BUT THE RECONSTRUCTION STILL HAS TO CARRY THE MECHANISM, or it
+     is not reproducing the binary. Getting the SENSE backwards
+     would nerf every bike in the game, and nothing on screen would
+     say so.
+
+   o AND IT WIDENS SECTION 6's WARNING. Anything measured against a
+     cracked MotoRacer has to account for BOTH penalties, not one.
+     A torque figure taken from a build that failed this check is
+     10 per cent low and there is no way to tell from the numbers.
+
+5.2.  FOUR "ILLEGAL VERSION" SITES, THREE MECHANISMS, AND THEY ARE
+      PROGRESSION-GATED
+
+   Section 4 describes ONE in-game nag, at 0x0047e8e0, orphaned by the
+   crack. A sweep for the immediates that build the string - the whole
+   point of building it four bytes at a time is that it does not appear
+   in a strings dump, so the immediates are the only handle - finds
+   FOUR sites [verified]:
+
+   +--------------+----------------------------+--------------------------------+
+   | String at    | In                         | Payload on failure             |
+   +==============+============================+================================+
+   | 0x0045d1fd   | maybe_Racer_ApplyCornering | draws, then zeroes the local   |
+   |              | 0x0045d110                 | racer's realSpeedMax AND       |
+   |              |                            | wheelieScale                   |
+   +--------------+----------------------------+--------------------------------+
+   | 0x00466e3b   | FUN_00466d70               | draws only                     |
+   +--------------+----------------------------+--------------------------------+
+   | 0x00468f10   | maybe_Racer_UpdateGroundCo | draws, then zeroes the local   |
+   |              | ntact 0x00468ca0           | racer's active flag            |
+   +--------------+----------------------------+--------------------------------+
+   | 0x0047e8f1   | maybe_Race_UpdateProgress  | the block section 4 describes  |
+   |              | 0x0047e3d0                 | - ORPHANED by the crack at     |
+   |              |                            | 0x0047e8db                     |
+   +--------------+----------------------------+--------------------------------+
+
+   o SO THE PROJECT KNEW ABOUT ONE OF FOUR, and the three it did not
+     know about are the three that are still LIVE. Only the fourth was
+     neutralised by the crack. Sections 4 and 6 are not wrong; they are
+     one quarter of the picture.
+
+   o AND THREE OF THE FOUR ARE INSIDE THE PER-RACER PHYSICS TICK, not
+     in startup or in a menu. That is why five previous passes missed
+     them: section 7 found the other sites by working outwards from
+     strings, and these have no string to work outwards from and no
+     failure path that looks like protection.
+
+5.2.1.  Three different mechanisms, and a third flag
+
+   The four sites do not share a check. Three distinct ones feed them,
+   and each writes its own flag - THREE CONSECUTIVE DWORDS in .data,
+   which is itself the tell:
+
+   +----------------------+--------------+------------------------------------------+
+   | Flag                 | Address      | Set by                                   |
+   +======================+==============+==========================================+
+   | g_protectionPassed   | 0x004dc1f4   | the registry PId check - section 2       |
+   +----------------------+--------------+------------------------------------------+
+   | g_codeCheckPassed    | 0x004dc1f8   | the two-byte code check in               |
+   |                      |              | maybe_Racer_ApplyCornering               |
+   +----------------------+--------------+------------------------------------------+
+   | g_windowTokenOk      | 0x004dc1fc   | the GetWindowLongA token check in        |
+   |                      |              | maybe_Racer_UpdateGroundContact          |
+   +----------------------+--------------+------------------------------------------+
+
+   o CHECK A - TWO BYTES OF ITS OWN CODE. 5.1 covers it:
+     [0x00442761] == 0x75 and [0x00442762] == 0x22, in the same
+     function as the patched disc check at 0x00442785.
+
+   o CHECK B - AN EIGHT-ENTRY BYTE TABLE. FUN_00466d70 builds
+     16 bytes on the stack as eight (offset, expected) PAIRS and walks
+     them against the code at 0x004b1830:
+
+         MOV [ESP+0x134], 0x683c502d
+         MOV [ESP+0x138], 0x754d0843
+         MOV [ESP+0x13c], 0x7573ff6d
+         MOV [ESP+0x140], 0xff86eb84
+         MOV [ESP+0x6c],  0x4b1830        the base
+     loop:
+         CL = [ESP+EAX+0x134]             the offset
+         DL = [ESP+EAX+0x135]             the expected byte
+         CMP [ECX+EDI], DL
+         JNZ fail
+         EAX += 2;  CMP EAX, 0x10;  JC loop
+
+     0x004b1830 IS ABOVE 0x004b0000. This section originally read
+     that as "a LIBRARY function's bytes, not the game's". IT IS
+     NOT - it is maybe_CdAudio_GetTrackPos, and it is the game's.
+     See 5.3, which corrects this and answers 5.2.5's token
+     question at the same time.
+
+   o CHECK C - A WINDOW-USERDATA TOKEN. maybe_Racer_UpdateGroundContact
+     calls GetWindowLongA(hwnd, -21) - GWL_USERDATA - adds
+     [0x00540488], and requires the sum to equal 0x7b5403. Nothing to
+     do with the disc, the registry or the code: a value someone else
+     has to have planted at run time.
+
+5.2.2.  The payloads escalate, and two of them are not survivable
+
+   +--------------------------------+-----------------------------+
+   | Zeroed                         | Consequence                 |
+   +================================+=============================+
+   | realSpeedMax   racer+0xb4      | maybe_Physics_TickDrivetrain|
+   |                                | clamps speed and            |
+   |                                | gearboxRoadSpeed to it, so  |
+   |                                | THE BIKE CANNOT MOVE        |
+   +--------------------------------+-----------------------------+
+   | wheelieScale   racer+0xb8      | Engine_TorqueAt returns     |
+   |                                | scale * curve, so torque is |
+   |                                | ZERO as well                |
+   +--------------------------------+-----------------------------+
+   | active         racer+0x68      | Race_TickAllRacers and the  |
+   |                                | draw loop both skip the     |
+   |                                | racer - REMOVED FROM THE    |
+   |                                | RACE                        |
+   +--------------------------------+-----------------------------+
+
+   o THIS IS THE FAMILIAR ANTI-PIRACY PATTERN, and it is the reason
+     for looking: a cracked copy is not refused, it is made
+     unfinishable. The 1.1x torque cut in 5.1 is the gentle end of the
+     same design. At the other end the player's bike simply stops, or
+     leaves the race, with ILLEGAL VERSION painted over it.
+
+   o BELT AND BRACES ON THE FIRST ONE. Zeroing realSpeedMax alone
+     would stop the bike; zeroing wheelieScale as well makes the
+     engine produce no torque either. Two independent kills for one
+     failed check.
+
+5.2.3.  All three fire only deep into a CHAMPIONSHIP
+
+   +------------------------------+----------------------------------------------+
+   | Site                         | Only runs when                               |
+   +==============================+==============================================+
+   | maybe_Racer_ApplyCornering   | g_nSelectedMode == 2 (CHAMPIONSHIP) and      |
+   |                              | championship index > 2                       |
+   +------------------------------+----------------------------------------------+
+   | FUN_00466d70                 | g_nSelectedMode == 2 and championship index  |
+   |                              | >= half of [0x005083b4]                      |
+   +------------------------------+----------------------------------------------+
+   | maybe_Racer_UpdateGroundCont | a chain of flag tests, one of which is       |
+   | act                          | [0x004dbffc] != 0                            |
+   +------------------------------+----------------------------------------------+
+
+   g_nSelectedMode == 2 is championship in a solo game -
+   subsystems/menu-pages.txt records the mode numbering as 0 practice,
+   1 single race, 2 championship - and 0x00509ba8 is the championship
+   index, the same one that page uses to select the championship
+   definition at 0x00508934 + index * 0x50.
+
+   o SO NONE OF THIS CAN FIRE IN PRACTICE, IN A SINGLE RACE, OR IN THE
+     FIRST FEW CHAMPIONSHIPS. A pirate gets a game that plays
+     perfectly for hours and then quietly becomes impossible - which
+     is the whole point of the design, and the reason a check like
+     this survives casual testing by whoever cracked it.
+
+   o AND IT IS WHY NO REPLAY IN THIS PROJECT WOULD EVER HAVE SHOWN IT.
+     Every capture so far has been a single race.
+
+5.2.4.  Our copy passes all three, and that was checked
+
+   +-------------------------+----------------------------------------+
+   | Check A, two bytes      | 0x00442761 reads 75 22 - PASSES        |
+   +-------------------------+----------------------------------------+
+   | Check B, eight bytes    | all eight match at 0x004b1830 - PASSES |
+   +-------------------------+----------------------------------------+
+   | Check C, window token   | RUNTIME. Cannot be settled statically, |
+   |                         | and rule 8 forbids running the game.   |
+   |                         | It is also short-circuited to PASS     |
+   |                         | when [0x004dbffc] is 0                 |
+   +-------------------------+----------------------------------------+
+
+   None of the bytes either code check watches is among the seven
+   patched sites in binary-modifications.txt, so the crack simply
+   never touched them.
+
+   o WHICH MEANS OUR COPY IS TWO BYTES AWAY FROM AN UNPLAYABLE
+     CHAMPIONSHIP. Anyone "tidying up" the disc-check function at
+     0x00442761, or the library routine at 0x004b1830, would trip a
+     check whose symptom appears hours later in a different subsystem.
+     That is worth knowing before anyone patches anything else in this
+     binary.
+
+   o AND THE RECONSTRUCTION MUST CARRY ALL OF IT. Not the checks
+     themselves - a rebuilt executable cannot check bytes it no longer
+     has - but the KNOWLEDGE that realSpeedMax, wheelieScale and
+     active have a writer of last resort that is not physics. A future
+     session finding "active mysteriously zero" now has somewhere to
+     look.
+
+5.2.5.  Open
+
+   o ANSWERED IN 5.3.1 - maybe_CdAudio_GetTrackPos plants it, and
+     the token is a CD TRACK POSITION. What track and offset
+     0x7b5403 minus [0x00540488] corresponds to is still [open].
+   o FUN_00466d70's own purpose - it is one of the racer tick chain's
+     unnamed functions and the check is bolted into it, exactly as
+     check A is bolted into maybe_Racer_ApplyCornering. [open]
+   o Whether the retail 3.20 build has the same four sites, which
+     would confirm they are Delphine's and not a re-release addition.
+     releases.txt 141 already records ILLEGAL VERSION as ABSENT from
+     one of the examined images. [open]
+
+5.3.  CORRECTION AND ANSWER - check B is not a library routine, and
+      check C is a disc check
+
+   5.2.1 says check B watches "a LIBRARY function's bytes, not the
+   game's", on the strength of 0x004b1830 being above the 0x004b0000
+   cliff. THAT IS WRONG, and the error came from trusting an address
+   range instead of reading the function.
+
+   0x004b1830 is maybe_CdAudio_GetTrackPos, and it is plainly the
+   game's [verified] - it calls mciSendCommandA twice and reports
+   failures through the game's own error string,
+   "MCI_SET_MCI_STATUS error in getT..." at 0x004f26bc.
+
+5.3.1.  And it plants the token check C reads
+
+   5.2.5 lists as open: "Check C's expected token, 0x7b5403 minus
+   [0x00540488], and who plants it in the window's userdata". This
+   function is who [verified]:
+
+       MVar1 = mciSendCommandA(dev, 0x814, 0x110, &status);
+       if (MVar1 == 0) {
+           SetWindowLongA(hwnd, -0x15, status.position);
+           *out = status.position;
+           return 0;
+       }
+
+   -0x15 is GWL_USERDATA - the same slot
+   maybe_Racer_UpdateGroundContact reads back with GetWindowLongA.
+
+   o SO CHECK C IS A DISC CHECK WEARING A WINDOW PROPERTY. The CD
+     audio code stashes the current TRACK POSITION in the window's
+     userdata as a side effect of asking for it, and the physics
+     later reads it, adds [0x00540488] and requires 0x7b5403. Fail
+     the CD and the racer's active flag is zeroed.
+
+   o WHICH MAKES ALL THREE CHECKS COHERENT. Check A watches the disc
+     check's own bytes, check B watches the CD AUDIO routine's bytes,
+     and check C watches the value that routine produces. They all
+     guard the same thing from three directions, and none of them
+     looks like protection where it sits.
+
+   o THE EXPECTED POSITION IS NOT DERIVED HERE. 0x7b5403 minus
+     whatever [0x00540488] holds at the time is a specific MCI
+     position, and what track and offset that corresponds to is not
+     established. Still [open], but the question is now a concrete
+     one about a CD rather than about an unknown token.
+
+5.3.2.  The 0x004b0000 cliff is not a clean library boundary
+
+   CLAUDE.md and code-map.txt record a named-function cliff at
+   0x004b0000 and say every function at or above it is library. That
+   is a good heuristic and it is NOT exact.
+
+   +--------------+---------------------------------------------+
+   | 0x004b1830   | maybe_CdAudio_GetTrackPos - mciSendCommandA |
+   |              | plus a game error string                    |
+   +--------------+---------------------------------------------+
+   | 0x004b00e0   | 1599 bytes, __thiscall, RET 0x3c - the FX   |
+   |              | trail emitter, called only by               |
+   |              | maybe_Fx_SpawnTrail                         |
+   +--------------+---------------------------------------------+
+   | 0x004b1160   | Rand_Next, which formats/bpt.txt named long |
+   | 0x004b1140   | ago and subsystems/camera.txt then called   |
+   |              | "CRT [inferred] from its address range"     |
+   +--------------+---------------------------------------------+
+
+   Only three functions in 0x004b0000-0x004cf5ff take eight or more
+   stack arguments, and two of them are on that list. A CRT routine
+   with fifteen arguments and a this pointer does not exist.
+
+   o SO THE CLIFF SORTS BY LINK ORDER, NOT BY ORIGIN. Most of what
+     is above it is MFC and CRT; a handful of game translation units
+     landed there too. An "it is above 0x004b0000 therefore it is
+     library" argument is a guess, and this document has now made it
+     twice - once about Rand_Next, once about check B.
+
+   o THE RULE THAT FOLLOWS: the cliff is fine for TRIAGE - deciding
+     what not to read first - and is not evidence about any
+     individual function. Read the function.
+
+6.  What this contaminated
+
+   Two existing documents recorded consequences of the patch as facts
+   about the game. Both are now corrected.
+
+   o subsystems/config-globals.txt listed 0x004dc1f4 as set to 1
+     unconditionally at init, and carried an open question asking why it
+     was never set from a flag. The answer is that the branch was
+     removed. In the original it is conditional.
+
+   o formats/bpt-carac.txt noted that DAT_004dc1f4 == 0 subtracts a
+     constant from NbSpeed, correctly, but without knowing what the flag
+     was - so the penalty read as an unexplained special case in the
+     bike-parameter format rather than as anti-piracy.
+
+   The general lesson is worth a rule: in a cracked binary,
+   unconditional is a claim that has to be earned. A flag with no
+   conditional writer, a comparison with no consumer, and a branch with
+   only one edge are all things a patch produces.
+
+7.  How the sites were found
+
+   Recorded because the method generalises and the first two attempts at
+   it were wrong.
+
+   o Scanning for runs of two or more 0x90 inside a function body found
+     three of the four immediately. MSVC pads BETWEEN functions with
+     0xCC, so an interior NOP run is anomalous. This missed the fourth,
+     which is a JMP patch with only one NOP.
+
+   o Scanning for any CMP or TEST followed immediately by a non-
+     consuming instruction returned 103 hits and was useless. About a
+     hundred of those are a single alignment NOP sitting between a TEST
+     and its Jcc, which is harmless - flags survive a NOP.
+
+   o Widening that to skip NOPs and check the first real instruction was
+     worse, not better: flags also survive MOV, PUSH and LEA, so CMP /
+     MOV / Jcc is ordinary code. The output exceeded the tool limit.
+
+   o What worked was a precise structural signature rather than a
+     semantic one: a 5-byte E9 rel32 followed by a stray 0x90, inside a
+     function. Two hits, one of them the real fourth site and the other
+     a backward loop edge in the CRT's __output.
+
+   One candidate was inspected and DISMISSED. ProcessMessageFilter at
+   0x004c6b39 has a dead CMP EAX,0x8001 before an unconditional JMP,
+   which matches the semantic signature. It is not a patch: a 6-byte
+   conditional could not have fitted, because 0x004c6b43 is both the
+   fallthrough and the target of the JZ at 0x004c6b37. The layout is
+   original, and the dead CMP is MSVC leaving a comparison behind when
+   both branch targets tail-merged [verified].
+
+8.  What it means for the port
+
+   o The reconstruction must NOT transcribe the patched forms. At all
+     four sites the original conditional is recoverable and should be
+     written as source, then the whole scheme compiled out behind a
+     single flag.
+
+   o g_protectionPassed should be a compile-time constant 1 in the port,
+     which is what the crack achieves at runtime. The NbSpeed penalty
+     then disappears with it, and bike handling matches a legitimate
+     disc.
+
+   o CdAudio_FindMotoRacerDrive cannot simply be deleted, because the
+     redbook audio path depends on it to locate a drive. Separate the
+     label test from the drive search.
+
+   o The MCI and redbook audio layer is dead on modern hardware anyway -
+     drives are gone and the tracks are usually ripped. That is a
+     separate porting decision, but this note is where the dependency
+     was found.
+
+   o The 153 orphaned bytes at 0x0047e8e0 are worth keeping disassembled
+     as a curiosity, but they are not part of the reconstruction.
+
+   Nothing here obstructs the renderer work, which remains the mission.
+   It is recorded so that no future session mistakes a patched branch
+   for original logic - which has already happened twice.
+
+9.  Open questions
+
+   o How maybe_g_expectedPId is computed. It comes from FUN_0045a480
+     over a path or install string, and the algorithm has not been read.
+     Without it we cannot say what a passing registry value looks like.
+
+   o ANSWERED, and the answer was no. A byte-diff against
+     ORIGINAL_MOTO.EXE found SEVEN modified sites, not four. The three
+     extra ones are equal-length edits - 33 c0 to eb f4, 0f 84 to 0f 8d,
+     74 to 7d - which leave no structural trace and which no scan of
+     this kind could have found. Two of them are not copy protection at
+     all. See binary-modifications.txt.
+
+   o maybe_g_protTokenC at 0x004e90bc is written by five menu functions
+     and read only by FUN_00499ed0. Whether it is a third token or an
+     unrelated global that happens to sit adjacent is not established.
+
+   o What MCI item 0x3e0c04 is the length OF - the whole disc or a
+     particular track. maybe_CdAudio_GetStatus's item argument was not
+     decoded.
+
+
+A FIFTH PAYLOAD - THE GEARBOX TAKES 9 M/S OFF THE TOP SPEED
+
+   maybe_Gearbox_EngineToSpeed (0x0048dd90) converts engine speed back
+   to road speed and clamps it to realSpeedMax at instance+0x90. The
+   clamp is not used as read:
+
+       cap = this[0x90]                          realSpeedMax
+       if (!g_windowTokenOk) cap -= 9.0          [0x004d1c98, float]
+
+   g_windowTokenOk is check C, the GWL_USERDATA token planted by
+   maybe_CdAudio_GetTrackPos. Fail it and every gear tops out 9 m/s -
+   about 32 km/h - lower, continuously, for the whole race.
+
+   IT IS THE Carac_Load SHAPE, ONE LAYER DOWN. Carac_Load takes 1.0
+   off NbSpeed once at load; this degrades on every conversion, and it
+   is invisible to anything that inspects the carac table, because the
+   table is untouched.
+
+   THE FLAG READS 1 IN OUR COPY [verified, live], so the subtraction
+   does not fire and every capture taken so far is clean.
+
+   IT DOES NOT EXPLAIN THE GEAR-TOP PLATEAU. maybe_Physics_TickDrivetrain
+   carries an open question - the original settles at 17.85 in gear 1
+   where the arithmetic predicts 18.30. This subtraction was an obvious
+   candidate and it is not the answer: 9.0 is twenty times the 0.45 gap
+   and the flag passes anyway. The plateau is still open.
+
+   THE PORT MUST NOT REPRODUCE IT. A rebuilt executable has no bytes to
+   check and is legitimate by construction, so it takes the pass branch
+   - cap = realSpeedMax, no subtraction. Same rule as the driveInterlock
+   gate in engine_torque_at.

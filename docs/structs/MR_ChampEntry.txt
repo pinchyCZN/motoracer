@@ -1,0 +1,159 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                           MR_CHAMPENTRY
+
+
+Abstract
+
+   Size: 0x50 [verified] - operator_new(count * 0x50), stored to
+   the base at 0x00429add, and the LEA/SHL pair at 0x00447b53
+   that indexes it.  Ghidra type applied: no.
+
+   One race of a championship.  The championship is an array of
+   these, parsed at page 3's enter; page 6 uses the current entry
+   to choose the track and the bike, so in championship the player
+   picks neither.
+
+Table of Contents
+
+   1. The layout
+   2. Where the array lives
+   3. The file, and who parses it
+   4. Who reads an entry
+   5. Open questions
+
+1.  The layout
+
+   +--------+------+----------+------------+------------------------+
+   | Offset | Size | Type     | Confidence | Notes                  |
+   +========+======+==========+============+========================+
+   | +0x00  | 0x20 | char[]   | verified   | track name, strncpy'd  |
+   |        |      |          |            | at 0x1f.  Matched      |
+   |        |      |          |            | against the LIST.BPT   |
+   |        |      |          |            | names at 0x00447977    |
+   +--------+------+----------+------------+------------------------+
+   | +0x20  |   4  | int      | verified   | read at 0x00447b5b,    |
+   |        |      |          |            | stored to 0x004dc068   |
+   |        |      |          |            | at 0x00447b5e.  What   |
+   |        |      |          |            | that global MEANS is   |
+   |        |      |          |            | open - see section 5   |
+   +--------+------+----------+------------+------------------------+
+   | +0x24  |   4  | int      | verified   | stored to              |
+   |        |      |          |            | g_nPocketBikeSelected  |
+   |        |      |          |            | by the lines following |
+   +--------+------+----------+------------+------------------------+
+   | +0x28  |   4  | int      | verified   | stored at 0x00429bfd;  |
+   |        |      |          |            | no reader identified   |
+   +--------+------+----------+------------+------------------------+
+   | +0x2c  |   4  | int      | verified   | stored at 0x00429c0f;  |
+   |        |      |          |            | no reader identified   |
+   +--------+------+----------+------------+------------------------+
+   | +0x30  | 0x20 | char[]   | verified   | a second string,       |
+   |        |      |          |            | strncpy'd at 0x1f; no  |
+   |        |      |          |            | reader identified      |
+   +--------+------+----------+------------+------------------------+
+   | +0x50  |      |          |            | stride ends            |
+   +--------+------+----------+------------+------------------------+
+
+   The four ints all come back from FUN_00425080, which takes no
+   argument and returns the next int from the open script.
+
+2.  Where the array lives
+
+   +------------+-------------------------------------------------+
+   | 0x00508934 | base pointer, operator_new(count * 0x50)        |
+   | 0x005083b4 | entry count, the file's NumberEntry             |
+   | 0x00509ba8 | the current entry's index                       |
+   +------------+-------------------------------------------------+
+
+   An entry is 0x00508934 + 0x00509ba8 * 0x50.  The base is freed
+   and reallocated on every parse, so a pointer into it does not
+   survive a return to page 3.  App_Shutdown frees it at 0x0047360e.
+
+   THE INDEX IS ALSO THE PROGRESS COUNTER.  0x00509ba8 against
+   0x005083b4 is how the game knows the championship is over, and
+   the same comparison is one of the copy protection's gates - see
+   subsystems/copy-protection.txt section 5.
+
+3.  The file, and who parses it
+
+   Page 3's enter builds the name into 0x0053f678, opens it with
+   FUN_004246a0 at 0x004426ac, and parses it with FUN_00429a00 at
+   0x004426bd.
+
+       Data\champ%c.spt        0x004e927c, when 0x004dc048 == 0
+       Data\champ%c%02d.spt    0x004e9264, otherwise
+
+   The %c is g_cfgDifficulty + 0x41, so difficulty 0..4 asks for
+   champA through champE.  A .spt request opens the compiled .BPT -
+   the shipped files are CHAMPA.BPT, CHAMPB.BPT and CHAMPC.BPT.  See
+   formats/bpt.txt section 2.
+
+   FUN_00429a00 reads NumberEntry, allocates, reads the first
+   entry's name from the key "LevelList", then loops the rest.  It
+   returns 1, and throws a C++ exception when handed a script that
+   is not open - the +0x8 test at the top of the function.
+
+   o THE FIRST ENTRY'S NAME IS READ WITH A DIFFERENT FUNCTION.  It
+     comes from Settings_ReadString with the key "LevelList"; every
+     later name comes from Script_ReadString with no key.  So the
+     file names the first entry and positions for the rest.
+
+   o THE PARSE IS THE GATE ON PAGE 3's AUDIO.  0x004426ca branches
+     on the return, and the CD cue and the voice line at 0x00442703
+     are both inside the taken side.  A championship file that does
+     not parse leaves page 3 silent - which is a better tell than
+     anything on screen.
+
+4.  Who reads an entry
+
+   +-----------------------------+-------------------------------+
+   | FUN_00429a00                | the parser; builds every      |
+   |                             | field                         |
+   +-----------------------------+-------------------------------+
+   | FUN_00447920 @ 0x00447977   | strcmps +0x00 against each    |
+   |                             | LIST.BPT name to choose the   |
+   |                             | track, in mode 2 only         |
+   +-----------------------------+-------------------------------+
+   | MenuPage06_RaceSelect_Enter | copies +0x20 and +0x24 out    |
+   | @ 0x00447b4d                |                               |
+   +-----------------------------+-------------------------------+
+   | FUN_004580f0                | six reads, 0x0045815e to      |
+   |                             | 0x00458276 - the end-of-race  |
+   |                             | progression.  0x004581a5 in   |
+   |                             | it raises an unlock flag; see |
+   |                             | subsystems/config-file.txt 4  |
+   +-----------------------------+-------------------------------+
+   | MenuPage21_ChampionshipSave | two reads, 0x004511a3 and     |
+   | _Tick                       | 0x004511f0                    |
+   +-----------------------------+-------------------------------+
+   | MenuPage08_NetRaceLobby     | 0x0044ad5e and 0x0044c834 -   |
+   | _Enter and _Tick            | the net lobby indexes it too  |
+   +-----------------------------+-------------------------------+
+
+   That is every xref to 0x00508934, listed rather than summarised
+   because the set is small enough to check and the obvious
+   summary - "only page 6 uses it" - is wrong.
+
+5.  Open questions
+
+   o 0x004dc068 IS PROBABLY THE REVERSE-TRACK ENABLED FLAG, which
+     would make +0x20 and +0x24 the pair (reverse, pocket) for that
+     race.  src/menu.h names it g_reverseEnabled, the companion to
+     g_nReverseAvailable at 0x004dc040, and the supporting evidence
+     is that MenuPage03_MainMenu_Tick READ-WRITES it at 0x00442e96 -
+     the indicator toggle - while page 3's Enter gates that indicator
+     on g_nReverseAvailable or the cheat flag at 0x004dc050.
+
+     NOT SETTLED.  g_nRaceReverse at 0x004dc144 has 15 xrefs of its
+     own and may be what the RACE reads, which would make these two
+     another available/enabled pair rather than one flag.  Nothing
+     has been traced from 0x004dc068 into the track loader.
+
+   o +0x28, +0x2c and the +0x30 string have no identified reader.
+     They are parsed and, on the xrefs, never used - worth
+     distrusting before believing.  FUN_004580f0's six reads are
+     the place to look; they were not walked.
+
+   o Why the net lobby indexes a championship array at all.

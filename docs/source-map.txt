@@ -1,0 +1,168 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                    SOURCE MAP FROM THE ASSERT SITES
+
+
+Abstract
+
+   Thirteen original source paths under D:\Dsed\mr320\ survive in the
+   binary, and code-map.txt uses them to attribute functions to
+   translation units. Each path is referenced from one or more assert
+   sites, and every site pushes a LINE NUMBER beside it.
+
+   That turns thirteen file names into forty-three anchors of the form
+   file + line + function. The line numbers ORDER the functions within a
+   file, which is worth more for the reconstruction than the attribution
+   alone: a translation unit can be laid out in something close to its
+   original sequence instead of by address.
+
+   Everything here is [verified] - read out of the binary by
+   tools/ghidra_assert_map.java, which re-derives the table from the
+   reference set rather than from this document.
+
+Table of Contents
+
+   1. The map
+   2. What it establishes
+   3. Limits
+
+1.  The map
+
+   Sorted by file then line, which is the order the original source had.
+   A message of (generic assert) means the site used the bare format
+   string with no distinct text; (not recovered) means the call did not
+   match the expected push shape.
+
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | File                  | Line | Function                        | Message                           |
+   +=======================+======+=================================+===================================+
+   | Dsi_d3d.cpp           | 2474 | maybe_D3D_LoadRawToTexture      | impossible de locker la surface.  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | animDecor.cpp         | 179  | FUN_0048b370                    | BAD AnimDecor type !              |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | animDecor.cpp         | 256  | AnimDecor_Load                  | TROP D'OBJETS ANIMES              |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | animDecor.cpp         | 297  | AnimDecor_Load                  | TROP DE FRAMES DANS L'ANIM        |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | event.cpp             | 3104 | maybe_Event_WndProc             | DestroyPlayer ERROR !             |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | event.cpp             | 3107 | maybe_Event_WndProc             | CloseSession ERROR !              |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | frame3d.cpp           | 1717 | FUN_00422280                    | NEW error.                        |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\bitmap.cpp       | 163  | Bitmap_LoadFile                 | TGA-File numid not supported.     |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\bitmap.cpp       | 164  | Bitmap_LoadFile                 | TGA-File must be no-paletted.     |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\bitmap.cpp       | 165  | Bitmap_LoadFile                 | TGA-File imgtyp not supported.    |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\bitmap.cpp       | 166  | Bitmap_LoadFile                 | TGA-File must be no-paletted.     |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\bitmap.cpp       | 167  | Bitmap_LoadFile                 | TGA-File must be 24 bits.         |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\bitmap.cpp       | 172  | Bitmap_LoadFile                 | NEW error.                        |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\bitmap.cpp       | 177  | Bitmap_LoadFile                 | NEW error.                        |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\bitmap.cpp       | 214  | Lez_LoadFile                    | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\menu.cpp         | 321  | Menu_Tick                       | MENU-Actived error.               |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\menu.cpp         | 1629 | Menu_AddTextButton              | MAX_BUTTON reached.               |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\menu.cpp         | 1666 | Menu_AddSpriteButton            | MAX_BUTTON reached.               |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\menuTools.cpp    | 68   | FUN_00479260                    | PSCREEN ERROR.                    |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\menuTools.cpp    | 429  | FUN_00479630                    | NEW failed                        |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 3141 | MenuPage06_RaceSelect_Enter     | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 3740 | MenuPage07_NetSessionList_Enter | pIDP not initialized.             |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 3797 | MenuPage07_NetSessionList_Enter | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 3846 | FUN_00449560                    | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 3892 | MenuPage07_NetSessionList_Tick  | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 4066 | MenuPage07_NetSessionList_Tick  | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 4626 | MenuPage08_NetRaceLobby_Tick    | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 4635 | MenuPage08_NetRaceLobby_Tick    | Probleme d'enchenement des menus. |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 7448 | MenuPage23_DataDisk_Tick        | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageMainMenu.cpp | 7629 | MenuPage23_DataDisk_Enter       | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageProtocol.cpp | 463  | MenuPage15_NameEntry_Enter      | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageProtocol.cpp | 467  | MenuPage15_NameEntry_Enter      | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageProtocol.cpp | 472  | MenuPage15_NameEntry_Enter      | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageProtocol.cpp | 477  | MenuPage15_NameEntry_Enter      | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageProtocol.cpp | 482  | MenuPage15_NameEntry_Enter      | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageProtocol.cpp | 537  | MenuPage15_NameEntry_Enter      | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | menu\pageProtocol.cpp | 1161 | MenuPage19_Enter                | (generic assert)                  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | player.cpp            | 3457 | FUN_00462c60                    | (not recovered)                   |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | player.cpp            | 3764 | FUN_00462c60                    | (not recovered)                   |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | screen3d\bankw.Cpp    | 771  | FUN_00401e40                    | MALLOC error in BANK creating.    |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | screen3d\dd.cpp       | 706  | Cdd_GetCaps                     | Cdd::getCaps(),[%s,%d]            |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | screen3d\dd.cpp       | 3648 | maybe_Cdd_LoadRawToSurface      | impossible de locker la surface.  |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+   | screen3d\screen3d.cpp | 1302 | Screen3D_BeginFrame             | BeginDisplay failed               |
+   +-----------------------+------+---------------------------------+-----------------------------------+
+
+2.  What it establishes
+
+   o Five consecutive lines, 163 to 167, are all TGA validation checks
+     inside Bitmap_LoadFile. That is a run of guard clauses at the head
+     of the loader, and it dates the file layout: the checks precede the
+     two allocation failures at 172 and 177.
+
+   o pageMainMenu.cpp reaches at least line 7629, and menu.cpp at least
+     1666. The menu system is by some margin the largest translation
+     unit the asserts expose.
+
+   o Cdd_GetCaps carries the message Cdd::getCaps(), which names the
+     original method outright and confirms both the Cdd class prefix and
+     our chosen name for it.
+
+   o Dsi_d3d.cpp:2474 and screen3d\dd.cpp:3648 share the message
+     'impossible de locker la surface.' - the same failure written once
+     for the D3D texture path and once for the DirectDraw surface path,
+     which supports reading them as parallel implementations of one
+     operation.
+
+   o Four functions still named FUN_ are attributed to a file and a line
+     by this table alone: FUN_00422280 in frame3d.cpp, FUN_0048b370 in
+     animDecor.cpp, FUN_00479260 and FUN_00479630 in menu\menuTools.cpp,
+     and FUN_00401e40 in screen3d\bankw.Cpp.
+
+   o FUN_00462c60 contains asserts at player.cpp:3457 and :3764, so one
+     function spans at least 307 source lines.
+
+3.  Limits
+
+   Forty-three sites is a thin sample of a game this size, and the files
+   are the ones that happened to assert. Absence from this table says
+   nothing: screen3d.cpp appears once, at line 1302, and is certainly
+   thousands of lines long.
+
+   The line numbers are also only as good as the assert placement. They
+   locate the assert, not the start of the function, so they bound a
+   function's position rather than fixing it. Two asserts in one
+   function bound its extent from both ends, which is why the player.cpp
+   pair is worth more than a single site.
+

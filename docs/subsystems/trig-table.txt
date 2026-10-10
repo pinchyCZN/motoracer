@@ -1,0 +1,325 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            THE COSINE TABLE
+
+
+Abstract
+
+   g_cosTable at 0x005fcb80 is where every rotation in the game gets
+   its sine and cosine. 0x4000 floats, one full turn, built once at
+   startup by Trig_BuildCosTable (0x004901e0) and read from 335 sites.
+
+   It is COSINE. That was an open question through several sessions
+   because the table is all zeros in the image and the builder had not
+   been found; this note records both the answer and the search, since
+   the search is the reusable part.
+
+Table of Contents
+
+   1. The table
+   2. The builder
+      2.1. Two things the store address hides
+      2.2. The constant is not 2*pi
+      2.3. The radians-to-index constant, and the port got it wrong
+   3. How callers use it
+      3.1. The pair idiom
+      3.2. The 153 bare reads, and why they are not globals
+   4. How it was found
+   5. What the port does
+   6. Open questions
+
+
+1.  The table
+
+   +---------------+------------------------------------------------+
+   | Address       | 0x005fcb80                                     |
+   +===============+================================================+
+   | Size          | 0x10000 bytes = 0x4000 floats                  |
+   +---------------+------------------------------------------------+
+   | Span          | 0x005fcb80 .. 0x0060cb7f                       |
+   +---------------+------------------------------------------------+
+   | Contents      | g_cosTable[i] = cos(2*pi * i / 0x4000)         |
+   +---------------+------------------------------------------------+
+   | In the image  | all zeros - built at run time                  |
+   +---------------+------------------------------------------------+
+   | References    | 335 - 217 FLD, 84 FMUL, 1 FSUBR, 2 LEA, 31 MOV |
+   +---------------+------------------------------------------------+
+   | Of those      | 2 writes, both inside the builder              |
+   +---------------+------------------------------------------------+
+
+   Ghidra type applied: yes, float[0x4000], which turns every one of
+   those 335 raw addresses into an array subscript in the decompiler
+   [verified].
+
+   ANGLES ARE 14-BIT FIXED POINT throughout the engine: 0x4000 to the
+   turn, 0x1000 to the quarter. Wrapping is AND 0x3fff, not a fmod, and
+   that mask is the single most common instruction pair in the game's
+   float code - it appears in 47 distinct functions.
+
+
+2.  The builder
+
+   Trig_BuildCosTable, 0x004901e0, 55 bytes, sixteen instructions. One
+   caller: App_Init, at 0x00472c66 [verified].
+
+       004901e3  XOR EAX,EAX
+       004901e5  JMP 0x004901ee
+       004901e7  FSTP float ptr [EAX*0x4 + 0x5fcb7c]
+       004901ee  MOV dword ptr [ESP],EAX
+       004901f2  INC EAX
+       004901f3  FILD dword ptr [ESP]
+       004901f7  CMP EAX,0x4000
+       004901fc  FMUL double ptr [0x004d1e38]     ; 6.283185307178
+       00490202  FMUL float ptr [0x004d1e40]      ; 1.0f/16384
+       00490208  FCOS
+       0049020a  JL 0x004901e7
+       0049020c  FSTP float ptr [EAX*0x4 + 0x5fcb7c]
+
+   That is, in full:
+
+       for (i = 0; i < 0x4000; i++)
+           g_cosTable[i] = (float)cos(i * 6.283185307178 / 16384.0);
+
+2.1.  Two things the store address hides
+
+   THE BASE IS 0x5fcb7c, NOT 0x5fcb80. The index register has already
+   been incremented by the time the store executes, so the address is
+   (i+1)*4 + 0x5fcb7c, which is i*4 + 0x5fcb80 - entry i, as intended.
+   Reading the store address literally puts the table one entry low and
+   makes every later offset calculation wrong by four bytes.
+
+   THE COSINE IS COMPUTED BEFORE THE BOUND IS TESTED, so the final
+   value falls out of the loop with a live FPU stack and is stored by
+   the duplicate FSTP at 0x0049020c. Compiler loop rotation, not a
+   source-level special case. All 0x4000 entries are written; entry
+   0x3fff is written by the copy.
+
+   That second point is also why the function was hard to find - see
+   section 4.
+
+2.2.  The constant is not 2*pi
+
+   The double at 0x004d1e38 is 6.283185307178. Thirteen significant
+   digits, SHORT OF THE TRUE 2*pi BY 1.6e-12, which is about 7150 ulp
+   [verified]. Somebody typed it rather than deriving it.
+
+       literal   6.2831853071779999
+       true      6.2831853071795862
+
+   It makes no visible difference - the error is far below float
+   precision, and the built table is bit-identical to one built from
+   the true 2*pi for all but a handful of entries. It is recorded
+   because a port that wants the table bit-exact must use the literal,
+   and because "the constant is slightly wrong" is exactly the kind of
+   thing that gets silently corrected during transcription and then
+   costs an afternoon later.
+
+
+2.3.  The radians-to-index constant, and the port got it wrong
+
+   The conversion an angle goes through to become a table index is
+   the double at 0x004d0ed0.  THREE ADDRESSES HOLD THE SAME EIGHT
+   BYTES - 0x004d0ed0, 0x004d0300 and 0x004d13a0 - so it is one
+   constant the compiler pooled three times [verified]:
+
+       0x004d0ed0   2b ce c9 6d 30 5f a4 40   2607.5945876182718
+
+   IT IS BUILT FROM THE TYPED 2*pi OF 2.2, not the true one:
+
+       0x4000 / 6.283185307178     2607.5945876182718   <- the binary
+       0x4000 / true 2*pi          2607.5945876176133
+
+   1448 ulp apart.  Racer_ComposeOrientation multiplies by it three
+   times, once per Euler angle, and truncates each result with __ftol
+   - 0x0045cba9, 0x0045cbd8 and 0x0045cc07 [verified].
+
+   THE THREE HOMES HAVE DIFFERENT CONSUMERS, which is why there are
+   three:
+
+   +--------------+------------------------------------------------+
+   | Address      | Consumer                                       |
+   +==============+================================================+
+   | 0x004d0ed0   | Racer_ComposeOrientation, above                |
+   +--------------+------------------------------------------------+
+   | 0x004d0300   | maybe_Racer_Draw's INLINE euler-to-matrix      |
+   |              | builds - a run of __ftol calls followed by     |
+   |              | table loads.  src/racerdraw.c                  |
+   +--------------+------------------------------------------------+
+   | 0x004d13a0   | DECOR PLACEMENT - an MR_TrkInstance stores     |
+   |              | three Euler angles in radians and the same     |
+   |              | multiply indexes the table for                 |
+   |              | mat34_from_euler.  A palm carries yaw only,    |
+   |              | a boat pitch and roll.  src/trk.h at           |
+   |              | MR_TrkInstance.rot                             |
+   +--------------+------------------------------------------------+
+
+   ALL THREE COMMENTS SPELLED IT "0x4000 / 2pi" AND ALL THREE WERE
+   WRONG in the same way - it is 0x4000 over the TYPED 2*pi of 2.2.
+   The sweep corrected them one at a time as it reached each file.
+   The lesson is 2.2's: a constant that looks like a familiar one
+   invites being rewritten as the familiar one.
+
+   THIS IS THE SILENT CORRECTION 2.2 WARNED ABOUT, and it happened.
+   The port spelled its own conversion as 16384.0 / 6.283185307179586
+   - the true 2*pi, written out as a literal - so every angle the
+   quantiser produced carried a systematic 2.5e-13 relative error.
+   The effect is tiny: about 4e-9 of an index at full scale, which
+   flips a truncated index roughly once in 2.4e8 conversions.  It was
+   never going to show in a trace.
+
+   It is now TRIG_IDX_PER_RAD in src/trig.h, built from TRIG_TWO_PI,
+   with TRIG_RAD_PER_IDX as the inverse.  The inverse is OURS - the
+   original keeps the index and never converts back - but it uses the
+   same 2*pi so the round trip closes.  Three separate spellings in
+   race.c collapsed into it.
+
+
+3.  How callers use it
+
+3.1.  The pair idiom
+
+   A caller that needs an angle reads TWO entries: index i, and its
+   partner at (i - 0x1000) & 0x3fff. Since cos(t - 90deg) = sin(t),
+   that pair is
+
+       (g_cosTable[i], g_cosTable[(i - 0x1000) & 0x3fff]) = (cos t, sin t)
+
+   verified numerically against the built table rather than taken from
+   the identity [verified].
+
+   So a sine and a cosine cost two masked array reads and no call. That
+   is why the engine inlines this everywhere instead of calling the CRT
+   - and why an angle is an int in every struct that stores one.
+
+   MenuTools_BuildViewMatrix (0x0047b1d0) is the clearest example: it
+   converts three Euler angles with __ftol and takes three pairs.
+
+3.2.  The 153 bare reads, and why they are not globals
+
+   153 of the 335 references are ABSOLUTE addresses with no index
+   register - FLD float ptr [0x005fcb80] rather than FLD float ptr
+   [EAX*0x4 + 0x5fcb80]. Three addresses account for nearly all of
+   them:
+
+   +--------------+-------------+------------------+
+   | Address      | Entry       | Value            |
+   +==============+=============+==================+
+   | 0x005fcb80   | [0x0000]    | 1.0              |
+   +--------------+-------------+------------------+
+   | 0x005feb80   | [0x0800]    | 0.70710677       |
+   +--------------+-------------+------------------+
+   | 0x00608b80   | [0x3000]    | -1.19e-12, i.e. 0|
+   +--------------+-------------+------------------+
+
+   THESE ARE NOT SEPARATE GLOBALS. They are entries of this table read
+   at CONSTANT indices - an inlined euler-to-matrix helper called with
+   literal angle arguments. The compiler cannot constant-fold a table
+   lookup, so it emits the entire 3x3 composition at run time and
+   genuinely multiplies by 1.0 and by 0.0 [verified].
+
+   maybe_Racer_Draw at 0x004603eb shows both forms four instructions
+   apart, which is the proof:
+
+       004603eb  FLD  float ptr [EAX*0x4 + 0x5fcb80]   ; variable angle
+       004603f2  FLD  float ptr [0x005fcb80]           ; literal angle 0
+       004603f8  FMUL float ptr [0x005fcb80]
+       004603fe  LEA  EDI,[ECX*0x4 + 0x5fcb80]
+
+   o THIS IS WHY SETTLING SINE VERSUS COSINE MATTERED. Entry 0 is
+     1.0 for cosine and 0.0 for sine, so those 153 sites are either
+     multiplying by one or erasing their operand. Both readings
+     produce plausible-looking decompilation and only one of them
+     draws anything.
+
+   o AN FMUL BY [0x00608b80] IS A MULTIPLY BY ZERO and there are
+     dozens of them. That looked wrong enough to be worth checking
+     the instruction encodings byte by byte before believing it -
+     ModRM 0x0d is mod 00 / rm 101, disp32 with no base, so the
+     absolute form is real. It is not a bug: the products land in a
+     matrix that is being composed, not in geometry being scaled.
+
+   Screen3D_TransformVertsShaded (0x0049b4e4) builds its override
+   matrix this way, from literal angles 0 and 0x3000 - a fixed -90
+   degree rotation about one axis. That is the first concrete answer to
+   what the shaded transform's second matrix is FOR.
+
+
+4.  How it was found
+
+   Worth recording because the obvious searches all failed.
+
+   +------------------------------+----------------------------------+
+   | Search                       | Result                           |
+   +==============================+==================================+
+   | FSIN instruction             | 26 hits, 15 functions, none a    |
+   |                              | builder - all easing and         |
+   |                              | animation code                   |
+   +------------------------------+----------------------------------+
+   | CMP against 0x4000 / 0x3fff  | 90 functions, dominated by the   |
+   |                              | angle mask; the builder is in    |
+   |                              | there but invisible in the noise |
+   +------------------------------+----------------------------------+
+   | symbols inside the span      | none - consistent with one table |
+   |                              | but says nothing about the writer|
+   +------------------------------+----------------------------------+
+   | WRITE references into        | TWO, four instructions apart,    |
+   | 0x005fcb80..0x0060cb7f       | both in FUN_004901e0             |
+   +------------------------------+----------------------------------+
+
+   THE LAST QUERY IS THE ONE THAT SHOULD HAVE BEEN FIRST. "Which
+   instructions write into this address range" is a direct question
+   with a small answer, and the reference manager answers it in one
+   pass. FSIN and loop-bound searches are guesses about how the builder
+   is written; the write query does not care.
+
+   It also survives the two things that defeated the guesses: FCOS is
+   not FSIN, and the loop bound was rotated out of the shape a
+   counter-search expects.
+
+   o AND IT WORKS EVEN WHEN THE WRITER IS SPARSE. Only two of the
+     0x4000 stores appear as references, because the rest go through
+     a walking index the analyser does not resolve. Two was enough.
+
+
+5.  What the port does
+
+   src/trig.c and src/trig.h. The table is built the same way, from the
+   same literal, and the pair idiom is two macros:
+
+       #define trig_cos(i) (g_cosTable[(i) & TRIG_MASK])
+       #define trig_sin(i) (g_cosTable[((i) - TRIG_QUARTER) & TRIG_MASK])
+
+   trig_build_table() is called from main.cpp where App_Init calls the
+   original, before anything can rotate.
+
+   THE 14-BIT ANGLE CONVENTION IS KEPT. Switching to radians would mean
+   converting at every boundary with a subsystem that still speaks
+   fixed point, and the table is the cheaper and more faithful choice
+   anyway. Nothing about it is a 1997 compromise that a modern port
+   needs to undo.
+
+   A port MAY fold the constant-index reads described in 3.2 to
+   literals - multiplying by g_cosTable[0] is a multiply by 1.0 and by
+   g_cosTable[0x3000] a multiply by 0.0 - but only once the function
+   doing it has been read. Doing it blind would collapse a matrix
+   composition that some caller depends on.
+
+
+6.  Open questions
+
+   o WHAT UNITS THE ANGLE IS IN BEFORE __ftol. Callers convert a float
+     to the table index with __ftol, which truncates toward zero, but
+     the value arriving on the FPU stack comes from too far away for
+     the decompiler to follow. Whether the engine stores angles as
+     floats in 0..0x4000 or scales at the point of use is unread.
+
+   o WHETHER ANY CALLER READS A PARTNER OTHER THAN i - 0x1000. Every
+     one examined uses the quarter-turn offset, but 335 sites were not
+     all read.
+
+   o FUN_004b0bec, in the library address region, reads the table at
+     both constant indices. It is the only function at or above
+     0x004b0000 that touches it, which makes it game code that landed
+     on the wrong side of the MFC/CRT cliff, or an inlined helper the
+     linker placed oddly. Unresolved; see docs/code-map.txt.

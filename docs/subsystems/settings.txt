@@ -1,0 +1,286 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                            SETTINGS LOADER
+
+
+Abstract
+
+   Settings_LoadAll at 0x0042ae30 reads 36 named settings through
+   Settings_ReadInt at 0x00425bb0 and distributes them across the config
+   globals. Reading it resolved those globals in one pass and corrected
+   two earlier identifications.
+
+   The count was given as 33 in an earlier version of this note. That
+   missed SmallFonts, EnumSession and SpeedUnit, which are read after
+   the action-binding loop rather than with the rest. Counting the
+   DefName string and the fourteen action values, Settings_LoadAll
+   performs 51 reads in total, which is exactly the record count of
+   CONFIG.BPT. The position of each one in the file is in
+   subsystems/config-file.txt.
+
+   THE TABLE THEN DISAGREED WITH THE COUNT FOR A WHILE. It carried 33
+   rows against an abstract that said 36, and the three missing were
+   MasterVolume, CDVolume and WaveVolume - see the note below the
+   table for why that particular kind of setting hides.
+
+Table of Contents
+
+   1. How the mapping was recovered
+   2. The settings
+   3. ScreenMode decodes to the three resolutions
+   4. Correction: g_use3dfxDriver was wrong
+   5. Correction: the DetectD3DCard setting is dead
+   6. D3DOnlyEmulation, and what mode 2 means
+   7. Open questions
+
+
+1.  How the mapping was recovered
+
+   Ghidra did not recover the argument to Settings_ReadInt, so the calls
+   decompile as bare FUN_00425bb0() with the result assigned to a global
+   and no indication of which setting was read. The names are still
+   there in the instruction stream: each call is preceded by a PUSH of a
+   name string.
+
+   Pairing PUSH <string> / CALL Settings_ReadInt / MOV [global],EAX
+   across the function body recovers all 33 associations mechanically,
+   with no guesswork. That is the technique to reach for whenever a
+   decompiled argument list comes back empty.
+
+2.  The settings
+
+   +-------------------+----------------------+---------------------------------+
+   | Setting           | Global               | Note                            |
+   +===================+======================+=================================+
+   | ScreenMode        | g_cfgScreenMode      | 0, 1 or 2; see below            |
+   +-------------------+----------------------+---------------------------------+
+   | FullScreen        | g_fullscreenResolved | see below                       |
+   +-------------------+----------------------+---------------------------------+
+   | Mode_169          | g_cfgWidescreen169   | 16:9 widescreen                 |
+   +-------------------+----------------------+---------------------------------+
+   | DetectD3DCard     | g_use3DHardware      | dead read; see below            |
+   +-------------------+----------------------+---------------------------------+
+   | D3DOnlyEmulation  | g_rendererMode       | see below                       |
+   +-------------------+----------------------+---------------------------------+
+   | DrawLand          | g_cfgDrawLand        |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | MapMode           | g_cfgMapMode         |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | DisplaySignal     | g_cfgDisplaySignal   |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | CurrentDetail     | g_cfgDetailLevel     |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | SmallFonts        | g_cfgSmallFonts      |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | CounterType       | g_cfgCounterType     |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | ShowCounter       | g_cfgShowCounter     |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | SpeedUnit         | g_cfgSpeedUnit       |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | CurrentDifficulty | g_cfgDifficulty      |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | NbComputerCut     | g_cfgNbComputerCut   |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | EnumSession       | g_cfgEnumSession     |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | AmbiantState      | g_cfgAmbiantState    | spelling is the original's      |
+   +-------------------+----------------------+---------------------------------+
+   | MotoState         | g_cfgMotoState       |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | SoundState        | g_cfgSoundState      |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | VoicesState       | g_cfgVoicesState     |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | AudioState        | g_cfgAudioState      |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | Wave16Bits        | g_cfgWave16Bits      | audio sample depth, not display |
+   +-------------------+----------------------+---------------------------------+
+   | MasterVolume      | -                    | passed to Mixer_SetVolume(0),   |
+   |                   |                      | not stored in a global          |
+   +-------------------+----------------------+---------------------------------+
+   | CDVolume          | -                    | Mixer_SetVolume(1)              |
+   +-------------------+----------------------+---------------------------------+
+   | WaveVolume        | -                    | Mixer_SetVolume(2)              |
+   +-------------------+----------------------+---------------------------------+
+   | Stereo            | g_cfgStereo          |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | ReplayRate        | g_cfgReplayRate      |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | InputDevice       | g_cfgInputDevice     |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | JoyType           | g_cfgJoyType         |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | LastLevel         | g_lastLevel          | persisted session state         |
+   +-------------------+----------------------+---------------------------------+
+   | LastMaxTour       | g_lastMaxTour        |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | LastCurMode       | g_lastCurMode        |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | LastNbComp        | g_lastNbComp         |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | LastRev           | g_lastRev            |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | LastPokt          | g_lastPokt           |                                 |
+   +-------------------+----------------------+---------------------------------+
+   | LastMoto          | g_lastMoto           |                                 |
+   +-------------------+----------------------+---------------------------------+
+
+   Note Wave16Bits is an audio setting. It is unrelated to the 16-bit
+   display lock, despite the similar name.
+
+   THE THREE VOLUMES HAD BEEN MISSED, and the reason is worth
+   recording: the recovery technique in section 1 pairs a PUSH of a
+   name with a MOV to a global, and these three have no MOV. The read
+   result goes straight into a call, so a scan looking for an
+   assignment finds nothing -
+
+       PUSH "MasterVolume" / CALL Settings_ReadInt / PUSH EAX /
+       PUSH 0 / MOV ECX,0x5d2958 / CALL Mixer_SetVolume
+
+   at 0x0042b2d5 [verified], and the setting drops out of the table
+   silently. THE COUNT WAS RIGHT AND THE TABLE WAS SHORT, which is
+   the useful signal: any setting whose value is CONSUMED rather than
+   STORED will hide the same way, and a row count that disagrees with
+   a stated total is where it shows up.
+
+   The value is a PLAIN INT in 0..32, not a byte and not a
+   percentage: CONFIG.BPT records 18 to 20, defaulting to 32, and
+   Mixer_Init writes 0x20 into all three max fields. See
+   subsystems/menu-pages.txt section 2.4.5.
+
+3.  ScreenMode decodes to the three resolutions
+
+   The loader converts ScreenMode into a pixel count [verified]:
+
+   +------------+--------------------+------------+
+   | ScreenMode | g_screenPixelCount | Decodes as |
+   +============+====================+============+
+   | 0          | 0x12c00 = 76800    | 320 x 240  |
+   +------------+--------------------+------------+
+   | 1          | 0x30000 = 196608   | 512 x 384  |
+   +------------+--------------------+------------+
+   | 2          | 0x4b000 = 307200   | 640 x 480  |
+   +------------+--------------------+------------+
+
+   Any other value is coerced to 2. These are exactly the three
+   resolutions named in the menu strings, so the framebuffer size is
+   derived from a single stored mode index rather than from a
+   width/height pair.
+
+   This numbering has since been confirmed twice more, from directions
+   unrelated to the loader [verified].
+
+   First, three one-line menu actions do nothing but select a
+   resolution, and between them they enumerate the whole mapping:
+   Menu_SetScreenMode_320x240 at 0x0043a2d0 sets mode 0,
+   Menu_SetScreenMode_512x384 at 0x0043a300 sets mode 1, and
+   Menu_SetScreenMode_640x480 at 0x0043a320 sets mode 2. Each writes the
+   matching pixel count and raises DAT_004e9ce4.
+
+   Second, the DirectDraw enumeration callback computes the same index
+   from a mode's own dimensions and stores it in the display-mode
+   record, and the options page copies it straight out of that record
+   into g_cfgScreenMode. See structs/MR_DisplayMode.txt sections 3 and
+   5.1.
+
+   Worth stating plainly because an earlier note in this project had
+   mode 2 as 320x240, the lowest rather than the highest. It is 640x480.
+
+4.  Correction: g_use3dfxDriver was wrong
+
+   renderer-mode.txt named 0x004dbff0 g_use3dfxDriver because the -3DFX
+   branch sets it to 1. That was wrong. The setting behind it is
+   FullScreen, and the resolution chain is:
+
+   g_fullscreenResolved = Settings_ReadInt("FullScreen");
+   if (g_ddUsingEnumeratedDevice)  g_fullscreenResolved = 1;
+   if (g_cfgFullscreen != -1)      g_fullscreenResolved = g_cfgFullscreen;
+
+   So it is the resolved fullscreen flag: stored preference, forced on
+   when a secondary enumerated 3D device is in use, then overridden by
+   -fullscreen or -windowed if either was given. Renamed
+   g_fullscreenResolved.
+
+   The -3DFX branch sets it because a 3Dfx pass-through card can only
+   run fullscreen, not because the global has anything to do with 3Dfx.
+
+   There are now three fullscreen-related globals and they form a chain:
+
+   +-----------------------------------+---------------------------------------+
+   | Global                            | Role                                  |
+   +===================================+=======================================+
+   | g_cfgFullscreen (0x004dc1f0)      | command line only; -1 means not given |
+   +-----------------------------------+---------------------------------------+
+   | g_fullscreenResolved (0x004dbff0) | stored setting plus overrides         |
+   +-----------------------------------+---------------------------------------+
+   | g_ddFullscreen (0x005d43a8)       | what the Cdd surface code branches on |
+   +-----------------------------------+---------------------------------------+
+
+5.  Correction: the DetectD3DCard setting is dead
+
+   renderer-mode.txt said g_use3DHardware is "seeded from a stored
+   DetectD3DCard setting", with the command line overriding a persisted
+   preference. That is wrong, and the full function makes it plain:
+
+   0042b3fe  CALL Settings_ReadInt        ; "DetectD3DCard"
+   0042b403  MOV  [g_use3DHardware], EAX  ; store the setting
+   0042b408  MOV  EAX, 1
+   0042b410  MOV  [g_use3DHardware], EAX  ; immediately overwrite with 1
+
+   The stored value is written and then unconditionally replaced with 1
+   before anything reads it [verified]. DetectD3DCard has no effect.
+   Only the later -NoD3D / -D3D / -3DFX branch can change
+   g_use3DHardware, and the default is on.
+
+   Whether that is a deliberate force-on or a leftover is unclear
+   [guess]. Preserve it in transcription either way.
+
+6.  D3DOnlyEmulation, and what mode 2 means
+
+   renderer-mode.txt left g_rendererMode == 2 as an open question. The
+   stored setting is D3DOnlyEmulation, and the loader normalises it:
+
+   g_rendererMode = Settings_ReadInt("D3DOnlyEmulation");
+   if (g_rendererMode == 2)      { DAT_0053be0c = 1; g_rendererMode = 0; }
+   else if (g_rendererMode == 0) { DAT_0053be0c = 0; g_rendererMode = 0; }
+   else                          { g_rendererMode = 1; }
+
+   So the stored setting has three values and is folded into a two-
+   valued runtime flag:
+
+   +---------------+-------------+--------------+
+   | Stored        | Runtime     | DAT_0053be0c |
+   +===============+=============+==============+
+   | 0             | 0, hardware | 0            |
+   +---------------+-------------+--------------+
+   | 2             | 0, hardware | 1            |
+   +---------------+-------------+--------------+
+   | anything else | 1, software | untouched    |
+   +---------------+-------------+--------------+
+
+   The name confirms the sense of the flag: "D3D only emulation" means
+   use only the software emulation device, which is why value 1 selects
+   the software path. Value 2 is a second hardware variant distinguished
+   solely by DAT_0053be0c, which is still unidentified.
+
+7.  Open questions
+
+   o What does DAT_0053be0c gate? It is the only thing separating stored
+     mode 0 from stored mode 2, and it is zeroed at the top of
+     Main_InitAndParseCommandLine.
+   o Settings_ReadInt (0x00425bb0) takes a name and a this pointer and
+     returns an int. Confirm whether it reads the registry, an .ini
+     file, or a cached profile object, and give it a proper signature so
+     the argument stops disappearing from the decompilation.
+   o The "Last*" block at 0x00580838 is copied wholesale to 0x00542860
+     when DAT_004dbcfc is set. That looks like a saved-game or profile
+     snapshot.
+   o A loop near the end reads "Action%dKey" and "Action%dBtn" pairs
+     into a table ending at 0x0053eb18. That is the input binding table
+     and is worth a pass of its own.
+   o Several settings are read and discarded in the decompilation
+     (Settings_ReadInt called with no assignment). Check whether the
+     results are genuinely unused or whether Ghidra lost the
+     destination.

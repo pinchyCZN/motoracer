@@ -1,0 +1,1262 @@
+MotoRacer PC Reverse Engineering                           Analysis Note
+
+
+                          PORT DIVERGENCES
+
+
+Abstract
+
+   Every place src/ does something the binary does not, ordered so
+   that fixing one does not have to be undone to fix the next.
+
+   THIS IS A WORK LIST, NOT A CONFESSION LOG. An entry is here
+   because it is still true of the code. When one is fixed it moves
+   to section 4 with a sentence saying what replaced it, and the
+   reasoning behind the fix lives with the code, not here.
+
+   Section 3 is the opposite list: divergences that are deliberate
+   and STAY. It exists so they are not re-opened every few sessions.
+
+Table of Contents
+
+   1. How to read this
+   2. The list
+      2.1.  The race bike placement is two lifts, not one matrix
+      2.2.  The ride height is a static stand-in
+      2.3.  The rider is not placed separately from the bike
+      2.4.  Two members are inverted that should not be
+      2.5.  unitsPerMetre is calibrated by eye
+      2.6.  The bike is on a rail - CLOSED
+      2.7.  The automatic upshift is ours
+      2.8.  The crash fall side is a stand-in
+      2.9.  Leaving a crash zeroes the whole velocity
+      2.10. The side camera is ours
+      2.11. The rider pose under lean
+      2.12. The wall clip is not called
+      2.13. The vertical step is 12x too small - CLOSED
+   3. Deliberate divergences that stay
+   4. Closed
+
+1.  How to read this
+
+   Each entry carries a CLASS:
+
+   5a     a value chosen because it produced the right pixels, which
+          is what CLAUDE.md rule 5a forbids. These are the ones that
+          silently fight the real code when it lands.
+
+   gap    the original does something we cannot currently express.
+          Not a hack - an unimplemented mechanism. Honest, but it
+          keeps the port from matching.
+
+   ours   code with no original at all, written to fill a hole. Fine
+          when it is a debug aid and named as one; not fine when it
+          stands in for game logic nobody has read yet.
+
+   The order is by DEPENDENCY, not by severity: 1 must be read
+   before 2 and 3 can be, because all three come out of the same
+   block of code.
+
+   +------+------------------------------------+----------+----------------+
+   | #    | Item                               | Class    | State          |
+   +======+====================================+==========+================+
+   | 1    | The race bike placement            | 5a       | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 2    | The ride-height stand-in           | 5a       | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 3    | The per-part placement split       | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 4    | The two skipped inverses           | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 5    | unitsPerMetre = 100                | 5a       | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 6    | The bike is on a rail              | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 7    | The automatic upshift              | ours     | open           |
+   +------+------------------------------------+----------+----------------+
+   | 8    | Crash fall side from bit 0         | ours     | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 9    | Crash exit zeroes all speed        | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 10   | race_camera_toggle_side            | ours     | decide         |
+   +------+------------------------------------+----------+----------------+
+   | 11   | The rider pose under lean          | gap      | open           |
+   +------+------------------------------------+----------+----------------+
+   | 12   | The wall clip is not called        | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 13   | The vertical step is 12x too small  | gap     | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 14   | The bars steer the wrong way       | ours     | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 15   | The wall recovery never fires      | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 16   | The advance is 0.64 of MOTO's      | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 17   | The rider tumble matrix            | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 19   | moveDir lags the heading after a   | gap      | CLOSED         |
+   |      | wall recovery                      |          |                |
+   +------+------------------------------------+----------+----------------+
+   | 18   | MR_Gearbox is not the racer's gear | gap      | open           |
+   +------+------------------------------------+----------+----------------+
+   | 20   | The bike drives on without its     | gap      | CLOSED         |
+   |      | rider                              |          |                |
+   +------+------------------------------------+----------+----------------+
+   | 21   | The wheelie ramp is never ticked   | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 22   | The crash smoke                    | gap      | open           |
+   +------+------------------------------------+----------+----------------+
+   | 23   | The wheelie is invisible           | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+   | 23   | The rider stood up through the     | gap      | CLOSED         |
+   |      | whole fall                         |          |                |
+   +------+------------------------------------+----------+----------------+
+   | 24   | The crashed rider was drawn in the | gap      | CLOSED         |
+   |      | road                               |          |                |
+   +------+------------------------------------+----------+----------------+
+   | 25   | The crash never ended              | gap      | CLOSED         |
+   +------+------------------------------------+----------+----------------+
+
+2.  The list
+
+2.1.  The race bike placement is two lifts, not one matrix
+
+   Class 5a.  src/race.c.
+
+   maybe_Racer_Draw builds ONE placement and both the body and the
+   part pivots come off it. The port has two different numbers:
+
+       s_race_bikeLift  = 2 * 96 * rayonAr                 = 61.44
+       bikeWorld[10]    = 96 * hauteurCadre + 48 * rayonAr = 71.04
+
+   The first is derived, but from maybe_Racer_PlaceWheels 0x0045c7c0
+   - a different function than the one that places the bike for
+   drawing. The second is a formula fitted to a single stationary
+   measurement of a single bike, and its own comment says so.
+
+   WHAT WAS MEASURED. The position handed to FUN_00403740 at
+   0x0045ff99 sits at racerPos.y + 43.13, constant while the bike
+   yaws and leans:
+
+       pos - racerPos   (-33.0098, 43.1268, -44.9199)
+                        (-34.9307, 43.1295, -43.3926)
+
+   In matBikeRoot's frame the first component reads 55.74 against
+   96 * hauteurCadre = 55.68.
+
+   DO NOT FIT A FORMULA TO THE TOTAL. Four have been fitted and
+   refuted already, because rayonAv equals rayonAr on both pocket
+   sets AND on the full dirt bike - only the street bike separates
+   them, so a wrong formula agrees with three of the four bike
+   sets.
+
+   AND IT IS NOT A LIFT AT ALL. Read out of 0x0045f8c0..0x0045f9ee,
+   the placement is assembled from the WHEEL CONTACTS plus two
+   suspension-dependent vectors, each rotated by its own matrix:
+
+       dir  = normalize(frontContact - rearContact)
+       mid  = rearContact + dir * 48 * axeDistance
+
+       A    = ( 0, 96 * hauteurCadre + 40 * forkDive,       0 )
+       B    = ( 0, rayonAr * (12 * springBounce + 48),      0 )
+
+       pos  = mid + M_A * A + M_B * B
+
+   The four scalars are verified: 0x004d102c = 96.0, 0x004d0f8c =
+   40.0, 0x004d0e98 = 48.0, 0x004d1050 = 0.125, and 12.0 is
+   0.125 * 96.0 folded. hauteurCadre is carac 22 at 0x005092d0 and
+   rayonAr carac 16 at 0x005092b8, both at stride 292. forkDive is
+   racer+0x2e39 and springBounce racer+0x2e91.
+
+   SO A CONSTANT CAN NEVER BE RIGHT. forkDive and springBounce move
+   every frame, which is exactly why the bike sinks under braking
+   and over crests and why four static formulas each matched one
+   captured frame and nothing else.
+
+   CAPTURED, THREE FRAMES, hooks at 0x0045f95d, 0x0045f98c and
+   0x0045f9d9 - one at rest on the grid and two under power in a
+   left turn. Every sign is POSITIVE; nothing is negated.
+
+   AT REST, forkDive = springBounce = 0:
+
+       rearContact  (-128.0000,   0.0000, 1974.0000)
+       B'           (  0.0000,   15.3600,    0.0000)
+       A'           (  0.0000,   55.6800,    0.0000)
+       pos          (-128.0000,  71.0400, 2058.0000)
+
+   so 15.36 = 48 * rayonAr with rayonAr 0.32, 55.68 = 96 *
+   hauteurCadre with hauteurCadre 0.58, and pos.z - rearContact.z
+   = 84.0 = 48 * axeDistance with axeDistance 1.75.
+
+   LEANING, two frames, forkDive 0.18635 and 0.17634:
+
+       A'  (-6.3360, 62.7651, 2.5091)   |A'| = 63.134
+       A'  (-5.2932, 62.4681, 2.2962)   |A'| = 62.734
+
+   against 96 * hauteurCadre + 40 * forkDive = 63.134 and 62.734.
+   Exact. So A KEEPS ITS LENGTH AND IS ROTATED by a matrix that
+   carries the bike's orientation.
+
+   B IS NOT ROTATED. On the same two frames it read (0.0063,
+   15.3600, 0.0165) and (0.0193, 15.3599, 0.0494) - the length is
+   48 * rayonAr to five figures and the direction is world up to
+   within a twentieth of a degree. springBounce was 0 throughout,
+   so the 12 * springBounce term is untested.
+
+   THE y ARITHMETIC CLOSES EXACTLY. pos.y - A'.y - B'.y is 0.0000
+   on all three frames, and both contacts sit at y = -0.0, so the
+   anchor lies in the contact plane.
+
+   AND THE ANCHOR IS THE REAR WHEEL CONTACT, NOT THE RACER
+   POSITION. That single fact is the bug: race.c hangs the bike off
+   r->pos and adds a constant, where the original hangs it off
+   racer+0x338 and adds two suspension vectors.
+
+   THE ANCHOR IS THE MIDPOINT OF THE TWO CONTACTS, captured
+   directly at 0x0045f9a8 where EDX holds it and ECX holds the
+   sum. Three frames in a left turn:
+
+       |front - rear|   168.0000   = 96 * axeDistance, exactly
+       |mid   - rear|    84.0000   = 48 * axeDistance, exactly
+       (mid-rear)/(front-rear)     = 0.500000, exactly
+       pos - (mid + sum)           < 1.3e-4 on every component
+
+   AN EARLIER RUN OF THIS MEASUREMENT WAS POLLUTED BY WALL
+   COLLISIONS. It reconstructed the anchor by subtraction and got
+   82.65 and 84.93 against the required 84.0, which looked like a
+   flaw in the model and was not: the bike was being pushed off
+   the rails between the contacts being written and the draw
+   reading them. With tools/mr_cheats.py --on nowalls the same
+   measurement is exact on every frame. Any capture that involves
+   cornering needs the rails off.
+
+   THE FRONT CONTACT IS WRITTEN HERE TOO. The first Vec3_Add, at
+   0x0045f87c, stores rear + dir * 96 * axeDistance into
+   racer+0x1B4 - so the front contact is recomputed from the rear
+   one and the wheelbase every draw, not carried independently.
+
+   A IS ROTATED, B IS NOT. Over five frames |A'| tracked
+   96 * hauteurCadre + 40 * forkDive exactly:
+
+       forkDive   0.18635  0.17634  0.16635  0.15635  0.14635
+       |A'|        63.134   62.734   62.334   61.934   61.534
+
+   while B' held 48 * rayonAr to five figures pointing at world up
+   to within a twentieth of a degree. springBounce read 0 on every
+   frame, so the 12 * springBounce term is still untested.
+
+   WHAT IS STILL OPEN: WHICH MATRIX ROTATES A. Its up axis is
+   A'/|A'|, which is measured - (-0.06806, 0.99702, 0.03637) on
+   one frame - but the matrix itself is not. racer+0x2e55 is NOT
+   it: read live it is a pure yaw, up axis exactly (0, 1, 0), so
+   the roll is composed on somewhere between there and the draw.
+
+   The port already builds that composition for the body - the
+   rolled matBikeRoot in race.c - so the implementable step is to
+   use its up axis for A and CHECK it against the five captured
+   A' values. That is a prediction to test, not a value to fit.
+
+   IMPLEMENTED in race_bike_place, and the arithmetic checks out
+   against the three clean frames:
+
+       forkDive   |A| measured   |A| formula      error
+       0.16635        62.3345       62.3340    +5.1e-04
+       0.15635        61.9355       61.9340    +1.5e-03
+       0.14635        61.5344       61.5340    +4.1e-04
+
+   with pos - (mid + A + B) closing to 1.2e-4 on every component.
+
+   THE UNIT-LENGTH CHECK IS THE INDEPENDENT ONE. Recovering the up
+   axis as (sum - B) / |A formula| gives exactly 1.000000 on all
+   three frames. Any error in B - a wrong scalar, a rotation it
+   does not actually get - would leave that off unity, so it
+   confirms B as 48 * rayonAr along world up without relying on
+   the same reasoning that produced it.
+
+   A RIDES THE LEAN AXIS - SETTLED. Captured at a real 52 degree
+   lean, with A' and racer+0x2e1d read on the same frame:
+
+       lean deg   forkDive   |A| meas   |A| form   tilt deg
+       -52.0835   -0.01246    55.1815    55.1815    52.0753
+       -52.1345   -0.01400    55.1201    55.1201    52.1191
+       -52.1787   -0.01476    55.0896    55.0896    52.1631
+       -52.1716   -0.01514    55.0745    55.0745    52.1631
+       -52.2137   -0.01532    55.0672    55.0672    52.2070
+       -52.1510   -0.01541    55.0636    55.0636    52.1411
+
+   |A| matches the formula to four decimals on every frame, and the
+   tilt of A' away from world up matches |lean| to within 0.016 of a
+   degree. So the up axis A rides IS the lean-rolled one, which is
+   what race_bike_place uses. The earlier frames could not show this
+   because they leaned only 2 to 4 degrees.
+
+   springBounce read 0 on every frame captured, at full lean and
+   under power, so the 12 * springBounce term is inert in practice
+   and still untested. [open, but it changes nothing observed]
+
+   CORRECTION: B RIDES THE SAME AXIS AS A. The first version of
+   this section said B was world up, on five frames that were
+   captured with the bike jammed against a guard rail and with the
+   lean INFERRED from A rather than read. Re-measured with A', B'
+   and racer+0x2e1d on the same frame, across leans from 8.5 to 52
+   degrees:
+
+       lean deg    |B|      B tilt    |A|      A tilt   |Bhat-Ahat|
+       -52.1449   15.3600   52.1411   55.0621  52.1411   0.000471
+       -11.6040   15.3600   11.6016   55.0678  11.6016   0.000000
+       -10.4453   15.3600   10.4370   55.0683  10.4370   0.000000
+        -9.4020   15.3600    9.3823   55.0688   9.3823   0.000000
+        -8.4627   15.3600    8.4595   55.0693   8.4595   0.000000
+
+   so the placement collapses to one scalar along one axis:
+
+       pos = mid + (96 * hauteurCadre + 40 * forkDive
+                    + rayonAr * (12 * springBounce + 48)) * up
+
+   Adding B straight up instead is 13 units out at 52 degrees.
+
+   SYMPTOM: the bike sits about a tyre's rubber depth into the
+   road, rim flush with the surface.
+
+2.2.  The ride height is a static stand-in - CLOSED
+
+   It disappeared rather than being replaced, which is what 2.1
+   predicted. The placement is built from the wheel contacts, and
+   those already sit on the tarmac, so the ride height is whatever
+   the suspension made it that frame. Both the bounds scan in
+   race_load and s_race_bikeLift are gone.
+
+2.3.  The rider is not placed separately from the bike
+
+   Class gap.  src/model.c, src/race.c.  SCOPE: CRASHES ONLY.
+
+   maybe_Racer_Draw calls Skl_BuildPartMatrices TWICE and composes
+   parts 3..14 against the RIDER position and every other part
+   against the bike position. MR_BikeDraw has one placement for
+   the whole skeleton.
+
+   IN NORMAL RIDING THE SPLIT IS A NO-OP, which is the finding
+   that resizes this item. Both halves were read live:
+
+       matRiderRoot   racer+0x3085   up axis tilt 52.1411 deg
+       bike root      racer+0x2e55   up axis tilt  0.0000 deg
+       lean                          52.1510 deg
+
+   matRiderRoot is the bike's yaw matrix WITH THE LEAN ROLLED IN -
+   exactly the matrix the port already passes as bd.orient - while
+   racer+0x2e55 carries yaw alone. And riderPosition, at
+   racer+0x30b5, is written from ESP+0x1b0 at 0x00460e5a, which is
+   the bike placement itself. So while crashLatch is clear the
+   rider and the bike share both matrix and position.
+
+   THE SPLIT ONLY BITES IN A CRASH. There maybe_Racer_Draw skips
+   the writeback, so matRiderRoot keeps the tumble that
+   UpdateCrash composes into it and riderPosition keeps its last
+   value plus a vertical offset - 0x004d1060, or 0x004d1024 when
+   PersoAnim is set.
+
+   IMPLEMENTED. MR_BikeDraw gained riderOrient and riderPos, and
+   bike_draw_body_parts composes parts 3..14 against them. NULL means
+   "the same as the bike", which is what the original itself does
+   while crashLatch is clear - it copies the bike placement into
+   riderPosition every frame and only stops when the rider is thrown.
+   So nothing looks different today and the branch exists for when
+   the tumble does.
+
+   THE RANGE WAS VERIFIED AT THE INSTRUCTION LEVEL, because it
+   disagrees with the skeleton and the code has to win:
+
+       00461631   CMP ECX,0x3    JL  -> the bike placement
+       0046163a   CMP ECX,0xe    JG  -> the bike placement
+
+   The parent array in skl-rot.txt 2 puts the rider at members 5..16,
+   so 3..14 both takes two bike parts and leaves the RIGHT ARM behind
+   on the bike. Those limb labels are [inferred]; this branch is
+   read. An arm that stays with the bars while the body goes is a
+   plausible crash - but that is not why the range is written down,
+   it is written down because 0x00461631 says so.
+
+   WHAT IS STILL MISSING is the tumble itself: matRiderRoot's
+   rotation while crashLatch is set, built from g_cosTable lookups at
+   a rate proportional to the rider's slide speed (racers.txt
+   9.35.5), and the vertical offset the crash branch adds to
+   riderPosition. Both are drawing, not simulation - no state depends
+   on them - so the split can sit here correct and inert until
+   somebody wants the animation. [open]
+
+2.4.  Two members are inverted that should not be - CLOSED
+
+   Not a divergence. Both special cases already agree, by two
+   different routes, and the port needs no change.
+
+   MEMBER 0 IS IDENTITY, so inverting it is a no-op. Read out of
+   the running port mid-race, s_race_bikeSkl.mat[0] deviates from
+   the identity by 1.19e-12 - the root member carries no rotation
+   and skl_load has already re-centred the skeleton on its origin.
+   Whatever matrix the original hands loop index 0, composing an
+   identity inverse in front of it changes nothing.
+
+   MEMBER 3 IS STORED PRE-INVERTED, so the bake's inverse cancels
+   and the arm matrix arrives intact. mat[3] read:
+
+       1.0000000   0.0000000   0.0000000
+       0.0000000   0.9907460   0.1357294
+       0.0000000  -0.1357294   0.9907460
+
+   a pure X rotation of 7.804 degrees with no translation - which
+   is inverse(A) for the swingarm A that skl_swingarm builds. The
+   original reaches the same place by skipping the inverse and
+   passing A directly; skl.c reaches it by storing inverse(A) and
+   letting the draw invert it back. Already verified end to end:
+   A applied to record[16].pos gives the captured draw position.
+
+   WHAT WOULD BREAK THE FIRST EQUIVALENCE is an animation frame
+   that rotates joint 0. The original ignores mat[0] whatever it
+   holds; the port only ignores it while it is identity. No
+   shipped animation does, but that is the thing to check if a
+   future one appears to tilt the whole bike.
+
+2.5.  unitsPerMetre is calibrated by eye - CLOSED
+
+   It is 128, and the original states it outright. FUN_0046b120 at
+   0x0046bc8a advances a racer by
+
+       pos += moveDir * speed * dtMs * 1.28
+
+   where 1.28 is the DOUBLE at 0x004d1010. dtMs is the 0.1-scaled
+   millisecond unit, 3.3 at 33 ms, so a second of travel is
+   speed * 1000 * 0.1 * 1.28 = speed * 128 world units.
+
+   IT WAS ALREADY IN THE PORT, one file over. racer.c has carried
+   it as AI_STEP_SCALE, with the address, since racer_ai_integrate
+   was transcribed. race.c had an independent guess for the same
+   quantity and neither knew about the other - which is the case
+   for keeping a constant in one place with its address, not two.
+
+   THE TRAVEL CROSS-CHECK WAS DISCARDED. Two runs were attempted and
+   neither is usable: the first had the rails off and left the
+   circuit entirely, falling 1053 units through terrain the track
+   does not cover; the second had them on and spent its window
+   bouncing off them. Their ratios, 0.987 and 0.910, are recorded
+   here only so nobody re-derives support from them - they measure
+   the collision response, not the scale.
+
+   A VALID VERSION IS EASY AND WORTH DOING: with the rails off there
+   are about SIX SECONDS of straight before the terrain changes,
+   which is ample for an acceleration run. Sample the position and
+   speed each frame inside that window rather than differencing two
+   endpoints across a corner.
+
+   The reading at 0x004d1010 does not depend on any of that. It is
+   static evidence - the constant the original's own integrator
+   multiplies by - and it stands on its own.
+
+   THE CAVEAT IS CLOSED. 0x004d1010 has only AI and network
+   references, so for a while 128 was verified for those two and
+   inferred for the human. The human's own integrator has now been
+   read - ModelInstance_Integrate at 0x0048dac7 - and it states
+   the same value as a SEPARATE constant, the double 128.0 at
+   0x004d1c30:
+
+       displacement = moveDir * speed * 128.0 * dt-factors
+
+   The AI writes the scale as 1.28 against a 0.1-scaled
+   millisecond; the player's writes 128.0 directly. Same number,
+   two spellings, three integrators. Nothing is inferred any more.
+
+   TWO TRAPS THIS MEASUREMENT HIT, both worth knowing:
+
+   o 0x004d1010 IS A DOUBLE. Read as a float it is 89128.96.
+
+   o A ONE-FRAME send_input ADVANCES TWO. The reply says ran=2.
+     Read the counter at 0x004e981c either side and use the
+     observed count; frame-loop.txt 1.4 records the same trap
+     costing several rounds of measurement before.
+
+2.6.  The bike is on a rail - CLOSED
+
+   THE TITLE WAS MISLEADING FROM THE START and cost two sessions.
+   "Steering never becomes a heading" described a mechanism that
+   was already present: race_tick_physics has always advanced
+   s_race_yawWorld through racer_steer_torque, which is a faithful
+   transcription of ApplySteering's tail. The bars turned the
+   heading; they always did.
+
+   WHAT WAS ACTUALLY WRONG was the position. The bike's location
+   came from a segment index and a lateral offset - lane
+   coordinates - so however the heading moved, the bike could only
+   ever slide along the racing line and could not leave the road
+   surface at all.
+
+   FIXED. race_tick_physics now integrates the position along
+   r->moveDir and asks the track afterwards which segment that
+   landed in, which is the original's arrangement:
+   ModelInstance_Integrate moves, UpdateGroundContact reacts.
+   race_fall_and_land adds the vertical half through
+   racer_gravity_step at 2.5 g, with the original's 32-unit
+   airborne threshold.
+
+   THE LESSON IS THE NAMING. An item named for a suspected cause
+   rather than an observed symptom sends the next reader after the
+   wrong thing. "The bike is on a rail" is what could be seen; the
+   steering was a guess about why, and it was wrong.
+
+2.7.  The automatic upshift is ours
+
+   Class ours.  src/race.c.
+
+   The original drives its two shift requesters from input bits
+   0x10 and 0x20 in maybe_Racer_UpdateAirborne - manual shift
+   buttons - and nothing read so far decides an AUTOMATIC upshift.
+   Ours asks for one when the engine would over-rev and for a
+   downshift when it would bog. That is what the ratios imply, not
+   what any function says.
+
+   The gearbox mode at racer+0x88 reads 1, the assisted gearbox, so
+   the requester exists somewhere. Find it.
+
+2.8.  The crash fall side is a stand-in
+
+   Class ours.  src/racer.c.
+
+   The original takes bit 0 of something and falls left; ours picks
+   a side by a different rule. Getting it wrong only picks the
+   wrong side of a crash, which is why it has survived - but it is
+   still a guess in place of a read.
+
+2.9.  Leaving a crash zeroes the whole velocity
+
+   Class gap.  src/racer.c.
+
+   The original calls SetLongSpeed(instance, 0.0), which zeroes
+   only the FORWARD component, so a bike sliding sideways when the
+   crash ends keeps that drift. Ours zeroes speed outright because
+   MR_Drivetrain carries no velDir.
+
+   The fix is a struct change, not a formula: give the drivetrain
+   the direction vector the original keeps.
+
+2.10.  The side camera is ours
+
+   Class ours.  src/race.h, race_camera_toggle_side.
+
+   Retail's view key swaps high and low from behind; ours swings 90
+   degrees to the bike's left. It exists because the fork and the
+   wheels cannot be seen from a chase cam, which is a real need.
+
+   DECIDE, do not drift: either it becomes a named debug override
+   that is off by default and does not touch the retail view key,
+   or it goes. Right now it is neither.
+
+2.11.  The rider pose under lean
+
+   Class gap.  src/racer.c, racer_build_pose.  OBSERVED, not yet
+   diagnosed.
+
+   With the bike's own lean now correct, the rider on top of it is
+   the obvious remaining difference from retail. The machinery is
+   present - racer_build_pose stacks the stance, pitch, lean,
+   stunt and crash passes that maybe_Racer_UpdatePose stacks, and
+   each weight carries an ORIGIN tag - so this is not a missing
+   subsystem. It is a discrepancy inside one that is already
+   transcribed, and finding it means comparing per-part angles
+   against a capture rather than reasoning about the weights.
+
+   THREE CANDIDATES, in the order worth checking:
+
+   o THE STUNT PASS IS NOT SEQUENCED. racer_pose_stunt_step walks
+     the run but the pass does not advance through it the way the
+     original does. Already marked [open] in racer.c.
+
+   o THE LOCAL AND REMOTE LEAN PATHS DISAGREE BY DESIGN, and which
+     one a racer takes is decided by isLocal. The local path
+     derives the slide mix from LEAN and the remote path from
+     SPEED, so picking the wrong one is not a small error - it
+     changes what causes the rider to slide off the seat.
+
+   o THE .ROT INDICES. gauche/droite against derapGauche/
+     derapDroite, plus saut and descent by the sign of the pitch
+     weight. A swapped pair would look like a plausible pose in
+     the wrong situation, which is the hardest kind to spot.
+
+   ONE CAUSE IS ALREADY FIXED and is worth knowing about before
+   measuring, because it changes what a fresh capture will show.
+   racer_pose_pitch takes (front.y - rear.y) / (axeDistance * 48)
+   times 4. Until the ground-contact fix in section 4, those were
+   the chassis points, whose y differed by a constant 5.76 on flat
+   ground - so p was pinned at 0.2743 and the rider wore saut.rot,
+   the jump pose, at 27 per cent weight permanently. That is gone.
+
+   WHAT TO MEASURE FIRST: the per-part angles at racer+0x63C +
+   (lod*20 + part)*100 + 0x0C, for the rider members 5..16, at a
+   known lean, against the port's own. That says whether the
+   angles differ or only their application does - the same split
+   that took several sessions to see for the bike.
+
+2.12.  The wall clip is not called
+
+   Class gap.  src/race.c.  INTRODUCED BY 2.6's FIX.
+
+   On a rail the bike could not leave the road, so guard rails
+   never had to be tested. Free position removes that guarantee
+   and nothing replaced it: the bike now drives through the rails
+   and off into the terrain.
+
+   EVERYTHING NEEDED IS ALREADY TRANSCRIBED, which is what makes
+   this a wiring job rather than a reading one:
+
+       trk_clip_move_against_walls   the two planes, the reflect
+       racer_wall_impact_cos         head-on-ness
+       racer_wall_crash              the three conditions
+       racer_wall_stop               speed to zero, slide to 0.8
+
+   The original calls the clip from UpdateGroundContact BEFORE it
+   samples the ground (racers.txt 9.29.7), so the order is: move,
+   clip against the segment's two wall planes, then snap. Our
+   race_fall_and_land does the move and the snap with nothing
+   between them.
+
+   WIRED, in race_clip_walls. Move, clip, then fall - the original's
+   order, with the push-out at 32 along the wall normal and the
+   reflected direction fed back into s_race_yawMove so the bike
+   stops driving into the rail it just bounced off.
+
+   THREE THINGS THAT FELL INTO PLACE:
+
+   o Game_RandNext is one CALL and a RET - a thunk to the CRT rand.
+     So rand() & 3 in the port IS the transcription, not a stand-in.
+
+   o The slide gate is racer+0x307d, the WHEELIE ANGLE, so the third
+     crash condition reads as: wheelie into a rail above 20 km/h and
+     you go down whatever the angle.
+
+   o THE '3' KEY turns them off, matching the switch
+     tools/mr_cheats.py pokes into MOTO.EXE so the two can be put in
+     the same state for a comparison. Off at load.  It was a [DEBUG]
+     nowalls ini setting and is now a key, because a comparison
+     session switches it constantly and an ini switch costs a restart
+     - which reverts the MOTO side too, that one being a code patch.
+
+     IT HAS TO SWITCH BOTH WALL SITES.  The clip stops the bike
+     CROSSING a rail; trk_contain_point clamps it back inside one it
+     is already past, every frame.  Gating only the clip left the
+     containment holding the bike on the wall and made the switch
+     look broken - which is how it read after the containment was
+     imported.
+
+   ONE CHOICE MADE RATHER THAN READ. racer+0x2dbc selects between a
+   flat one-in-four that ignores the geometry and the pair that reads
+   it, and what writes that field is unidentified. We take the
+   geometric pair, because its inputs - impact angle and speed - are
+   ones we can supply honestly, and because a random crash on every
+   wall touch would be indistinguishable from a bug while the rest of
+   this path settles. Marked in the source. [open]
+
+   MEASURED AGAINST MOTO.EXE, and the first wiring was wrong in two
+   ways that only a capture could show. tools/mr_place.py writes the
+   position and the orientation directly, so an impact can be set up
+   at a chosen angle and repeated exactly; segment 3 of ile01 is a
+   straight 2560 units wide, and placing the bike at one rail facing
+   the other gives a square hit with 2480 units of run-up.
+
+   o THE DAMPING RUNS BEFORE THE BRANCH, not after. 0x004692b3
+     loads racer+0x124, multiplies by the double 0.75 at 0x004d0ff0
+     and stores it back at 0x004692d3 - ahead of the branch at
+     0x004692ef - so the scrape's 0.5 and 0.3 are taken from the
+     DAMPED speed. Doing it afterwards leaves the speed right, since
+     0.75 and 0.3 commute, and the slide a third too high. The
+     ratio was exactly 0.7500 on all four captured hits.
+
+   o THE BOUNCE/SCRAPE GATE IS THREE-DIMENSIONAL. The test at
+     0x004692e4 dots the reflected unit direction (ESP+0x20)
+     against the frame's original move (ESP+0x98) and compares
+     against the float 0.0 at 0x004d0e54: negative scrapes,
+     non-negative bounces. Our move had no y, because the fall was
+     applied after the clip rather than before it:
+
+       +------------+--------+--------+--------------+-----------+
+       | impact     | dot 3D | dot XZ | MOTO chose   | we chose  |
+       +============+========+========+==============+===========+
+       | square on  |  -77.4 |  -93.2 | scrape       | scrape    |
+       +------------+--------+--------+--------------+-----------+
+       | 50 degrees |  +30.1 |   -3.4 | bounce       | scrape    |
+       +------------+--------+--------+--------------+-----------+
+
+     The reflection only negates the component along the wall
+     normal, so the fall's downward step survives it unchanged and
+     contributes POSITIVELY to the dot on every hit. Dropping y
+     therefore biases marginal angles into the scrape - and a
+     scrape leaves the direction alone, which is precisely the
+     reported symptom of being unable to steer off a rail.
+
+     FIXED by splitting race_fall_and_land into race_fall_step and
+     race_land and clipping between them, which is the original's
+     own order: move in 3D, clip, then snap.
+
+   AND IT UNBLOCKS 2.3. racer_wall_crash sets crashLatch, which is
+   the only thing the per-part placement split was waiting on.
+
+2.13.  The vertical step is 12x too small - CLOSED
+
+   Class gap.  src/racer.c racer_integrate.  CLOSED by import 5.
+
+   THE GROUNDED BRANCH DOES NOT INTEGRATE GRAVITY AT ALL. It adds
+   a constant straight to the displacement:
+
+       disp.y += dt * -1255.68          0x004d1c78
+
+   and -1255.68 is -128 * 9.81 - gravity in the same 128 units per
+   metre the displacement uses. With dt = frameDelta * 0.01 = 0.033
+   that is -41.437 a frame, against the -41.4374 measured live off
+   MOTO.EXE. It is applied when the caller forbids a lift or the
+   step is already downward, so a grounded bike is pressed onto the
+   road every frame and the ground snap takes it back.
+
+   WHICH IS WHY IT WAS CONSTANT. The note below wondered whether a
+   value that does not vary with speed or time could be an
+   integrated fall. It is not: it is a fixed per-frame push, and
+   the guess that it might be a fixed OFFSET was closer than the
+   gravity reading.
+
+   OURS USED THE AIRBORNE FORMULA ON THE GROUNDED PATH -
+   racer_gravity_step, 2.5 g into the polar velocity - which gives
+   about -3.4. That is the whole of the 12x.
+
+   The velocity/moveDir merge below was a real bug and worth
+   fixing, but it was not this one.
+
+   The move handed to the wall gate carries a downward step, and
+   2.12 showed that step decides which branch a marginal impact
+   takes. Ours is the wrong size, so the branch selection is still
+   wrong even though the gate is now three-dimensional.
+
+   +---------------------------+--------------+-------------------+
+   | per-frame vertical step   | MOTO.EXE     | ours              |
+   +===========================+==============+===================+
+   | grounded, any speed       |     -41.4374 |     about -3.4    |
+   +---------------------------+--------------+-------------------+
+
+   MOTO's is CONSTANT - identical to four decimals across six
+   consecutive frames and across two impacts at different speeds,
+   with prevPos.y exactly 0.0 every frame. A value that does not
+   vary with speed or time is not obviously an integrated fall, so
+   do not assume this is a gravity constant that needs scaling:
+   it may be a fixed offset between the tracked point and the
+   ground. Settle it by reading ModelInstance_Integrate rather than
+   by fitting a multiplier - 41.4374 factors several plausible ways
+   and picking one by arithmetic would be a guess wearing a
+   derivation.
+
+   MEASURED ON BOTH SIDES FROM ONE PLACEMENT. mr_place.py --to both
+   puts the two games at the same spot facing the same way, so the
+   run below is the same experiment twice: square-right, then 46
+   frames of nothing but throttle, no steering at all.
+
+   +--------------+---------------------------+------------------+
+   | after 46     | MOTO.EXE                  | ours             |
+   +==============+===========================+==================+
+   | position     | (1174.3, 0, 2504.5)       | (1230.2, 0,      |
+   |              |                           |  2058.0)         |
+   +--------------+---------------------------+------------------+
+   | heading      | +3.8 deg, along the track | -90 deg, at the  |
+   |              |                           | wall             |
+   +--------------+---------------------------+------------------+
+   | travel       | -                         | +90 deg,         |
+   |              |                           | reflected        |
+   +--------------+---------------------------+------------------+
+
+   MOTO crossed the track, met the rail and came away TURNED
+   PARALLEL to it, advancing 446 units down the straight. Ours
+   crossed, met the rail, and its z never moved at all: the heading
+   stayed pinned at -90 into the wall while the travel direction
+   flipped between +90 and -90 on each contact.
+
+   AND MOTO DID NOT CRASH TO GET THERE. crashLatch was 0 at the end
+   of the run, onGround 1, speed 13.16 m/s - so this is not a crash
+   and respawn, it is ordinary riding. Something realigns the
+   heading with the travel after an impact and our port has no
+   equivalent: s_race_yawWorld only ever moves through
+   racer_steer_torque, so with no steering input it cannot change.
+
+   NOT THE ORIENTATION REBUILD. The ground probes at 0x00469506
+   multiply axeDistance by racer+0xd4 and +0xd8 - the PREVIOUS
+   forward row - so F = normalize(P1-P2) reproduces the heading it
+   started from plus terrain pitch. That path preserves the
+   heading; it cannot be what rotates it.
+
+   TWO CAUSES, BOTH NOW LOCATED. See racers.txt 9.29.12.1 and
+   9.29.12.2 for the evidence; the divergences are:
+
+   o WE CLIP ONCE, THE ORIGINAL CLIPS TWICE - against the racer's
+     segment and then against racer+0x31c1, the segment it is
+     entering. Consecutive segments share wall planes on a
+     straight, so one pass looks right everywhere except a bend.
+     That is the curve half of the complaint.
+
+   o APPLYSTEERING YAWS THE BIKE WITH THE BARS CENTRED. Captured
+     from ComposeOrientation's return address with steer == 0.0
+     at every call, swinging the heading back to the segment's own
+     direction at a steady 4.4 degrees a frame and stopping there.
+     s_race_yawWorld has no such term, so our bike keeps pointing
+     into the rail forever. That is the sticking half.
+
+   UpdateLean was the wrong tree and is now ruled out, as is the
+   TickRemote path - both read flImpactBlend, neither steers.
+
+   A LIKELY CAUSE, FOUND BY THE BYTE-EXACT PASS. velocity and
+   moveDir were the same original field, +0x018c, held as two
+   separate vectors in our struct. So racer_gravity_step tilted a
+   private vertical vector that nothing else read, while the
+   position advanced along a moveDir that stayed horizontal - and
+   the vertical step became a small independent term instead of
+   the y component of a full-magnitude velocity. Merged; the
+   measurement needs redoing against the merged field before this
+   is called closed.
+
+   WHY IT SHOWS UP AS STICKING. Too small a y term shrinks the
+   gate's positive contribution, so impacts that MOTO bounces we
+   scrape - and a scrape leaves the travel direction untouched.
+   The bike then keeps its heading into the rail and is clipped
+   back to the hit point every frame, which reads as being glued
+   to a wall that will not release.
+
+   WHAT IS ALREADY CONFIRMED TO MATCH, so it is not worth
+   re-checking:
+
+   o The segment passed to the clip. UpdateGroundContact hands it
+     racer+0x31bd, the segment of prevPos, NOT of the new position
+     - verified with the two entry-plane distances either side of a
+     boundary. race_clip_walls resolves the same segment from the
+     same point.
+
+   o The push-out. 0x004690ae is hit + normal * 32 on all three
+     axes, taken from the hit point and not from the overshooting
+     destination, so the along-wall travel really is discarded by
+     the original too.
+
+   o Trk_ClipMoveAgainstWalls does not write its pTo argument. The
+     caller's push-out is the only thing that moves the racer.
+
+2.19.  moveDir lags the heading after a wall recovery
+
+   Class gap.  src/racer.c racer_integrate.  OPEN.
+
+   THE RECOVERY ITSELF IS NOW EXACT. Driven square into the right
+   rail, both games turn -90 to parallel with the pending yaw
+   matching at every step - -76.6, -63.3, -49.9, -36.5, -22.9,
+   -9.6, 0 - and both settle on a heading of about +3.7.
+
+   WHAT DIFFERS IS WHERE THEY GO NEXT:
+
+   +-----------+----------------+----------------+
+   |           | MOTO.EXE       | ours           |
+   +===========+================+================+
+   | heading   |     3.85       |     3.65       |
+   +-----------+----------------+----------------+
+   | moveDir   |     5.77       |    -2.22       |
+   +-----------+----------------+----------------+
+   | disp.x    |    -6.28       |    +1.16       |
+   +-----------+----------------+----------------+
+
+   Under yaw = atan2(-x, z) a POSITIVE yaw travels -X, so MOTO's
+   moveDir of +5.77 carries it away from the +X rail while ours at
+   -2.22 carries it back into one. The bike then re-contacts, is
+   pushed out to exactly 1248 - the wall at 1280 less the 32-unit
+   push-out - and the cycle repeats.
+
+   THE BLEND ITSELF IS IDENTICAL - hooked at 0x0048da21 over six
+   frames: a constant 0.85 weight closing 15 per cent of the gap,
+   exactly as transcribed. racer_integrate needed no change.
+
+   AND OUR SIDE WAS BOUNCING ALL ALONG. Sampled a frame at a time,
+   moveDir flips to +65.9 on contact and x snaps to 1248 - the
+   wall at 1280 less the 32 push-out - so the bounce branch fired
+   and assigned the reflected direction correctly. One frame later
+   moveDir reads -62.9, back on a smooth track as if nothing had
+   happened.
+
+   IT WAS BEING OVERWRITTEN. An older slip model kept the travel
+   direction in the scalar s_race_yawMove and republished
+   r->moveDir from it every frame, AFTER racer_integrate had
+   computed it. Ninety-five lines of race.c, removed.
+
+   THE SAME SHAPE AS import 4's matOrientation OVERRIDE, and worth
+   naming as a pattern: an import lands, the scaffolding it
+   replaced keeps running, and the import's output is silently
+   discarded downstream. Both times the imported function was
+   correct and the bug was that nothing had removed what it
+   superseded. When an import does not change behaviour, look for
+   the old path still writing the same field.
+   riderBits ALSO STICKS AT 129 ON OURS against MOTO's 0, so bit 0
+   - the wall-touch flag - is cleared somewhere we do not clear
+   it. Probably the same frame reset that clears the pair flags.
+
+2.17.  The rider tumble matrix - CLOSED
+
+   Class gap.  src/racer.c, src/race.c.
+
+   THE CRASH SIMULATION HAD BEEN RIGHT SINCE IMPORT 3 - the rider
+   was launched, dragged, bounced off the ground and timed out
+   correctly. What was missing was that NOBODY DREW HIM THERE.
+
+   THREE PIECES, and the first is the one that mattered:
+
+   o THE DRAW NEVER USED THE RIDER'S PLACEMENT. model.c has
+     carried riderOrient/riderPos since the per-part split -
+     parts 3..14 compose against them rather than the bike's,
+     which is the whole point of that split - and race.c never
+     set either. The rider stayed welded to the bike however far
+     racer_update_crash threw him. Set now, while crashLatch is.
+
+   o matRiderRoot WAS NEVER SEEDED. racer_begin_crash now copies
+     matOrientation into it, which is what 0x00468006 does at the
+     end of the original's root build. The yaw-cancelling multiply
+     ahead of that is not transcribed and only matters when the
+     matrix already holds something. [open]
+
+   o THE TUMBLE ITSELF:
+
+         rate = f_30e1 * (flRiderSpeed / flRiderSpeedRef) * dt
+         matRiderRoot = Euler(rate) * matRiderRoot
+
+     with f_30e1 = (0, fallSide, fallSide) from the crash entry -
+     so he rolls and yaws about the side he went down and never
+     pitches. The ratio IS the animation curve: 1.0 at the throw,
+     0 when he stops sliding, so he spins fast and winds down
+     without a separate timer.
+
+   ONE DELIBERATE SHORTCUT. The original composes three angle-table
+   lookups by hand; this uses mat34_from_euler, the same rotation
+   by a shorter route. The table quantises to 0x4000 steps and
+   this does not, so the two can drift by up to a fifth of a
+   degree a frame - invisible on a tumbling body, and worth noting
+   rather than chasing.
+
+2.20.  The bike drives on without its rider - CLOSED
+
+   Class gap.  src/race.c.
+
+   TWO THINGS THE CRASH NEVER REACHED, both of them wiring rather
+   than physics:
+
+   o THE DRIVETRAIN KEPT RUNNING. race_tick_physics gated only the
+     BARS on crashLatch; racer_apply_drive and
+     physics_tick_drivetrain ran regardless, so the bike
+     accelerated away from under its own rider. Measured on
+     MOTO.EXE a crashed bike's speed decays a clean 0.9 a frame -
+     4.37, 3.56, 2.90, 2.37, 1.93 - with no re-acceleration, which
+     only holds if the whole input chain is skipped.
+
+   o THE BIKE DID NOT LIE DOWN. maybe_Racer_Draw at 0x0045f563
+     tests crashLatch and OVERWRITES the lean it is about to roll
+     in with crashFallSide, plus or minus pi/2, so the bike goes
+     flat on the side the rider went down. It is the same field
+     the tumble axes come from, which is why bike and rider always
+     agree about which way the crash went.
+
+2.21.  The wheelie ramp is never ticked - CLOSED
+
+   Class gap.  src/race.c.
+
+   physics_wheelie_tick has been in physics.c, complete and
+   documented, with NO CALLER. s_race_wheelie.angle therefore sat
+   at the memset zero for the whole of the port's life.
+
+   TWO CONSEQUENCES, and the second is why it went unnoticed: the
+   bike could not wheelie at all, and the third wall-crash
+   condition - a wheelie above 20 km/h, which is the only
+   DETERMINISTIC one of the three - could never fire from play.
+   Every crash reachable by driving was the 1-in-4 gate.
+
+2.22.  The crash smoke
+
+   Class gap.  OPEN, and it is a whole missing subsystem rather
+   than a missing call.
+
+   The reset half of what this entry used to cover is done -
+   race_reset_crashes with its gate and cascade, called from
+   racer_update_crash.
+
+   THE SMOKE IS ONE CLIENT OF AN FX PARTICLE POOL THE PORT DOES NOT
+   HAVE. 128 records, an allocator, a per-frame tick and a
+   billboard draw, and the wheel spray is the same system - which
+   is why the port has no dust anywhere, not just at a crash.
+   racer_fx_gate, racer_fx_in_range and racer_fx_particle_count
+   were written for it and have never had a caller.
+
+   The chain is now read end to end and written up in
+   subsystems/fx-particles.txt: the record, maybe_Fx_Burst and its
+   two crash call sites (0x004681b3 at the bike, 0x004686f6 where
+   the rider lands), the tick with its constants, and the draw.
+
+   ONE PIECE IS STILL MISSING BEFORE IT CAN BE WRITTEN. The
+   billboard frame is inlined into maybe_Fx_DrawParticle and the
+   decompiler renders it with extraout_ST0 / extraout_ST1
+   phantoms. Transcribing those as though they were variables is
+   how mat34_from_euler came out wrong the first time, so it wants
+   a symbolic read of the x87 block instead. See fx-particles.txt
+   7 and 8.
+
+2.23.  The rider stood up through the whole fall - CLOSED
+
+   Class gap.  src/racer.c, src/race.c.
+
+   FOUR THINGS, and they compound - each one alone would have been
+   visible, and together they made the fall unrecognisable.
+
+   o THE RIDER ROOT WAS SEEDED UPRIGHT. racer_begin_crash copied
+     matOrientation, so the rider was thrown standing. The
+     original keeps only the YAW of matRiderRoot and lays a flat
+     frame at that heading down by a literal -pi/2 - rows
+     (lateral, -forward, up). Now racer_lay_rider_root, shared
+     with the site below.
+
+     THE -pi/2 IS NOT crashFallSide, and the two are easy to
+     confuse because both are +-pi/2. It reaches the euler builder
+     as the constant table indices 0x2000 and 0x3000, so a rider
+     going down either way starts from the same attitude.
+
+   o NOTHING MAINTAINED matRiderRoot WHILE HE WAS ABOARD. The
+     original's DRAW writes the bike's matrix and position into
+     matRiderRoot and riderPosition on every frame crashLatch is
+     clear (0x00460db7, 0x00460e53). Those are not crash state -
+     and because the lay-down reads the yaw back out of
+     matRiderRoot, a zeroed one threw every rider down the world
+     +Z axis whatever way the bike was facing.
+
+   o THE GROUND CONTACT NEVER RE-LAID HIM. 0x00468640 rebuilds the
+     rider root the same way on EVERY grounded frame, which is
+     what confines the free tumble to the air. Without it the
+     tumble kept accumulating on the ground and rolled him through
+     the road. Traced on MOTO.EXE, matRiderRoot's row2 stayed
+     exactly (0,1,0) for ten consecutive grounded frames while
+     row0 turned 0.046 -> 0.0 in the XZ plane - a pure yaw, which
+     only the re-lay produces.
+
+   o THE TUMBLE MULTIPLIED ON THE WRONG SIDE. The original
+     multiplies each of matRiderRoot's four rows by the rotation,
+     which is matRiderRoot * Euler(rate) - the rates are read in
+     the rider's own frame. Ours had Euler(rate) * matRiderRoot,
+     which turns the surviving yaw rate into a world-axis tilt.
+
+   VERIFIED A/B, same wall, same wheelie crash on both games:
+
+   +----------------+---------------------------+---------------------------+
+   | Quantity       | MOTO.EXE                  | mracer                    |
+   +================+===========================+===========================+
+   | frameDelta     | 3.3000                    | 3.3005                    |
+   +----------------+---------------------------+---------------------------+
+   | root2, the up  | (0,1,0) held every frame  | (0,1,0) held every frame  |
+   | axis           |                           |                           |
+   +----------------+---------------------------+---------------------------+
+   | root0.x        | .0464 .0410 .0360 .0307   | .0464 .0410 .0357 .0303   |
+   +----------------+---------------------------+---------------------------+
+   | riderPos.y     | 0.00 after the first tick | 0.00 after the first tick |
+   +----------------+---------------------------+---------------------------+
+
+   root2 HOLDING IS THE TEST THAT MATTERS. It is what the ground
+   re-lay produces and what the wrong multiply order destroys, so a
+   run where it stays (0,1,0) for ten frames rules out both.
+
+   MOTO'S HARNESS RUNS TWO ENGINE FRAMES PER STEP, so its columns
+   above are every OTHER frame of ours. Both racers read frameDelta
+   3.3 and g_frameDelta is 33 ms, so the timebases are the same and
+   only the stepping differs - do not read the 2:1 as a physics
+   divergence.
+
+2.24.  The crashed rider was drawn in the road - CLOSED
+
+   Class gap.  src/race.c.
+
+   racer_update_crash pins riderPosition.y to the TRUNCATED ground
+   height, so the simulated value IS the road surface and the model
+   has to be lifted onto it. maybe_Racer_Draw adds a constant at
+   0x00460ea6 and nothing else:
+
+       PersoAnim set     + 32.0    0x004d1024
+       PersoAnim clear   + 64.0    0x004d1060
+
+   PersoAnim is carac index 72, the same int flag the ground probes
+   are gated on, loaded once at 0x0045f2a5. Read live on ile01,
+   riderPosition.y was 0.0 for every frame of a crash and the flag
+   was 0, so the lift was 64.
+
+2.25.  The crash never ended - CLOSED
+
+   Class gap.  src/racer.c.
+
+   A crashed bike stayed down for the rest of the race. Measured:
+   crashTimerMs ran to -161 over 160 frames with crashLatch still
+   1, riderSpeed 0 and speed pinned at 0 - and because the
+   drivetrain is gated on crashLatch, the bike could never move
+   again.
+
+   racer_place_from_grid NEVER SET slotIndex. The memset leaves it
+   0, so racer 1 carried slot 0, and race_tick_physics passes
+   r->slotIndex to race_reset_crashes as the racer to bring back
+   up. Asking to raise racer 0 while racer 1 is still down is
+   exactly the case the gate refuses (race.h), so it returned 0
+   every frame and the latch was never cleared.
+
+   MOTO.EXE reads 1 at racer+0x2dd0 for racer 1, and the original
+   tests this->slotIndex == g_viewedRacerIndex - racers.txt 9.12.
+
+   THIS IS THE THIRD FIELD OF THIS KIND. humanPlayer and soloMode
+   were the first two (racers-convergence.txt 9.61.4) and the shape is
+   identical: a field the memset zeroes, nothing writes, and whose
+   zero is a legal value rather than an obvious error. Worth a
+   sweep of the rest of the record rather than waiting for the
+   fourth. [open]
+
+2.23.  The wheelie is invisible - CLOSED
+
+   Class gap.  src/race.c, src/racer.c.
+
+   THE WHEELIE WAS WORKING PERFECTLY AND TELLING NOBODY. Measured
+   mid-run with the button held: s_race_wheelie.angle 1.5708 -
+   pi/2, the cap - timer 79.2, scale 2.0. A correct wheelie that
+   nothing could see.
+
+   THE ORIGINAL HAS NO WHEELIE OBJECT. maybe_Racer_UpdateWheelie
+   writes racer+0x307d directly at 0x004660fe, and SEVEN functions
+   read it there: UpdateLean for the pitch, ApplySteering to halve
+   the turn rate, UpdateGroundContact for the third wall-crash
+   condition, plus ApplyDrive, EmitWheelFx, UpdatePose and the
+   engine sound. Ours kept it in a static beside the racer, so
+   every one of those consumers read a permanent zero.
+
+   THREE CONSEQUENCES, and only the first was visible: no pitch,
+   no steering penalty, and the one DETERMINISTIC wall-crash gate
+   could never fire - which is why crashes looked unimplemented
+   and every reachable one was the 1-in-4 roll.
+
+   THE PITCH IS NOT THE ANGLE. UpdateLean at 0x0046a343 takes
+
+       pitch = sin(wheelieAngle) * -0.785398
+
+   with the constant a DOUBLE holding -pi/4, so a full wheelie of
+   pi/2 tips the bike 45 degrees and no further, coming up fast
+   and easing off at the top. Read as a float it is 3.37e12 - the
+   same width trap as 0x004d12a8 in the recovery yaw.
+
+   CONFIRMED AGAINST RETAIL by forcing stuntHeld through the debug
+   pipe, since send_input has no stunt bit: MOTO reaches 1.5708
+   exactly as ours does, for a 45-degree nose-up.
+
+   STILL OURS: the pitch is composed at draw time rather than
+   folded into matBikeRoot where UpdateLean puts it, so anything
+   reading matBikeRoot sees no wheelie. Retiring MR_Wheelie into
+   racer+0x307d outright would close both. [open]
+
+3.  Deliberate divergences that stay
+
+   Recorded so they are not re-opened. Each is argued where it
+   lives; this is an index, not a restatement.
+
+   o transform.c - zero guards on the perspective divide, a bound
+     check on the pool, and clearing the shade field. The original
+     divides unconditionally and does not clear.
+
+   o racer.c - soloMode (racer+0x4) is set to 1 on EVERY racer,
+     where Racer_Create is passed 0 for every racer in a network
+     game and maybe_Game_StartRacePending then sets 1 for the
+     LOCAL SLOT ALONE at 0x00410f65. MR_Racer.txt 23.1 has the
+     three-case table.
+
+     THE REASON IS race_lap_visible, which gates the lap
+     close-out on it: a remote racer with 0 never completes a lap,
+     never reaches RACESTATE_FINISHED, and a net race therefore
+     cannot end - race_net_check_over waits for a finisher that
+     never arrives. Retail does not have the problem because its
+     netplay is unfinished.
+
+     THE NARROWER FIX WOULD BE 1 ON THE LOCAL SLOT AND 0
+     ELSEWHERE, matching the binary, and then teaching
+     race_lap_visible about remote racers instead. Worth doing if
+     anything else turns out to read the field.
+
+   o queue.c - the span buffer is off. The original enables it in
+     Screen3D_Open. This is the only divergence in that file that
+     changes what is drawn.
+
+   o clip.c, sprite.c - guards against a zero divisor the original
+     does not have.
+
+   o prim.c - a 16-bit colour value kept in a wider field.
+
+   o skl.h - the angle table is cleared before it is filled.
+
+   o sprite.c - decoding happens at load, where the original defers
+     it; and the 4:3 constants are computed where the original
+     hardcodes 0x280.
+
+   o d3d9rt.cpp - not a translation of Dsi_d3d.cpp at all. Execute
+     buffers have no modern equivalent; what is reproduced is the
+     semantics. See d3d-execute-buffers.txt.
+
+   o The debug overrides: [DEBUG] physics=0 for the autoSpeed rail,
+     autospeed, unitspermetre, startpage, startpaused, fastforward,
+     autopilot, logfile, logpath.  All off or inert by default,
+     all named in the ini.
+
+     logfile IS THE ODD ONE OUT and is worth knowing about
+     before the next time a log is wanted: the file half of mrlog
+     is OFF unless the key says otherwise, so a build with no ini
+     writes no file at all.  The console half is never gated.
+     log.h has the reasoning; the short version is that the open
+     truncates, so an unasked-for run would destroy the log from
+     the asked-for one before it.
+
+     The file lands BESIDE THE EXE, with [DEBUG] logpath as an
+     override - so two installs on one machine keep separate
+     logs instead of overwriting one.
+
+   o autopilot.c/h - OURS ENTIRELY, no original.  A debug driver
+     that synthesises the keyboard's button word so a race can be
+     finished unattended, which is what makes the end-of-race
+     sequence testable at all.  It feeds the real input path, so
+     nothing downstream is bypassed.  It is NOT a sixth gameplay
+     file under rule 13: it simulates nothing and its output is an
+     INPUT, which puts it with timing.c.  See
+     subsystems/autopilot.txt.
+
+4.  Closed
+
+   o The rear wheel sank into the road. race.c fed the DRAW the pair
+     from racer_wheel_contacts, which carries an up term of
+     96 * (hauteurCadre - 2 * rayon). That is 0 for the front wheel
+     of every shipped bike - hauteurCadre is exactly twice rayonAv -
+     and -5.76 for the rear of the street bike, so only the rear
+     showed it, as a tyre sunk to the rim. The pair the racer
+     actually stores at racer+0x1B4 and racer+0x338 has no up term:
+     measured live, rear - pos = (+83.9185, 0.0000, -3.6997) and
+     front - pos its exact negation, both 84.0000 long and both at
+     the racer's own height. racer_wheel_ground is that pair.
+
+     THE SAME ERROR WAS LEANING THE RIDER. racer_build_pose takes
+     (front.y - rear.y) over the wheelbase as a terrain tilt, and the
+     chassis pair differs in y by a constant 5.76 on flat ground, so
+     the pose carried a permanent false tilt. Both call sites moved.
+
+   o The chase camera. Three constants fitted to a single paused
+     frame - 480 back, 256 up, 1975 ahead - replaced by
+     Camera_UpdateChase 0x0046f840, reconstructed in race.c. The
+     lens, 394, was never a fit: it is g_projScaleX read live.
+
+   o The menu bike placement. Three formulas were fitted and
+     refuted before bikes_display_lift was read off the two addends
+     at 0x0045f828..0x0045ff62 - 96 * hauteurCadre - 48 * rayonAv,
+     verified on all four bike sets to 2e-4.
+
+   o The menu model offset. Was minus the model's own bounding-box
+     centre, which pushed the bike 28.8 down and 9.6 back. The
+     original applies nothing; the placement comes from the same
+     matrix as everything else.
+
+   o Baking the posed mesh. bike_draw now transforms each member's
+     slice of the bind pool by its own matrix, which is what the
+     original does. See racers.txt 9.64.
+
+   o Two separate draw paths for the menu and the race. One
+     bike_draw now, as the original has one maybe_Racer_Draw.
+
